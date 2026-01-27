@@ -1,0 +1,39 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.lib
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test artifacts
+Testing/
+*.log
+
+# Database files (for testing)
+*.db/
+testdb/
+
+# Coverage
+*.gcno
+*.gcda
+*.gcov
+coverage/
+
+# Package files
+*.tar.gz
+*.zip
