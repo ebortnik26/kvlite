@@ -2,53 +2,89 @@
 #define KVLITE_OPTIONS_H
 
 #include <cstddef>
+#include <cstdint>
 
 namespace kvlite {
 
+// Garbage collection policy for selecting files to compact
+enum class GCPolicy {
+    // Select files with the highest ratio of dead entries (default)
+    HIGHEST_DEAD_RATIO,
+
+    // Select the oldest files first
+    OLDEST_FIRST,
+
+    // Select files with the most dead entries (absolute count)
+    MOST_DEAD_ENTRIES,
+
+    // Manual selection only via compact() API
+    MANUAL
+};
+
 // Options to control the behavior of a database
 struct Options {
-    // Create the database if it does not exist
+    // --- Storage Options ---
+
+    // Maximum size of a single log file in bytes
+    // When exceeded, a new log file is created
+    // Default: 1GB
+    size_t log_file_size = 1ULL * 1024 * 1024 * 1024;
+
+    // Size of the write buffer in bytes
+    // Writes accumulate here before flushing to a new log file
+    // Default: 64MB
+    size_t write_buffer_size = 64 * 1024 * 1024;
+
+    // --- L1 Index Options ---
+
+    // Number of updates before persisting L1 index snapshot
+    // L1 WAL is truncated after successful snapshot
+    // Default: 10 million
+    uint64_t l1_snapshot_interval = 10'000'000;
+
+    // --- L2 Index Cache Options ---
+
+    // Size of the LRU cache for L2 indices in bytes
+    // Hot log file indices are kept in memory
+    // Default: 256MB
+    size_t l2_cache_size = 256 * 1024 * 1024;
+
+    // --- Garbage Collection Options ---
+
+    // Policy for selecting log files to compact
+    // Default: HIGHEST_DEAD_RATIO
+    GCPolicy gc_policy = GCPolicy::HIGHEST_DEAD_RATIO;
+
+    // Minimum dead entry ratio to trigger automatic GC
+    // Range: 0.0 to 1.0 (e.g., 0.5 = 50% dead entries)
+    // Default: 0.5
+    double gc_threshold = 0.5;
+
+    // Maximum number of files to compact in a single GC run
+    // Default: 10
+    int gc_max_files = 10;
+
+    // --- General Options ---
+
+    // Create the database directory if it does not exist
     bool create_if_missing = false;
 
     // Raise an error if the database already exists
     bool error_if_exists = false;
 
-    // Amount of data to build up in memory before writing to disk
-    // Default: 4MB
-    size_t write_buffer_size = 4 * 1024 * 1024;
-
-    // Maximum number of open files that can be used by the DB
-    // Default: 1000
-    int max_open_files = 1000;
-
-    // Size of the block cache in bytes
-    // Default: 8MB
-    size_t block_cache_size = 8 * 1024 * 1024;
-
-    // Approximate size of user data packed per block
-    // Default: 4KB
-    size_t block_size = 4 * 1024;
-
-    // Use bloom filters to reduce disk reads
-    bool use_bloom_filter = true;
-
-    // Bits per key for bloom filter (if enabled)
-    int bloom_filter_bits_per_key = 10;
-
-    // Sync writes to disk immediately
-    // Setting this to true will be slower but more durable
+    // Sync writes to disk immediately (slower but more durable)
     bool sync_writes = false;
 
-    // Compress data blocks using compression
-    bool compression = true;
+    // Enable checksums for data integrity verification
+    bool verify_checksums = true;
 };
 
 // Options for read operations
 struct ReadOptions {
-    // If true, all data read will be verified against checksums
+    // If true, verify checksum of data read from disk
     bool verify_checksums = false;
 
-    // If true, do not cache data read by this operation
+    // If true, cache the L2 index if not already cached
     bool fill_cache = true;
 };
 
