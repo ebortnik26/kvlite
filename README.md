@@ -167,33 +167,29 @@ L2 index files sequentially, using L1 to filter out old versions.
 
 ### Administrative Operations
 
-For garbage collection, statistics, and maintenance operations, use `DBAdmin`:
+Garbage collection, statistics, and maintenance are available directly on `DB`:
 
 ```cpp
-#include <kvlite/db_admin.h>
-
-kvlite::DBAdmin admin(db);
-
 // Trigger GC with configured policy
-admin.gc();
+db.gc();
 
 // Compact specific log files
-admin.gc({file_id1, file_id2, file_id3});
+db.gc({file_id1, file_id2, file_id3});
 
 // Check GC status
-if (admin.isGCRunning()) {
-    admin.waitForGC();
+if (db.isGCRunning()) {
+    db.waitForGC();
 }
 
 // Get statistics
 kvlite::DBStats stats;
-admin.getStats(stats);
+db.getStats(stats);
 std::cout << "Current version: " << stats.current_version << std::endl;
 std::cout << "Active snapshots: " << stats.active_snapshots << std::endl;
 
 // Force flush and L1 snapshot
-admin.flush();
-admin.snapshotL1Index();
+db.flush();
+db.snapshotL1Index();
 ```
 
 ## Configuration
@@ -413,7 +409,6 @@ void example(kvlite::DB& db) {
 
 ```cpp
 #include <kvlite/kvlite.h>
-#include <kvlite/db_admin.h>
 
 void auditKeyHistory(kvlite::DB& db, const std::string& key) {
     std::string value;
@@ -428,9 +423,8 @@ void auditKeyHistory(kvlite::DB& db, const std::string& key) {
     std::cout << "Current: " << value << " (v" << version << ")" << std::endl;
 
     // Walk backwards through history (if versions still retained)
-    kvlite::DBAdmin admin(db);
     kvlite::DBStats stats;
-    admin.getStats(stats);
+    db.getStats(stats);
 
     for (uint64_t v = version; v > stats.oldest_version; ) {
         std::string old_value;
