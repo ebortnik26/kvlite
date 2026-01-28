@@ -2,16 +2,12 @@
 #define KVLITE_DB_H
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <shared_mutex>
 #include <string>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "kvlite/status.h"
@@ -23,12 +19,8 @@ namespace kvlite {
 
 // Forward declarations for internal components
 namespace internal {
-class WriteBuffer;
-class DataCache;
-class LogManager;
 class L1IndexManager;
-class L2Index;
-class L2Cache;
+class StorageManager;
 struct LogEntry;
 struct IndexEntry;
 }  // namespace internal
@@ -42,21 +34,9 @@ struct DBStats {
     uint64_t l1_index_size = 0;
     uint64_t l2_cache_size = 0;
     uint64_t l2_cached_count = 0;
-    uint64_t updates_since_snapshot = 0;
     uint64_t current_version = 0;
     uint64_t oldest_version = 0;
     uint64_t active_snapshots = 0;
-    bool gc_running = false;
-};
-
-// Information about a single log file
-struct LogFileInfo {
-    uint32_t file_id;
-    uint64_t size;
-    uint64_t num_entries;
-    uint64_t min_version;
-    uint64_t max_version;
-    bool gc_eligible;
 };
 
 class DB {
@@ -175,22 +155,13 @@ public:
 
     Status createIterator(std::unique_ptr<Iterator>& iterator);
 
-    // --- Garbage Collection ---
-
-    Status gc();
-    Status gc(const std::vector<uint32_t>& file_ids);
-    bool isGCRunning() const;
-    Status waitForGC();
-
     // --- Maintenance ---
 
     Status flush();
-    Status snapshotL1Index();
 
     // --- Statistics ---
 
     Status getStats(DBStats& stats) const;
-    Status getLogFiles(std::vector<LogFileInfo>& files) const;
     Status getPath(std::string& path) const;
 
     // --- Version Info ---
@@ -218,28 +189,14 @@ private:
 
     Status syncIfNeeded(const WriteOptions& options);
 
-    // GC helpers
-    Status gcFile(uint32_t file_id, uint64_t min_version);
-    bool canCollectVersion(uint64_t version) const;
-
-    // Iterator support
-    std::vector<uint32_t> getFileIdsForIteration() const;
-    Status readLogEntry(uint32_t file_id, uint64_t offset,
-                        internal::LogEntry& entry);
-    bool isLatestVersion(const std::string& key, uint64_t version) const;
-    internal::L2Index* getL2Index(uint32_t file_id);
-
     // State
     bool is_open_ = false;
     std::string db_path_;
     Options options_;
 
     // Core components
-    std::unique_ptr<internal::WriteBuffer> write_buffer_;
-    std::unique_ptr<internal::DataCache> data_cache_;
-    std::unique_ptr<internal::LogManager> log_manager_;
     std::unique_ptr<internal::L1IndexManager> l1_index_;
-    std::unique_ptr<internal::L2Cache> l2_cache_;
+    std::unique_ptr<internal::StorageManager> storage_;
 
     // Version management
     std::atomic<uint64_t> current_version_{0};
@@ -248,12 +205,6 @@ private:
     // Snapshot tracking
     std::set<uint64_t> active_snapshots_;
     mutable std::mutex snapshot_mutex_;
-
-    // GC state
-    std::atomic<bool> gc_running_{false};
-    std::thread gc_thread_;
-    std::mutex gc_mutex_;
-    std::condition_variable gc_cv_;
 
     // Write serialization
     mutable std::mutex write_mutex_;

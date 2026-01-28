@@ -165,32 +165,21 @@ while (iter->next(key, value, version).ok()) {
 Note: Keys are returned in arbitrary order (not sorted). The iterator scans
 L2 index files sequentially, using L1 to filter out old versions.
 
-### Administrative Operations
-
-Garbage collection, statistics, and maintenance are available directly on `DB`:
+### Maintenance Operations
 
 ```cpp
-// Trigger GC with configured policy
-db.gc();
-
-// Compact specific log files
-db.gc({file_id1, file_id2, file_id3});
-
-// Check GC status
-if (db.isGCRunning()) {
-    db.waitForGC();
-}
-
 // Get statistics
 kvlite::DBStats stats;
 db.getStats(stats);
 std::cout << "Current version: " << stats.current_version << std::endl;
 std::cout << "Active snapshots: " << stats.active_snapshots << std::endl;
 
-// Force flush and L1 snapshot
+// Force flush write buffer to disk
 db.flush();
-db.snapshotL1Index();
 ```
+
+Note: Garbage collection runs automatically in the background based on the
+configured `gc_policy` and `gc_threshold` options.
 
 ## Configuration
 
