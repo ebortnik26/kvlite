@@ -155,9 +155,6 @@ Unordered iteration over all keys (useful for full database copy/replication):
 std::unique_ptr<kvlite::Iterator> iter;
 db.createIterator(iter);
 
-std::cout << "Iterating " << iter->totalKeys() << " keys "
-          << "at version " << iter->snapshotVersion() << std::endl;
-
 std::string key, value;
 uint64_t version;
 while (iter->next(key, value, version).ok()) {
@@ -166,7 +163,7 @@ while (iter->next(key, value, version).ok()) {
 ```
 
 Note: Keys are returned in arbitrary order (not sorted). The iterator scans
-all L2 index files on creation and holds an implicit snapshot.
+L2 index files sequentially, using L1 to filter out old versions.
 
 ### Administrative Operations
 

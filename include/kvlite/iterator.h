@@ -21,10 +21,11 @@ class IteratorImpl;
 // Keys are returned in arbitrary order (hash/storage order, not sorted).
 //
 // Implementation:
-//   1. On creation, scans all L2 index files sequentially
-//   2. Builds in-memory map: key -> (version, file_id, offset)
-//      keeping only the latest version per key where version <= snapshot
-//   3. next() walks through the map, reading values from log files on demand
+//   Scans L2 index files sequentially. For each (key, version, offset) entry:
+//   1. Skip if version > snapshot_version
+//   2. Check L1 index: is this the latest version for key where version <= snapshot?
+//   3. If yes, read value from log file and emit
+//   No additional in-memory index needed - L1 is already in memory.
 //
 // Usage:
 //   std::unique_ptr<kvlite::Iterator> iter;
@@ -61,13 +62,6 @@ public:
     // Get the snapshot version this iterator uses.
     // All reads are consistent as of this version.
     uint64_t snapshotVersion() const;
-
-    // Get the total number of unique keys in this iterator.
-    // Available after construction (result of L2 scan).
-    size_t totalKeys() const;
-
-    // Get the number of keys remaining to iterate.
-    size_t remainingKeys() const;
 
 private:
     friend class DB;
