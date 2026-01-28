@@ -1,12 +1,8 @@
 #ifndef KVLITE_DB_H
 #define KVLITE_DB_H
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
-#include <set>
-#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -21,8 +17,6 @@ namespace kvlite {
 namespace internal {
 class L1IndexManager;
 class StorageManager;
-struct LogEntry;
-struct IndexEntry;
 }  // namespace internal
 
 // Database statistics
@@ -170,47 +164,10 @@ public:
     uint64_t getOldestVersion() const;
 
 private:
-    // Internal snapshot management
-    Status createSnapshotInternal(uint64_t& snapshot_version);
-    Status releaseSnapshotInternal(uint64_t snapshot_version);
-    uint64_t getOldestSnapshotVersion() const;
-
-    // Internal helpers
-    Status recover();
-    Status writeEntry(const std::string& key, const std::string& value,
-                      bool tombstone, const WriteOptions& options,
-                      uint64_t& version);
-    Status readValue(const std::string& key, uint64_t upper_bound,
-                     std::string& value, uint64_t& version);
-
-    uint64_t allocateVersion();
-    void updateL1Index(const std::string& key, uint64_t version,
-                       uint32_t file_id);
-
-    Status syncIfNeeded(const WriteOptions& options);
-
-    // State
-    bool is_open_ = false;
     std::string db_path_;
     Options options_;
-
-    // Core components
     std::unique_ptr<internal::L1IndexManager> l1_index_;
     std::unique_ptr<internal::StorageManager> storage_;
-
-    // Version management
-    std::atomic<uint64_t> current_version_{0};
-    std::atomic<uint64_t> oldest_version_{0};
-
-    // Snapshot tracking
-    std::set<uint64_t> active_snapshots_;
-    mutable std::mutex snapshot_mutex_;
-
-    // Write serialization
-    mutable std::mutex write_mutex_;
-
-    // General state mutex
-    mutable std::shared_mutex state_mutex_;
 };
 
 }  // namespace kvlite
