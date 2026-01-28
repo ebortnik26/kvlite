@@ -70,10 +70,10 @@ int main() {
     // Read latest
     std::string value;
     uint64_t version;
-    db.get("key", &value, &version);  // value="value2", version=2
+    db.get("key", value, version);  // value="value2", version=2
 
     // Read at specific version
-    db.getByVersion("key", 2, &value);  // value="value1" (version < 2)
+    db.getByVersion("key", 2, value);  // value="value1" (version < 2)
 
     return 0;
 }
@@ -88,18 +88,18 @@ int main() {
 Status put(const std::string& key, const std::string& value);
 
 // Read latest version
-Status get(const std::string& key, std::string* value);
-Status get(const std::string& key, std::string* value, uint64_t* version);
+Status get(const std::string& key, std::string& value);
+Status get(const std::string& key, std::string& value, uint64_t& version);
 
 // Read at specific version (largest version < upper_bound)
 Status getByVersion(const std::string& key, uint64_t upper_bound,
-                    std::string* value);
+                    std::string& value);
 
 // Delete (creates tombstone with new version)
 Status remove(const std::string& key);
 
-// Check existence (sets *exists to true/false)
-Status exists(const std::string& key, bool* exists);
+// Check existence
+Status exists(const std::string& key, bool& exists);
 ```
 
 ### Batch Operations
@@ -135,11 +135,11 @@ std::cout << "Snapshot at version " << snapshot->version() << std::endl;
 
 // Reads through snapshot always see same version
 std::string v1, v2;
-snapshot->get("key1", &v1);
+snapshot->get("key1", v1);
 
 db.put("key1", "new_value");  // New write after snapshot
 
-snapshot->get("key1", &v2);   // Still sees old value
+snapshot->get("key1", v2);   // Still sees old value
 assert(v1 == v2);
 
 // Release snapshot to allow GC of old versions
@@ -274,7 +274,7 @@ void backupToFile(kvlite::DB& db, const std::string& backup_path) {
     for (const auto& key : keys_to_backup) {
         std::string value;
         uint64_t version;
-        if (snapshot->get(key, &value, &version).ok()) {
+        if (snapshot->get(key, value, version).ok()) {
             out << key << ":" << version << ":" << value << "\n";
         }
     }
@@ -304,9 +304,9 @@ void demonstrateConcurrentSnapshots(kvlite::DB& db) {
     db.put("counter", "300");  // version 3
 
     std::string vA, vB, vLatest;
-    snapshotA->get("counter", &vA);   // "100"
-    snapshotB->get("counter", &vB);   // "200"
-    db.get("counter", &vLatest);      // "300"
+    snapshotA->get("counter", vA);   // "100"
+    snapshotB->get("counter", vB);   // "200"
+    db.get("counter", vLatest);      // "300"
 
     std::cout << "Snapshot A (v" << snapshotA->version() << "): " << vA << std::endl;
     std::cout << "Snapshot B (v" << snapshotB->version() << "): " << vB << std::endl;
@@ -397,7 +397,7 @@ void auditKeyHistory(kvlite::DB& db, const std::string& key) {
     uint64_t version;
 
     // Get current version info
-    if (!db.get(key, &value, &version).ok()) {
+    if (!db.get(key, value, version).ok()) {
         std::cout << "Key not found" << std::endl;
         return;
     }
@@ -409,7 +409,7 @@ void auditKeyHistory(kvlite::DB& db, const std::string& key) {
     for (uint64_t v = version; v > oldest; ) {
         std::string old_value;
         uint64_t entry_version;
-        if (db.getByVersion(key, v, &old_value, &entry_version).ok()) {
+        if (db.getByVersion(key, v, old_value, entry_version).ok()) {
             std::cout << "v" << entry_version << ": " << old_value << std::endl;
             v = entry_version;  // Move to previous version
         } else {

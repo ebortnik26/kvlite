@@ -101,23 +101,23 @@ public:
 
     // Get the latest value for the given key
     // Returns Status::NotFound if the key does not exist
-    Status get(const std::string& key, std::string* value,
+    Status get(const std::string& key, std::string& value,
                const ReadOptions& options = ReadOptions());
 
     // Get the latest value and its version
-    Status get(const std::string& key, std::string* value, uint64_t* version,
+    Status get(const std::string& key, std::string& value, uint64_t& version,
                const ReadOptions& options = ReadOptions());
 
     // Get the value at a specific version (point-in-time read)
     // Returns the latest version of key where version < upper_bound
     // Returns Status::NotFound if key did not exist at that version
     Status getByVersion(const std::string& key, uint64_t upper_bound,
-                        std::string* value,
+                        std::string& value,
                         const ReadOptions& options = ReadOptions());
 
     // Get the value at a specific version with version info
     Status getByVersion(const std::string& key, uint64_t upper_bound,
-                        std::string* value, uint64_t* entry_version,
+                        std::string& value, uint64_t& entry_version,
                         const ReadOptions& options = ReadOptions());
 
     // Remove the entry for the given key
@@ -126,8 +126,7 @@ public:
                   const WriteOptions& options = WriteOptions());
 
     // Check if a key exists (latest version)
-    // Sets *exists to true if key exists, false otherwise
-    Status exists(const std::string& key, bool* exists,
+    Status exists(const std::string& key, bool& exists,
                   const ReadOptions& options = ReadOptions());
 
     // --- Batch Operations ---

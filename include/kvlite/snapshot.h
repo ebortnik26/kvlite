@@ -23,7 +23,7 @@ class SnapshotImpl;
 // Usage:
 //   auto snapshot = db.createSnapshot();
 //   std::string value;
-//   snapshot->get("key", &value);  // Reads at snapshot version
+//   snapshot->get("key", value);  // Reads at snapshot version
 //   // ... more reads ...
 //   db.releaseSnapshot(std::move(snapshot));  // Allow GC of old versions
 //
@@ -42,16 +42,15 @@ public:
     // Get the value for the given key as of this snapshot's version.
     // Equivalent to db.getByVersion(key, version_), but reusable.
     // Returns Status::NotFound if key does not exist at this version.
-    Status get(const std::string& key, std::string* value,
+    Status get(const std::string& key, std::string& value,
                const ReadOptions& options = ReadOptions()) const;
 
     // Get the value and its version
-    Status get(const std::string& key, std::string* value, uint64_t* entry_version,
+    Status get(const std::string& key, std::string& value, uint64_t& entry_version,
                const ReadOptions& options = ReadOptions()) const;
 
     // Check if a key exists at this snapshot's version
-    // Sets *exists to true if key exists, false otherwise
-    Status exists(const std::string& key, bool* exists,
+    Status exists(const std::string& key, bool& exists,
                   const ReadOptions& options = ReadOptions()) const;
 
     // Get the version this snapshot represents
