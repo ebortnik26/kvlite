@@ -3,57 +3,71 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 #include <unordered_map>
+#include <functional>
+
+#include "log_entry.h"
 
 namespace kvlite {
 namespace internal {
 
 // In-memory buffer for pending writes before flush to log files.
 //
-// Stores the latest write for each key. On flush, entries are written
-// to the log file and the buffer is cleared.
+// Structure: key → [(version₁, value₁), (version₂, value₂), ...]
+//            sorted by version, ascending
+//
+// Conceptually the same as an L2 file, but read-write.
+// On flush, all entries are written to the log file and the buffer is cleared.
 //
 // Thread-safety: Concurrency is managed at per-bucket level (not shown here).
 class WriteBuffer {
 public:
     struct Entry {
-        uint64_t version;
+        PackedVersion pv;
         std::string value;
-        bool tombstone;
+
+        uint64_t version() const { return pv.version(); }
+        bool tombstone() const { return pv.tombstone(); }
+
+        bool operator<(const Entry& other) const { return pv < other.pv; }
     };
 
     WriteBuffer() = default;
     ~WriteBuffer() = default;
 
-    // Insert or update an entry
+    // Append a new entry for a key
     void put(const std::string& key, uint64_t version,
              const std::string& value, bool tombstone);
 
-    // Get the entry for a key if present
+    // Get the latest entry for a key
     // Returns true if found, false if not in buffer
-    bool get(const std::string& key, Entry& entry) const;
+    bool get(const std::string& key,
+             std::string& value, uint64_t& version, bool& tombstone) const;
 
-    // Check if key exists in buffer
-    bool contains(const std::string& key) const;
+    // Get entry for a key with largest version < upper_bound
+    // Returns true if found, false if not in buffer
+    bool getByVersion(const std::string& key, uint64_t upper_bound,
+                      std::string& value, uint64_t& version, bool& tombstone) const;
 
-    // Remove an entry (used after flush)
-    void remove(const std::string& key);
+    // --- Flush support ---
+
+    // Iterate over all entries (for flush)
+    void forEach(const std::function<void(const std::string&,
+                                          const std::vector<Entry>&)>& fn) const;
 
     // Clear all entries
     void clear();
 
-    // Get all entries for flushing
-    const std::unordered_map<std::string, Entry>& entries() const {
-        return buffer_;
-    }
-
     // Statistics
-    size_t size() const { return buffer_.size(); }
+    size_t keyCount() const { return buffer_.size(); }
+    size_t entryCount() const;
     size_t memoryUsage() const;
     bool empty() const { return buffer_.empty(); }
 
 private:
-    std::unordered_map<std::string, Entry> buffer_;
+    // Key -> list of (version, value, tombstone), sorted by version ascending
+    std::unordered_map<std::string, std::vector<Entry>> buffer_;
 };
 
 } // namespace internal

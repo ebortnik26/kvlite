@@ -74,6 +74,9 @@ public:
                const ReadOptions& options);
     Status getByVersion(const std::string& key, uint64_t upper_bound,
                         std::string& value, const ReadOptions& options);
+    Status getByVersion(const std::string& key, uint64_t upper_bound,
+                        std::string& value, uint64_t& version,
+                        const ReadOptions& options);
     Status remove(const std::string& key, const WriteOptions& options);
     Status exists(const std::string& key, bool& exists,
                   const ReadOptions& options);
@@ -108,6 +111,9 @@ public:
     Status getPath(std::string& path) const;
 
     // --- Iterator Support ---
+
+    // Create an iterator with an implicit snapshot
+    Status createIterator(std::unique_ptr<IteratorImpl>& iterator);
 
     // Get all file IDs for iteration
     std::vector<uint32_t> getFileIdsForIteration() const;
@@ -192,14 +198,22 @@ public:
     }
 
     uint64_t version() const { return version_; }
+    bool isValid() const { return db_ != nullptr; }
 
-    Status get(const std::string& key, std::string& value) {
-        return db_->getByVersion(key, version_ + 1, value, ReadOptions());
+    Status get(const std::string& key, std::string& value,
+               const ReadOptions& options = ReadOptions()) {
+        return db_->getByVersion(key, version_ + 1, value, options);
     }
 
-    Status exists(const std::string& key, bool& exists) {
+    Status get(const std::string& key, std::string& value, uint64_t& entry_version,
+               const ReadOptions& options = ReadOptions()) {
+        return db_->getByVersion(key, version_ + 1, value, entry_version, options);
+    }
+
+    Status exists(const std::string& key, bool& exists,
+                  const ReadOptions& options = ReadOptions()) {
         std::string value;
-        Status s = get(key, value);
+        Status s = get(key, value, options);
         if (s.ok()) {
             exists = true;
             return Status::ok();
@@ -210,6 +224,9 @@ public:
         return s;
     }
 
+    // Prevent release on move
+    void detach() { db_ = nullptr; }
+
 private:
     DBImpl* db_;
     uint64_t version_;
@@ -218,7 +235,7 @@ private:
 // Iterator implementation
 class IteratorImpl {
 public:
-    explicit IteratorImpl(DBImpl* db);
+    IteratorImpl(DBImpl* db, uint64_t snapshot_version);
     ~IteratorImpl();
 
     bool valid() const;
@@ -228,6 +245,7 @@ public:
     const std::string& key() const;
     const std::string& value() const;
     uint64_t version() const;
+    uint64_t snapshotVersion() const { return snapshot_version_; }
 
 private:
     Status advance();
@@ -235,6 +253,7 @@ private:
     Status loadNextEntry();
 
     DBImpl* db_;
+    uint64_t snapshot_version_;
     Status status_;
 
     // Current position

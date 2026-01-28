@@ -87,10 +87,21 @@ public:
     // Only valid after DB::read(batch) is called
     uint64_t snapshotVersion() const { return snapshot_version_; }
 
-private:
-    friend class DB;
-    friend class DBImpl;
+    // --- Output setters (used by DB::read implementation) ---
 
+    // Reserve space for results
+    void reserveResults(size_t count) { results_.reserve(count); }
+
+    // Add a result
+    void addResult(ReadResult result) { results_.push_back(std::move(result)); }
+
+    // Set the snapshot version used
+    void setSnapshotVersion(uint64_t version) { snapshot_version_ = version; }
+
+    // Clear results (but keep keys)
+    void clearResults() { results_.clear(); snapshot_version_ = 0; }
+
+private:
     std::vector<std::string> keys_;
     std::vector<ReadResult> results_;
     uint64_t snapshot_version_ = 0;

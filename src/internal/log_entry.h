@@ -7,6 +7,27 @@
 namespace kvlite {
 namespace internal {
 
+// Packed version: stores version (63 bits) + tombstone flag (MSB) in 64 bits.
+// Used by LogEntry, WriteBuffer::Entry, and anywhere version+tombstone are stored together.
+struct PackedVersion {
+    uint64_t data = 0;
+
+    static constexpr uint64_t kTombstoneMask = 1ULL << 63;
+    static constexpr uint64_t kVersionMask = ~kTombstoneMask;
+
+    PackedVersion() = default;
+    PackedVersion(uint64_t version, bool tombstone)
+        : data(tombstone ? (version | kTombstoneMask) : version) {}
+    explicit PackedVersion(uint64_t packed) : data(packed) {}
+
+    uint64_t version() const { return data & kVersionMask; }
+    bool tombstone() const { return (data & kTombstoneMask) != 0; }
+
+    bool operator<(const PackedVersion& other) const {
+        return version() < other.version();
+    }
+};
+
 // Log entry stored in data files.
 //
 // On-disk format:
@@ -15,36 +36,20 @@ namespace internal {
 // │      8 bytes     │ 4 bytes │  4 bytes  │ var │  var  │ 4 bytes  │
 // └──────────────────┴─────────┴───────────┴─────┴───────┴──────────┘
 //
-// Version encoding: MSB is tombstone flag, lower 63 bits are version.
-// Max version: 2^63 - 1 (still effectively unlimited)
-//
 // Total header size: 16 bytes (before key/value)
 // Checksum: CRC32 of all preceding bytes
-
 struct LogEntry {
-    uint64_t version = 0;
+    PackedVersion pv;
     std::string key;
     std::string value;
-    bool tombstone = false;
 
-    // Pack version and tombstone into single 64-bit value for serialization
-    uint64_t packedVersion() const {
-        return tombstone ? (version | kTombstoneMask) : version;
-    }
+    uint64_t version() const { return pv.version(); }
+    bool tombstone() const { return pv.tombstone(); }
 
-    // Unpack version and tombstone from serialized 64-bit value
-    static void unpackVersion(uint64_t packed, uint64_t& version, bool& tombstone) {
-        tombstone = (packed & kTombstoneMask) != 0;
-        version = packed & kVersionMask;
-    }
-
-    // Calculate serialized size
     size_t serializedSize() const {
         return kHeaderSize + key.size() + value.size() + kChecksumSize;
     }
 
-    static constexpr uint64_t kTombstoneMask = 1ULL << 63;
-    static constexpr uint64_t kVersionMask = ~kTombstoneMask;
     static constexpr size_t kHeaderSize = 8 + 4 + 4;  // packed_version + key_len + value_len
     static constexpr size_t kChecksumSize = 4;
 };
