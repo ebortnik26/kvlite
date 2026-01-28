@@ -16,6 +16,7 @@ namespace kvlite {
 class DBImpl;
 class DBAdmin;
 class Snapshot;
+class Iterator;
 
 class DB {
 public:
@@ -102,6 +103,14 @@ public:
 
     // Release a snapshot, allowing GC of versions it was protecting
     Status releaseSnapshot(std::unique_ptr<Snapshot> snapshot);
+
+    // --- Iteration ---
+
+    // Create an unordered iterator over all keys in the database.
+    // Returns the latest version of each key as of iteration start.
+    // Useful for full database copy (local backup or remote replication).
+    // Note: Scans all L2 index files on creation; may take time for large DBs.
+    Status createIterator(std::unique_ptr<Iterator>& iterator);
 
 private:
     friend class DBAdmin;

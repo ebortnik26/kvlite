@@ -147,6 +147,27 @@ assert(v1 == v2);
 db.releaseSnapshot(std::move(snapshot));
 ```
 
+### Iteration
+
+Unordered iteration over all keys (useful for full database copy/replication):
+
+```cpp
+std::unique_ptr<kvlite::Iterator> iter;
+db.createIterator(iter);
+
+std::cout << "Iterating " << iter->totalKeys() << " keys "
+          << "at version " << iter->snapshotVersion() << std::endl;
+
+std::string key, value;
+uint64_t version;
+while (iter->next(key, value, version).ok()) {
+    std::cout << key << " = " << value << " (v" << version << ")" << std::endl;
+}
+```
+
+Note: Keys are returned in arbitrary order (not sorted). The iterator scans
+all L2 index files on creation and holds an implicit snapshot.
+
 ### Administrative Operations
 
 For garbage collection, statistics, and maintenance operations, use `DBAdmin`:

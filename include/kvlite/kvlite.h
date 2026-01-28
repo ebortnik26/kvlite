@@ -8,6 +8,7 @@
 #include "kvlite/write_batch.h"
 #include "kvlite/read_batch.h"
 #include "kvlite/snapshot.h"
+#include "kvlite/iterator.h"
 #include "kvlite/db.h"
 
 #endif // KVLITE_KVLITE_H
