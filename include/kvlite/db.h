@@ -87,7 +87,7 @@ public:
 
     // Close the database
     // Flushes write buffer, persists L1 snapshot, and releases resources
-    void close();
+    Status close();
 
     // Check if the database is open
     bool isOpen() const;
@@ -147,16 +147,16 @@ public:
     // Create a snapshot at the current version
     // The snapshot provides a consistent point-in-time view
     // Must be released with releaseSnapshot() to allow GC
-    std::unique_ptr<Snapshot> createSnapshot();
+    Status createSnapshot(std::unique_ptr<Snapshot>& snapshot);
 
     // Release a snapshot, allowing GC of versions it was protecting
-    void releaseSnapshot(std::unique_ptr<Snapshot> snapshot);
+    Status releaseSnapshot(std::unique_ptr<Snapshot> snapshot);
 
     // Get the current (latest committed) version
-    uint64_t getCurrentVersion() const;
+    Status getCurrentVersion(uint64_t& version) const;
 
     // Get the oldest version still retained (limited by snapshots)
-    uint64_t getOldestVersion() const;
+    Status getOldestVersion(uint64_t& version) const;
 
     // --- Garbage Collection ---
 
@@ -190,10 +190,10 @@ public:
     // --- Statistics ---
 
     // Get database statistics
-    DBStats getStats() const;
+    Status getStats(DBStats& stats) const;
 
     // Get information about all log files
-    std::vector<LogFileInfo> getLogFiles() const;
+    Status getLogFiles(std::vector<LogFileInfo>& files) const;
 
     // Get the database path
     const std::string& getPath() const;

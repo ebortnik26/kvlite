@@ -130,7 +130,8 @@ for (const auto& result : rbatch.results()) {
 
 ```cpp
 // Create a snapshot at current version
-auto snapshot = db.createSnapshot();
+std::unique_ptr<kvlite::Snapshot> snapshot;
+db.createSnapshot(snapshot);
 std::cout << "Snapshot at version " << snapshot->version() << std::endl;
 
 // Reads through snapshot always see same version
@@ -166,13 +167,16 @@ if (db.isGCRunning()) {
 
 ```cpp
 // Get current (latest) version
-uint64_t current = db.getCurrentVersion();
+uint64_t current;
+db.getCurrentVersion(current);
 
 // Get oldest retained version (limited by snapshots)
-uint64_t oldest = db.getOldestVersion();
+uint64_t oldest;
+db.getOldestVersion(oldest);
 
 // Statistics
-auto stats = db.getStats();
+kvlite::DBStats stats;
+db.getStats(stats);
 std::cout << "Current version: " << stats.current_version << std::endl;
 std::cout << "Active snapshots: " << stats.active_snapshots << std::endl;
 ```
@@ -264,7 +268,8 @@ GC can collect: versions < 200 (now S2 is oldest)
 
 void backupToFile(kvlite::DB& db, const std::string& backup_path) {
     // Create snapshot - all reads will see consistent state
-    auto snapshot = db.createSnapshot();
+    std::unique_ptr<kvlite::Snapshot> snapshot;
+    db.createSnapshot(snapshot);
     std::cout << "Backing up at version " << snapshot->version() << std::endl;
 
     std::ofstream out(backup_path);
@@ -294,12 +299,14 @@ void demonstrateConcurrentSnapshots(kvlite::DB& db) {
     db.put("counter", "100");  // version 1
 
     // Snapshot A sees counter=100
-    auto snapshotA = db.createSnapshot();
+    std::unique_ptr<kvlite::Snapshot> snapshotA;
+    db.createSnapshot(snapshotA);
 
     db.put("counter", "200");  // version 2
 
     // Snapshot B sees counter=200
-    auto snapshotB = db.createSnapshot();
+    std::unique_ptr<kvlite::Snapshot> snapshotB;
+    db.createSnapshot(snapshotB);
 
     db.put("counter", "300");  // version 3
 
@@ -405,7 +412,8 @@ void auditKeyHistory(kvlite::DB& db, const std::string& key) {
     std::cout << "Current: " << value << " (v" << version << ")" << std::endl;
 
     // Walk backwards through history (if versions still retained)
-    uint64_t oldest = db.getOldestVersion();
+    uint64_t oldest;
+    db.getOldestVersion(oldest);
     for (uint64_t v = version; v > oldest; ) {
         std::string old_value;
         uint64_t entry_version;
