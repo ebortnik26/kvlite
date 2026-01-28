@@ -147,18 +147,6 @@ assert(v1 == v2);
 db.releaseSnapshot(std::move(snapshot));
 ```
 
-### Version Info
-
-```cpp
-// Get current (latest) version
-uint64_t current;
-db.getCurrentVersion(current);
-
-// Get oldest retained version (limited by snapshots)
-uint64_t oldest;
-db.getOldestVersion(oldest);
-```
-
 ### Administrative Operations
 
 For garbage collection, statistics, and maintenance operations, use `DBAdmin`:
@@ -407,6 +395,7 @@ void example(kvlite::DB& db) {
 
 ```cpp
 #include <kvlite/kvlite.h>
+#include <kvlite/db_admin.h>
 
 void auditKeyHistory(kvlite::DB& db, const std::string& key) {
     std::string value;
@@ -421,9 +410,11 @@ void auditKeyHistory(kvlite::DB& db, const std::string& key) {
     std::cout << "Current: " << value << " (v" << version << ")" << std::endl;
 
     // Walk backwards through history (if versions still retained)
-    uint64_t oldest;
-    db.getOldestVersion(oldest);
-    for (uint64_t v = version; v > oldest; ) {
+    kvlite::DBAdmin admin(db);
+    kvlite::DBStats stats;
+    admin.getStats(stats);
+
+    for (uint64_t v = version; v > stats.oldest_version; ) {
         std::string old_value;
         uint64_t entry_version;
         if (db.getByVersion(key, v, old_value, entry_version).ok()) {

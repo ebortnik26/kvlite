@@ -103,14 +103,6 @@ public:
     // Release a snapshot, allowing GC of versions it was protecting
     Status releaseSnapshot(std::unique_ptr<Snapshot> snapshot);
 
-    // --- Version Info ---
-
-    // Get the current (latest committed) version
-    Status getCurrentVersion(uint64_t& version) const;
-
-    // Get the oldest version still retained (limited by snapshots)
-    Status getOldestVersion(uint64_t& version) const;
-
 private:
     friend class DBAdmin;
     std::unique_ptr<DBImpl> impl_;
