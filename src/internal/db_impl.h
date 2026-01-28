@@ -22,6 +22,8 @@
 #include "l2_index.h"
 #include "l2_cache.h"
 #include "l1_wal.h"
+#include "data_cache.h"
+#include "write_buffer.h"
 
 namespace kvlite {
 namespace internal {
@@ -32,11 +34,20 @@ class IteratorImpl;
 
 // Internal implementation of the DB class.
 //
-// This class coordinates all internal components:
-// - LogManager: manages append-only log files
+// Storage model:
+// - Conceptually append-only: new versions are appended, old data is never modified
+// - Physically write-once: log files are immutable after write, deleted only by GC
+//
+// Components:
+// - WriteBuffer: pending writes before flush
+// - DataCache: read cache for (key, version) -> value
+// - LogManager: manages write-once log files
 // - L1Index: in-memory index (key -> file_id)
 // - L2Cache: LRU cache of per-file indices (key -> offset)
 // - L1WAL: write-ahead log for L1 index recovery
+//
+// Write path: WriteBuffer -> (on flush) -> LogFile + L1Index
+// Read path:  WriteBuffer -> DataCache -> L1Index -> L2Cache -> LogFile
 //
 // Thread-safety: All public methods are thread-safe.
 class DBImpl {
@@ -136,9 +147,11 @@ private:
     Options options_;
 
     // Core components
+    std::unique_ptr<WriteBuffer> write_buffer_;  // pending writes
+    std::unique_ptr<DataCache> data_cache_;      // (key, version) -> value
     std::unique_ptr<LogManager> log_manager_;
     std::unique_ptr<L1Index> l1_index_;
-    std::unique_ptr<L2Cache> l2_cache_;
+    std::unique_ptr<L2Cache> l2_cache_;          // file_id -> L2Index
     std::unique_ptr<L1WAL> l1_wal_;
 
     // Version management

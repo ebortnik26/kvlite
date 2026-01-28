@@ -12,7 +12,12 @@
 namespace kvlite {
 namespace internal {
 
-// A single append-only log file storing key-value entries.
+// A single write-once log file storing key-value entries.
+//
+// Write-once semantics:
+// - Only the current (active) file accepts appends
+// - Once sealed (size limit reached), a file becomes immutable
+// - Sealed files are read-only until deleted by GC
 //
 // File naming: log_NNNNNNNN.data (e.g., log_00000001.data)
 // Each log file has a corresponding L2 index: log_NNNNNNNN.idx
@@ -78,8 +83,11 @@ private:
     mutable std::mutex mutex_;  // Protects append operations
 };
 
-// Manages multiple log files.
-// Handles creation of new log files when current one reaches size limit.
+// Manages multiple write-once log files.
+//
+// Only one file (the current file) is active for writes at a time.
+// When it reaches the size limit, it is sealed and a new file is created.
+// Sealed files are immutable and only removed by GC.
 class LogManager {
 public:
     explicit LogManager(const std::string& db_path, uint64_t max_file_size = 1ULL << 30);

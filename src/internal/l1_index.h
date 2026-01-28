@@ -5,7 +5,6 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include <shared_mutex>
 #include <functional>
 
 #include "kvlite/status.h"
@@ -23,7 +22,7 @@ namespace internal {
 // 1. WAL (append-only delta log for crash recovery)
 // 2. Periodic snapshots (full dump every N updates + on shutdown)
 //
-// Thread-safety: All operations are thread-safe using read-write locks.
+// Thread-safety: Concurrency is managed at per-bucket level (not shown here).
 class L1Index {
 public:
     L1Index();
@@ -94,8 +93,6 @@ public:
 private:
     // Key -> list of (version, file_id), sorted by version ascending
     std::unordered_map<std::string, std::vector<IndexEntry>> index_;
-
-    mutable std::shared_mutex mutex_;
 
     // Statistics
     size_t total_entries_ = 0;
