@@ -14,7 +14,6 @@ namespace kvlite {
 
 // Forward declarations
 class DBImpl;
-class DBAdmin;
 class SnapshotImpl;
 class IteratorImpl;
 
@@ -64,9 +63,6 @@ public:
     // Unordered whole-database iterator.
     // Returns the latest version of each key as of the snapshot taken at creation.
     // Keys are returned in arbitrary order (not sorted).
-    //
-    // Implementation: Scans L2 index files sequentially, using L1 to filter
-    // out old versions. No additional in-memory index needed.
     class Iterator {
     public:
         ~Iterator();
@@ -175,8 +171,14 @@ public:
     // Useful for full database copy (backup/replication)
     Status createIterator(std::unique_ptr<Iterator>& iterator);
 
+    // --- Implementation Access ---
+
+    // Returns internal implementation pointer.
+    // DBImpl is forward-declared only; users cannot dereference this.
+    // Used by DBAdmin to access administrative functionality.
+    DBImpl* impl() const { return impl_.get(); }
+
 private:
-    friend class DBAdmin;
     std::unique_ptr<DBImpl> impl_;
 };
 

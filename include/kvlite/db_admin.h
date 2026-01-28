@@ -9,8 +9,9 @@
 
 namespace kvlite {
 
-// Forward declaration
+// Forward declarations
 class DB;
+class DBImpl;
 
 // Database statistics
 struct DBStats {
@@ -61,11 +62,16 @@ struct LogFileInfo {
     bool gc_eligible;      // True if all versions < oldest snapshot
 };
 
-// Administrative operations for DB
-// These are separate from the core API to keep the main interface clean.
+// Administrative operations for DB.
+// Provides access to GC, maintenance, and statistics.
+// Separate from core API to keep the main DB interface clean.
 class DBAdmin {
 public:
+    // Construct from a DB instance (uses db.impl() internally)
     explicit DBAdmin(DB& db);
+
+    // Construct directly from implementation pointer
+    explicit DBAdmin(DBImpl* impl) : impl_(impl) {}
 
     // --- Garbage Collection ---
 
@@ -108,7 +114,7 @@ public:
     Status getPath(std::string& path) const;
 
 private:
-    DB& db_;
+    DBImpl* impl_;
 };
 
 } // namespace kvlite
