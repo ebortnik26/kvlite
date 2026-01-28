@@ -1,12 +1,8 @@
 #ifndef KVLITE_DB_H
 #define KVLITE_DB_H
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
-#include <set>
-#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -20,6 +16,7 @@ namespace kvlite {
 namespace internal {
 class L1IndexManager;
 class StorageManager;
+class VersionManager;
 }  // namespace internal
 
 // Database statistics
@@ -167,28 +164,11 @@ public:
     uint64_t getOldestVersion() const;
 
 private:
-    uint64_t allocateVersion();
-    uint64_t getOldestSnapshotVersion() const;
-    Status createSnapshotInternal(uint64_t& snapshot_version);
-    void releaseSnapshotInternal(uint64_t snapshot_version);
-
     std::string db_path_;
     Options options_;
+    std::unique_ptr<internal::VersionManager> versions_;
     std::unique_ptr<internal::L1IndexManager> l1_index_;
     std::unique_ptr<internal::StorageManager> storage_;
-
-    // Version counter state
-    std::atomic<uint64_t> current_version_{0};
-    uint64_t persisted_counter_{0};
-    uint64_t version_jump_{1'000'000};
-
-    // Snapshot tracking
-    std::set<uint64_t> active_snapshots_;
-    mutable std::mutex snapshot_mutex_;
-
-    // Concurrency control
-    mutable std::shared_mutex state_mutex_;
-    std::mutex write_mutex_;
 };
 
 }  // namespace kvlite

@@ -1,66 +1,14 @@
 #include "kvlite/db.h"
 
 #include <algorithm>
-#include <atomic>
-#include <cstdio>
-#include <mutex>
-#include <set>
-#include <shared_mutex>
 
+#include "internal/version_manager.h"
 #include "internal/l1_index_manager.h"
 #include "internal/storage_manager.h"
 #include "internal/log_entry.h"
 #include "internal/l2_index.h"
 
 namespace kvlite {
-
-namespace {
-
-constexpr uint64_t kDefaultVersionJump = 1'000'000;
-constexpr const char* kManifestFilename = "MANIFEST";
-
-// Simple manifest file: stores the persisted version counter.
-// Format: 8 bytes (little-endian uint64_t)
-class Manifest {
-public:
-    static Status read(const std::string& path, uint64_t& version_counter) {
-        FILE* f = fopen(path.c_str(), "rb");
-        if (!f) {
-            version_counter = 0;
-            return Status::OK();  // No manifest = fresh DB
-        }
-        size_t n = fread(&version_counter, sizeof(version_counter), 1, f);
-        fclose(f);
-        if (n != 1) {
-            return Status::Corruption("Failed to read manifest");
-        }
-        return Status::OK();
-    }
-
-    static Status write(const std::string& path, uint64_t version_counter) {
-        std::string tmp_path = path + ".tmp";
-        FILE* f = fopen(tmp_path.c_str(), "wb");
-        if (!f) {
-            return Status::IOError("Failed to create manifest");
-        }
-        size_t n = fwrite(&version_counter, sizeof(version_counter), 1, f);
-        fflush(f);
-        fclose(f);
-        if (n != 1) {
-            return Status::IOError("Failed to write manifest");
-        }
-        if (rename(tmp_path.c_str(), path.c_str()) != 0) {
-            return Status::IOError("Failed to rename manifest");
-        }
-        return Status::OK();
-    }
-};
-
-}  // namespace
-
-static std::string manifestPath(const std::string& db_path) {
-    return db_path + "/" + kManifestFilename;
-}
 
 // --- DB::Snapshot Implementation ---
 
@@ -69,7 +17,7 @@ DB::Snapshot::Snapshot(DB* db, uint64_t version)
 
 DB::Snapshot::~Snapshot() {
     if (db_) {
-        db_->releaseSnapshotInternal(version_);
+        db_->versions_->releaseSnapshot(version_);
     }
 }
 
@@ -81,7 +29,7 @@ DB::Snapshot::Snapshot(Snapshot&& other) noexcept
 DB::Snapshot& DB::Snapshot::operator=(Snapshot&& other) noexcept {
     if (this != &other) {
         if (db_) {
-            db_->releaseSnapshotInternal(version_);
+            db_->versions_->releaseSnapshot(version_);
         }
         db_ = other.db_;
         version_ = other.version_;
@@ -145,7 +93,7 @@ public:
     }
 
     ~Impl() {
-        db_->releaseSnapshotInternal(snapshot_version_);
+        db_->versions_->releaseSnapshot(snapshot_version_);
     }
 
     Status next(std::string& key, std::string& value, uint64_t& version) {
@@ -321,21 +269,23 @@ DB::DB(DB&& other) noexcept = default;
 DB& DB::operator=(DB&& other) noexcept = default;
 
 Status DB::open(const std::string& path, const Options& options) {
-    std::unique_lock lock(state_mutex_);
-
-    if (l1_index_ || storage_) {
+    if (versions_ || l1_index_ || storage_) {
         return Status::InvalidArgument("Database already open");
     }
 
     db_path_ = path;
     options_ = options;
 
-    // Read persisted version counter
-    Status s = Manifest::read(manifestPath(db_path_), persisted_counter_);
+    // Initialize version manager
+    versions_ = std::make_unique<internal::VersionManager>();
+    internal::VersionManager::Options ver_opts;
+    // ver_opts.version_jump = options.version_jump;  // if configurable
+
+    Status s = versions_->open(path, ver_opts);
     if (!s.ok()) {
+        versions_.reset();
         return s;
     }
-    current_version_.store(persisted_counter_);
 
     // Initialize L1 index manager
     l1_index_ = std::make_unique<internal::L1IndexManager>();
@@ -345,13 +295,17 @@ Status DB::open(const std::string& path, const Options& options) {
 
     s = l1_index_->open(path, l1_opts);
     if (!s.ok()) {
+        versions_->close();
+        versions_.reset();
         l1_index_.reset();
         return s;
     }
 
     s = l1_index_->recover();
     if (!s.ok()) {
+        versions_->close();
         l1_index_->close();
+        versions_.reset();
         l1_index_.reset();
         return s;
     }
@@ -369,12 +323,14 @@ Status DB::open(const std::string& path, const Options& options) {
     storage_opts.verify_checksums = options.verify_checksums;
 
     auto oldest_version_fn = [this]() {
-        return getOldestSnapshotVersion();
+        return versions_->oldestSnapshotVersion();
     };
 
     s = storage_->open(path, storage_opts, oldest_version_fn);
     if (!s.ok()) {
+        versions_->close();
         l1_index_->close();
+        versions_.reset();
         l1_index_.reset();
         storage_.reset();
         return s;
@@ -382,8 +338,10 @@ Status DB::open(const std::string& path, const Options& options) {
 
     s = storage_->recover();
     if (!s.ok()) {
+        versions_->close();
         l1_index_->close();
         storage_->close();
+        versions_.reset();
         l1_index_.reset();
         storage_.reset();
         return s;
@@ -393,13 +351,11 @@ Status DB::open(const std::string& path, const Options& options) {
 }
 
 Status DB::close() {
-    std::unique_lock lock(state_mutex_);
-
-    if (!l1_index_ && !storage_) {
+    if (!versions_ && !l1_index_ && !storage_) {
         return Status::OK();
     }
 
-    Status s1, s2, s3;
+    Status s1, s2, s3, s4;
 
     if (storage_) {
         s1 = storage_->flush();
@@ -412,70 +368,31 @@ Status DB::close() {
         l1_index_.reset();
     }
 
-    // Persist final version counter
-    Manifest::write(manifestPath(db_path_), current_version_.load());
+    if (versions_) {
+        s4 = versions_->close();
+        versions_.reset();
+    }
 
     if (!s1.ok()) return s1;
     if (!s2.ok()) return s2;
-    return s3;
+    if (!s3.ok()) return s3;
+    return s4;
 }
 
 bool DB::isOpen() const {
-    std::shared_lock lock(state_mutex_);
-    return l1_index_ != nullptr && storage_ != nullptr;
+    return versions_ != nullptr && l1_index_ != nullptr && storage_ != nullptr;
 }
 
-// --- Version allocation ---
-
-uint64_t DB::allocateVersion() {
-    uint64_t version = current_version_.fetch_add(1) + 1;
-
-    // Check if we need to persist a new counter boundary
-    if (version >= persisted_counter_ + version_jump_) {
-        std::lock_guard lock(write_mutex_);
-        // Double-check after acquiring lock
-        if (version >= persisted_counter_ + version_jump_) {
-            uint64_t new_counter = (version / version_jump_ + 1) * version_jump_;
-            Manifest::write(manifestPath(db_path_), new_counter);
-            persisted_counter_ = new_counter;
-        }
-    }
-
-    return version;
-}
-
-// --- Snapshot management ---
-
-uint64_t DB::getOldestSnapshotVersion() const {
-    std::lock_guard lock(snapshot_mutex_);
-    if (active_snapshots_.empty()) {
-        return current_version_.load();
-    }
-    return *active_snapshots_.begin();
-}
-
-Status DB::createSnapshotInternal(uint64_t& snapshot_version) {
-    snapshot_version = current_version_.load();
-    std::lock_guard lock(snapshot_mutex_);
-    active_snapshots_.insert(snapshot_version);
-    return Status::OK();
-}
-
-void DB::releaseSnapshotInternal(uint64_t snapshot_version) {
-    std::lock_guard lock(snapshot_mutex_);
-    active_snapshots_.erase(snapshot_version);
-}
 
 // --- Point Operations ---
 
 Status DB::put(const std::string& key, const std::string& value,
                const WriteOptions& options) {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
 
-    uint64_t version = allocateVersion();
+    uint64_t version = versions_->allocateVersion();
 
     uint32_t file_id;
     Status s = storage_->writeEntry(key, value, version, false, file_id);
@@ -502,7 +419,6 @@ Status DB::get(const std::string& key, std::string& value,
 
 Status DB::get(const std::string& key, std::string& value, uint64_t& version,
                const ReadOptions& options) {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
@@ -525,7 +441,6 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
 Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
                         std::string& value, uint64_t& entry_version,
                         const ReadOptions& options) {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
@@ -540,12 +455,11 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
 }
 
 Status DB::remove(const std::string& key, const WriteOptions& options) {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
 
-    uint64_t version = allocateVersion();
+    uint64_t version = versions_->allocateVersion();
 
     uint32_t file_id;
     Status s = storage_->writeEntry(key, "", version, true, file_id);
@@ -581,7 +495,6 @@ Status DB::exists(const std::string& key, bool& exists,
 // --- Batch Operations ---
 
 Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
@@ -591,7 +504,7 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
     }
 
     // All operations in batch get the same version
-    uint64_t version = allocateVersion();
+    uint64_t version = versions_->allocateVersion();
 
     for (const auto& op : batch.operations()) {
         uint32_t file_id;
@@ -614,7 +527,6 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
 }
 
 Status DB::read(ReadBatch& batch, const ReadOptions& options) {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
@@ -626,7 +538,7 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
     }
 
     // Create implicit snapshot for consistent reads
-    uint64_t snapshot_version = current_version_.load();
+    uint64_t snapshot_version = versions_->currentVersion();
     batch.setSnapshotVersion(snapshot_version);
     batch.reserveResults(batch.count());
 
@@ -649,17 +561,11 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
 // --- Snapshots ---
 
 Status DB::createSnapshot(std::unique_ptr<Snapshot>& snapshot) {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
 
-    uint64_t version;
-    Status s = createSnapshotInternal(version);
-    if (!s.ok()) {
-        return s;
-    }
-
+    uint64_t version = versions_->createSnapshot();
     snapshot = std::unique_ptr<Snapshot>(new Snapshot(this, version));
     return Status::OK();
 }
@@ -667,7 +573,7 @@ Status DB::createSnapshot(std::unique_ptr<Snapshot>& snapshot) {
 Status DB::releaseSnapshot(std::unique_ptr<Snapshot> snapshot) {
     if (snapshot) {
         snapshot->detach();  // Prevent double-release in destructor
-        releaseSnapshotInternal(snapshot->version());
+        versions_->releaseSnapshot(snapshot->version());
     }
     return Status::OK();
 }
@@ -675,17 +581,11 @@ Status DB::releaseSnapshot(std::unique_ptr<Snapshot> snapshot) {
 // --- Iteration ---
 
 Status DB::createIterator(std::unique_ptr<Iterator>& iterator) {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
 
-    uint64_t snapshot_version;
-    Status s = createSnapshotInternal(snapshot_version);
-    if (!s.ok()) {
-        return s;
-    }
-
+    uint64_t snapshot_version = versions_->createSnapshot();
     auto impl = std::make_unique<Iterator::Impl>(this, snapshot_version);
     iterator = std::unique_ptr<Iterator>(new Iterator(std::move(impl)));
     return Status::OK();
@@ -694,7 +594,6 @@ Status DB::createIterator(std::unique_ptr<Iterator>& iterator) {
 // --- Maintenance ---
 
 Status DB::flush() {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
@@ -704,7 +603,6 @@ Status DB::flush() {
 // --- Statistics ---
 
 Status DB::getStats(DBStats& stats) const {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
@@ -714,13 +612,10 @@ Status DB::getStats(DBStats& stats) const {
     stats.l1_index_size = l1_index_->memoryUsage();
     stats.l2_cache_size = storage_->l2CacheSize();
     stats.l2_cached_count = storage_->l2CachedCount();
-    stats.current_version = current_version_.load();
-    stats.oldest_version = getOldestSnapshotVersion();
+    stats.current_version = versions_->currentVersion();
+    stats.oldest_version = versions_->oldestSnapshotVersion();
 
-    {
-        std::lock_guard lock(snapshot_mutex_);
-        stats.active_snapshots = active_snapshots_.size();
-    }
+    stats.active_snapshots = versions_->activeSnapshotCount();
 
     // These would need L1 index iteration to compute accurately
     stats.num_live_entries = l1_index_->keyCount();
@@ -730,7 +625,6 @@ Status DB::getStats(DBStats& stats) const {
 }
 
 Status DB::getPath(std::string& path) const {
-    std::shared_lock state_lock(state_mutex_);
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
@@ -739,11 +633,11 @@ Status DB::getPath(std::string& path) const {
 }
 
 uint64_t DB::getCurrentVersion() const {
-    return current_version_.load();
+    return versions_->currentVersion();
 }
 
 uint64_t DB::getOldestVersion() const {
-    return getOldestSnapshotVersion();
+    return versions_->oldestSnapshotVersion();
 }
 
 }  // namespace kvlite
