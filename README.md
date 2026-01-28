@@ -147,22 +147,6 @@ assert(v1 == v2);
 db.releaseSnapshot(std::move(snapshot));
 ```
 
-### Garbage Collection
-
-```cpp
-// Trigger GC with configured policy
-// Only collects versions older than oldest active snapshot
-db.gc();
-
-// Compact specific log files
-db.gc({file_id1, file_id2, file_id3});
-
-// Check GC status
-if (db.isGCRunning()) {
-    db.waitForGC();
-}
-```
-
 ### Version Info
 
 ```cpp
@@ -173,12 +157,37 @@ db.getCurrentVersion(current);
 // Get oldest retained version (limited by snapshots)
 uint64_t oldest;
 db.getOldestVersion(oldest);
+```
 
-// Statistics
+### Administrative Operations
+
+For garbage collection, statistics, and maintenance operations, use `DBAdmin`:
+
+```cpp
+#include <kvlite/db_admin.h>
+
+kvlite::DBAdmin admin(db);
+
+// Trigger GC with configured policy
+admin.gc();
+
+// Compact specific log files
+admin.gc({file_id1, file_id2, file_id3});
+
+// Check GC status
+if (admin.isGCRunning()) {
+    admin.waitForGC();
+}
+
+// Get statistics
 kvlite::DBStats stats;
-db.getStats(stats);
+admin.getStats(stats);
 std::cout << "Current version: " << stats.current_version << std::endl;
 std::cout << "Active snapshots: " << stats.active_snapshots << std::endl;
+
+// Force flush and L1 snapshot
+admin.flush();
+admin.snapshotL1Index();
 ```
 
 ## Configuration
