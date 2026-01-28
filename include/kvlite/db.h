@@ -9,11 +9,13 @@
 #include "kvlite/status.h"
 #include "kvlite/options.h"
 #include "kvlite/write_batch.h"
+#include "kvlite/read_batch.h"
 
 namespace kvlite {
 
-// Forward declaration
+// Forward declarations
 class DBImpl;
+class Snapshot;
 
 // Database statistics
 struct DBStats {
@@ -23,11 +25,11 @@ struct DBStats {
     // Total size of all log files in bytes
     uint64_t total_log_size = 0;
 
-    // Number of live entries (keys)
+    // Number of live entries (latest version per key)
     uint64_t num_live_entries = 0;
 
-    // Number of dead entries (tombstones + overwritten)
-    uint64_t num_dead_entries = 0;
+    // Number of historical entries (older versions + tombstones)
+    uint64_t num_historical_entries = 0;
 
     // Size of L1 index in memory (bytes)
     uint64_t l1_index_size = 0;
@@ -41,6 +43,15 @@ struct DBStats {
     // Number of updates since last L1 snapshot
     uint64_t updates_since_snapshot = 0;
 
+    // Current global version (latest committed)
+    uint64_t current_version = 0;
+
+    // Oldest version still retained (limited by oldest snapshot)
+    uint64_t oldest_version = 0;
+
+    // Number of active snapshots
+    uint64_t active_snapshots = 0;
+
     // Whether GC is currently running
     bool gc_running = false;
 };
@@ -49,9 +60,10 @@ struct DBStats {
 struct LogFileInfo {
     uint32_t file_id;
     uint64_t size;
-    uint64_t live_entries;
-    uint64_t dead_entries;
-    double dead_ratio;  // dead_entries / (live + dead)
+    uint64_t num_entries;
+    uint64_t min_version;  // Oldest version in this file
+    uint64_t max_version;  // Newest version in this file
+    bool gc_eligible;      // True if all versions < oldest snapshot
 };
 
 class DB {
@@ -83,40 +95,80 @@ public:
     // --- Basic Operations ---
 
     // Set the value for the given key
-    // If the key exists, its value is overwritten
+    // Creates a new version; previous versions are retained until GC
     Status put(const std::string& key, const std::string& value,
                const WriteOptions& options = WriteOptions());
 
-    // Get the value for the given key
+    // Get the latest value for the given key
     // Returns Status::NotFound if the key does not exist
     Status get(const std::string& key, std::string* value,
                const ReadOptions& options = ReadOptions());
 
+    // Get the latest value and its version
+    Status get(const std::string& key, std::string* value, uint64_t* version,
+               const ReadOptions& options = ReadOptions());
+
+    // Get the value at a specific version (point-in-time read)
+    // Returns the latest version of key where version < upper_bound
+    // Returns Status::NotFound if key did not exist at that version
+    Status getByVersion(const std::string& key, uint64_t upper_bound,
+                        std::string* value,
+                        const ReadOptions& options = ReadOptions());
+
+    // Get the value at a specific version with version info
+    Status getByVersion(const std::string& key, uint64_t upper_bound,
+                        std::string* value, uint64_t* entry_version,
+                        const ReadOptions& options = ReadOptions());
+
     // Remove the entry for the given key
-    // Writes a tombstone; actual deletion happens during GC
+    // Writes a tombstone with a new version; actual deletion happens during GC
     Status remove(const std::string& key,
                   const WriteOptions& options = WriteOptions());
 
-    // Check if a key exists
+    // Check if a key exists (latest version)
     bool exists(const std::string& key,
                 const ReadOptions& options = ReadOptions());
 
     // --- Batch Operations ---
 
     // Apply a batch of writes atomically
-    // All operations in the batch succeed or fail together
+    // All operations in the batch get the same version
     Status write(const WriteBatch& batch,
                  const WriteOptions& options = WriteOptions());
+
+    // Execute a batch of reads at a consistent snapshot
+    // Creates a temporary snapshot, performs all reads, then releases it
+    // Results are stored in the batch object
+    Status read(ReadBatch& batch,
+                const ReadOptions& options = ReadOptions());
+
+    // --- Snapshots ---
+
+    // Create a snapshot at the current version
+    // The snapshot provides a consistent point-in-time view
+    // Must be released with releaseSnapshot() to allow GC
+    std::unique_ptr<Snapshot> createSnapshot();
+
+    // Release a snapshot, allowing GC of versions it was protecting
+    void releaseSnapshot(std::unique_ptr<Snapshot> snapshot);
+
+    // Get the current (latest committed) version
+    uint64_t getCurrentVersion() const;
+
+    // Get the oldest version still retained (limited by snapshots)
+    uint64_t getOldestVersion() const;
 
     // --- Garbage Collection ---
 
     // Trigger garbage collection manually
+    // Only collects versions older than the oldest active snapshot
     // Compacts log files according to the configured GC policy
     // Returns immediately if GC is already running
     Status gc();
 
     // Trigger garbage collection on specific files
     // Merges the specified files, respecting 1GB output file limit
+    // Respects oldest snapshot version
     Status gc(const std::vector<uint32_t>& file_ids);
 
     // Check if GC is currently running
