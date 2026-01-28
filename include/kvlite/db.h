@@ -15,11 +15,88 @@ namespace kvlite {
 // Forward declarations
 class DBImpl;
 class DBAdmin;
-class Snapshot;
-class Iterator;
+class SnapshotImpl;
+class IteratorImpl;
 
 class DB {
 public:
+    // --- Nested Classes ---
+
+    // A Snapshot represents a consistent point-in-time view of the database.
+    // All reads through a snapshot see data as of the snapshot's version.
+    // Must be released with DB::releaseSnapshot() to allow GC of old versions.
+    class Snapshot {
+    public:
+        ~Snapshot();
+
+        // Non-copyable
+        Snapshot(const Snapshot&) = delete;
+        Snapshot& operator=(const Snapshot&) = delete;
+
+        // Movable
+        Snapshot(Snapshot&& other) noexcept;
+        Snapshot& operator=(Snapshot&& other) noexcept;
+
+        // Get the value for the given key as of this snapshot's version.
+        Status get(const std::string& key, std::string& value,
+                   const ReadOptions& options = ReadOptions()) const;
+
+        // Get the value and its version
+        Status get(const std::string& key, std::string& value, uint64_t& entry_version,
+                   const ReadOptions& options = ReadOptions()) const;
+
+        // Check if a key exists at this snapshot's version
+        Status exists(const std::string& key, bool& exists,
+                      const ReadOptions& options = ReadOptions()) const;
+
+        // Get the version this snapshot represents
+        uint64_t version() const;
+
+        // Check if the snapshot is still valid (not released)
+        bool isValid() const;
+
+    private:
+        friend class DB;
+        Snapshot(DB* db, uint64_t version);
+        std::unique_ptr<SnapshotImpl> impl_;
+    };
+
+    // Unordered whole-database iterator.
+    // Returns the latest version of each key as of the snapshot taken at creation.
+    // Keys are returned in arbitrary order (not sorted).
+    //
+    // Implementation: Scans L2 index files sequentially, using L1 to filter
+    // out old versions. No additional in-memory index needed.
+    class Iterator {
+    public:
+        ~Iterator();
+
+        // Non-copyable
+        Iterator(const Iterator&) = delete;
+        Iterator& operator=(const Iterator&) = delete;
+
+        // Movable
+        Iterator(Iterator&& other) noexcept;
+        Iterator& operator=(Iterator&& other) noexcept;
+
+        // Advance to next entry and retrieve key/value.
+        // Returns OK on success, NotFound when exhausted.
+        Status next(std::string& key, std::string& value);
+
+        // Advance to next entry and retrieve key/value/version.
+        Status next(std::string& key, std::string& value, uint64_t& version);
+
+        // Get the snapshot version this iterator uses.
+        uint64_t snapshotVersion() const;
+
+    private:
+        friend class DB;
+        explicit Iterator(std::unique_ptr<IteratorImpl> impl);
+        std::unique_ptr<IteratorImpl> impl_;
+    };
+
+    // --- DB Methods ---
+
     DB();
     ~DB();
 
@@ -34,25 +111,21 @@ public:
     // --- Lifecycle ---
 
     // Open a database at the specified path
-    // Creates the directory if options.create_if_missing is true
     Status open(const std::string& path, const Options& options = Options());
 
     // Close the database
-    // Flushes write buffer, persists L1 snapshot, and releases resources
     Status close();
 
     // Check if the database is open
     bool isOpen() const;
 
-    // --- Basic Operations ---
+    // --- Point Operations ---
 
     // Set the value for the given key
-    // Creates a new version; previous versions are retained until GC
     Status put(const std::string& key, const std::string& value,
                const WriteOptions& options = WriteOptions());
 
     // Get the latest value for the given key
-    // Returns Status::NotFound if the key does not exist
     Status get(const std::string& key, std::string& value,
                const ReadOptions& options = ReadOptions());
 
@@ -60,9 +133,7 @@ public:
     Status get(const std::string& key, std::string& value, uint64_t& version,
                const ReadOptions& options = ReadOptions());
 
-    // Get the value at a specific version (point-in-time read)
-    // Returns the latest version of key where version < upper_bound
-    // Returns Status::NotFound if key did not exist at that version
+    // Get the value at a specific version (largest version < upper_bound)
     Status getByVersion(const std::string& key, uint64_t upper_bound,
                         std::string& value,
                         const ReadOptions& options = ReadOptions());
@@ -73,7 +144,6 @@ public:
                         const ReadOptions& options = ReadOptions());
 
     // Remove the entry for the given key
-    // Writes a tombstone with a new version; actual deletion happens during GC
     Status remove(const std::string& key,
                   const WriteOptions& options = WriteOptions());
 
@@ -83,22 +153,17 @@ public:
 
     // --- Batch Operations ---
 
-    // Apply a batch of writes atomically
-    // All operations in the batch get the same version
+    // Apply a batch of writes atomically (all ops get same version)
     Status write(const WriteBatch& batch,
                  const WriteOptions& options = WriteOptions());
 
     // Execute a batch of reads at a consistent snapshot
-    // Creates a temporary snapshot, performs all reads, then releases it
-    // Results are stored in the batch object
     Status read(ReadBatch& batch,
                 const ReadOptions& options = ReadOptions());
 
     // --- Snapshots ---
 
     // Create a snapshot at the current version
-    // The snapshot provides a consistent point-in-time view
-    // Must be released with releaseSnapshot() to allow GC
     Status createSnapshot(std::unique_ptr<Snapshot>& snapshot);
 
     // Release a snapshot, allowing GC of versions it was protecting
@@ -106,10 +171,8 @@ public:
 
     // --- Iteration ---
 
-    // Create an unordered iterator over all keys in the database.
-    // Returns the latest version of each key as of iteration start.
-    // Useful for full database copy (local backup or remote replication).
-    // Note: Scans all L2 index files on creation; may take time for large DBs.
+    // Create an unordered iterator over all keys
+    // Useful for full database copy (backup/replication)
     Status createIterator(std::unique_ptr<Iterator>& iterator);
 
 private:

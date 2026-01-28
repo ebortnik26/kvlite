@@ -130,7 +130,7 @@ for (const auto& result : rbatch.results()) {
 
 ```cpp
 // Create a snapshot at current version
-std::unique_ptr<kvlite::Snapshot> snapshot;
+std::unique_ptr<kvlite::DB::Snapshot> snapshot;
 db.createSnapshot(snapshot);
 std::cout << "Snapshot at version " << snapshot->version() << std::endl;
 
@@ -152,7 +152,7 @@ db.releaseSnapshot(std::move(snapshot));
 Unordered iteration over all keys (useful for full database copy/replication):
 
 ```cpp
-std::unique_ptr<kvlite::Iterator> iter;
+std::unique_ptr<kvlite::DB::Iterator> iter;
 db.createIterator(iter);
 
 std::string key, value;
@@ -283,7 +283,7 @@ GC can collect: versions < 200 (now S2 is oldest)
 
 void backupToFile(kvlite::DB& db, const std::string& backup_path) {
     // Create snapshot - all reads will see consistent state
-    std::unique_ptr<kvlite::Snapshot> snapshot;
+    std::unique_ptr<kvlite::DB::Snapshot> snapshot;
     db.createSnapshot(snapshot);
     std::cout << "Backing up at version " << snapshot->version() << std::endl;
 
@@ -314,13 +314,13 @@ void demonstrateConcurrentSnapshots(kvlite::DB& db) {
     db.put("counter", "100");  // version 1
 
     // Snapshot A sees counter=100
-    std::unique_ptr<kvlite::Snapshot> snapshotA;
+    std::unique_ptr<kvlite::DB::Snapshot> snapshotA;
     db.createSnapshot(snapshotA);
 
     db.put("counter", "200");  // version 2
 
     // Snapshot B sees counter=200
-    std::unique_ptr<kvlite::Snapshot> snapshotB;
+    std::unique_ptr<kvlite::DB::Snapshot> snapshotB;
     db.createSnapshot(snapshotB);
 
     db.put("counter", "300");  // version 3
