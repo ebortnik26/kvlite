@@ -126,8 +126,9 @@ public:
                   const WriteOptions& options = WriteOptions());
 
     // Check if a key exists (latest version)
-    bool exists(const std::string& key,
-                const ReadOptions& options = ReadOptions());
+    // Sets *exists to true if key exists, false otherwise
+    Status exists(const std::string& key, bool* exists,
+                  const ReadOptions& options = ReadOptions());
 
     // --- Batch Operations ---
 

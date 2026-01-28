@@ -98,8 +98,8 @@ Status getByVersion(const std::string& key, uint64_t upper_bound,
 // Delete (creates tombstone with new version)
 Status remove(const std::string& key);
 
-// Check existence
-bool exists(const std::string& key);
+// Check existence (sets *exists to true/false)
+Status exists(const std::string& key, bool* exists);
 ```
 
 ### Batch Operations

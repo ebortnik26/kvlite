@@ -50,8 +50,9 @@ public:
                const ReadOptions& options = ReadOptions()) const;
 
     // Check if a key exists at this snapshot's version
-    bool exists(const std::string& key,
-                const ReadOptions& options = ReadOptions()) const;
+    // Sets *exists to true if key exists, false otherwise
+    Status exists(const std::string& key, bool* exists,
+                  const ReadOptions& options = ReadOptions()) const;
 
     // Get the version this snapshot represents
     uint64_t version() const;

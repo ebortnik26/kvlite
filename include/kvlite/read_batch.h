@@ -69,7 +69,13 @@ public:
     const std::vector<ReadResult>& results() const { return results_; }
 
     // Get a specific result by index
-    const ReadResult& result(size_t index) const { return results_[index]; }
+    // Returns nullptr if index is out of bounds
+    const ReadResult* result(size_t index) const {
+        if (index >= results_.size()) {
+            return nullptr;
+        }
+        return &results_[index];
+    }
 
     // Number of keys in the batch
     size_t count() const { return keys_.size(); }
