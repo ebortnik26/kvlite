@@ -163,8 +163,16 @@ public:
     uint64_t getOldestVersion() const;
 
 private:
+    struct Impl;
+
+    uint64_t allocateVersion();
+    uint64_t getOldestSnapshotVersion() const;
+    Status createSnapshotInternal(uint64_t& snapshot_version);
+    void releaseSnapshotInternal(uint64_t snapshot_version);
+
     std::string db_path_;
     Options options_;
+    std::unique_ptr<Impl> impl_;
     std::unique_ptr<internal::L1IndexManager> l1_index_;
     std::unique_ptr<internal::StorageManager> storage_;
 };
