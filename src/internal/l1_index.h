@@ -12,6 +12,53 @@
 namespace kvlite {
 namespace internal {
 
+// Payload encoding for inline file_ids in 64-bit DHT payloads.
+//
+// Inline (bit 0 = 1):
+//   bit 0:      1 (inline flag)
+//   bit 1:      has_second (0 = 1 file_id, 1 = 2 file_ids)
+//   bits 2-32:  file_id_0 (31 bits, max 2^31-1)
+//   bits 33-63: file_id_1 (31 bits, valid only if has_second=1)
+//
+// Overflow (bit 0 = 0):
+//   bits 0-63: (pool_handle + 1) << 1  (always non-zero, bit 0 = 0)
+//   Pool handle is an index into IdVecPool.
+namespace Payload {
+
+static constexpr uint32_t kMaxInlineFileId = (1u << 31) - 1;
+
+inline bool isInline(uint64_t p) { return (p & 1) != 0; }
+inline bool isOverflow(uint64_t p) { return (p & 1) == 0; }
+
+inline uint64_t makeInline1(uint32_t fid) {
+    return 1ULL | (static_cast<uint64_t>(fid) << 2);
+}
+
+inline uint64_t makeInline2(uint32_t fid0, uint32_t fid1) {
+    return 1ULL | (1ULL << 1) |
+           (static_cast<uint64_t>(fid0) << 2) |
+           (static_cast<uint64_t>(fid1) << 33);
+}
+
+inline uint32_t inlineCount(uint64_t p) {
+    return ((p >> 1) & 1) ? 2 : 1;
+}
+
+inline uint32_t inlineFileId(uint64_t p, uint32_t idx) {
+    if (idx == 0) return static_cast<uint32_t>((p >> 2) & kMaxInlineFileId);
+    return static_cast<uint32_t>((p >> 33) & kMaxInlineFileId);
+}
+
+inline uint32_t toHandle(uint64_t p) {
+    return static_cast<uint32_t>(p >> 1) - 1;
+}
+
+inline uint64_t fromHandle(uint32_t handle) {
+    return static_cast<uint64_t>(handle + 1) << 1;
+}
+
+}  // namespace Payload
+
 // L1 Index: In-memory index mapping keys to file_id lists.
 //
 // Structure: key → [file_id₁, file_id₂, ...]
@@ -33,9 +80,9 @@ public:
     // Latest file_id is always at index 0.
     void put(const std::string& key, uint32_t file_id);
 
-    // Get all file_ids for a key. Returns nullptr if key doesn't exist.
+    // Get all file_ids for a key. Returns false if key doesn't exist.
     // File IDs are ordered latest-first.
-    const std::vector<uint32_t>* getFileIds(const std::string& key) const;
+    bool getFileIds(const std::string& key, std::vector<uint32_t>& out) const;
 
     // Get the latest file_id for a key (index 0). O(1).
     // Returns false if key doesn't exist.

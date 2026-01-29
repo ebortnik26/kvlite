@@ -9,14 +9,10 @@
 #include <string>
 #include <vector>
 
+#include "id_vec_pool.h"
+
 namespace kvlite {
 namespace internal {
-
-// A record holding file_id list for a fingerprint slot.
-// Stored externally; the DHT holds pointers to these.
-struct KeyRecord {
-    std::vector<uint32_t> file_ids;  // reverse-sorted by version (latest first)
-};
 
 // Delta Hash Table: a compact hash table inspired by the Pliops XDP paper.
 //
@@ -32,7 +28,9 @@ struct KeyRecord {
 //
 // When a bucket overflows, an extension bucket is chained.
 //
-// Target: ~9 bytes per key in the DHT itself (payload pointer dominates).
+// Each entry stores a 64-bit payload (instead of a pointer). The payload
+// is opaque to the DHT — callers encode inline file_ids or overflow
+// KeyRecord pointers as they see fit.
 class DeltaHashTable {
 public:
     struct Config {
@@ -51,22 +49,31 @@ public:
     DeltaHashTable(DeltaHashTable&&) = delete;
     DeltaHashTable& operator=(DeltaHashTable&&) = delete;
 
-    // Insert a key, returning a pointer to its KeyRecord.
-    // If the fingerprint already exists, returns the existing record.
-    KeyRecord* insert(const std::string& key);
+    // Insert a key with an initial payload.
+    // If the fingerprint already exists, returns {existing_payload, false}.
+    // If new, inserts with initial_payload and returns {initial_payload, true}.
+    std::pair<uint64_t, bool> insert(const std::string& key, uint64_t initial_payload);
 
     // Insert by pre-computed hash (for snapshot loading).
-    // Decomposes hash into bucket/lslot/fingerprint and find-or-creates.
-    KeyRecord* insertByHash(uint64_t hash);
+    // Same semantics as insert().
+    std::pair<uint64_t, bool> insertByHash(uint64_t hash, uint64_t initial_payload);
 
-    // Find a key's record. Returns nullptr if not found.
-    KeyRecord* find(const std::string& key) const;
+    // Find a key's payload. Returns {payload, true} if found, {0, false} if not.
+    std::pair<uint64_t, bool> find(const std::string& key) const;
+
+    // Update the payload for an existing key. Returns true if key was found.
+    bool updatePayload(const std::string& key, uint64_t new_payload);
 
     // Remove a key. Returns true if key was found and removed.
     bool remove(const std::string& key);
 
-    // Iterate over all records, providing the reconstructed 64-bit hash.
-    void forEach(const std::function<void(uint64_t hash, const KeyRecord&)>& fn) const;
+    // Iterate over all entries, providing the reconstructed 64-bit hash and payload.
+    void forEach(const std::function<void(uint64_t hash, uint64_t payload)>& fn) const;
+
+    // Access the DHT's id-vector pool. Callers use this to allocate/release
+    // overflow vectors and to access their contents.
+    IdVecPool& idVecPool() { return pool_; }
+    const IdVecPool& idVecPool() const { return pool_; }
 
     size_t size() const;
     size_t memoryUsage() const;
@@ -93,10 +100,10 @@ private:
     // Used as intermediate representation for encode/decode.
     struct TrieEntry {
         uint64_t fingerprint;
-        KeyRecord* record;
+        uint64_t payload;
     };
 
-    // An lslot's decoded contents: list of (fingerprint, record*) pairs.
+    // An lslot's decoded contents: list of (fingerprint, payload) pairs.
     struct LSlotContents {
         std::vector<TrieEntry> entries;
     };
@@ -134,12 +141,17 @@ private:
     size_t bucketDataBits() const;
 
     // Lookup across bucket chain (fingerprint-only match)
-    KeyRecord* findInChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                            uint64_t fp) const;
+    // Returns payload (0 if not found).
+    uint64_t findInChain(uint32_t bucket_idx, uint32_t lslot_idx,
+                          uint64_t fp) const;
 
     // Insert into bucket chain, handling overflow
-    KeyRecord* insertIntoChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                                uint64_t fp, KeyRecord* record);
+    void insertIntoChain(uint32_t bucket_idx, uint32_t lslot_idx,
+                          uint64_t fp, uint64_t payload);
+
+    // Update payload in bucket chain. Returns true if found.
+    bool updateInChain(uint32_t bucket_idx, uint32_t lslot_idx,
+                        uint64_t fp, uint64_t new_payload);
 
     // Remove from bucket chain (fingerprint-only match)
     bool removeFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
@@ -177,8 +189,8 @@ private:
     std::vector<Bucket> buckets_;
     std::unique_ptr<BucketLock[]> bucket_locks_;
     std::vector<std::unique_ptr<Bucket>> extensions_;
-    std::vector<std::unique_ptr<KeyRecord>> records_;
-    std::mutex alloc_mutex_;    // protects records_ and extensions_
+    std::mutex ext_mutex_;      // protects extensions_
+    IdVecPool pool_;
     std::atomic<size_t> size_{0};
 };
 

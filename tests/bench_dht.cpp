@@ -68,8 +68,7 @@ static void bench_dht_insert(int N) {
 
     double start = now_ms();
     for (int i = 0; i < N; ++i) {
-        KeyRecord* rec = dht.insert(keys[i]);
-        rec->entries.push_back({static_cast<uint64_t>(i), static_cast<uint64_t>(i * 10)});
+        dht.insert(keys[i], static_cast<uint64_t>(i * 10 + 1));
     }
     double elapsed = now_ms() - start;
     printf("DHT insert %6dk: %8.2f ms  (%5.0f ns/op, mem=%zu KB)\n",
@@ -82,14 +81,15 @@ static void bench_dht_find(int N) {
     std::vector<std::string> keys(N);
     for (int i = 0; i < N; ++i) {
         keys[i] = "key_" + std::to_string(i);
-        dht.insert(keys[i]);
+        dht.insert(keys[i], static_cast<uint64_t>(i + 1));
     }
 
     double start = now_ms();
     int found = 0;
     for (int iter = 0; iter < 3; ++iter) {
         for (int i = 0; i < N; ++i) {
-            if (dht.find(keys[i])) ++found;
+            auto [payload, ok] = dht.find(keys[i]);
+            if (ok) ++found;
         }
     }
     double elapsed = now_ms() - start;

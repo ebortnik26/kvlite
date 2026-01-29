@@ -89,62 +89,212 @@ L1Index::L1Index() : dht_(defaultDHTConfig()) {}
 L1Index::~L1Index() = default;
 
 void L1Index::put(const std::string& key, uint32_t file_id) {
-    KeyRecord* record = dht_.insert(key);
-    if (record->file_ids.empty() || record->file_ids[0] != file_id) {
-        record->file_ids.insert(record->file_ids.begin(), file_id);
+    using namespace Payload;
+    auto& pool = dht_.idVecPool();
+
+    // If file_id exceeds inline capacity, go straight to overflow
+    if (file_id > kMaxInlineFileId) {
+        // Try insert with a temporary inline payload; if new, allocate overflow
+        auto [payload, is_new] = dht_.insert(key, makeInline1(0));
+        if (is_new) {
+            uint32_t h = pool.allocate();
+            pool.get(h).push_back(file_id);
+            dht_.updatePayload(key, fromHandle(h));
+            ++total_entries_;
+            return;
+        }
+        // Existing key
+        if (isInline(payload)) {
+            uint32_t count = inlineCount(payload);
+            uint32_t h = pool.allocate();
+            auto& vec = pool.get(h);
+            vec.push_back(file_id);
+            vec.push_back(inlineFileId(payload, 0));
+            if (count == 2) {
+                vec.push_back(inlineFileId(payload, 1));
+            }
+            dht_.updatePayload(key, fromHandle(h));
+            ++total_entries_;
+        } else {
+            auto& vec = pool.get(toHandle(payload));
+            if (vec.empty() || vec[0] != file_id) {
+                vec.insert(vec.begin(), file_id);
+                ++total_entries_;
+            }
+        }
+        return;
+    }
+
+    auto [payload, is_new] = dht_.insert(key, makeInline1(file_id));
+    if (is_new) {
         ++total_entries_;
+        return;
+    }
+
+    // Existing key
+    if (isInline(payload)) {
+        uint32_t count = inlineCount(payload);
+        uint32_t fid0 = inlineFileId(payload, 0);
+        if (fid0 == file_id) {
+            return;  // already at front
+        }
+        if (count == 1) {
+            dht_.updatePayload(key, makeInline2(file_id, fid0));
+        } else {
+            // count == 2, promote to overflow
+            uint32_t fid1 = inlineFileId(payload, 1);
+            if (fid1 == file_id) {
+                // file_id exists but not at front: reorder to [file_id, fid0]
+                dht_.updatePayload(key, makeInline2(file_id, fid0));
+                return;  // no new entry, just reorder
+            }
+            uint32_t h = pool.allocate();
+            pool.get(h) = {file_id, fid0, fid1};
+            dht_.updatePayload(key, fromHandle(h));
+        }
+        ++total_entries_;
+    } else {
+        // overflow
+        auto& vec = pool.get(toHandle(payload));
+        if (vec.empty() || vec[0] != file_id) {
+            vec.insert(vec.begin(), file_id);
+            ++total_entries_;
+        }
     }
 }
 
-const std::vector<uint32_t>* L1Index::getFileIds(const std::string& key) const {
-    KeyRecord* record = dht_.find(key);
-    if (!record || record->file_ids.empty()) {
-        return nullptr;
+bool L1Index::getFileIds(const std::string& key, std::vector<uint32_t>& out) const {
+    using namespace Payload;
+
+    auto [payload, found] = dht_.find(key);
+    if (!found) return false;
+
+    out.clear();
+    if (isInline(payload)) {
+        out.push_back(inlineFileId(payload, 0));
+        if (inlineCount(payload) == 2) {
+            out.push_back(inlineFileId(payload, 1));
+        }
+    } else {
+        out = dht_.idVecPool().get(toHandle(payload));
     }
-    return &record->file_ids;
+    return true;
 }
 
 bool L1Index::getLatest(const std::string& key, uint32_t& file_id) const {
-    KeyRecord* record = dht_.find(key);
-    if (!record || record->file_ids.empty()) {
-        return false;
+    using namespace Payload;
+
+    auto [payload, found] = dht_.find(key);
+    if (!found) return false;
+
+    if (isInline(payload)) {
+        file_id = inlineFileId(payload, 0);
+    } else {
+        const auto& vec = dht_.idVecPool().get(toHandle(payload));
+        if (vec.empty()) return false;
+        file_id = vec[0];
     }
-    file_id = record->file_ids[0];
     return true;
 }
 
 bool L1Index::contains(const std::string& key) const {
-    KeyRecord* record = dht_.find(key);
-    return record != nullptr && !record->file_ids.empty();
+    auto [payload, found] = dht_.find(key);
+    return found;
 }
 
 void L1Index::remove(const std::string& key) {
-    KeyRecord* record = dht_.find(key);
-    if (record) {
-        total_entries_ -= record->file_ids.size();
-        dht_.remove(key);
+    using namespace Payload;
+
+    auto [payload, found] = dht_.find(key);
+    if (!found) return;
+
+    if (isInline(payload)) {
+        total_entries_ -= inlineCount(payload);
+    } else {
+        uint32_t h = toHandle(payload);
+        total_entries_ -= dht_.idVecPool().get(h).size();
+        dht_.idVecPool().release(h);
     }
+    dht_.remove(key);
 }
 
 void L1Index::removeFile(const std::string& key, uint32_t file_id) {
-    KeyRecord* record = dht_.find(key);
-    if (!record) return;
+    using namespace Payload;
+    auto& pool = dht_.idVecPool();
 
-    auto it = std::find(record->file_ids.begin(), record->file_ids.end(), file_id);
-    if (it != record->file_ids.end()) {
-        record->file_ids.erase(it);
-        --total_entries_;
-    }
+    auto [payload, found] = dht_.find(key);
+    if (!found) return;
 
-    if (record->file_ids.empty()) {
-        dht_.remove(key);
+    if (isInline(payload)) {
+        uint32_t count = inlineCount(payload);
+        uint32_t fid0 = inlineFileId(payload, 0);
+        if (count == 1) {
+            if (fid0 == file_id) {
+                dht_.remove(key);
+                --total_entries_;
+            }
+        } else {
+            // count == 2
+            uint32_t fid1 = inlineFileId(payload, 1);
+            if (fid0 == file_id) {
+                dht_.updatePayload(key, makeInline1(fid1));
+                --total_entries_;
+            } else if (fid1 == file_id) {
+                dht_.updatePayload(key, makeInline1(fid0));
+                --total_entries_;
+            }
+        }
+    } else {
+        // overflow
+        uint32_t h = toHandle(payload);
+        auto& vec = pool.get(h);
+        auto it = std::find(vec.begin(), vec.end(), file_id);
+        if (it != vec.end()) {
+            vec.erase(it);
+            --total_entries_;
+        }
+        if (vec.empty()) {
+            pool.release(h);
+            dht_.remove(key);
+        } else if (vec.size() <= 2) {
+            // Demote back to inline if all remaining ids fit
+            bool can_inline = true;
+            for (uint32_t fid : vec) {
+                if (fid > kMaxInlineFileId) {
+                    can_inline = false;
+                    break;
+                }
+            }
+            if (can_inline) {
+                uint64_t new_payload;
+                if (vec.size() == 1) {
+                    new_payload = makeInline1(vec[0]);
+                } else {
+                    new_payload = makeInline2(vec[0], vec[1]);
+                }
+                pool.release(h);
+                dht_.updatePayload(key, new_payload);
+            }
+        }
     }
 }
 
 void L1Index::forEach(
     const std::function<void(const std::vector<uint32_t>&)>& fn) const {
-    dht_.forEach([&fn](uint64_t /*hash*/, const KeyRecord& record) {
-        fn(record.file_ids);
+    using namespace Payload;
+    const auto& pool = dht_.idVecPool();
+
+    dht_.forEach([&fn, &pool](uint64_t /*hash*/, uint64_t payload) {
+        if (isInline(payload)) {
+            std::vector<uint32_t> fids;
+            fids.push_back(inlineFileId(payload, 0));
+            if (inlineCount(payload) == 2) {
+                fids.push_back(inlineFileId(payload, 1));
+            }
+            fn(fids);
+        } else {
+            fn(pool.get(toHandle(payload)));
+        }
     });
 }
 
@@ -171,6 +321,8 @@ static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
 static constexpr uint32_t kVersion = 3;
 
 Status L1Index::saveSnapshot(const std::string& path) const {
+    using namespace Payload;
+
     std::ofstream file(path, std::ios::binary);
     if (!file) {
         return Status::IOError("Failed to create snapshot file: " + path);
@@ -186,15 +338,25 @@ Status L1Index::saveSnapshot(const std::string& path) const {
     uint64_t num_records = dht_.size();
     writer.writeVal(num_records);
 
-    // For each record
-    dht_.forEach([&writer](uint64_t hash, const KeyRecord& record) {
+    // For each record: decode payload into file_ids and write
+    const auto& pool = dht_.idVecPool();
+    dht_.forEach([&writer, &pool](uint64_t hash, uint64_t payload) {
         writer.writeVal(hash);
 
-        uint32_t num_file_ids = static_cast<uint32_t>(record.file_ids.size());
-        writer.writeVal(num_file_ids);
-
-        for (uint32_t fid : record.file_ids) {
-            writer.writeVal(fid);
+        if (isInline(payload)) {
+            uint32_t count = inlineCount(payload);
+            writer.writeVal(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t fid = inlineFileId(payload, i);
+                writer.writeVal(fid);
+            }
+        } else {
+            const auto& file_ids = pool.get(toHandle(payload));
+            uint32_t num_file_ids = static_cast<uint32_t>(file_ids.size());
+            writer.writeVal(num_file_ids);
+            for (uint32_t fid : file_ids) {
+                writer.writeVal(fid);
+            }
         }
     });
 
@@ -210,6 +372,8 @@ Status L1Index::saveSnapshot(const std::string& path) const {
 }
 
 Status L1Index::loadSnapshot(const std::string& path) {
+    using namespace Payload;
+
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         return Status::IOError("Failed to open snapshot file: " + path);
@@ -249,16 +413,37 @@ Status L1Index::loadSnapshot(const std::string& path) {
             return Status::Corruption("Failed to read file_id count");
         }
 
-        KeyRecord* record = dht_.insertByHash(hash);
-        record->file_ids.reserve(num_file_ids);
+        std::vector<uint32_t> file_ids(num_file_ids);
         for (uint32_t e = 0; e < num_file_ids; ++e) {
-            uint32_t file_id;
-            if (!reader.readVal(file_id)) {
+            if (!reader.readVal(file_ids[e])) {
                 return Status::Corruption("Failed to read file_id");
             }
-            record->file_ids.push_back(file_id);
-            ++total_entries_;
         }
+
+        // Build payload: inline if <=2 file_ids and all fit in 31 bits, else overflow
+        uint64_t payload;
+        bool can_inline = (num_file_ids <= 2);
+        if (can_inline) {
+            for (uint32_t fid : file_ids) {
+                if (fid > kMaxInlineFileId) {
+                    can_inline = false;
+                    break;
+                }
+            }
+        }
+
+        if (can_inline && num_file_ids == 1) {
+            payload = makeInline1(file_ids[0]);
+        } else if (can_inline && num_file_ids == 2) {
+            payload = makeInline2(file_ids[0], file_ids[1]);
+        } else {
+            uint32_t h = dht_.idVecPool().allocate();
+            dht_.idVecPool().get(h) = std::move(file_ids);
+            payload = fromHandle(h);
+        }
+
+        dht_.insertByHash(hash, payload);
+        total_entries_ += num_file_ids;
     }
 
     // Verify checksum
