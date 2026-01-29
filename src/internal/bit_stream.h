@@ -124,6 +124,13 @@ public:
         }
     }
 
+    // Read an Elias-gamma-coded value (result ≥ 1).
+    uint32_t readEliasGamma() {
+        uint8_t k = static_cast<uint8_t>(readUnary());
+        if (k == 0) return 1;
+        return (1u << k) | static_cast<uint32_t>(read(k));
+    }
+
     size_t position() const { return pos_; }
 
     void seek(size_t bit_offset) { pos_ = bit_offset; }
@@ -197,6 +204,16 @@ public:
                 write(1, 1);
             }
             write(0, 1);
+        }
+    }
+
+    // Write an Elias-gamma-coded value (n ≥ 1).
+    void writeEliasGamma(uint32_t n) {
+        assert(n >= 1);
+        uint8_t k = static_cast<uint8_t>(31 - __builtin_clz(n));
+        writeUnary(k);
+        if (k > 0) {
+            write(n & ((1u << k) - 1), k);
         }
     }
 

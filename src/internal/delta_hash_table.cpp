@@ -85,7 +85,8 @@ void DeltaHashTable::setExtensionPtr(Bucket& bucket, uint64_t ptr) const {
 //   for each fingerprint:
 //     [fingerprint_bits_]          — fingerprint value
 //     unary(M)                     — M values for this fingerprint
-//     M × [32 bits]                — the id values
+//     [32 bits]                    — first value (highest, stored raw)
+//     (M-1) × gamma(delta)        — deltas between consecutive desc values
 
 DeltaHashTable::LSlotContents DeltaHashTable::decodeLSlot(
     const uint8_t* bucket_data, size_t bit_offset,
@@ -101,8 +102,13 @@ DeltaHashTable::LSlotContents DeltaHashTable::decodeLSlot(
         contents.entries[i].fingerprint = reader.read(fingerprint_bits_);
         uint64_t num_values = reader.readUnary();
         contents.entries[i].values.resize(num_values);
-        for (uint64_t v = 0; v < num_values; ++v) {
-            contents.entries[i].values[v] = static_cast<uint32_t>(reader.read(32));
+        if (num_values > 0) {
+            contents.entries[i].values[0] = static_cast<uint32_t>(reader.read(32));
+            for (uint64_t v = 1; v < num_values; ++v) {
+                uint32_t delta = reader.readEliasGamma();
+                contents.entries[i].values[v] =
+                    contents.entries[i].values[v - 1] - delta;
+            }
         }
     }
 
@@ -125,8 +131,13 @@ size_t DeltaHashTable::encodeLSlot(
         writer.write(contents.entries[i].fingerprint, fingerprint_bits_);
         uint64_t num_values = contents.entries[i].values.size();
         writer.writeUnary(num_values);
-        for (uint64_t v = 0; v < num_values; ++v) {
-            writer.write(contents.entries[i].values[v], 32);
+        if (num_values > 0) {
+            writer.write(contents.entries[i].values[0], 32);
+            for (uint64_t v = 1; v < num_values; ++v) {
+                uint32_t delta =
+                    contents.entries[i].values[v - 1] - contents.entries[i].values[v];
+                writer.writeEliasGamma(delta);
+            }
         }
     }
 
@@ -149,13 +160,25 @@ size_t DeltaHashTable::totalLSlotBits(const uint8_t* bucket_data) const {
 
 // --- Calculate bits needed for an lslot ---
 
+// Bits needed to Elias-gamma-encode n (n ≥ 1).
+static uint8_t eliasGammaBits(uint32_t n) {
+    uint8_t k = 31 - __builtin_clz(n);  // floor(log2(n))
+    return 2 * k + 1;
+}
+
 size_t DeltaHashTable::lslotBitsNeeded(const LSlotContents& contents,
                                         uint8_t fp_bits) {
     size_t bits = contents.entries.size() + 1;  // unary(K)
     for (const auto& entry : contents.entries) {
         bits += fp_bits;                         // fingerprint
         bits += entry.values.size() + 1;         // unary(M)
-        bits += entry.values.size() * 32;        // M × 32-bit values
+        if (!entry.values.empty()) {
+            bits += 32;                          // first value raw
+            for (size_t v = 1; v < entry.values.size(); ++v) {
+                uint32_t delta = entry.values[v - 1] - entry.values[v];
+                bits += eliasGammaBits(delta);
+            }
+        }
     }
     return bits;
 }

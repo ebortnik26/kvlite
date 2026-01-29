@@ -2,11 +2,42 @@
 
 #include <map>
 #include <set>
+#include <vector>
 
+#include "internal/bit_stream.h"
 #include "internal/delta_hash_table.h"
 #include "internal/l1_index.h"
 
 using namespace kvlite::internal;
+
+// --- Elias Gamma Round-Trip Tests ---
+
+TEST(EliasGamma, RoundTrip) {
+    // Test a range of values including edge cases.
+    std::vector<uint32_t> test_values = {
+        1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 100, 255, 256,
+        1000, 10000, 65535, 65536, 100000, 1000000, 0x7FFFFFFFu
+    };
+
+    // Buffer with padding for BitReader/BitWriter (needs 8 bytes beyond data).
+    uint8_t buf[256] = {};
+
+    // Write all values.
+    BitWriter writer(buf, 0);
+    for (uint32_t v : test_values) {
+        writer.writeEliasGamma(v);
+    }
+
+    // Read them back.
+    BitReader reader(buf, 0);
+    for (uint32_t expected : test_values) {
+        uint32_t got = reader.readEliasGamma();
+        EXPECT_EQ(got, expected) << "mismatch for value " << expected;
+    }
+
+    // Positions should match.
+    EXPECT_EQ(reader.position(), writer.position());
+}
 
 // --- DeltaHashTable Tests ---
 
