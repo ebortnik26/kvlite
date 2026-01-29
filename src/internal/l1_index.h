@@ -4,11 +4,11 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <functional>
 
 #include "kvlite/status.h"
 #include "log_entry.h"
+#include "delta_hash_table.h"
 
 namespace kvlite {
 namespace internal {
@@ -91,10 +91,7 @@ public:
     // [checksum: 4 bytes]
 
 private:
-    // Key -> list of (version, file_id), sorted by version ascending
-    std::unordered_map<std::string, std::vector<IndexEntry>> index_;
-
-    // Statistics
+    DeltaHashTable dht_;
     size_t total_entries_ = 0;
 };
 

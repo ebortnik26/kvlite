@@ -40,7 +40,7 @@ public:
 
     // --- Lifecycle ---
 
-    Status open(const std::string& db_path, const Options& options = Options());
+    Status open(const std::string& db_path, const Options& options);
     Status close();
     bool isOpen() const;
 

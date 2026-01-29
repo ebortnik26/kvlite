@@ -57,7 +57,7 @@ public:
 
     // Open the index manager for a database path.
     // Does NOT recover - call recover() separately after open().
-    Status open(const std::string& db_path, const Options& options = Options());
+    Status open(const std::string& db_path, const Options& options);
 
     // Recover index state from snapshot + WAL.
     // Must be called after open() and before any read/write operations.
