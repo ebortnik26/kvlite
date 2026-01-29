@@ -29,6 +29,22 @@ bool L2Index::get(const std::string& key,
     return dht_.findAll(key, offsets, versions);
 }
 
+bool L2Index::get(const std::string& key, uint64_t upper_bound,
+                  uint64_t& offset, uint64_t& version) const {
+    std::vector<uint32_t> offsets, versions;
+    if (!dht_.findAll(key, offsets, versions)) return false;
+
+    // Pairs are sorted desc by offset. Find first with version <= upper_bound.
+    for (size_t i = 0; i < versions.size(); ++i) {
+        if (versions[i] <= upper_bound) {
+            offset = offsets[i];
+            version = versions[i];
+            return true;
+        }
+    }
+    return false;
+}
+
 bool L2Index::getLatest(const std::string& key,
                         uint32_t& offset, uint32_t& version) const {
     return dht_.findFirst(key, offset, version);
@@ -39,12 +55,9 @@ bool L2Index::contains(const std::string& key) const {
 }
 
 void L2Index::forEach(
-    const std::function<void(const std::vector<uint32_t>&,
-                             const std::vector<uint32_t>&)>& fn) const {
-    dht_.forEachGroup([&fn](uint64_t /*hash*/,
-                            const std::vector<uint32_t>& offsets,
-                            const std::vector<uint32_t>& versions) {
-        fn(offsets, versions);
+    const std::function<void(uint32_t offset, uint32_t version)>& fn) const {
+    dht_.forEach([&fn](uint64_t /*hash*/, uint32_t offset, uint32_t version) {
+        fn(offset, version);
     });
 }
 

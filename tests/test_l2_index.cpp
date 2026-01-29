@@ -366,10 +366,9 @@ TEST(L2Index, ForEach) {
     index.put("b", 200, 2);
 
     size_t count = 0;
-    index.forEach([&](const std::vector<uint32_t>& offsets,
-                      const std::vector<uint32_t>& versions) {
-        EXPECT_EQ(offsets.size(), 1u);
-        EXPECT_EQ(versions.size(), 1u);
+    index.forEach([&](uint32_t offset, uint32_t version) {
+        (void)offset;
+        (void)version;
         ++count;
     });
 
@@ -385,15 +384,12 @@ TEST(L2Index, ForEachMixed) {
     index.put("c", 500, 5);
     index.put("c", 600, 6);
 
-    std::set<size_t> sizes;
-    index.forEach([&](const std::vector<uint32_t>& offsets,
-                      const std::vector<uint32_t>&) {
-        sizes.insert(offsets.size());
+    size_t count = 0;
+    index.forEach([&](uint32_t, uint32_t) {
+        ++count;
     });
 
-    EXPECT_EQ(sizes.count(1u), 1u);
-    EXPECT_EQ(sizes.count(2u), 1u);
-    EXPECT_EQ(sizes.count(3u), 1u);
+    EXPECT_EQ(count, 6u);
 }
 
 TEST(L2Index, GetNonExistent) {

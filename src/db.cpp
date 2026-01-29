@@ -126,17 +126,13 @@ private:
         // Collect all entries from this L2 index
         l2_entries_.clear();
         if (current_l2_) {
-            current_l2_->forEach([this](const std::string& key,
-                                         const std::vector<internal::IndexEntry>& entries) {
-                for (const auto& entry : entries) {
-                    // Only consider entries within our snapshot
-                    if (entry.version <= snapshot_version_) {
-                        L2Entry e;
-                        e.key = key;
-                        e.version = entry.version;
-                        e.offset = entry.location;
-                        l2_entries_.push_back(std::move(e));
-                    }
+            current_l2_->forEach([this](uint32_t offset, uint32_t version) {
+                // Only consider entries within our snapshot
+                if (version <= snapshot_version_) {
+                    L2Entry e;
+                    e.version = version;
+                    e.offset = offset;
+                    l2_entries_.push_back(std::move(e));
                 }
             });
         }
@@ -162,15 +158,23 @@ private:
 
             const auto& entry = l2_entries_[l2_entry_idx_];
 
+            // Read the log entry to get key and value
+            internal::LogEntry log_entry;
+            Status s = db_->storage_->readLogEntry(current_file_id_, entry.offset, log_entry);
+            if (!s.ok()) {
+                l2_entry_idx_++;
+                continue;
+            }
+
             // Skip if we've already returned this key
-            if (seen_keys_.count(entry.key)) {
+            if (seen_keys_.count(log_entry.key)) {
                 l2_entry_idx_++;
                 continue;
             }
 
             // Check L1 index: is this file the latest for this key?
             uint32_t latest_fid;
-            if (!db_->l1_index_->getLatest(entry.key, latest_fid).ok()) {
+            if (!db_->l1_index_->getLatest(log_entry.key, latest_fid).ok()) {
                 l2_entry_idx_++;
                 continue;
             }
@@ -181,23 +185,15 @@ private:
                 continue;
             }
 
-            // This is the latest version - read the actual entry
-            internal::LogEntry log_entry;
-            Status s = db_->storage_->readLogEntry(current_file_id_, entry.offset, log_entry);
-            if (!s.ok()) {
-                l2_entry_idx_++;
-                continue;
-            }
-
             // Skip tombstones
             if (log_entry.tombstone()) {
-                seen_keys_.insert(entry.key);
+                seen_keys_.insert(log_entry.key);
                 l2_entry_idx_++;
                 continue;
             }
 
             // Found a valid entry
-            seen_keys_.insert(entry.key);
+            seen_keys_.insert(log_entry.key);
             current_key_ = std::move(log_entry.key);
             current_value_ = std::move(log_entry.value);
             current_version_ = log_entry.version();
@@ -207,8 +203,7 @@ private:
     }
 
     struct L2Entry {
-        std::string key;
-        uint64_t version;
+        uint32_t version;
         uint32_t offset;
     };
 

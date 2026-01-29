@@ -33,6 +33,11 @@ public:
              std::vector<uint32_t>& offsets,
              std::vector<uint32_t>& versions) const;
 
+    // Get the latest entry for a key with version <= upper_bound.
+    // Returns false if no matching entry exists.
+    bool get(const std::string& key, uint64_t upper_bound,
+             uint64_t& offset, uint64_t& version) const;
+
     // Get the latest (highest offset) entry for a key.
     // Returns false if key doesn't exist.
     bool getLatest(const std::string& key,
@@ -41,9 +46,9 @@ public:
     // Check if a key exists.
     bool contains(const std::string& key) const;
 
-    // Iterate over all (offset, version) groups.
-    void forEach(const std::function<void(const std::vector<uint32_t>&,
-                                          const std::vector<uint32_t>&)>& fn) const;
+    // Iterate over all (offset, version) pairs.
+    void forEach(const std::function<void(uint32_t offset,
+                                          uint32_t version)>& fn) const;
 
     size_t keyCount() const;
     size_t entryCount() const;
