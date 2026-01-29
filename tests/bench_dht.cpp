@@ -58,7 +58,7 @@ static DeltaHashTable::Config benchConfig() {
     return cfg;
 }
 
-static void bench_dht_insert(int N) {
+static void bench_dht_add(int N) {
     DeltaHashTable dht(benchConfig());
 
     std::vector<std::string> keys(N);
@@ -68,10 +68,10 @@ static void bench_dht_insert(int N) {
 
     double start = now_ms();
     for (int i = 0; i < N; ++i) {
-        dht.insert(keys[i], static_cast<uint64_t>(i * 10 + 1));
+        dht.addEntry(keys[i], static_cast<uint32_t>(i * 10 + 1));
     }
     double elapsed = now_ms() - start;
-    printf("DHT insert %6dk: %8.2f ms  (%5.0f ns/op, mem=%zu KB)\n",
+    printf("DHT add    %6dk: %8.2f ms  (%5.0f ns/op, mem=%zu KB)\n",
            N/1000, elapsed, elapsed * 1e6 / N, dht.memoryUsage() / 1024);
 }
 
@@ -81,15 +81,15 @@ static void bench_dht_find(int N) {
     std::vector<std::string> keys(N);
     for (int i = 0; i < N; ++i) {
         keys[i] = "key_" + std::to_string(i);
-        dht.insert(keys[i], static_cast<uint64_t>(i + 1));
+        dht.addEntry(keys[i], static_cast<uint32_t>(i + 1));
     }
 
     double start = now_ms();
     int found = 0;
     for (int iter = 0; iter < 3; ++iter) {
         for (int i = 0; i < N; ++i) {
-            auto [payload, ok] = dht.find(keys[i]);
-            if (ok) ++found;
+            uint32_t val;
+            if (dht.findFirst(keys[i], val)) ++found;
         }
     }
     double elapsed = now_ms() - start;
@@ -103,8 +103,8 @@ int main() {
     bench_bitstream_write();
 
     printf("\n=== DeltaHashTable ===\n");
-    bench_dht_insert(10'000);
-    bench_dht_insert(100'000);
+    bench_dht_add(10'000);
+    bench_dht_add(100'000);
     bench_dht_find(10'000);
     bench_dht_find(100'000);
 

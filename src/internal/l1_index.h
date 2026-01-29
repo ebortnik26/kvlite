@@ -12,57 +12,10 @@
 namespace kvlite {
 namespace internal {
 
-// Payload encoding for inline file_ids in 64-bit DHT payloads.
-//
-// Inline (bit 0 = 1):
-//   bit 0:      1 (inline flag)
-//   bit 1:      has_second (0 = 1 file_id, 1 = 2 file_ids)
-//   bits 2-32:  file_id_0 (31 bits, max 2^31-1)
-//   bits 33-63: file_id_1 (31 bits, valid only if has_second=1)
-//
-// Overflow (bit 0 = 0):
-//   bits 0-63: (pool_handle + 1) << 1  (always non-zero, bit 0 = 0)
-//   Pool handle is an index into IdVecPool.
-namespace Payload {
-
-static constexpr uint32_t kMaxInlineFileId = (1u << 31) - 1;
-
-inline bool isInline(uint64_t p) { return (p & 1) != 0; }
-inline bool isOverflow(uint64_t p) { return (p & 1) == 0; }
-
-inline uint64_t makeInline1(uint32_t fid) {
-    return 1ULL | (static_cast<uint64_t>(fid) << 2);
-}
-
-inline uint64_t makeInline2(uint32_t fid0, uint32_t fid1) {
-    return 1ULL | (1ULL << 1) |
-           (static_cast<uint64_t>(fid0) << 2) |
-           (static_cast<uint64_t>(fid1) << 33);
-}
-
-inline uint32_t inlineCount(uint64_t p) {
-    return ((p >> 1) & 1) ? 2 : 1;
-}
-
-inline uint32_t inlineFileId(uint64_t p, uint32_t idx) {
-    if (idx == 0) return static_cast<uint32_t>((p >> 2) & kMaxInlineFileId);
-    return static_cast<uint32_t>((p >> 33) & kMaxInlineFileId);
-}
-
-inline uint32_t toHandle(uint64_t p) {
-    return static_cast<uint32_t>(p >> 1) - 1;
-}
-
-inline uint64_t fromHandle(uint32_t handle) {
-    return static_cast<uint64_t>(handle + 1) << 1;
-}
-
-}  // namespace Payload
-
 // L1 Index: In-memory index mapping keys to file_id lists.
 //
 // Structure: key → [file_id₁, file_id₂, ...]
-//            reverse-sorted by version (latest first)
+//            sorted by value desc (latest/highest first)
 //
 // Version resolution is delegated to L2 indexes.
 //
@@ -70,7 +23,7 @@ inline uint64_t fromHandle(uint32_t handle) {
 // 1. WAL (append-only delta log for crash recovery)
 // 2. Periodic snapshots (full dump every N updates + on shutdown)
 //
-// Thread-safety: Concurrency is managed at per-bucket level (not shown here).
+// Thread-safety: Concurrency is managed at per-bucket level in the DHT.
 class L1Index {
 public:
     L1Index();
@@ -116,9 +69,9 @@ public:
     // Load snapshot from file
     Status loadSnapshot(const std::string& path);
 
-    // Snapshot file format (v3):
+    // Snapshot file format (v4):
     // [magic: 4 bytes]["L1IX"]
-    // [version: 4 bytes][3]
+    // [version: 4 bytes][4]
     // [num_records: 8 bytes]
     // For each record:
     //   [hash: 8 bytes]
@@ -129,7 +82,7 @@ public:
 
 private:
     DeltaHashTable dht_;
-    size_t total_entries_ = 0;
+    size_t key_count_ = 0;
 };
 
 } // namespace internal

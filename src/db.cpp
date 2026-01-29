@@ -168,17 +168,14 @@ private:
                 continue;
             }
 
-            // Check L1 index: is this file_id in the key's L1 file_id list?
-            auto* file_id_list = db_->l1_index_->getFileIds(entry.key);
-            if (!file_id_list) {
+            // Check L1 index: is this file the latest for this key?
+            uint32_t latest_fid;
+            if (!db_->l1_index_->getLatest(entry.key, latest_fid).ok()) {
                 l2_entry_idx_++;
                 continue;
             }
 
-            // Only process entries from the first (latest) file that contains this key
-            // at our snapshot version. Check if current_file_id_ is the first file_id
-            // in the L1 list that we're iterating through.
-            if (file_id_list->empty() || (*file_id_list)[0] != current_file_id_) {
+            if (latest_fid != current_file_id_) {
                 // This file is not the latest for this key, skip
                 l2_entry_idx_++;
                 continue;
@@ -420,14 +417,14 @@ Status DB::get(const std::string& key, std::string& value, uint64_t& version,
         return Status::InvalidArgument("Database not open");
     }
 
-    auto* file_ids = l1_index_->getFileIds(key);
-    if (!file_ids) {
+    std::vector<uint32_t> file_ids;
+    if (!l1_index_->getFileIds(key, file_ids)) {
         return Status::NotFound(key);
     }
 
     // Iterate file_ids (latest first). On fingerprint collision,
     // readValue returns NotFound for non-matching keys; try the next.
-    for (uint32_t fid : *file_ids) {
+    for (uint32_t fid : file_ids) {
         Status s = storage_->readValue(fid, key, version, value);
         if (s.ok()) {
             return s;
@@ -452,13 +449,13 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
         return Status::InvalidArgument("Database not open");
     }
 
-    auto* file_ids = l1_index_->getFileIds(key);
-    if (!file_ids) {
+    std::vector<uint32_t> file_ids;
+    if (!l1_index_->getFileIds(key, file_ids)) {
         return Status::NotFound(key);
     }
 
     // file_ids are latest-first; scan each file's L2 for the version
-    for (uint32_t fid : *file_ids) {
+    for (uint32_t fid : file_ids) {
         internal::L2Index* l2 = storage_->getL2Index(fid);
         if (!l2) continue;
         uint64_t offset;

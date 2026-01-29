@@ -9,8 +9,6 @@
 #include <string>
 #include <vector>
 
-#include "id_vec_pool.h"
-
 namespace kvlite {
 namespace internal {
 
@@ -23,14 +21,14 @@ namespace internal {
 //   fingerprint  → stored in delta trie for identity
 //
 // Each bucket is a fixed-size byte array containing up to 2^lslot_bits
-// logical slots (lslots). Each lslot stores a variable number of entries
-// using delta-encoded fingerprints in a trie structure.
+// logical slots (lslots). Each lslot stores grouped entries:
+//   unary(K)  — K unique fingerprints
+//   for each fingerprint:
+//     [fp_bits]       — fingerprint (stored once)
+//     unary(M)        — M ids for this fingerprint
+//     M × [32 bits]   — the id values
 //
 // When a bucket overflows, an extension bucket is chained.
-//
-// Each entry stores a 64-bit payload (instead of a pointer). The payload
-// is opaque to the DHT — callers encode inline file_ids or overflow
-// KeyRecord pointers as they see fit.
 class DeltaHashTable {
 public:
     struct Config {
@@ -49,44 +47,41 @@ public:
     DeltaHashTable(DeltaHashTable&&) = delete;
     DeltaHashTable& operator=(DeltaHashTable&&) = delete;
 
-    // Insert a key with an initial payload.
-    // If the fingerprint already exists, returns {existing_payload, false}.
-    // If new, inserts with initial_payload and returns {initial_payload, true}.
-    std::pair<uint64_t, bool> insert(const std::string& key, uint64_t initial_payload);
+    // Add a value for a key's fingerprint. Duplicate values are not added.
+    void addEntry(const std::string& key, uint32_t value);
 
-    // Insert by pre-computed hash (for snapshot loading).
-    // Same semantics as insert().
-    std::pair<uint64_t, bool> insertByHash(uint64_t hash, uint64_t initial_payload);
+    // Add a value by pre-computed hash (for snapshot loading).
+    void addEntryByHash(uint64_t hash, uint32_t value);
 
-    // Find a key's payload. Returns {payload, true} if found, {0, false} if not.
-    std::pair<uint64_t, bool> find(const std::string& key) const;
+    // Find all values for a key. Returns true if key exists.
+    // Values are ordered highest-first (latest id first).
+    bool findAll(const std::string& key, std::vector<uint32_t>& out) const;
 
-    // Update the payload for an existing key. Returns true if key was found.
-    bool updatePayload(const std::string& key, uint64_t new_payload);
+    // Find the first (highest/latest) value for a key. Returns true if found.
+    bool findFirst(const std::string& key, uint32_t& value) const;
 
-    // Remove a key. Returns true if key was found and removed.
-    bool remove(const std::string& key);
+    // Check if a key exists.
+    bool contains(const std::string& key) const;
 
-    // Iterate over all entries, providing the reconstructed 64-bit hash and payload.
-    void forEach(const std::function<void(uint64_t hash, uint64_t payload)>& fn) const;
+    // Remove a specific value from a key. Returns true if found and removed.
+    bool removeEntry(const std::string& key, uint32_t value);
 
-    // Access the DHT's id-vector pool. Callers use this to allocate/release
-    // overflow vectors and to access their contents.
-    IdVecPool& idVecPool() { return pool_; }
-    const IdVecPool& idVecPool() const { return pool_; }
+    // Remove all values for a key. Returns number of values removed.
+    size_t removeAll(const std::string& key);
 
+    // Iterate over all entries, providing the reconstructed hash and each value.
+    void forEach(const std::function<void(uint64_t hash, uint32_t value)>& fn) const;
+
+    // Iterate over all groups, providing the reconstructed hash and all values.
+    void forEachGroup(const std::function<void(uint64_t hash, const std::vector<uint32_t>&)>& fn) const;
+
+    // Total number of id entries across all fingerprints.
     size_t size() const;
     size_t memoryUsage() const;
     void clear();
 
 private:
-    // A bucket is a fixed-size byte array.
-    // Layout: [lslot0_data | lslot1_data | ... | padding | ext_ptr(8 bytes)]
-    // The last 8 bytes hold an extension pointer (index into extensions_,
-    // 0 = no extension, 1-based index otherwise).
     // Extra bytes at end of each bucket for safe word-level bit I/O.
-    // BitReader/BitWriter may load/store 8 bytes from any byte offset
-    // within the data area; the padding prevents out-of-bounds access.
     static constexpr uint32_t kBucketPadding = 8;
 
     struct Bucket {
@@ -96,68 +91,60 @@ private:
         Bucket() = default;
     };
 
-    // Represents a single entry within an lslot's delta trie.
-    // Used as intermediate representation for encode/decode.
+    // A single fingerprint group: one fingerprint with its associated values.
     struct TrieEntry {
         uint64_t fingerprint;
-        uint64_t payload;
+        std::vector<uint32_t> values;  // sorted desc (highest/latest first)
     };
 
-    // An lslot's decoded contents: list of (fingerprint, payload) pairs.
+    // An lslot's decoded contents: list of fingerprint groups.
     struct LSlotContents {
-        std::vector<TrieEntry> entries;
+        std::vector<TrieEntry> entries;  // sorted by fingerprint asc
     };
 
     uint64_t hashKey(const std::string& key) const;
 
-    // Extract components from hash
     uint32_t bucketIndex(uint64_t hash) const;
     uint32_t lslotIndex(uint64_t hash) const;
     uint64_t fingerprint(uint64_t hash) const;
 
-    // Get the data offset (in bits) where lslot j starts in a bucket.
-    // This requires scanning previous lslots (they're variable-width).
-    // Returns the bit offset within the bucket data.
     size_t lslotBitOffset(const uint8_t* bucket_data, uint32_t target_lslot) const;
 
-    // Decode an lslot at the given bit offset. Returns the contents and
-    // the bit position after the lslot.
     LSlotContents decodeLSlot(const uint8_t* bucket_data, size_t bit_offset,
                                size_t* end_bit_offset = nullptr) const;
 
-    // Encode an lslot's contents at the given bit offset.
-    // Returns the bit position after the written data.
     size_t encodeLSlot(uint8_t* bucket_data, size_t bit_offset,
                        const LSlotContents& contents) const;
 
-    // Get total bits used by all lslots in a bucket.
     size_t totalLSlotBits(const uint8_t* bucket_data) const;
 
-    // Extension pointer management (stored in last 8 bytes of bucket)
     uint64_t getExtensionPtr(const Bucket& bucket) const;
     void setExtensionPtr(Bucket& bucket, uint64_t ptr) const;
 
-    // Available data bits in a bucket (total bytes minus extension pointer)
     size_t bucketDataBits() const;
 
-    // Lookup across bucket chain (fingerprint-only match)
-    // Returns payload (0 if not found).
-    uint64_t findInChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                          uint64_t fp) const;
+    // Calculate bits needed for an lslot's contents.
+    static size_t lslotBitsNeeded(const LSlotContents& contents, uint8_t fp_bits);
 
-    // Insert into bucket chain, handling overflow
-    void insertIntoChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                          uint64_t fp, uint64_t payload);
+    // Chain-aware operations. All scan the full extension chain.
+    // Bucket lock must be held by caller.
 
-    // Update payload in bucket chain. Returns true if found.
-    bool updateInChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                        uint64_t fp, uint64_t new_payload);
+    // Collect all values for a fingerprint across the chain.
+    void findAllInChain(uint32_t bucket_idx, uint32_t lslot_idx,
+                        uint64_t fp, std::vector<uint32_t>& out) const;
 
-    // Remove from bucket chain (fingerprint-only match)
-    bool removeFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                          uint64_t fp);
+    // Add a value to the first bucket in the chain that has space.
+    void addToChain(uint32_t bucket_idx, uint32_t lslot_idx,
+                    uint64_t fp, uint32_t value);
 
-    // Per-bucket spinlock. 1 byte each, contention is rare due to hashing.
+    // Remove a specific value from the chain. Returns true if found.
+    bool removeValueFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
+                              uint64_t fp, uint32_t value);
+
+    // Remove all values for a fingerprint from the chain. Returns count removed.
+    size_t removeAllFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
+                              uint64_t fp);
+
     struct BucketLock {
         std::atomic<uint8_t> locked{0};
 
@@ -189,8 +176,7 @@ private:
     std::vector<Bucket> buckets_;
     std::unique_ptr<BucketLock[]> bucket_locks_;
     std::vector<std::unique_ptr<Bucket>> extensions_;
-    std::mutex ext_mutex_;      // protects extensions_
-    IdVecPool pool_;
+    std::mutex ext_mutex_;
     std::atomic<size_t> size_{0};
 };
 

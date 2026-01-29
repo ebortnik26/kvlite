@@ -77,9 +77,9 @@ public:
     // May trigger auto-snapshot if snapshot_interval is reached.
     Status put(const std::string& key, uint32_t file_id);
 
-    // Get all file_ids for a key. Returns nullptr if key doesn't exist.
+    // Get all file_ids for a key. Returns false if key doesn't exist.
     // File IDs are ordered latest-first.
-    const std::vector<uint32_t>* getFileIds(const std::string& key) const;
+    bool getFileIds(const std::string& key, std::vector<uint32_t>& out) const;
 
     // Get the latest file_id for a key. O(1).
     // Returns NotFound if key doesn't exist.
