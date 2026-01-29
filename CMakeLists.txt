@@ -31,6 +31,9 @@ set(KVLITE_SOURCES
     src/internal/lslot_codec.cpp
     src/internal/delta_hash_table.cpp
     src/internal/l1_index.cpp
+    src/internal/l2_lslot_codec.cpp
+    src/internal/l2_delta_hash_table.cpp
+    src/internal/l2_index.cpp
 )
 
 # Create library

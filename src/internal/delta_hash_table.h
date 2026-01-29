@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "internal/delta_hash_table_base.h"
 #include "internal/lslot_codec.h"
 
 namespace kvlite {
@@ -26,14 +27,12 @@ namespace internal {
 // logical slots (lslots). Lslot encoding format is defined in LSlotCodec.
 //
 // When a bucket overflows, an extension bucket is chained.
-class DeltaHashTable {
-public:
-    struct Config {
-        uint8_t bucket_bits = 20;     // i: 2^20 = 1M buckets
-        uint8_t lslot_bits = 5;       // j: 32 lslots per bucket
-        uint32_t bucket_bytes = 512;  // fixed bucket size in bytes
-    };
+// Thread-safe: per-bucket spinlocks protect concurrent access.
+class DeltaHashTable : private DeltaHashTableBase<LSlotCodec> {
+    using Base = DeltaHashTableBase<LSlotCodec>;
 
+public:
+    using Base::Config;
     using TrieEntry = LSlotCodec::TrieEntry;
     using LSlotContents = LSlotCodec::LSlotContents;
 
@@ -73,7 +72,8 @@ public:
     void forEach(const std::function<void(uint64_t hash, uint32_t value)>& fn) const;
 
     // Iterate over all groups, providing the reconstructed hash and all values.
-    void forEachGroup(const std::function<void(uint64_t hash, const std::vector<uint32_t>&)>& fn) const;
+    void forEachGroup(const std::function<void(uint64_t hash,
+                                               const std::vector<uint32_t>&)>& fn) const;
 
     // Total number of id entries across all fingerprints.
     size_t size() const;
@@ -81,51 +81,6 @@ public:
     void clear();
 
 private:
-    // Extra bytes at end of each bucket for safe word-level bit I/O.
-    static constexpr uint32_t kBucketPadding = 8;
-
-    struct Bucket {
-        std::vector<uint8_t> data;
-
-        explicit Bucket(uint32_t size) : data(size + kBucketPadding, 0) {}
-        Bucket() = default;
-    };
-
-    uint64_t hashKey(const std::string& key) const;
-
-    uint32_t bucketIndex(uint64_t hash) const;
-    uint32_t lslotIndex(uint64_t hash) const;
-    uint64_t fingerprint(uint64_t hash) const;
-
-    uint64_t getExtensionPtr(const Bucket& bucket) const;
-    void setExtensionPtr(Bucket& bucket, uint64_t ptr) const;
-
-    size_t bucketDataBits() const;
-
-    // Re-encode all lslots into the bucket, preserving the extension pointer.
-    // Caller has already verified the data fits.
-    void reencodeAllLSlots(Bucket& bucket,
-                           const std::vector<LSlotContents>& all_slots);
-
-    // Chain-aware operations. All scan the full extension chain.
-    // Bucket lock must be held by caller.
-
-    // Collect all values for a fingerprint across the chain.
-    void findAllInChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                        uint64_t fp, std::vector<uint32_t>& out) const;
-
-    // Add a value to the first bucket in the chain that has space.
-    void addToChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                    uint64_t fp, uint32_t value);
-
-    // Remove a specific value from the chain. Returns true if found.
-    bool removeValueFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                              uint64_t fp, uint32_t value);
-
-    // Remove all values for a fingerprint from the chain. Returns count removed.
-    size_t removeAllFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                              uint64_t fp);
-
     struct BucketLock {
         std::atomic<uint8_t> locked{0};
 
@@ -152,12 +107,12 @@ private:
         BucketLockGuard& operator=(const BucketLockGuard&) = delete;
     };
 
-    Config config_;
-    uint8_t fingerprint_bits_;
-    LSlotCodec lslot_codec_;
-    std::vector<Bucket> buckets_;
+    void addImpl(uint32_t bi, uint32_t li, uint64_t fp, uint32_t value);
+
+    size_t removeAllFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
+                              uint64_t fp);
+
     std::unique_ptr<BucketLock[]> bucket_locks_;
-    std::vector<std::unique_ptr<Bucket>> extensions_;
     std::mutex ext_mutex_;
     std::atomic<size_t> size_{0};
 };

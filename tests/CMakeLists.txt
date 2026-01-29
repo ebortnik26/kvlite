@@ -67,8 +67,31 @@ target_link_libraries(kvlite_dht_test
         pthread
 )
 
+# L2 Index tests
+add_executable(kvlite_l2_test
+    test_l2_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_lslot_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_delta_hash_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/status.cpp
+)
+
+target_include_directories(kvlite_l2_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_l2_test
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
 # Register tests with CTest
 include(GoogleTest)
 gtest_discover_tests(kvlite_test)
 gtest_discover_tests(kvlite_bitstream_test)
 gtest_discover_tests(kvlite_dht_test)
+gtest_discover_tests(kvlite_l2_test)

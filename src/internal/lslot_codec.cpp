@@ -1,4 +1,4 @@
-#include "internal/lslot_codec.h"
+ #include "internal/lslot_codec.h"
 #include "internal/bit_stream.h"
 
 namespace kvlite {
