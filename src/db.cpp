@@ -186,7 +186,7 @@ private:
 
             // This is the latest version - read the actual entry
             internal::LogEntry log_entry;
-            s = db_->storage_->readLogEntry(current_file_id_, entry.offset, log_entry);
+            Status s = db_->storage_->readLogEntry(current_file_id_, entry.offset, log_entry);
             if (!s.ok()) {
                 l2_entry_idx_++;
                 continue;
@@ -420,13 +420,23 @@ Status DB::get(const std::string& key, std::string& value, uint64_t& version,
         return Status::InvalidArgument("Database not open");
     }
 
-    uint32_t file_id;
-    Status s = l1_index_->getLatest(key, file_id);
-    if (!s.ok()) {
-        return s;
+    auto* file_ids = l1_index_->getFileIds(key);
+    if (!file_ids) {
+        return Status::NotFound(key);
     }
 
-    return storage_->readValue(file_id, key, version, value);
+    // Iterate file_ids (latest first). On fingerprint collision,
+    // readValue returns NotFound for non-matching keys; try the next.
+    for (uint32_t fid : *file_ids) {
+        Status s = storage_->readValue(fid, key, version, value);
+        if (s.ok()) {
+            return s;
+        }
+        if (!s.isNotFound()) {
+            return s;  // propagate non-NotFound errors
+        }
+    }
+    return Status::NotFound(key);
 }
 
 Status DB::getByVersion(const std::string& key, uint64_t upper_bound,

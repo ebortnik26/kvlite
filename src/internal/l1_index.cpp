@@ -142,17 +142,9 @@ void L1Index::removeFile(const std::string& key, uint32_t file_id) {
 }
 
 void L1Index::forEach(
-    const std::function<void(const std::string&,
-                              const std::vector<uint32_t>&)>& fn) const {
-    dht_.forEach([&fn](const KeyRecord& record) {
-        fn(record.key, record.file_ids);
-    });
-}
-
-void L1Index::forEachKey(
-    const std::function<void(const std::string&)>& fn) const {
-    dht_.forEach([&fn](const KeyRecord& record) {
-        fn(record.key);
+    const std::function<void(const std::vector<uint32_t>&)>& fn) const {
+    dht_.forEach([&fn](uint64_t /*hash*/, const KeyRecord& record) {
+        fn(record.file_ids);
     });
 }
 
@@ -176,7 +168,7 @@ void L1Index::clear() {
 // --- Persistence ---
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
-static constexpr uint32_t kVersion = 2;
+static constexpr uint32_t kVersion = 3;
 
 Status L1Index::saveSnapshot(const std::string& path) const {
     std::ofstream file(path, std::ios::binary);
@@ -190,15 +182,13 @@ Status L1Index::saveSnapshot(const std::string& path) const {
     writer.write(kMagic, 4);
     writer.writeVal(kVersion);
 
-    // Number of keys
-    uint64_t num_keys = dht_.size();
-    writer.writeVal(num_keys);
+    // Number of records
+    uint64_t num_records = dht_.size();
+    writer.writeVal(num_records);
 
-    // For each key
-    dht_.forEach([&writer](const KeyRecord& record) {
-        uint32_t key_len = static_cast<uint32_t>(record.key.size());
-        writer.writeVal(key_len);
-        writer.write(record.key.data(), key_len);
+    // For each record
+    dht_.forEach([&writer](uint64_t hash, const KeyRecord& record) {
+        writer.writeVal(hash);
 
         uint32_t num_file_ids = static_cast<uint32_t>(record.file_ids.size());
         writer.writeVal(num_file_ids);
@@ -239,24 +229,19 @@ Status L1Index::loadSnapshot(const std::string& path) {
         return Status::Corruption("Unsupported snapshot version");
     }
 
-    // Number of keys
-    uint64_t num_keys;
-    if (!reader.readVal(num_keys)) {
-        return Status::Corruption("Failed to read key count");
+    // Number of records
+    uint64_t num_records;
+    if (!reader.readVal(num_records)) {
+        return Status::Corruption("Failed to read record count");
     }
 
     // Clear current state and rebuild
     clear();
 
-    for (uint64_t k = 0; k < num_keys; ++k) {
-        uint32_t key_len;
-        if (!reader.readVal(key_len)) {
-            return Status::Corruption("Failed to read key length");
-        }
-
-        std::string key(key_len, '\0');
-        if (!reader.read(key.data(), key_len)) {
-            return Status::Corruption("Failed to read key data");
+    for (uint64_t k = 0; k < num_records; ++k) {
+        uint64_t hash;
+        if (!reader.readVal(hash)) {
+            return Status::Corruption("Failed to read hash");
         }
 
         uint32_t num_file_ids;
@@ -264,7 +249,7 @@ Status L1Index::loadSnapshot(const std::string& path) {
             return Status::Corruption("Failed to read file_id count");
         }
 
-        KeyRecord* record = dht_.insert(key);
+        KeyRecord* record = dht_.insertByHash(hash);
         record->file_ids.reserve(num_file_ids);
         for (uint32_t e = 0; e < num_file_ids; ++e) {
             uint32_t file_id;

@@ -50,13 +50,8 @@ public:
     // Remove a specific file_id from a key's list
     void removeFile(const std::string& key, uint32_t file_id);
 
-    // Iterate over all keys and their file_ids
-    // Callback receives (key, file_ids) for each key
-    void forEach(const std::function<void(const std::string&,
-                                          const std::vector<uint32_t>&)>& fn) const;
-
-    // Iterate over all keys (without file_ids, for efficiency)
-    void forEachKey(const std::function<void(const std::string&)>& fn) const;
+    // Iterate over all file_id lists
+    void forEach(const std::function<void(const std::vector<uint32_t>&)>& fn) const;
 
     // Get statistics
     size_t keyCount() const;
@@ -74,12 +69,12 @@ public:
     // Load snapshot from file
     Status loadSnapshot(const std::string& path);
 
-    // Snapshot file format:
+    // Snapshot file format (v3):
     // [magic: 4 bytes]["L1IX"]
-    // [version: 4 bytes][2]
-    // [num_keys: 8 bytes]
-    // For each key:
-    //   [key_len: 4 bytes][key: var]
+    // [version: 4 bytes][3]
+    // [num_records: 8 bytes]
+    // For each record:
+    //   [hash: 8 bytes]
     //   [num_file_ids: 4 bytes]
     //   For each file_id:
     //     [file_id: 4 bytes]

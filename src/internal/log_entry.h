@@ -54,7 +54,7 @@ struct LogEntry {
     static constexpr size_t kChecksumSize = 4;
 };
 
-// Index entry stored in the L1 index.
+// Index entry stored in the L2 index.
 // location = file_id (which log file), 32 bits is sufficient.
 struct IndexEntry {
     uint64_t version = 0;

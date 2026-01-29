@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "kvlite/status.h"
-#include "log_entry.h"
 
 namespace kvlite {
 namespace internal {
@@ -99,12 +98,8 @@ public:
 
     // --- Iteration ---
 
-    // Iterate over all keys and their file_ids
-    void forEach(const std::function<void(const std::string&,
-                                          const std::vector<uint32_t>&)>& fn) const;
-
-    // Iterate over all keys (without entries)
-    void forEachKey(const std::function<void(const std::string&)>& fn) const;
+    // Iterate over all file_id lists (no key available)
+    void forEach(const std::function<void(const std::vector<uint32_t>&)>& fn) const;
 
     // --- Maintenance ---
 

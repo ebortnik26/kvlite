@@ -12,10 +12,9 @@
 namespace kvlite {
 namespace internal {
 
-// A record holding the full key and its file_id list.
+// A record holding file_id list for a fingerprint slot.
 // Stored externally; the DHT holds pointers to these.
 struct KeyRecord {
-    std::string key;
     std::vector<uint32_t> file_ids;  // reverse-sorted by version (latest first)
 };
 
@@ -53,8 +52,12 @@ public:
     DeltaHashTable& operator=(DeltaHashTable&&) = delete;
 
     // Insert a key, returning a pointer to its KeyRecord.
-    // If the key already exists, returns the existing record.
+    // If the fingerprint already exists, returns the existing record.
     KeyRecord* insert(const std::string& key);
+
+    // Insert by pre-computed hash (for snapshot loading).
+    // Decomposes hash into bucket/lslot/fingerprint and find-or-creates.
+    KeyRecord* insertByHash(uint64_t hash);
 
     // Find a key's record. Returns nullptr if not found.
     KeyRecord* find(const std::string& key) const;
@@ -62,8 +65,8 @@ public:
     // Remove a key. Returns true if key was found and removed.
     bool remove(const std::string& key);
 
-    // Iterate over all records.
-    void forEach(const std::function<void(const KeyRecord&)>& fn) const;
+    // Iterate over all records, providing the reconstructed 64-bit hash.
+    void forEach(const std::function<void(uint64_t hash, const KeyRecord&)>& fn) const;
 
     size_t size() const;
     size_t memoryUsage() const;
@@ -130,17 +133,17 @@ private:
     // Available data bits in a bucket (total bytes minus extension pointer)
     size_t bucketDataBits() const;
 
-    // Lookup across bucket chain
+    // Lookup across bucket chain (fingerprint-only match)
     KeyRecord* findInChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                            uint64_t fp, const std::string& key) const;
+                            uint64_t fp) const;
 
     // Insert into bucket chain, handling overflow
     KeyRecord* insertIntoChain(uint32_t bucket_idx, uint32_t lslot_idx,
                                 uint64_t fp, KeyRecord* record);
 
-    // Remove from bucket chain
+    // Remove from bucket chain (fingerprint-only match)
     bool removeFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                          uint64_t fp, const std::string& key);
+                          uint64_t fp);
 
     // Per-bucket spinlock. 1 byte each, contention is rare due to hashing.
     struct BucketLock {

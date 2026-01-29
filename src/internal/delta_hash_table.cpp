@@ -151,11 +151,11 @@ KeyRecord* DeltaHashTable::find(const std::string& key) const {
 
     // Lock the primary bucket. The lock protects the entire chain.
     BucketLockGuard guard(const_cast<DeltaHashTable*>(this)->bucket_locks_[bi]);
-    return findInChain(bi, li, fp, key);
+    return findInChain(bi, li, fp);
 }
 
 KeyRecord* DeltaHashTable::findInChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                                        uint64_t fp, const std::string& key) const {
+                                        uint64_t fp) const {
     const Bucket* bucket = &buckets_[bucket_idx];
 
     while (bucket) {
@@ -163,7 +163,7 @@ KeyRecord* DeltaHashTable::findInChain(uint32_t bucket_idx, uint32_t lslot_idx,
         LSlotContents contents = decodeLSlot(bucket->data.data(), bit_off);
 
         for (const auto& entry : contents.entries) {
-            if (entry.fingerprint == fp && entry.record->key == key) {
+            if (entry.fingerprint == fp) {
                 return entry.record;
             }
         }
@@ -188,8 +188,8 @@ KeyRecord* DeltaHashTable::insert(const std::string& key) {
     // Lock the target bucket for the entire insert operation.
     BucketLockGuard guard(bucket_locks_[bi]);
 
-    // Check if key already exists (under lock).
-    KeyRecord* existing = findInChain(bi, li, fp, key);
+    // Check if fingerprint already exists (under lock).
+    KeyRecord* existing = findInChain(bi, li, fp);
     if (existing) {
         return existing;
     }
@@ -199,7 +199,31 @@ KeyRecord* DeltaHashTable::insert(const std::string& key) {
     {
         std::lock_guard<std::mutex> alloc_guard(alloc_mutex_);
         auto record = std::make_unique<KeyRecord>();
-        record->key = key;
+        record_ptr = record.get();
+        records_.push_back(std::move(record));
+    }
+
+    insertIntoChain(bi, li, fp, record_ptr);
+    size_.fetch_add(1, std::memory_order_relaxed);
+    return record_ptr;
+}
+
+KeyRecord* DeltaHashTable::insertByHash(uint64_t hash) {
+    uint32_t bi = bucketIndex(hash);
+    uint32_t li = lslotIndex(hash);
+    uint64_t fp = fingerprint(hash);
+
+    BucketLockGuard guard(bucket_locks_[bi]);
+
+    KeyRecord* existing = findInChain(bi, li, fp);
+    if (existing) {
+        return existing;
+    }
+
+    KeyRecord* record_ptr;
+    {
+        std::lock_guard<std::mutex> alloc_guard(alloc_mutex_);
+        auto record = std::make_unique<KeyRecord>();
         record_ptr = record.get();
         records_.push_back(std::move(record));
     }
@@ -307,7 +331,7 @@ bool DeltaHashTable::remove(const std::string& key) {
 
     BucketLockGuard guard(bucket_locks_[bi]);
 
-    if (removeFromChain(bi, li, fp, key)) {
+    if (removeFromChain(bi, li, fp)) {
         size_.fetch_sub(1, std::memory_order_relaxed);
         return true;
     }
@@ -315,7 +339,7 @@ bool DeltaHashTable::remove(const std::string& key) {
 }
 
 bool DeltaHashTable::removeFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                                      uint64_t fp, const std::string& key) {
+                                      uint64_t fp) {
     // Bucket lock is held by caller.
     Bucket* bucket = &buckets_[bucket_idx];
 
@@ -331,7 +355,7 @@ bool DeltaHashTable::removeFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
         auto& entries = all_slots[lslot_idx].entries;
         bool found = false;
         for (auto it = entries.begin(); it != entries.end(); ++it) {
-            if (it->fingerprint == fp && it->record->key == key) {
+            if (it->fingerprint == fp) {
                 entries.erase(it);
                 found = true;
                 break;
@@ -366,24 +390,30 @@ bool DeltaHashTable::removeFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
 // They are not internally thread-safe with concurrent mutations.
 
 void DeltaHashTable::forEach(
-    const std::function<void(const KeyRecord&)>& fn) const {
+    const std::function<void(uint64_t hash, const KeyRecord&)>& fn) const {
+    uint32_t num_buckets = 1u << config_.bucket_bits;
     uint32_t num_lslots = 1u << config_.lslot_bits;
 
-    auto scanBucket = [&](const Bucket* bucket) {
+    auto scanBucket = [&](uint32_t bucket_idx, const Bucket* bucket) {
         size_t offset = 0;
         for (uint32_t s = 0; s < num_lslots; ++s) {
             LSlotContents contents = decodeLSlot(bucket->data.data(), offset,
                                                   &offset);
             for (const auto& entry : contents.entries) {
-                fn(*entry.record);
+                // Reconstruct hash from (bucket_idx, lslot_idx, fingerprint)
+                uint64_t hash =
+                    (static_cast<uint64_t>(bucket_idx) << (64 - config_.bucket_bits)) |
+                    (static_cast<uint64_t>(s) << fingerprint_bits_) |
+                    entry.fingerprint;
+                fn(hash, *entry.record);
             }
         }
     };
 
-    for (const auto& bucket : buckets_) {
-        const Bucket* b = &bucket;
+    for (uint32_t bi = 0; bi < num_buckets; ++bi) {
+        const Bucket* b = &buckets_[bi];
         while (b) {
-            scanBucket(b);
+            scanBucket(bi, b);
             uint64_t ext_ptr = getExtensionPtr(*b);
             if (ext_ptr == 0) break;
             b = extensions_[ext_ptr - 1].get();
@@ -412,7 +442,6 @@ size_t DeltaHashTable::memoryUsage() const {
     // KeyRecords
     for (const auto& rec : records_) {
         usage += sizeof(KeyRecord);
-        usage += rec->key.capacity();
         usage += rec->file_ids.capacity() * sizeof(uint32_t);
     }
 

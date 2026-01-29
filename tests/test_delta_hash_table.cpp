@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <map>
+#include <set>
+
 #include "internal/delta_hash_table.h"
 
 using namespace kvlite::internal;
@@ -20,7 +23,6 @@ TEST(DeltaHashTable, InsertAndFind) {
 
     KeyRecord* rec = dht.insert("hello");
     ASSERT_NE(rec, nullptr);
-    EXPECT_EQ(rec->key, "hello");
     EXPECT_TRUE(rec->file_ids.empty());
 
     // Add a file_id
@@ -28,7 +30,6 @@ TEST(DeltaHashTable, InsertAndFind) {
 
     KeyRecord* found = dht.find("hello");
     ASSERT_NE(found, nullptr);
-    EXPECT_EQ(found->key, "hello");
     ASSERT_EQ(found->file_ids.size(), 1u);
     EXPECT_EQ(found->file_ids[0], 100u);
 
@@ -93,15 +94,23 @@ TEST(DeltaHashTable, ForEach) {
     dht.insert("b")->file_ids.push_back(20);
     dht.insert("c")->file_ids.push_back(30);
 
-    std::map<std::string, std::vector<uint32_t>> collected;
-    dht.forEach([&](const KeyRecord& rec) {
-        collected[rec.key] = rec.file_ids;
+    std::map<uint64_t, std::vector<uint32_t>> collected;
+    dht.forEach([&](uint64_t hash, const KeyRecord& rec) {
+        collected[hash] = rec.file_ids;
     });
 
     EXPECT_EQ(collected.size(), 3u);
-    EXPECT_EQ(collected["a"][0], 10u);
-    EXPECT_EQ(collected["b"][0], 20u);
-    EXPECT_EQ(collected["c"][0], 30u);
+
+    // Verify all file_ids are present (order depends on hash)
+    std::set<uint32_t> all_fids;
+    for (const auto& [hash, fids] : collected) {
+        for (uint32_t fid : fids) {
+            all_fids.insert(fid);
+        }
+    }
+    EXPECT_EQ(all_fids.count(10u), 1u);
+    EXPECT_EQ(all_fids.count(20u), 1u);
+    EXPECT_EQ(all_fids.count(30u), 1u);
 }
 
 TEST(DeltaHashTable, ManyKeys) {
@@ -121,7 +130,6 @@ TEST(DeltaHashTable, ManyKeys) {
         std::string key = "key_" + std::to_string(i);
         KeyRecord* rec = dht.find(key);
         ASSERT_NE(rec, nullptr) << "key not found: " << key;
-        EXPECT_EQ(rec->key, key);
         ASSERT_EQ(rec->file_ids.size(), 1u);
         EXPECT_EQ(rec->file_ids[0], static_cast<uint32_t>(i * 10));
     }
@@ -159,13 +167,11 @@ TEST(DeltaHashTable, EmptyKeyAndBinaryKey) {
     // Empty key
     KeyRecord* r1 = dht.insert("");
     ASSERT_NE(r1, nullptr);
-    EXPECT_EQ(r1->key, "");
 
     // Binary key with null bytes
     std::string binary_key("\x00\x01\x02\x03", 4);
     KeyRecord* r2 = dht.insert(binary_key);
     ASSERT_NE(r2, nullptr);
-    EXPECT_EQ(r2->key, binary_key);
 
     EXPECT_EQ(dht.size(), 2u);
     EXPECT_NE(dht.find(""), nullptr);
@@ -274,14 +280,13 @@ TEST(L1IndexDHT, ForEach) {
     index.put("a", 10);
     index.put("b", 20);
 
-    std::map<std::string, size_t> seen;
-    index.forEach([&](const std::string& key, const std::vector<uint32_t>& file_ids) {
-        seen[key] = file_ids.size();
+    size_t count = 0;
+    index.forEach([&](const std::vector<uint32_t>& file_ids) {
+        EXPECT_EQ(file_ids.size(), 1u);
+        ++count;
     });
 
-    EXPECT_EQ(seen.size(), 2u);
-    EXPECT_EQ(seen["a"], 1u);
-    EXPECT_EQ(seen["b"], 1u);
+    EXPECT_EQ(count, 2u);
 }
 
 TEST(L1IndexDHT, Snapshot) {
@@ -394,7 +399,6 @@ TEST(DeltaHashTable, ConcurrentInsertSameKeys) {
                 std::string key = "shared_key_" + std::to_string(i);
                 KeyRecord* rec = dht.insert(key);
                 ASSERT_NE(rec, nullptr);
-                EXPECT_EQ(rec->key, key);
             }
         });
     }
