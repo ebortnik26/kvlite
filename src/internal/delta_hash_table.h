@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "internal/lslot_codec.h"
+
 namespace kvlite {
 namespace internal {
 
@@ -21,12 +23,7 @@ namespace internal {
 //   fingerprint  → stored in delta trie for identity
 //
 // Each bucket is a fixed-size byte array containing up to 2^lslot_bits
-// logical slots (lslots). Each lslot stores grouped entries:
-//   unary(K)  — K unique fingerprints
-//   for each fingerprint:
-//     [fp_bits]       — fingerprint (stored once)
-//     unary(M)        — M ids for this fingerprint
-//     M × [32 bits]   — the id values
+// logical slots (lslots). Lslot encoding format is defined in LSlotCodec.
 //
 // When a bucket overflows, an extension bucket is chained.
 class DeltaHashTable {
@@ -36,6 +33,9 @@ public:
         uint8_t lslot_bits = 5;       // j: 32 lslots per bucket
         uint32_t bucket_bytes = 512;  // fixed bucket size in bytes
     };
+
+    using TrieEntry = LSlotCodec::TrieEntry;
+    using LSlotContents = LSlotCodec::LSlotContents;
 
     DeltaHashTable();
     explicit DeltaHashTable(const Config& config);
@@ -91,40 +91,21 @@ private:
         Bucket() = default;
     };
 
-    // A single fingerprint group: one fingerprint with its associated values.
-    struct TrieEntry {
-        uint64_t fingerprint;
-        std::vector<uint32_t> values;  // sorted desc (highest/latest first)
-    };
-
-    // An lslot's decoded contents: list of fingerprint groups.
-    struct LSlotContents {
-        std::vector<TrieEntry> entries;  // sorted by fingerprint asc
-    };
-
     uint64_t hashKey(const std::string& key) const;
 
     uint32_t bucketIndex(uint64_t hash) const;
     uint32_t lslotIndex(uint64_t hash) const;
     uint64_t fingerprint(uint64_t hash) const;
 
-    size_t lslotBitOffset(const uint8_t* bucket_data, uint32_t target_lslot) const;
-
-    LSlotContents decodeLSlot(const uint8_t* bucket_data, size_t bit_offset,
-                               size_t* end_bit_offset = nullptr) const;
-
-    size_t encodeLSlot(uint8_t* bucket_data, size_t bit_offset,
-                       const LSlotContents& contents) const;
-
-    size_t totalLSlotBits(const uint8_t* bucket_data) const;
-
     uint64_t getExtensionPtr(const Bucket& bucket) const;
     void setExtensionPtr(Bucket& bucket, uint64_t ptr) const;
 
     size_t bucketDataBits() const;
 
-    // Calculate bits needed for an lslot's contents.
-    static size_t lslotBitsNeeded(const LSlotContents& contents, uint8_t fp_bits);
+    // Re-encode all lslots into the bucket, preserving the extension pointer.
+    // Caller has already verified the data fits.
+    void reencodeAllLSlots(Bucket& bucket,
+                           const std::vector<LSlotContents>& all_slots);
 
     // Chain-aware operations. All scan the full extension chain.
     // Bucket lock must be held by caller.
@@ -173,6 +154,7 @@ private:
 
     Config config_;
     uint8_t fingerprint_bits_;
+    LSlotCodec lslot_codec_;
     std::vector<Bucket> buckets_;
     std::unique_ptr<BucketLock[]> bucket_locks_;
     std::vector<std::unique_ptr<Bucket>> extensions_;

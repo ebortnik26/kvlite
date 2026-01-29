@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "internal/bit_stream.h"
+#include "internal/lslot_codec.h"
 #include "internal/delta_hash_table.h"
 #include "internal/l1_index.h"
 
@@ -37,6 +38,162 @@ TEST(EliasGamma, RoundTrip) {
 
     // Positions should match.
     EXPECT_EQ(reader.position(), writer.position());
+}
+
+// --- LSlotCodec Tests ---
+
+TEST(LSlotCodec, EncodeDecodeEmpty) {
+    LSlotCodec codec(39);  // typical fingerprint_bits = 64 - 20 - 5
+    LSlotCodec::LSlotContents contents;
+
+    // Buffer with padding
+    uint8_t buf[128] = {};
+    size_t end = codec.encode(buf, 0, contents);
+    EXPECT_GT(end, 0u);  // at least the unary(0) terminator
+
+    size_t decoded_end;
+    LSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
+    EXPECT_EQ(decoded_end, end);
+    EXPECT_TRUE(decoded.entries.empty());
+}
+
+TEST(LSlotCodec, EncodeDecodeSingleEntry) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
+    LSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0x1234;
+    entry.values = {100};
+    contents.entries.push_back(entry);
+
+    uint8_t buf[128] = {};
+    size_t end = codec.encode(buf, 0, contents);
+
+    size_t decoded_end;
+    LSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
+    EXPECT_EQ(decoded_end, end);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].fingerprint, 0x1234u);
+    ASSERT_EQ(decoded.entries[0].values.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].values[0], 100u);
+}
+
+TEST(LSlotCodec, EncodeDecodeMultipleValues) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
+    LSlotCodec::TrieEntry entry;
+    entry.fingerprint = 42;
+    entry.values = {300, 200, 100};  // desc order
+    contents.entries.push_back(entry);
+
+    uint8_t buf[128] = {};
+    size_t end = codec.encode(buf, 0, contents);
+
+    size_t decoded_end;
+    LSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
+    EXPECT_EQ(decoded_end, end);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    ASSERT_EQ(decoded.entries[0].values.size(), 3u);
+    EXPECT_EQ(decoded.entries[0].values[0], 300u);
+    EXPECT_EQ(decoded.entries[0].values[1], 200u);
+    EXPECT_EQ(decoded.entries[0].values[2], 100u);
+}
+
+TEST(LSlotCodec, EncodeDecodeMultipleFingerprints) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
+
+    LSlotCodec::TrieEntry e1;
+    e1.fingerprint = 10;
+    e1.values = {50, 40};
+    contents.entries.push_back(e1);
+
+    LSlotCodec::TrieEntry e2;
+    e2.fingerprint = 20;
+    e2.values = {90};
+    contents.entries.push_back(e2);
+
+    uint8_t buf[256] = {};
+    size_t end = codec.encode(buf, 0, contents);
+
+    size_t decoded_end;
+    LSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
+    EXPECT_EQ(decoded_end, end);
+    ASSERT_EQ(decoded.entries.size(), 2u);
+    EXPECT_EQ(decoded.entries[0].fingerprint, 10u);
+    EXPECT_EQ(decoded.entries[1].fingerprint, 20u);
+    ASSERT_EQ(decoded.entries[0].values.size(), 2u);
+    ASSERT_EQ(decoded.entries[1].values.size(), 1u);
+}
+
+TEST(LSlotCodec, BitsNeeded) {
+    LSlotCodec::LSlotContents empty;
+    EXPECT_EQ(LSlotCodec::bitsNeeded(empty, 39), 1u);  // just unary(0)
+
+    LSlotCodec::LSlotContents contents;
+    LSlotCodec::TrieEntry entry;
+    entry.fingerprint = 1;
+    entry.values = {100};
+    contents.entries.push_back(entry);
+
+    size_t bits = LSlotCodec::bitsNeeded(contents, 39);
+    // unary(1)=2 + fp=39 + unary(1)=2 + raw_val=32 = 75
+    EXPECT_EQ(bits, 75u);
+}
+
+TEST(LSlotCodec, BitOffsetAndTotalBits) {
+    LSlotCodec codec(39);
+
+    // Encode 3 consecutive lslots
+    uint8_t buf[512] = {};
+    size_t offset = 0;
+
+    LSlotCodec::LSlotContents s0;
+    LSlotCodec::TrieEntry e0;
+    e0.fingerprint = 1;
+    e0.values = {10};
+    s0.entries.push_back(e0);
+    offset = codec.encode(buf, offset, s0);
+
+    LSlotCodec::LSlotContents s1;  // empty
+    offset = codec.encode(buf, offset, s1);
+
+    LSlotCodec::LSlotContents s2;
+    LSlotCodec::TrieEntry e2;
+    e2.fingerprint = 2;
+    e2.values = {20};
+    s2.entries.push_back(e2);
+    offset = codec.encode(buf, offset, s2);
+
+    // bitOffset(0) should be 0
+    EXPECT_EQ(codec.bitOffset(buf, 0), 0u);
+
+    // bitOffset(1) should skip s0
+    size_t off1 = codec.bitOffset(buf, 1);
+    EXPECT_GT(off1, 0u);
+
+    // totalBits for 3 lslots should match the final offset
+    EXPECT_EQ(codec.totalBits(buf, 3), offset);
+}
+
+TEST(LSlotCodec, NonZeroBitOffset) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
+    LSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0xFF;
+    entry.values = {42};
+    contents.entries.push_back(entry);
+
+    uint8_t buf[128] = {};
+    // Encode at a non-zero bit offset
+    size_t end = codec.encode(buf, 7, contents);
+    EXPECT_GT(end, 7u);
+
+    size_t decoded_end;
+    LSlotCodec::LSlotContents decoded = codec.decode(buf, 7, &decoded_end);
+    EXPECT_EQ(decoded_end, end);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].fingerprint, 0xFFu);
+    EXPECT_EQ(decoded.entries[0].values[0], 42u);
 }
 
 // --- DeltaHashTable Tests ---

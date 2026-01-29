@@ -48,6 +48,7 @@ target_link_libraries(kvlite_bitstream_test
 # DHT unit tests (self-contained, only links DHT + L1Index sources)
 add_executable(kvlite_dht_test
     test_delta_hash_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/lslot_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/l1_index.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp

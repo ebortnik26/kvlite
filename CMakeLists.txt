@@ -28,6 +28,7 @@ endif()
 set(KVLITE_SOURCES
     src/db.cpp
     src/status.cpp
+    src/internal/lslot_codec.cpp
     src/internal/delta_hash_table.cpp
     src/internal/l1_index.cpp
 )
