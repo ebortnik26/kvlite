@@ -120,14 +120,14 @@ private:
             return;
         }
 
-        uint32_t file_id = file_ids_[current_file_idx_];
-        current_l2_ = db_->storage_->getL2Index(file_id);
+        current_file_id_ = file_ids_[current_file_idx_];
+        current_l2_ = db_->storage_->getL2Index(current_file_id_);
 
         // Collect all entries from this L2 index
         l2_entries_.clear();
         if (current_l2_) {
-            current_l2_->forEach([this, file_id](const std::string& key,
-                                                  const std::vector<internal::IndexEntry>& entries) {
+            current_l2_->forEach([this](const std::string& key,
+                                         const std::vector<internal::IndexEntry>& entries) {
                 for (const auto& entry : entries) {
                     // Only consider entries within our snapshot
                     if (entry.version <= snapshot_version_) {
@@ -135,7 +135,6 @@ private:
                         e.key = key;
                         e.version = entry.version;
                         e.offset = entry.location;
-                        e.file_id = file_id;
                         l2_entries_.push_back(std::move(e));
                     }
                 }
@@ -169,27 +168,25 @@ private:
                 continue;
             }
 
-            // Check L1 index: is this the latest version at our snapshot?
-            uint32_t latest_file_id;
-            uint64_t latest_version;
-            Status s = db_->l1_index_->get(entry.key, snapshot_version_ + 1,
-                                           latest_file_id, latest_version);
-
-            if (!s.ok()) {
-                // Key doesn't exist at this snapshot (shouldn't happen, but skip)
+            // Check L1 index: is this file_id in the key's L1 file_id list?
+            auto* file_id_list = db_->l1_index_->getFileIds(entry.key);
+            if (!file_id_list) {
                 l2_entry_idx_++;
                 continue;
             }
 
-            if (entry.version != latest_version) {
-                // Not the latest version, skip
+            // Only process entries from the first (latest) file that contains this key
+            // at our snapshot version. Check if current_file_id_ is the first file_id
+            // in the L1 list that we're iterating through.
+            if (file_id_list->empty() || (*file_id_list)[0] != current_file_id_) {
+                // This file is not the latest for this key, skip
                 l2_entry_idx_++;
                 continue;
             }
 
             // This is the latest version - read the actual entry
             internal::LogEntry log_entry;
-            s = db_->storage_->readLogEntry(entry.file_id, entry.offset, log_entry);
+            s = db_->storage_->readLogEntry(current_file_id_, entry.offset, log_entry);
             if (!s.ok()) {
                 l2_entry_idx_++;
                 continue;
@@ -215,8 +212,7 @@ private:
     struct L2Entry {
         std::string key;
         uint64_t version;
-        uint64_t offset;
-        uint32_t file_id;
+        uint32_t offset;
     };
 
     DB* db_;
@@ -224,6 +220,7 @@ private:
 
     std::vector<uint32_t> file_ids_;
     size_t current_file_idx_ = 0;
+    uint32_t current_file_id_ = 0;
     internal::L2Index* current_l2_ = nullptr;
 
     std::vector<L2Entry> l2_entries_;
@@ -400,7 +397,7 @@ Status DB::put(const std::string& key, const std::string& value,
         return s;
     }
 
-    s = l1_index_->put(key, version, file_id);
+    s = l1_index_->put(key, file_id);
     if (!s.ok()) {
         return s;
     }
@@ -424,7 +421,7 @@ Status DB::get(const std::string& key, std::string& value, uint64_t& version,
     }
 
     uint32_t file_id;
-    Status s = l1_index_->getLatest(key, file_id, version);
+    Status s = l1_index_->getLatest(key, file_id);
     if (!s.ok()) {
         return s;
     }
@@ -445,13 +442,21 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
         return Status::InvalidArgument("Database not open");
     }
 
-    uint32_t file_id;
-    Status s = l1_index_->get(key, upper_bound, file_id, entry_version);
-    if (!s.ok()) {
-        return s;
+    auto* file_ids = l1_index_->getFileIds(key);
+    if (!file_ids) {
+        return Status::NotFound(key);
     }
 
-    return storage_->readValue(file_id, key, entry_version, value);
+    // file_ids are latest-first; scan each file's L2 for the version
+    for (uint32_t fid : *file_ids) {
+        internal::L2Index* l2 = storage_->getL2Index(fid);
+        if (!l2) continue;
+        uint64_t offset;
+        if (l2->get(key, upper_bound, offset, entry_version)) {
+            return storage_->readValue(fid, key, entry_version, value);
+        }
+    }
+    return Status::NotFound(key);
 }
 
 Status DB::remove(const std::string& key, const WriteOptions& options) {
@@ -467,7 +472,7 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
         return s;
     }
 
-    s = l1_index_->put(key, version, file_id);
+    s = l1_index_->put(key, file_id);
     if (!s.ok()) {
         return s;
     }
@@ -514,7 +519,7 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
             return s;
         }
 
-        s = l1_index_->put(op.key, version, file_id);
+        s = l1_index_->put(op.key, file_id);
         if (!s.ok()) {
             return s;
         }
@@ -546,11 +551,7 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
         ReadResult result;
         result.key = key;
 
-        uint32_t file_id;
-        Status s = l1_index_->get(key, snapshot_version + 1, file_id, result.version);
-        if (s.ok()) {
-            s = storage_->readValue(file_id, key, result.version, result.value);
-        }
+        Status s = getByVersion(key, snapshot_version + 1, result.value, result.version);
         result.status = s;
         batch.addResult(std::move(result));
     }

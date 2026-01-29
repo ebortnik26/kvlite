@@ -413,7 +413,7 @@ size_t DeltaHashTable::memoryUsage() const {
     for (const auto& rec : records_) {
         usage += sizeof(KeyRecord);
         usage += rec->key.capacity();
-        usage += rec->entries.capacity() * sizeof(IndexEntry);
+        usage += rec->file_ids.capacity() * sizeof(uint32_t);
     }
 
     return usage;

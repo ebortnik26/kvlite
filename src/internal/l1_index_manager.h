@@ -76,18 +76,15 @@ public:
     // Insert a new entry for a key.
     // Logs to WAL, then updates in-memory index.
     // May trigger auto-snapshot if snapshot_interval is reached.
-    Status put(const std::string& key, uint64_t version, uint32_t file_id);
+    Status put(const std::string& key, uint32_t file_id);
 
-    // Get the file_id for a key at a specific version.
-    // Returns the entry with largest version < upper_bound.
-    // Returns NotFound if no such entry exists.
-    Status get(const std::string& key, uint64_t upper_bound,
-               uint32_t& file_id, uint64_t& version) const;
+    // Get all file_ids for a key. Returns nullptr if key doesn't exist.
+    // File IDs are ordered latest-first.
+    const std::vector<uint32_t>* getFileIds(const std::string& key) const;
 
-    // Get the latest entry for a key.
+    // Get the latest file_id for a key. O(1).
     // Returns NotFound if key doesn't exist.
-    Status getLatest(const std::string& key,
-                     uint32_t& file_id, uint64_t& version) const;
+    Status getLatest(const std::string& key, uint32_t& file_id) const;
 
     // Check if a key exists (has any version)
     bool contains(const std::string& key) const;
@@ -96,19 +93,15 @@ public:
     // Logs to WAL, then updates in-memory index.
     Status remove(const std::string& key);
 
-    // Remove entries where version < threshold (GC cleanup).
-    // Note: This is an in-memory-only operation, not logged to WAL,
-    // since old versions will be re-filtered on recovery anyway.
-    void removeOldVersions(const std::string& key, uint64_t threshold);
+    // Remove a specific file_id from a key's list.
+    // Note: This is an in-memory-only operation, not logged to WAL.
+    void removeFile(const std::string& key, uint32_t file_id);
 
     // --- Iteration ---
 
-    // Get all entries for a key
-    std::vector<IndexEntry> getEntries(const std::string& key) const;
-
-    // Iterate over all keys and their entries
+    // Iterate over all keys and their file_ids
     void forEach(const std::function<void(const std::string&,
-                                          const std::vector<IndexEntry>&)>& fn) const;
+                                          const std::vector<uint32_t>&)>& fn) const;
 
     // Iterate over all keys (without entries)
     void forEachKey(const std::function<void(const std::string&)>& fn) const;

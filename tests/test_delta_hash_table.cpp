@@ -21,17 +21,16 @@ TEST(DeltaHashTable, InsertAndFind) {
     KeyRecord* rec = dht.insert("hello");
     ASSERT_NE(rec, nullptr);
     EXPECT_EQ(rec->key, "hello");
-    EXPECT_TRUE(rec->entries.empty());
+    EXPECT_TRUE(rec->file_ids.empty());
 
-    // Add an entry
-    rec->entries.push_back({1, 100});
+    // Add a file_id
+    rec->file_ids.push_back(100);
 
     KeyRecord* found = dht.find("hello");
     ASSERT_NE(found, nullptr);
     EXPECT_EQ(found->key, "hello");
-    ASSERT_EQ(found->entries.size(), 1u);
-    EXPECT_EQ(found->entries[0].version, 1u);
-    EXPECT_EQ(found->entries[0].location, 100u);
+    ASSERT_EQ(found->file_ids.size(), 1u);
+    EXPECT_EQ(found->file_ids[0], 100u);
 
     EXPECT_EQ(dht.size(), 1u);
 }
@@ -45,12 +44,12 @@ TEST(DeltaHashTable, InsertDuplicate) {
     DeltaHashTable dht(testConfig());
 
     KeyRecord* r1 = dht.insert("key1");
-    r1->entries.push_back({1, 10});
+    r1->file_ids.push_back(10);
 
     KeyRecord* r2 = dht.insert("key1");
     EXPECT_EQ(r1, r2);  // same pointer
     EXPECT_EQ(dht.size(), 1u);
-    ASSERT_EQ(r2->entries.size(), 1u);
+    ASSERT_EQ(r2->file_ids.size(), 1u);
 }
 
 TEST(DeltaHashTable, Remove) {
@@ -90,19 +89,19 @@ TEST(DeltaHashTable, Clear) {
 TEST(DeltaHashTable, ForEach) {
     DeltaHashTable dht(testConfig());
 
-    dht.insert("a")->entries.push_back({1, 10});
-    dht.insert("b")->entries.push_back({2, 20});
-    dht.insert("c")->entries.push_back({3, 30});
+    dht.insert("a")->file_ids.push_back(10);
+    dht.insert("b")->file_ids.push_back(20);
+    dht.insert("c")->file_ids.push_back(30);
 
-    std::map<std::string, std::vector<IndexEntry>> collected;
+    std::map<std::string, std::vector<uint32_t>> collected;
     dht.forEach([&](const KeyRecord& rec) {
-        collected[rec.key] = rec.entries;
+        collected[rec.key] = rec.file_ids;
     });
 
     EXPECT_EQ(collected.size(), 3u);
-    EXPECT_EQ(collected["a"][0].version, 1u);
-    EXPECT_EQ(collected["b"][0].version, 2u);
-    EXPECT_EQ(collected["c"][0].version, 3u);
+    EXPECT_EQ(collected["a"][0], 10u);
+    EXPECT_EQ(collected["b"][0], 20u);
+    EXPECT_EQ(collected["c"][0], 30u);
 }
 
 TEST(DeltaHashTable, ManyKeys) {
@@ -112,7 +111,7 @@ TEST(DeltaHashTable, ManyKeys) {
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
         KeyRecord* rec = dht.insert(key);
-        rec->entries.push_back({static_cast<uint64_t>(i), static_cast<uint64_t>(i * 10)});
+        rec->file_ids.push_back(static_cast<uint32_t>(i * 10));
     }
 
     EXPECT_EQ(dht.size(), static_cast<size_t>(N));
@@ -123,22 +122,22 @@ TEST(DeltaHashTable, ManyKeys) {
         KeyRecord* rec = dht.find(key);
         ASSERT_NE(rec, nullptr) << "key not found: " << key;
         EXPECT_EQ(rec->key, key);
-        ASSERT_EQ(rec->entries.size(), 1u);
-        EXPECT_EQ(rec->entries[0].version, static_cast<uint64_t>(i));
+        ASSERT_EQ(rec->file_ids.size(), 1u);
+        EXPECT_EQ(rec->file_ids[0], static_cast<uint32_t>(i * 10));
     }
 }
 
 TEST(DeltaHashTable, InsertAfterRemove) {
     DeltaHashTable dht(testConfig());
 
-    dht.insert("key1")->entries.push_back({1, 10});
+    dht.insert("key1")->file_ids.push_back(10);
     EXPECT_TRUE(dht.remove("key1"));
     EXPECT_EQ(dht.find("key1"), nullptr);
 
     // Re-insert
     KeyRecord* rec = dht.insert("key1");
     ASSERT_NE(rec, nullptr);
-    EXPECT_TRUE(rec->entries.empty());  // fresh record
+    EXPECT_TRUE(rec->file_ids.empty());  // fresh record
     EXPECT_EQ(dht.size(), 1u);
 }
 
@@ -180,55 +179,63 @@ TEST(DeltaHashTable, EmptyKeyAndBinaryKey) {
 
 using kvlite::Status;
 
-TEST(L1IndexDHT, PutAndGet) {
+TEST(L1IndexDHT, PutAndGetLatest) {
     L1Index index;
 
-    index.put("key1", 1, 100);
-    index.put("key1", 5, 200);
-    index.put("key1", 10, 300);
+    index.put("key1", 100);
+    index.put("key1", 200);
+    index.put("key1", 300);
 
     uint32_t file_id;
-    uint64_t version;
+    EXPECT_TRUE(index.getLatest("key1", file_id));
+    EXPECT_EQ(file_id, 300u);  // latest (prepended last)
 
-    // Get version < 6 → should return version 5
-    EXPECT_TRUE(index.get("key1", 6, file_id, version));
-    EXPECT_EQ(file_id, 200u);
-    EXPECT_EQ(version, 5u);
+    // Check all file_ids
+    auto* fids = index.getFileIds("key1");
+    ASSERT_NE(fids, nullptr);
+    ASSERT_EQ(fids->size(), 3u);
+    EXPECT_EQ((*fids)[0], 300u);  // latest first
+    EXPECT_EQ((*fids)[1], 200u);
+    EXPECT_EQ((*fids)[2], 100u);
+}
 
-    // Get version < 1 → should fail
-    EXPECT_FALSE(index.get("key1", 1, file_id, version));
+TEST(L1IndexDHT, PutDuplicateFileId) {
+    L1Index index;
 
-    // Get version < 100 → should return version 10
-    EXPECT_TRUE(index.get("key1", 100, file_id, version));
-    EXPECT_EQ(file_id, 300u);
-    EXPECT_EQ(version, 10u);
+    index.put("key1", 100);
+    index.put("key1", 200);
+    // Putting 200 again should be a no-op (already at front)
+    index.put("key1", 200);
+
+    auto* fids = index.getFileIds("key1");
+    ASSERT_NE(fids, nullptr);
+    ASSERT_EQ(fids->size(), 2u);
+    EXPECT_EQ(index.entryCount(), 2u);
 }
 
 TEST(L1IndexDHT, GetLatest) {
     L1Index index;
-    index.put("key1", 1, 100);
-    index.put("key1", 5, 200);
+    index.put("key1", 100);
+    index.put("key1", 200);
 
     uint32_t file_id;
-    uint64_t version;
-    EXPECT_TRUE(index.getLatest("key1", file_id, version));
+    EXPECT_TRUE(index.getLatest("key1", file_id));
     EXPECT_EQ(file_id, 200u);
-    EXPECT_EQ(version, 5u);
 
-    EXPECT_FALSE(index.getLatest("missing", file_id, version));
+    EXPECT_FALSE(index.getLatest("missing", file_id));
 }
 
 TEST(L1IndexDHT, Contains) {
     L1Index index;
     EXPECT_FALSE(index.contains("key1"));
-    index.put("key1", 1, 100);
+    index.put("key1", 100);
     EXPECT_TRUE(index.contains("key1"));
 }
 
 TEST(L1IndexDHT, Remove) {
     L1Index index;
-    index.put("key1", 1, 100);
-    index.put("key1", 2, 200);
+    index.put("key1", 100);
+    index.put("key1", 200);
     EXPECT_EQ(index.entryCount(), 2u);
 
     index.remove("key1");
@@ -237,28 +244,39 @@ TEST(L1IndexDHT, Remove) {
     EXPECT_EQ(index.entryCount(), 0u);
 }
 
-TEST(L1IndexDHT, RemoveOldVersions) {
+TEST(L1IndexDHT, RemoveFile) {
     L1Index index;
-    index.put("key1", 1, 100);
-    index.put("key1", 5, 200);
-    index.put("key1", 10, 300);
+    index.put("key1", 100);
+    index.put("key1", 200);
+    index.put("key1", 300);
 
-    index.removeOldVersions("key1", 6);  // remove versions < 6
+    index.removeFile("key1", 200);
 
-    auto entries = index.getEntries("key1");
-    EXPECT_EQ(entries.size(), 1u);
-    EXPECT_EQ(entries[0].version, 10u);
-    EXPECT_EQ(index.entryCount(), 1u);
+    auto* fids = index.getFileIds("key1");
+    ASSERT_NE(fids, nullptr);
+    ASSERT_EQ(fids->size(), 2u);
+    EXPECT_EQ((*fids)[0], 300u);
+    EXPECT_EQ((*fids)[1], 100u);
+    EXPECT_EQ(index.entryCount(), 2u);
+}
+
+TEST(L1IndexDHT, RemoveFileRemovesKey) {
+    L1Index index;
+    index.put("key1", 100);
+    index.removeFile("key1", 100);
+    EXPECT_FALSE(index.contains("key1"));
+    EXPECT_EQ(index.keyCount(), 0u);
+    EXPECT_EQ(index.entryCount(), 0u);
 }
 
 TEST(L1IndexDHT, ForEach) {
     L1Index index;
-    index.put("a", 1, 10);
-    index.put("b", 2, 20);
+    index.put("a", 10);
+    index.put("b", 20);
 
     std::map<std::string, size_t> seen;
-    index.forEach([&](const std::string& key, const std::vector<IndexEntry>& entries) {
-        seen[key] = entries.size();
+    index.forEach([&](const std::string& key, const std::vector<uint32_t>& file_ids) {
+        seen[key] = file_ids.size();
     });
 
     EXPECT_EQ(seen.size(), 2u);
@@ -271,9 +289,9 @@ TEST(L1IndexDHT, Snapshot) {
 
     {
         L1Index index;
-        index.put("key1", 1, 100);
-        index.put("key1", 5, 200);
-        index.put("key2", 3, 300);
+        index.put("key1", 100);
+        index.put("key1", 200);
+        index.put("key2", 300);
 
         Status s = index.saveSnapshot(path);
         ASSERT_TRUE(s.ok()) << s.toString();
@@ -288,14 +306,11 @@ TEST(L1IndexDHT, Snapshot) {
         EXPECT_EQ(index.entryCount(), 3u);
 
         uint32_t file_id;
-        uint64_t version;
-        EXPECT_TRUE(index.getLatest("key1", file_id, version));
+        EXPECT_TRUE(index.getLatest("key1", file_id));
         EXPECT_EQ(file_id, 200u);
-        EXPECT_EQ(version, 5u);
 
-        EXPECT_TRUE(index.getLatest("key2", file_id, version));
+        EXPECT_TRUE(index.getLatest("key2", file_id));
         EXPECT_EQ(file_id, 300u);
-        EXPECT_EQ(version, 3u);
     }
 
     std::filesystem::remove(path);
@@ -304,7 +319,7 @@ TEST(L1IndexDHT, Snapshot) {
 TEST(L1IndexDHT, Clear) {
     L1Index index;
     for (int i = 0; i < 50; ++i) {
-        index.put("key" + std::to_string(i), i, i * 10);
+        index.put("key" + std::to_string(i), i * 10);
     }
     EXPECT_EQ(index.keyCount(), 50u);
 
@@ -335,7 +350,7 @@ TEST(DeltaHashTable, ConcurrentInsertAndFind) {
                 std::string key = "t" + std::to_string(t) + "_k" + std::to_string(i);
                 KeyRecord* rec = dht.insert(key);
                 ASSERT_NE(rec, nullptr);
-                rec->entries.push_back({static_cast<uint64_t>(i), static_cast<uint64_t>(t)});
+                rec->file_ids.push_back(static_cast<uint32_t>(t));
             }
         });
     }
@@ -438,7 +453,7 @@ TEST(L1IndexDHT, LargeScale) {
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        index.put(key, i + 1, i * 10);
+        index.put(key, static_cast<uint32_t>(i * 10));
     }
 
     EXPECT_EQ(index.keyCount(), static_cast<size_t>(N));
@@ -446,9 +461,7 @@ TEST(L1IndexDHT, LargeScale) {
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
         uint32_t file_id;
-        uint64_t version;
-        ASSERT_TRUE(index.getLatest(key, file_id, version));
+        ASSERT_TRUE(index.getLatest(key, file_id));
         EXPECT_EQ(file_id, static_cast<uint32_t>(i * 10));
-        EXPECT_EQ(version, static_cast<uint64_t>(i + 1));
     }
 }

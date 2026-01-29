@@ -7,16 +7,17 @@
 #include <functional>
 
 #include "kvlite/status.h"
-#include "log_entry.h"
 #include "delta_hash_table.h"
 
 namespace kvlite {
 namespace internal {
 
-// L1 Index: In-memory index mapping keys to file locations.
+// L1 Index: In-memory index mapping keys to file_id lists.
 //
-// Structure: key → [(version₁, file_id₁), (version₂, file_id₂), ...]
-//            sorted by version, ascending
+// Structure: key → [file_id₁, file_id₂, ...]
+//            reverse-sorted by version (latest first)
+//
+// Version resolution is delegated to L2 indexes.
 //
 // The L1 index is always fully loaded in memory. It is persisted via:
 // 1. WAL (append-only delta log for crash recovery)
@@ -28,44 +29,38 @@ public:
     L1Index();
     ~L1Index();
 
-    // Insert a new entry for a key
-    // Entries are kept sorted by version (ascending)
-    void put(const std::string& key, uint64_t version, uint32_t file_id);
+    // Prepend file_id to key's list (if not already at front).
+    // Latest file_id is always at index 0.
+    void put(const std::string& key, uint32_t file_id);
 
-    // Get the file_id for a key at a specific version
-    // Returns the entry with largest version < upper_bound
-    // Returns false if no such entry exists
-    bool get(const std::string& key, uint64_t upper_bound,
-             uint32_t& file_id, uint64_t& version) const;
+    // Get all file_ids for a key. Returns nullptr if key doesn't exist.
+    // File IDs are ordered latest-first.
+    const std::vector<uint32_t>* getFileIds(const std::string& key) const;
 
-    // Get the latest entry for a key
-    // Returns false if key doesn't exist
-    bool getLatest(const std::string& key,
-                   uint32_t& file_id, uint64_t& version) const;
+    // Get the latest file_id for a key (index 0). O(1).
+    // Returns false if key doesn't exist.
+    bool getLatest(const std::string& key, uint32_t& file_id) const;
 
-    // Check if a key exists (has any version)
+    // Check if a key exists (has any file_ids)
     bool contains(const std::string& key) const;
 
-    // Remove all entries for a key (used during GC compaction)
+    // Remove all file_ids for a key (used during GC compaction)
     void remove(const std::string& key);
 
-    // Remove entries for a key where version < threshold (GC cleanup)
-    void removeOldVersions(const std::string& key, uint64_t threshold);
+    // Remove a specific file_id from a key's list
+    void removeFile(const std::string& key, uint32_t file_id);
 
-    // Get all entries for a key (for debugging/testing)
-    std::vector<IndexEntry> getEntries(const std::string& key) const;
-
-    // Iterate over all keys and their entries
-    // Callback receives (key, entries) for each key
+    // Iterate over all keys and their file_ids
+    // Callback receives (key, file_ids) for each key
     void forEach(const std::function<void(const std::string&,
-                                          const std::vector<IndexEntry>&)>& fn) const;
+                                          const std::vector<uint32_t>&)>& fn) const;
 
-    // Iterate over all keys (without entries, for efficiency)
+    // Iterate over all keys (without file_ids, for efficiency)
     void forEachKey(const std::function<void(const std::string&)>& fn) const;
 
     // Get statistics
     size_t keyCount() const;
-    size_t entryCount() const;
+    size_t entryCount() const;  // total file_id refs across all keys
     size_t memoryUsage() const;
 
     // Clear all entries
@@ -81,13 +76,13 @@ public:
 
     // Snapshot file format:
     // [magic: 4 bytes]["L1IX"]
-    // [version: 4 bytes][1]
+    // [version: 4 bytes][2]
     // [num_keys: 8 bytes]
     // For each key:
     //   [key_len: 4 bytes][key: var]
-    //   [num_entries: 4 bytes]
-    //   For each entry:
-    //     [version: 8 bytes][file_id: 4 bytes]
+    //   [num_file_ids: 4 bytes]
+    //   For each file_id:
+    //     [file_id: 4 bytes]
     // [checksum: 4 bytes]
 
 private:

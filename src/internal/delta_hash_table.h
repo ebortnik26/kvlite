@@ -9,16 +9,14 @@
 #include <string>
 #include <vector>
 
-#include "log_entry.h"
-
 namespace kvlite {
 namespace internal {
 
-// A record holding the full key and its version list.
+// A record holding the full key and its file_id list.
 // Stored externally; the DHT holds pointers to these.
 struct KeyRecord {
     std::string key;
-    std::vector<IndexEntry> entries;  // sorted by version ascending
+    std::vector<uint32_t> file_ids;  // reverse-sorted by version (latest first)
 };
 
 // Delta Hash Table: a compact hash table inspired by the Pliops XDP paper.

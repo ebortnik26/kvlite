@@ -42,7 +42,7 @@ public:
     Status close();
 
     // Append a put operation
-    Status appendPut(const std::string& key, uint64_t version, uint32_t file_id);
+    Status appendPut(const std::string& key, uint32_t file_id);
 
     // Append a remove operation (for GC)
     Status appendRemove(const std::string& key);

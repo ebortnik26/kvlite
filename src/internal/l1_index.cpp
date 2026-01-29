@@ -88,103 +88,64 @@ L1Index::L1Index() : dht_(defaultDHTConfig()) {}
 
 L1Index::~L1Index() = default;
 
-void L1Index::put(const std::string& key, uint64_t version, uint32_t file_id) {
+void L1Index::put(const std::string& key, uint32_t file_id) {
     KeyRecord* record = dht_.insert(key);
-
-    IndexEntry entry;
-    entry.version = version;
-    entry.location = file_id;
-
-    // Insert maintaining sorted order by version
-    auto it = std::lower_bound(record->entries.begin(), record->entries.end(),
-                                entry);
-    record->entries.insert(it, entry);
-    ++total_entries_;
+    if (record->file_ids.empty() || record->file_ids[0] != file_id) {
+        record->file_ids.insert(record->file_ids.begin(), file_id);
+        ++total_entries_;
+    }
 }
 
-bool L1Index::get(const std::string& key, uint64_t upper_bound,
-                   uint32_t& file_id, uint64_t& version) const {
+const std::vector<uint32_t>* L1Index::getFileIds(const std::string& key) const {
     KeyRecord* record = dht_.find(key);
-    if (!record || record->entries.empty()) {
-        return false;
+    if (!record || record->file_ids.empty()) {
+        return nullptr;
     }
-
-    // Find largest version < upper_bound using binary search.
-    // Entries are sorted ascending by version.
-    IndexEntry target;
-    target.version = upper_bound;
-
-    // upper_bound points to first entry with version >= upper_bound
-    auto it = std::lower_bound(record->entries.begin(), record->entries.end(),
-                                target);
-
-    if (it == record->entries.begin()) {
-        return false;  // all versions >= upper_bound
-    }
-
-    --it;
-    file_id = static_cast<uint32_t>(it->location);
-    version = it->version;
-    return true;
+    return &record->file_ids;
 }
 
-bool L1Index::getLatest(const std::string& key,
-                         uint32_t& file_id, uint64_t& version) const {
+bool L1Index::getLatest(const std::string& key, uint32_t& file_id) const {
     KeyRecord* record = dht_.find(key);
-    if (!record || record->entries.empty()) {
+    if (!record || record->file_ids.empty()) {
         return false;
     }
-
-    const auto& last = record->entries.back();
-    file_id = static_cast<uint32_t>(last.location);
-    version = last.version;
+    file_id = record->file_ids[0];
     return true;
 }
 
 bool L1Index::contains(const std::string& key) const {
     KeyRecord* record = dht_.find(key);
-    return record != nullptr && !record->entries.empty();
+    return record != nullptr && !record->file_ids.empty();
 }
 
 void L1Index::remove(const std::string& key) {
     KeyRecord* record = dht_.find(key);
     if (record) {
-        total_entries_ -= record->entries.size();
+        total_entries_ -= record->file_ids.size();
         dht_.remove(key);
     }
 }
 
-void L1Index::removeOldVersions(const std::string& key, uint64_t threshold) {
+void L1Index::removeFile(const std::string& key, uint32_t file_id) {
     KeyRecord* record = dht_.find(key);
     if (!record) return;
 
-    auto it = std::partition_point(record->entries.begin(),
-                                    record->entries.end(),
-                                    [threshold](const IndexEntry& e) {
-                                        return e.version < threshold;
-                                    });
+    auto it = std::find(record->file_ids.begin(), record->file_ids.end(), file_id);
+    if (it != record->file_ids.end()) {
+        record->file_ids.erase(it);
+        --total_entries_;
+    }
 
-    size_t removed = std::distance(record->entries.begin(), it);
-    record->entries.erase(record->entries.begin(), it);
-    total_entries_ -= removed;
-
-    // If no entries remain, remove the key entirely
-    if (record->entries.empty()) {
+    if (record->file_ids.empty()) {
         dht_.remove(key);
     }
-}
-
-std::vector<IndexEntry> L1Index::getEntries(const std::string& key) const {
-    KeyRecord* record = dht_.find(key);
-    if (!record) return {};
-    return record->entries;
 }
 
 void L1Index::forEach(
     const std::function<void(const std::string&,
-                              const std::vector<IndexEntry>&)>& fn) const {
+                              const std::vector<uint32_t>&)>& fn) const {
     dht_.forEach([&fn](const KeyRecord& record) {
-        fn(record.key, record.entries);
+        fn(record.key, record.file_ids);
     });
 }
 
@@ -215,7 +176,7 @@ void L1Index::clear() {
 // --- Persistence ---
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
-static constexpr uint32_t kVersion = 1;
+static constexpr uint32_t kVersion = 2;
 
 Status L1Index::saveSnapshot(const std::string& path) const {
     std::ofstream file(path, std::ios::binary);
@@ -239,13 +200,11 @@ Status L1Index::saveSnapshot(const std::string& path) const {
         writer.writeVal(key_len);
         writer.write(record.key.data(), key_len);
 
-        uint32_t num_entries = static_cast<uint32_t>(record.entries.size());
-        writer.writeVal(num_entries);
+        uint32_t num_file_ids = static_cast<uint32_t>(record.file_ids.size());
+        writer.writeVal(num_file_ids);
 
-        for (const auto& entry : record.entries) {
-            writer.writeVal(entry.version);
-            uint32_t file_id = static_cast<uint32_t>(entry.location);
-            writer.writeVal(file_id);
+        for (uint32_t fid : record.file_ids) {
+            writer.writeVal(fid);
         }
     });
 
@@ -300,18 +259,20 @@ Status L1Index::loadSnapshot(const std::string& path) {
             return Status::Corruption("Failed to read key data");
         }
 
-        uint32_t num_entries;
-        if (!reader.readVal(num_entries)) {
-            return Status::Corruption("Failed to read entry count");
+        uint32_t num_file_ids;
+        if (!reader.readVal(num_file_ids)) {
+            return Status::Corruption("Failed to read file_id count");
         }
 
-        for (uint32_t e = 0; e < num_entries; ++e) {
-            uint64_t entry_version;
+        KeyRecord* record = dht_.insert(key);
+        record->file_ids.reserve(num_file_ids);
+        for (uint32_t e = 0; e < num_file_ids; ++e) {
             uint32_t file_id;
-            if (!reader.readVal(entry_version) || !reader.readVal(file_id)) {
-                return Status::Corruption("Failed to read entry");
+            if (!reader.readVal(file_id)) {
+                return Status::Corruption("Failed to read file_id");
             }
-            put(key, entry_version, file_id);
+            record->file_ids.push_back(file_id);
+            ++total_entries_;
         }
     }
 

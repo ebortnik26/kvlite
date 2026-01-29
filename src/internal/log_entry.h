@@ -54,12 +54,11 @@ struct LogEntry {
     static constexpr size_t kChecksumSize = 4;
 };
 
-// Index entry stored in L1 and L2 indices.
-// L1: location = file_id (which log file)
-// L2: location = offset (byte offset within log file)
+// Index entry stored in the L1 index.
+// location = file_id (which log file), 32 bits is sufficient.
 struct IndexEntry {
     uint64_t version = 0;
-    uint64_t location = 0;
+    uint32_t location = 0;
 
     bool operator<(const IndexEntry& other) const {
         return version < other.version;
