@@ -538,7 +538,7 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
     }
 
     // Create implicit snapshot for consistent reads
-    uint64_t snapshot_version = versions_->currentVersion();
+    uint64_t snapshot_version = versions_->latestVersion();
     batch.setSnapshotVersion(snapshot_version);
     batch.reserveResults(batch.count());
 
@@ -612,7 +612,7 @@ Status DB::getStats(DBStats& stats) const {
     stats.l1_index_size = l1_index_->memoryUsage();
     stats.l2_cache_size = storage_->l2CacheSize();
     stats.l2_cached_count = storage_->l2CachedCount();
-    stats.current_version = versions_->currentVersion();
+    stats.current_version = versions_->latestVersion();
     stats.oldest_version = versions_->oldestSnapshotVersion();
 
     stats.active_snapshots = versions_->activeSnapshotCount();
@@ -632,8 +632,8 @@ Status DB::getPath(std::string& path) const {
     return Status::OK();
 }
 
-uint64_t DB::getCurrentVersion() const {
-    return versions_->currentVersion();
+uint64_t DB::getLatestVersion() const {
+    return versions_->latestVersion();
 }
 
 uint64_t DB::getOldestVersion() const {

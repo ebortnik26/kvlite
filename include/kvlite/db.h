@@ -160,7 +160,7 @@ public:
 
     // --- Version Info ---
 
-    uint64_t getCurrentVersion() const;
+    uint64_t getLatestVersion() const;
     uint64_t getOldestVersion() const;
 
 private:

@@ -50,8 +50,8 @@ public:
     // Persists counter when crossing jump boundaries.
     uint64_t allocateVersion();
 
-    // Get current version (latest allocated).
-    uint64_t currentVersion() const;
+    // Get latest version (most recently allocated).
+    uint64_t latestVersion() const;
 
     // --- Snapshot Management ---
 
@@ -63,7 +63,7 @@ public:
     void releaseSnapshot(uint64_t version);
 
     // Get the oldest active snapshot version.
-    // Returns currentVersion() if no snapshots are active.
+    // Returns latestVersion() if no snapshots are active.
     uint64_t oldestSnapshotVersion() const;
 
     // Get number of active snapshots.
