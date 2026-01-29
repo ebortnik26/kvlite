@@ -17,6 +17,11 @@ namespace internal {
 // Stores (offset, version) pairs per fingerprint.
 // Append-only, write-once: no remove, update, or concurrency control.
 // Writes are assumed to arrive in sorted hash order (no bucket contention).
+//
+// Bucket format (managed by L2LSlotCodec header protocol):
+//   [32 bits: base_offset] [lslot 0] [lslot 1] ... [lslot N-1] [8 bytes: ext_ptr]
+//
+// All offsets within a bucket are encoded as gamma(offset - base_offset + 1).
 class L2DeltaHashTable : private DeltaHashTableBase<L2LSlotCodec> {
     using Base = DeltaHashTableBase<L2LSlotCodec>;
 

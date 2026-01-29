@@ -41,8 +41,7 @@ inline uint64_t dhtHashBytes(const void* data, size_t len) {
 //   explicit Codec(uint8_t fingerprint_bits);
 //   LSlotContents decode(const uint8_t*, size_t, size_t*) const;
 //   size_t encode(uint8_t*, size_t, const LSlotContents&) const;
-//   static size_t bitsNeeded(const LSlotContents&, uint8_t);
-//   size_t bitOffset(const uint8_t*, uint32_t) const;
+//   static size_t bitsNeeded(const LSlotContents&, uint8_t fp_bits);
 template<typename Codec>
 class DeltaHashTableBase {
 public:
@@ -73,6 +72,7 @@ protected:
         for (uint32_t i = 0; i < num_buckets; ++i) {
             buckets_.emplace_back(config_.bucket_bytes);
         }
+        clearBuckets();
     }
 
     ~DeltaHashTableBase() = default;
@@ -119,6 +119,12 @@ protected:
 
     // --- Decode / Encode ---
 
+    // Decode a single lslot from a bucket by index.
+    LSlotContents decodeLSlot(const Bucket& bucket, uint32_t lslot_idx) const {
+        size_t bit_off = lslot_codec_.bitOffset(bucket.data.data(), lslot_idx);
+        return lslot_codec_.decode(bucket.data.data(), bit_off);
+    }
+
     std::vector<LSlotContents> decodeAllLSlots(const Bucket& bucket) const {
         uint32_t n = numLSlots();
         std::vector<LSlotContents> slots(n);
@@ -163,8 +169,6 @@ protected:
         return ext ? extensions_[ext - 1].get() : nullptr;
     }
 
-    // Create a new extension bucket, link it, initialize empty lslots.
-    // NOT thread-safe — caller must hold any needed locks.
     Bucket* createExtension(Bucket& bucket) {
         auto ext = std::make_unique<Bucket>(config_.bucket_bytes);
         extensions_.push_back(std::move(ext));
@@ -172,20 +176,13 @@ protected:
         setExtensionPtr(bucket, ext_ptr);
 
         Bucket* ext_bucket = extensions_[ext_ptr - 1].get();
-        BitWriter writer(ext_bucket->data.data(), 0);
-        for (uint32_t s = 0; s < numLSlots(); ++s) {
-            writer.writeUnary(0);
-        }
+        initBucket(*ext_bucket);
         return ext_bucket;
     }
 
     // --- Generic chain helpers ---
 
     // Add to chain: decode → modify → check fit → re-encode or overflow.
-    // ModifyFn: void(std::vector<TrieEntry>& entries) — insert the value.
-    // UndoFn:   void(std::vector<TrieEntry>& entries) — revert on overflow.
-    // CreateExtFn: Bucket*(Bucket&) — create extension (allows derived class
-    //              to hold locks during extension creation).
     template<typename ModifyFn, typename UndoFn, typename CreateExtFn>
     void addToChainImpl(uint32_t bucket_idx, uint32_t lslot_idx,
                         ModifyFn&& modify, UndoFn&& undo,
@@ -212,14 +209,12 @@ protected:
     }
 
     // Find in chain: walk chain, collect from matching fingerprint entries.
-    // CollectFn: void(const TrieEntry&) — extract values from a matching entry.
     template<typename CollectFn>
     void findInChainImpl(uint32_t bucket_idx, uint32_t lslot_idx,
                          uint64_t fp, CollectFn&& collect) const {
         const Bucket* bucket = &buckets_[bucket_idx];
         while (bucket) {
-            size_t bit_off = lslot_codec_.bitOffset(bucket->data.data(), lslot_idx);
-            LSlotContents contents = lslot_codec_.decode(bucket->data.data(), bit_off);
+            LSlotContents contents = decodeLSlot(*bucket, lslot_idx);
             for (const auto& entry : contents.entries) {
                 if (entry.fingerprint == fp) {
                     collect(entry);
@@ -230,8 +225,6 @@ protected:
     }
 
     // Modify in chain: decode all → apply fn → re-encode if modified.
-    // Returns true if fn made changes in some bucket.
-    // ModifyFn: bool(std::vector<TrieEntry>& entries) — returns true if modified.
     template<typename ModifyFn>
     bool modifyInChainImpl(uint32_t bucket_idx, uint32_t lslot_idx,
                            ModifyFn&& fn) {
@@ -248,7 +241,6 @@ protected:
     }
 
     // Walk all entries: for each (bucket, lslot, entry) invoke callback.
-    // EntryFn: void(uint64_t hash, const TrieEntry& entry)
     template<typename EntryFn>
     void forEachEntryImpl(EntryFn&& fn) const {
         uint32_t num_buckets = 1u << config_.bucket_bits;
@@ -274,14 +266,6 @@ protected:
         }
     }
 
-    // Walk all groups (merged across extension chain).
-    // GroupFn: void(uint64_t hash, uint32_t lslot, uint64_t fp,
-    //              const Bucket* chain_head)
-    // — called once per unique (bucket, lslot, fp) group. The derived class
-    //   accumulates values across the chain itself using findInChainImpl or
-    //   its own logic. This pattern is too value-specific, so we provide
-    //   a simpler "scan each entry" helper and let the derived class merge.
-
     // --- Stats ---
 
     size_t bucketMemoryUsage() const {
@@ -291,11 +275,7 @@ protected:
 
     void clearBuckets() {
         for (auto& bucket : buckets_) {
-            std::memset(bucket.data.data(), 0, config_.bucket_bytes);
-            BitWriter writer(bucket.data.data(), 0);
-            for (uint32_t s = 0; s < numLSlots(); ++s) {
-                writer.writeUnary(0);
-            }
+            initBucket(bucket);
         }
         extensions_.clear();
     }
@@ -307,6 +287,19 @@ protected:
     Codec lslot_codec_;
     std::vector<Bucket> buckets_;
     std::vector<std::unique_ptr<Bucket>> extensions_;
+
+private:
+    void initBucket(Bucket& bucket) {
+        size_t data_bytes = config_.bucket_bytes - 8;
+        uint64_t ext_ptr = getExtensionPtr(bucket);
+        std::memset(bucket.data.data(), 0, data_bytes);
+        setExtensionPtr(bucket, ext_ptr);
+
+        BitWriter writer(bucket.data.data(), 0);
+        for (uint32_t s = 0; s < numLSlots(); ++s) {
+            writer.writeUnary(0);
+        }
+    }
 };
 
 }  // namespace internal

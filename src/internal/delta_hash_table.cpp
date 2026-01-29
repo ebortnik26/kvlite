@@ -42,8 +42,7 @@ bool DeltaHashTable::findFirst(const std::string& key, uint32_t& value) const {
 
     const Bucket* bucket = &buckets_[bi];
     while (bucket) {
-        size_t bit_off = lslot_codec_.bitOffset(bucket->data.data(), li);
-        LSlotContents contents = lslot_codec_.decode(bucket->data.data(), bit_off);
+        LSlotContents contents = decodeLSlot(*bucket, li);
 
         for (const auto& entry : contents.entries) {
             if (entry.fingerprint == fp && !entry.values.empty()) {

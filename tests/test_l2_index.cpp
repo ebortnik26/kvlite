@@ -434,4 +434,3 @@ TEST(L2Index, LargeScale) {
         EXPECT_EQ(ver, static_cast<uint32_t>(i + 1));
     }
 }
-

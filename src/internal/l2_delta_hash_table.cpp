@@ -42,8 +42,7 @@ bool L2DeltaHashTable::findFirst(const std::string& key,
 
     const Bucket* bucket = &buckets_[bi];
     while (bucket) {
-        size_t bit_off = lslot_codec_.bitOffset(bucket->data.data(), li);
-        LSlotContents contents = lslot_codec_.decode(bucket->data.data(), bit_off);
+        LSlotContents contents = decodeLSlot(*bucket, li);
 
         for (const auto& entry : contents.entries) {
             if (entry.fingerprint == fp && !entry.offsets.empty()) {
@@ -206,8 +205,8 @@ void L2DeltaHashTable::forEachGroup(
         while (b) {
             size_t offset = 0;
             for (uint32_t s = 0; s < n_lslots; ++s) {
-                LSlotContents contents = lslot_codec_.decode(
-                    b->data.data(), offset, &offset);
+                LSlotContents contents =
+                    lslot_codec_.decode(b->data.data(), offset, &offset);
                 for (const auto& entry : contents.entries) {
                     bool merged = false;
                     for (auto& g : groups) {

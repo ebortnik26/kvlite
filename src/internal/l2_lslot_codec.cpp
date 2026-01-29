@@ -24,13 +24,13 @@ L2LSlotCodec::LSlotContents L2LSlotCodec::decode(
         entry.offsets.resize(num_entries);
         entry.versions.resize(num_entries);
         if (num_entries > 0) {
-            // Decode offsets (delta + Elias gamma, desc order)
+            // Offsets: 32-bit raw first, gamma deltas for rest (desc)
             entry.offsets[0] = static_cast<uint32_t>(reader.read(32));
             for (uint64_t v = 1; v < num_entries; ++v) {
                 uint32_t delta = reader.readEliasGamma();
                 entry.offsets[v] = entry.offsets[v - 1] - delta;
             }
-            // Decode versions (delta + Elias gamma, desc order)
+            // Versions: 32-bit raw first, gamma deltas for rest (desc)
             entry.versions[0] = static_cast<uint32_t>(reader.read(32));
             for (uint64_t v = 1; v < num_entries; ++v) {
                 uint32_t delta = reader.readEliasGamma();
@@ -60,13 +60,13 @@ size_t L2LSlotCodec::encode(
         uint64_t num_entries = entry.offsets.size();
         writer.writeUnary(num_entries);
         if (num_entries > 0) {
-            // Encode offsets
+            // Offsets: 32-bit raw first, gamma deltas for rest (desc)
             writer.write(entry.offsets[0], 32);
             for (uint64_t v = 1; v < num_entries; ++v) {
                 uint32_t delta = entry.offsets[v - 1] - entry.offsets[v];
                 writer.writeEliasGamma(delta);
             }
-            // Encode versions
+            // Versions: 32-bit raw first, gamma deltas for rest (desc)
             writer.write(entry.versions[0], 32);
             for (uint64_t v = 1; v < num_entries; ++v) {
                 uint32_t delta = entry.versions[v - 1] - entry.versions[v];
@@ -91,12 +91,14 @@ size_t L2LSlotCodec::bitsNeeded(const LSlotContents& contents,
         bits += fp_bits;                         // fingerprint
         bits += entry.offsets.size() + 1;        // unary(M)
         if (!entry.offsets.empty()) {
-            bits += 32;                          // first offset raw
+            // Offsets: 32-bit raw first + gamma deltas
+            bits += 32;
             for (size_t v = 1; v < entry.offsets.size(); ++v) {
                 uint32_t delta = entry.offsets[v - 1] - entry.offsets[v];
                 bits += eliasGammaBits(delta);
             }
-            bits += 32;                          // first version raw
+            // Versions: 32-bit raw first + gamma deltas
+            bits += 32;
             for (size_t v = 1; v < entry.versions.size(); ++v) {
                 uint32_t delta = entry.versions[v - 1] - entry.versions[v];
                 bits += eliasGammaBits(delta);
@@ -106,7 +108,8 @@ size_t L2LSlotCodec::bitsNeeded(const LSlotContents& contents,
     return bits;
 }
 
-size_t L2LSlotCodec::bitOffset(const uint8_t* data, uint32_t target_lslot) const {
+size_t L2LSlotCodec::bitOffset(const uint8_t* data,
+                                uint32_t target_lslot) const {
     size_t offset = 0;
     for (uint32_t s = 0; s < target_lslot; ++s) {
         decode(data, offset, &offset);
@@ -114,7 +117,8 @@ size_t L2LSlotCodec::bitOffset(const uint8_t* data, uint32_t target_lslot) const
     return offset;
 }
 
-size_t L2LSlotCodec::totalBits(const uint8_t* data, uint32_t num_lslots) const {
+size_t L2LSlotCodec::totalBits(const uint8_t* data,
+                                uint32_t num_lslots) const {
     return bitOffset(data, num_lslots);
 }
 

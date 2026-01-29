@@ -14,10 +14,13 @@ namespace internal {
 //   for each fingerprint:
 //     [fingerprint_bits]             — fingerprint value
 //     unary(M)                       — M entries
-//     [32 bits]                      — first offset (raw, highest)
+//     [32 bits]                      — first offset (highest, raw)
 //     (M-1) x gamma(delta_offset)   — offset deltas (desc order)
-//     [32 bits]                      — first version (raw, highest)
+//     [32 bits]                      — first version (highest, raw)
 //     (M-1) x gamma(delta_version)  — version deltas (desc order)
+//
+// Same encoding pattern as L1 (LSlotCodec), applied to two parallel sequences
+// (offsets and versions) per fingerprint group.
 //
 // The codec operates on raw uint8_t* pointers and owns no memory.
 class L2LSlotCodec {
