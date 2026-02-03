@@ -1,14 +1,19 @@
 #include <gtest/gtest.h>
 
+#include <cstring>
+#include <fcntl.h>
 #include <set>
+#include <unistd.h>
 #include <vector>
 
 #include "internal/bit_stream.h"
 #include "internal/l2_lslot_codec.h"
 #include "internal/l2_delta_hash_table.h"
 #include "internal/l2_index.h"
+#include "internal/log_file.h"
 
 using namespace kvlite::internal;
+using kvlite::Status;
 
 // --- L2LSlotCodec Tests ---
 
@@ -360,38 +365,6 @@ TEST(L2Index, Contains) {
     EXPECT_TRUE(index.contains("key1"));
 }
 
-TEST(L2Index, ForEach) {
-    L2Index index;
-    index.put("a", 100, 1);
-    index.put("b", 200, 2);
-
-    size_t count = 0;
-    index.forEach([&](uint32_t offset, uint32_t version) {
-        (void)offset;
-        (void)version;
-        ++count;
-    });
-
-    EXPECT_EQ(count, 2u);
-}
-
-TEST(L2Index, ForEachMixed) {
-    L2Index index;
-    index.put("a", 100, 1);
-    index.put("b", 200, 2);
-    index.put("b", 300, 3);
-    index.put("c", 400, 4);
-    index.put("c", 500, 5);
-    index.put("c", 600, 6);
-
-    size_t count = 0;
-    index.forEach([&](uint32_t, uint32_t) {
-        ++count;
-    });
-
-    EXPECT_EQ(count, 6u);
-}
-
 TEST(L2Index, GetNonExistent) {
     L2Index index;
     std::vector<uint32_t> offsets, versions;
@@ -429,4 +402,158 @@ TEST(L2Index, LargeScale) {
         EXPECT_EQ(off, static_cast<uint32_t>(i * 100));
         EXPECT_EQ(ver, static_cast<uint32_t>(i + 1));
     }
+}
+
+// --- L2Index Serialization Tests ---
+
+class L2IndexSerializationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        path_ = "/tmp/l2_index_test_" + std::to_string(getpid()) + ".idx";
+    }
+    void TearDown() override {
+        ::unlink(path_.c_str());
+    }
+    std::string path_;
+};
+
+TEST_F(L2IndexSerializationTest, EmptyRoundTrip) {
+    L2Index src;
+
+    LogFile wf;
+    ASSERT_TRUE(wf.create(path_).ok());
+    ASSERT_TRUE(src.writeTo(wf).ok());
+    wf.close();
+
+    L2Index dst;
+    LogFile rf;
+    ASSERT_TRUE(rf.open(path_).ok());
+    ASSERT_TRUE(dst.readFrom(rf).ok());
+    rf.close();
+
+    EXPECT_EQ(dst.entryCount(), 0u);
+    EXPECT_EQ(dst.keyCount(), 0u);
+}
+
+TEST_F(L2IndexSerializationTest, SingleEntryRoundTrip) {
+    L2Index src;
+    src.put("hello", 100, 1);
+
+    LogFile wf;
+    ASSERT_TRUE(wf.create(path_).ok());
+    ASSERT_TRUE(src.writeTo(wf).ok());
+    wf.close();
+
+    L2Index dst;
+    LogFile rf;
+    ASSERT_TRUE(rf.open(path_).ok());
+    ASSERT_TRUE(dst.readFrom(rf).ok());
+    rf.close();
+
+    EXPECT_EQ(dst.entryCount(), 1u);
+    EXPECT_EQ(dst.keyCount(), 1u);
+
+    uint32_t off, ver;
+    ASSERT_TRUE(dst.getLatest("hello", off, ver));
+    EXPECT_EQ(off, 100u);
+    EXPECT_EQ(ver, 1u);
+}
+
+TEST_F(L2IndexSerializationTest, MultiEntryRoundTrip) {
+    L2Index src;
+    src.put("a", 100, 1);
+    src.put("a", 200, 2);
+    src.put("b", 300, 3);
+    src.put("c", 400, 4);
+    src.put("c", 500, 5);
+    src.put("c", 600, 6);
+
+    LogFile wf;
+    ASSERT_TRUE(wf.create(path_).ok());
+    ASSERT_TRUE(src.writeTo(wf).ok());
+    wf.close();
+
+    L2Index dst;
+    LogFile rf;
+    ASSERT_TRUE(rf.open(path_).ok());
+    ASSERT_TRUE(dst.readFrom(rf).ok());
+    rf.close();
+
+    EXPECT_EQ(dst.entryCount(), 6u);
+    EXPECT_EQ(dst.keyCount(), 3u);
+
+    // Verify all entries preserved via getLatest.
+    uint32_t off, ver;
+    ASSERT_TRUE(dst.getLatest("a", off, ver));
+    EXPECT_EQ(off, 200u);
+    EXPECT_EQ(ver, 2u);
+
+    ASSERT_TRUE(dst.getLatest("b", off, ver));
+    EXPECT_EQ(off, 300u);
+    EXPECT_EQ(ver, 3u);
+
+    ASSERT_TRUE(dst.getLatest("c", off, ver));
+    EXPECT_EQ(off, 600u);
+    EXPECT_EQ(ver, 6u);
+}
+
+TEST_F(L2IndexSerializationTest, CorruptedChecksum) {
+    L2Index src;
+    src.put("key", 100, 1);
+
+    LogFile wf;
+    ASSERT_TRUE(wf.create(path_).ok());
+    ASSERT_TRUE(src.writeTo(wf).ok());
+    wf.close();
+
+    // Corrupt a byte in the file.
+    {
+        LogFile f;
+        ASSERT_TRUE(f.open(path_).ok());
+        uint8_t byte = 0xFF;
+        uint64_t dummy;
+        // Overwrite byte 4 (inside the header entry_count field).
+        f.append(&byte, 1, dummy);  // appends at end, won't help
+        f.close();
+
+        // Directly corrupt via POSIX write.
+        int fd = ::open(path_.c_str(), O_WRONLY);
+        ASSERT_GE(fd, 0);
+        (void)::pwrite(fd, &byte, 1, 4);
+        ::close(fd);
+    }
+
+    L2Index dst;
+    LogFile rf;
+    ASSERT_TRUE(rf.open(path_).ok());
+    Status s = dst.readFrom(rf);
+    rf.close();
+
+    // Could be checksum mismatch or a read error due to size change.
+    EXPECT_FALSE(s.ok());
+}
+
+TEST_F(L2IndexSerializationTest, BadMagic) {
+    // Write a file with bad magic.
+    {
+        LogFile f;
+        ASSERT_TRUE(f.create(path_).ok());
+        uint32_t bad_magic = 0xDEADBEEF;
+        uint32_t zeros[3] = {0, 0, 0};
+        uint64_t dummy;
+        f.append(&bad_magic, sizeof(bad_magic), dummy);
+        f.append(zeros, sizeof(zeros), dummy);
+        // Write a CRC (won't match, but magic check comes first).
+        uint32_t crc = 0;
+        f.append(&crc, sizeof(crc), dummy);
+        f.close();
+    }
+
+    L2Index dst;
+    LogFile rf;
+    ASSERT_TRUE(rf.open(path_).ok());
+    Status s = dst.readFrom(rf);
+    rf.close();
+
+    EXPECT_TRUE(s.isCorruption());
 }

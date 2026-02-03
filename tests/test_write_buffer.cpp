@@ -1,9 +1,15 @@
 #include <gtest/gtest.h>
 
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "internal/crc32.h"
+#include "internal/delta_hash_table_base.h"
+#include "internal/l2_index.h"
+#include "internal/log_file.h"
 #include "internal/write_buffer.h"
 
 using kvlite::internal::WriteBuffer;
@@ -235,4 +241,228 @@ TEST(WriteBuffer, ConcurrentPutsSameKey) {
 
     EXPECT_EQ(wb.keyCount(), 1u);
     EXPECT_EQ(wb.entryCount(), static_cast<size_t>(kThreads * kPerThread));
+}
+
+// --- Flush tests ---------------------------------------------------------
+
+using kvlite::internal::L2Index;
+using kvlite::internal::LogFile;
+using kvlite::internal::LogEntry;
+using kvlite::internal::PackedVersion;
+using kvlite::internal::crc32;
+using kvlite::internal::dhtHashBytes;
+using kvlite::Status;
+
+namespace {
+
+class FlushTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        path_ = ::testing::TempDir() + "/flush_test_" +
+                std::to_string(reinterpret_cast<uintptr_t>(this)) + ".data";
+        ASSERT_TRUE(lf_.create(path_).ok());
+    }
+
+    void TearDown() override {
+        if (lf_.isOpen()) lf_.close();
+        std::remove(path_.c_str());
+    }
+
+    // Read one LogEntry from a given offset, return bytes consumed.
+    size_t readEntry(uint64_t offset, LogEntry& out) {
+        uint8_t hdr[LogEntry::kHeaderSize];
+        EXPECT_TRUE(lf_.readAt(offset, hdr, LogEntry::kHeaderSize).ok());
+
+        uint64_t pv_data;
+        uint32_t kl, vl;
+        std::memcpy(&pv_data, hdr, 8);
+        std::memcpy(&kl, hdr + 8, 4);
+        std::memcpy(&vl, hdr + 12, 4);
+
+        out.pv = PackedVersion(pv_data);
+        out.key.resize(kl);
+        out.value.resize(vl);
+
+        if (kl > 0) {
+            EXPECT_TRUE(lf_.readAt(offset + LogEntry::kHeaderSize, out.key.data(), kl).ok());
+        }
+        if (vl > 0) {
+            EXPECT_TRUE(lf_.readAt(offset + LogEntry::kHeaderSize + kl, out.value.data(), vl).ok());
+        }
+
+        return LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
+    }
+
+    // Verify CRC of an entry at a given offset with known total size.
+    void verifyCrc(uint64_t offset, size_t total_size) {
+        std::vector<uint8_t> buf(total_size);
+        ASSERT_TRUE(lf_.readAt(offset, buf.data(), total_size).ok());
+        size_t payload_len = total_size - LogEntry::kChecksumSize;
+        uint32_t expected;
+        std::memcpy(&expected, buf.data() + payload_len, 4);
+        uint32_t actual = crc32(buf.data(), payload_len);
+        EXPECT_EQ(actual, expected);
+    }
+
+    std::string path_;
+    LogFile lf_;
+};
+
+} // namespace
+
+TEST_F(FlushTest, EmptyBuffer) {
+    WriteBuffer wb;
+    L2Index idx;
+    Status s = wb.flush(lf_, idx);
+    EXPECT_TRUE(s.ok());
+    EXPECT_EQ(lf_.size(), 0u);
+    EXPECT_EQ(idx.entryCount(), 0u);
+}
+
+TEST_F(FlushTest, SingleEntry) {
+    WriteBuffer wb;
+    L2Index idx;
+    wb.put("hello", 42, "world", false);
+
+    Status s = wb.flush(lf_, idx);
+    ASSERT_TRUE(s.ok());
+
+    size_t expected_size = LogEntry::kHeaderSize + 5 + 5 + LogEntry::kChecksumSize;
+    EXPECT_EQ(lf_.size(), expected_size);
+
+    LogEntry entry;
+    size_t consumed = readEntry(0, entry);
+    EXPECT_EQ(consumed, expected_size);
+    EXPECT_EQ(entry.key, "hello");
+    EXPECT_EQ(entry.value, "world");
+    EXPECT_EQ(entry.version(), 42u);
+    EXPECT_FALSE(entry.tombstone());
+
+    verifyCrc(0, expected_size);
+
+    // Verify L2 index
+    EXPECT_EQ(idx.entryCount(), 1u);
+    uint32_t off32, ver32;
+    ASSERT_TRUE(idx.getLatest("hello", off32, ver32));
+    EXPECT_EQ(off32, 0u);
+    EXPECT_EQ(ver32, 42u);
+}
+
+TEST_F(FlushTest, TombstoneEntry) {
+    WriteBuffer wb;
+    L2Index idx;
+    wb.put("deleted", 7, "", true);
+
+    ASSERT_TRUE(wb.flush(lf_, idx).ok());
+
+    LogEntry entry;
+    readEntry(0, entry);
+    EXPECT_EQ(entry.key, "deleted");
+    EXPECT_EQ(entry.value, "");
+    EXPECT_EQ(entry.version(), 7u);
+    EXPECT_TRUE(entry.tombstone());
+}
+
+TEST_F(FlushTest, SortOrderHashThenVersion) {
+    WriteBuffer wb;
+    L2Index idx;
+    // Insert multiple keys with multiple versions
+    wb.put("aaa", 10, "v10", false);
+    wb.put("bbb", 5, "v5", false);
+    wb.put("aaa", 3, "v3", false);
+    wb.put("bbb", 1, "v1", false);
+    wb.put("ccc", 20, "v20", false);
+
+    ASSERT_TRUE(wb.flush(lf_, idx).ok());
+
+    // Read all entries back
+    std::vector<std::pair<uint64_t, uint64_t>> order; // (hash, version)
+    uint64_t offset = 0;
+    while (offset < lf_.size()) {
+        LogEntry entry;
+        size_t sz = readEntry(offset, entry);
+        uint64_t h = dhtHashBytes(entry.key.data(), entry.key.size());
+        order.push_back({h, entry.version()});
+        verifyCrc(offset, sz);
+        offset += sz;
+    }
+
+    ASSERT_EQ(order.size(), 5u);
+
+    // Verify sorted by (hash, version) ascending
+    for (size_t i = 1; i < order.size(); ++i) {
+        EXPECT_TRUE(order[i - 1].first < order[i].first ||
+                    (order[i - 1].first == order[i].first &&
+                     order[i - 1].second <= order[i].second))
+            << "Entry " << i << " is out of order";
+    }
+}
+
+TEST_F(FlushTest, RoundTrip) {
+    WriteBuffer wb;
+    L2Index idx;
+    wb.put("key1", 1, "val1", false);
+    wb.put("key1", 2, "val2", false);
+    wb.put("key2", 3, "val3", true);
+
+    ASSERT_TRUE(wb.flush(lf_, idx).ok());
+
+    // Read all entries back and verify contents
+    std::vector<LogEntry> entries;
+    uint64_t offset = 0;
+    while (offset < lf_.size()) {
+        LogEntry entry;
+        size_t sz = readEntry(offset, entry);
+        verifyCrc(offset, sz);
+        entries.push_back(std::move(entry));
+        offset += sz;
+    }
+
+    ASSERT_EQ(entries.size(), 3u);
+
+    // Collect into a map for verification (key -> list of versions)
+    std::map<std::string, std::vector<uint64_t>> by_key;
+    for (const auto& e : entries) {
+        by_key[e.key].push_back(e.version());
+    }
+
+    ASSERT_EQ(by_key.count("key1"), 1u);
+    ASSERT_EQ(by_key["key1"].size(), 2u);
+    // Versions should be sorted ascending within same key (same hash)
+    EXPECT_LT(by_key["key1"][0], by_key["key1"][1]);
+
+    ASSERT_EQ(by_key.count("key2"), 1u);
+    ASSERT_EQ(by_key["key2"].size(), 1u);
+
+    // Verify tombstone for key2
+    for (const auto& e : entries) {
+        if (e.key == "key2") {
+            EXPECT_TRUE(e.tombstone());
+            EXPECT_EQ(e.version(), 3u);
+        }
+    }
+
+    // Verify L2 index was populated correctly
+    EXPECT_EQ(idx.entryCount(), 3u);
+    EXPECT_EQ(idx.keyCount(), 2u);
+
+    // key1 should have 2 entries; latest version is 2
+    uint32_t off32, ver32;
+    ASSERT_TRUE(idx.getLatest("key1", off32, ver32));
+    EXPECT_EQ(ver32, 2u);
+
+    // key2 should have 1 entry
+    ASSERT_TRUE(idx.getLatest("key2", off32, ver32));
+    EXPECT_EQ(ver32, 3u);
+
+    // L2 offsets should point to valid entries we can read back
+    std::vector<uint32_t> offsets, versions;
+    ASSERT_TRUE(idx.get("key1", offsets, versions));
+    ASSERT_EQ(offsets.size(), 2u);
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        LogEntry le;
+        readEntry(offsets[i], le);
+        EXPECT_EQ(le.key, "key1");
+        EXPECT_EQ(le.version(), versions[i]);
+    }
 }

@@ -1,6 +1,11 @@
 #include "internal/write_buffer.h"
 
+#include <algorithm>
 #include <unordered_map>
+
+#include "internal/crc32.h"
+#include "internal/l2_index.h"
+#include "internal/log_file.h"
 
 namespace kvlite {
 namespace internal {
@@ -282,6 +287,82 @@ void WriteBuffer::clear() {
     freeOverflow();
     size_.store(0, std::memory_order_relaxed);
     key_count_.store(0, std::memory_order_relaxed);
+}
+
+Status WriteBuffer::flush(LogFile& lf, L2Index& index) {
+    struct FlatEntry {
+        uint64_t hash;
+        uint64_t version;
+        std::string key;
+        PackedVersion pv;
+        std::string value;
+    };
+
+    // Process one bucket at a time. Iterating buckets 0..N gives hash-prefix
+    // order; we only need to sort within each bucket by (hash, version).
+    std::vector<FlatEntry> bucket_entries;
+
+    for (uint32_t bi = 0; bi < kNumBuckets; ++bi) {
+        const Bucket* b = &buckets_[bi];
+        if (b->count == 0 && b->overflow == 0) continue;
+
+        bucket_entries.clear();
+
+        while (b) {
+            for (uint32_t i = 0; i < b->count; ++i) {
+                uint32_t off = b->slots[i].offset;
+                std::string key = readKey(off);
+                uint64_t h = dhtHashBytes(key.data(), key.size());
+                PackedVersion pv = readPackedVersion(off);
+                std::string val;
+                readValue(off, val);
+                bucket_entries.push_back({h, pv.version(), std::move(key),
+                                          pv, std::move(val)});
+            }
+            b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
+        }
+
+        std::sort(bucket_entries.begin(), bucket_entries.end(),
+                  [](const FlatEntry& a, const FlatEntry& b) {
+                      if (a.hash != b.hash) return a.hash < b.hash;
+                      return a.version < b.version;
+                  });
+
+        for (const auto& e : bucket_entries) {
+            uint32_t key_len = static_cast<uint32_t>(e.key.size());
+            uint32_t val_len = static_cast<uint32_t>(e.value.size());
+            size_t entry_size = LogEntry::kHeaderSize + key_len + val_len + LogEntry::kChecksumSize;
+
+            uint8_t stack_buf[4096];
+            std::unique_ptr<uint8_t[]> heap_buf;
+            uint8_t* buf = stack_buf;
+            if (entry_size > sizeof(stack_buf)) {
+                heap_buf = std::make_unique<uint8_t[]>(entry_size);
+                buf = heap_buf.get();
+            }
+
+            uint8_t* p = buf;
+            std::memcpy(p, &e.pv.data, 8);   p += 8;
+            std::memcpy(p, &key_len, 4);      p += 4;
+            std::memcpy(p, &val_len, 4);      p += 4;
+
+            std::memcpy(p, e.key.data(), key_len);   p += key_len;
+            std::memcpy(p, e.value.data(), val_len);  p += val_len;
+
+            size_t payload_len = LogEntry::kHeaderSize + key_len + val_len;
+            uint32_t checksum = crc32(buf, payload_len);
+            std::memcpy(p, &checksum, 4);
+
+            uint64_t offset;
+            Status s = lf.append(buf, entry_size, offset);
+            if (!s.ok()) return s;
+
+            index.put(e.key, static_cast<uint32_t>(offset),
+                      static_cast<uint32_t>(e.version));
+        }
+    }
+
+    return Status::OK();
 }
 
 } // namespace internal

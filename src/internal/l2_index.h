@@ -4,12 +4,14 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <functional>
 
+#include "kvlite/status.h"
 #include "l2_delta_hash_table.h"
 
 namespace kvlite {
 namespace internal {
+
+class LogFile;
 
 // L2 Index: In-memory per-file index mapping keys to (offset, version) lists.
 //
@@ -46,9 +48,11 @@ public:
     // Check if a key exists.
     bool contains(const std::string& key) const;
 
-    // Iterate over all (offset, version) pairs.
-    void forEach(const std::function<void(uint32_t offset,
-                                          uint32_t version)>& fn) const;
+    // Serialize to a LogFile.
+    Status writeTo(LogFile& file);
+
+    // Deserialize from a LogFile (reads from current position to end).
+    Status readFrom(LogFile& file);
 
     size_t keyCount() const;
     size_t entryCount() const;

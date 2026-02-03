@@ -11,9 +11,13 @@
 
 #include "internal/delta_hash_table_base.h"
 #include "log_entry.h"
+#include "kvlite/status.h"
 
 namespace kvlite {
 namespace internal {
+
+class LogFile;
+class L2Index;
 
 // In-memory buffer for pending writes before flush to log files.
 //
@@ -58,6 +62,10 @@ public:
                                           const std::vector<Entry>&)>& fn) const;
 
     void clear();
+
+    // Flush all entries to a LogFile sorted by (hash, version) ascending.
+    // Each written entry is also recorded in the L2 index.
+    Status flush(LogFile& lf, L2Index& index);
 
     size_t keyCount() const { return key_count_.load(std::memory_order_relaxed); }
     size_t entryCount() const { return size_.load(std::memory_order_relaxed); }

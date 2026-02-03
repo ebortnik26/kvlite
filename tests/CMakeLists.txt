@@ -73,6 +73,7 @@ add_executable(kvlite_l2_test
     ${CMAKE_SOURCE_DIR}/src/internal/l2_lslot_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/l2_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/l2_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 
@@ -93,6 +94,11 @@ target_link_libraries(kvlite_l2_test
 add_executable(kvlite_wb_test
     test_write_buffer.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_delta_hash_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_lslot_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 
 target_include_directories(kvlite_wb_test
