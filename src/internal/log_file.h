@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <string>
-#include <mutex>
 
 #include "kvlite/status.h"
 
@@ -15,7 +14,8 @@ namespace internal {
 // File naming: log_NNNNNNNN.data (e.g., log_00000001.data)
 // Each log file has a corresponding L2 index: log_NNNNNNNN.idx
 //
-// Thread-safety: append() is serialized via mutex.
+// Thread-safety: not thread-safe. append() is intended to be called
+// from a single-threaded context (e.g. WriteBuffer::flush).
 // readAt() uses pread and is safe for concurrent reads.
 class LogFile {
 public:
@@ -38,6 +38,7 @@ public:
     Status close();
 
     // Append raw bytes. Returns the byte offset where data was written.
+    // Not thread-safe; caller must serialize.
     Status append(const void* data, size_t len, uint64_t& offset);
 
     // Read bytes at a given offset (pread).
@@ -64,7 +65,6 @@ private:
     int fd_ = -1;
     std::string path_;
     uint64_t size_ = 0;
-    mutable std::mutex mutex_;
 };
 
 } // namespace internal

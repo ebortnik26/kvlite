@@ -98,8 +98,6 @@ Status LogFile::append(const void* data, size_t len, uint64_t& offset) {
         return Status::IOError("file not open");
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-
     offset = size_;
     const char* ptr = static_cast<const char*>(data);
     size_t remaining = len;
