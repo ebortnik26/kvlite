@@ -35,6 +35,7 @@ set(KVLITE_SOURCES
     src/internal/l2_delta_hash_table.cpp
     src/internal/l2_index.cpp
     src/internal/write_buffer.cpp
+    src/internal/log_file.cpp
 )
 
 # Create library
