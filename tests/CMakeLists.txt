@@ -89,9 +89,29 @@ target_link_libraries(kvlite_l2_test
         pthread
 )
 
+# WriteBuffer tests
+add_executable(kvlite_wb_test
+    test_write_buffer.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
+)
+
+target_include_directories(kvlite_wb_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_wb_test
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
 # Register tests with CTest
 include(GoogleTest)
 gtest_discover_tests(kvlite_test)
 gtest_discover_tests(kvlite_bitstream_test)
 gtest_discover_tests(kvlite_dht_test)
 gtest_discover_tests(kvlite_l2_test)
+gtest_discover_tests(kvlite_wb_test)
