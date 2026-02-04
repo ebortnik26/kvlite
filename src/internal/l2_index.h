@@ -26,6 +26,11 @@ public:
     L2Index();
     ~L2Index();
 
+    L2Index(const L2Index&) = delete;
+    L2Index& operator=(const L2Index&) = delete;
+    L2Index(L2Index&&) noexcept;
+    L2Index& operator=(L2Index&&) noexcept;
+
     // Append (offset, version) to key's list.
     void put(const std::string& key, uint32_t offset, uint32_t version);
 

@@ -77,6 +77,11 @@ protected:
 
     ~DeltaHashTableBase() = default;
 
+    DeltaHashTableBase(const DeltaHashTableBase&) = delete;
+    DeltaHashTableBase& operator=(const DeltaHashTableBase&) = delete;
+    DeltaHashTableBase(DeltaHashTableBase&&) noexcept = default;
+    DeltaHashTableBase& operator=(DeltaHashTableBase&&) noexcept = default;
+
     // --- Hash decomposition ---
 
     uint64_t hashKey(const std::string& key) const {

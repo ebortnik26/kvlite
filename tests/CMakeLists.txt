@@ -94,6 +94,7 @@ target_link_libraries(kvlite_l2_test
 add_executable(kvlite_wb_test
     test_write_buffer.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/l2_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/l2_delta_hash_table.cpp
@@ -108,6 +109,30 @@ target_include_directories(kvlite_wb_test
 )
 
 target_link_libraries(kvlite_wb_test
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
+# Segment tests
+add_executable(kvlite_seg_test
+    test_segment.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_delta_hash_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_lslot_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/status.cpp
+)
+
+target_include_directories(kvlite_seg_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_seg_test
     PRIVATE
         GTest::gtest
         GTest::gtest_main
@@ -141,4 +166,5 @@ gtest_discover_tests(kvlite_bitstream_test)
 gtest_discover_tests(kvlite_dht_test)
 gtest_discover_tests(kvlite_l2_test)
 gtest_discover_tests(kvlite_wb_test)
+gtest_discover_tests(kvlite_seg_test)
 gtest_discover_tests(kvlite_lf_test)

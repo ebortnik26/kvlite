@@ -16,8 +16,7 @@
 namespace kvlite {
 namespace internal {
 
-class LogFile;
-class L2Index;
+class Segment;
 
 // In-memory buffer for pending writes before flush to log files.
 //
@@ -63,9 +62,10 @@ public:
 
     void clear();
 
-    // Flush all entries to a LogFile sorted by (hash, version) ascending.
-    // Each written entry is also recorded in the L2 index.
-    Status flush(LogFile& lf, L2Index& index);
+    // Flush all entries to a new Segment.
+    // Creates a LogFile at path, writes entries sorted by (hash, version)
+    // ascending, and records each in the Segment's L2 index.
+    Status flush(const std::string& path, Segment& out);
 
     size_t keyCount() const { return key_count_.load(std::memory_order_relaxed); }
     size_t entryCount() const { return size_.load(std::memory_order_relaxed); }

@@ -12,6 +12,8 @@ L2DeltaHashTable::L2DeltaHashTable(const Config& config)
     : Base(config) {}
 
 L2DeltaHashTable::~L2DeltaHashTable() = default;
+L2DeltaHashTable::L2DeltaHashTable(L2DeltaHashTable&&) noexcept = default;
+L2DeltaHashTable& L2DeltaHashTable::operator=(L2DeltaHashTable&&) noexcept = default;
 
 // --- Find ---
 

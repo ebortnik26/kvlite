@@ -4,8 +4,7 @@
 #include <unordered_map>
 
 #include "internal/crc32.h"
-#include "internal/l2_index.h"
-#include "internal/log_file.h"
+#include "internal/segment.h"
 
 namespace kvlite {
 namespace internal {
@@ -289,7 +288,10 @@ void WriteBuffer::clear() {
     key_count_.store(0, std::memory_order_relaxed);
 }
 
-Status WriteBuffer::flush(LogFile& lf, L2Index& index) {
+Status WriteBuffer::flush(const std::string& path, Segment& out) {
+    Status s = out.create(path);
+    if (!s.ok()) return s;
+
     struct FlatEntry {
         uint64_t hash;
         uint64_t version;
@@ -354,11 +356,11 @@ Status WriteBuffer::flush(LogFile& lf, L2Index& index) {
             std::memcpy(p, &checksum, 4);
 
             uint64_t offset;
-            Status s = lf.append(buf, entry_size, offset);
+            s = out.append(buf, entry_size, offset);
             if (!s.ok()) return s;
 
-            index.put(e.key, static_cast<uint32_t>(offset),
-                      static_cast<uint32_t>(e.version));
+            out.addIndex(e.key, static_cast<uint32_t>(offset),
+                         static_cast<uint32_t>(e.version));
         }
     }
 

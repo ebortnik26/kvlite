@@ -35,6 +35,8 @@ static L2DeltaHashTable::Config defaultDHTConfig() {
 L2Index::L2Index() : dht_(defaultDHTConfig()) {}
 
 L2Index::~L2Index() = default;
+L2Index::L2Index(L2Index&&) noexcept = default;
+L2Index& L2Index::operator=(L2Index&&) noexcept = default;
 
 void L2Index::put(const std::string& key, uint32_t offset, uint32_t version) {
     bool is_new = !dht_.contains(key);

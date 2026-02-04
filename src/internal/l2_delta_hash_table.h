@@ -36,8 +36,8 @@ public:
 
     L2DeltaHashTable(const L2DeltaHashTable&) = delete;
     L2DeltaHashTable& operator=(const L2DeltaHashTable&) = delete;
-    L2DeltaHashTable(L2DeltaHashTable&&) = delete;
-    L2DeltaHashTable& operator=(L2DeltaHashTable&&) = delete;
+    L2DeltaHashTable(L2DeltaHashTable&&) noexcept;
+    L2DeltaHashTable& operator=(L2DeltaHashTable&&) noexcept;
 
     // Add an (offset, version) pair for a key's fingerprint.
     void addEntry(const std::string& key, uint32_t offset, uint32_t version);
