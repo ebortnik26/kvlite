@@ -1,6 +1,7 @@
 #include "internal/segment.h"
 
 #include <cstring>
+#include <memory>
 
 namespace kvlite {
 namespace internal {
@@ -108,53 +109,131 @@ Status Segment::close() {
 
 // --- Write ---
 
-Status Segment::append(const void* data, size_t len, uint64_t& offset) {
+Status Segment::put(const std::string& key, uint64_t version,
+                    const std::string& value, bool tombstone) {
     if (state_ != State::kWriting) {
-        return Status::InvalidArgument("Segment: append requires Writing state");
+        return Status::InvalidArgument("Segment: put requires Writing state");
     }
-    Status s = log_file_.append(data, len, offset);
-    if (s.ok()) {
-        data_size_ = offset + len;
-    }
-    return s;
-}
 
-Status Segment::addIndex(const std::string& key, uint32_t offset, uint32_t version) {
-    if (state_ != State::kWriting) {
-        return Status::InvalidArgument("Segment: addIndex requires Writing state");
+    PackedVersion pv(version, tombstone);
+    uint32_t key_len = static_cast<uint32_t>(key.size());
+    uint32_t val_len = static_cast<uint32_t>(value.size());
+    size_t entry_size = LogEntry::kHeaderSize + key_len + val_len +
+                        LogEntry::kChecksumSize;
+
+    uint8_t stack_buf[4096];
+    std::unique_ptr<uint8_t[]> heap_buf;
+    uint8_t* buf = stack_buf;
+    if (entry_size > sizeof(stack_buf)) {
+        heap_buf = std::make_unique<uint8_t[]>(entry_size);
+        buf = heap_buf.get();
     }
-    index_.put(key, offset, version);
+
+    uint8_t* p = buf;
+    std::memcpy(p, &pv.data, 8);   p += 8;
+    std::memcpy(p, &key_len, 4);   p += 4;
+    std::memcpy(p, &val_len, 4);   p += 4;
+    std::memcpy(p, key.data(), key_len);   p += key_len;
+    std::memcpy(p, value.data(), val_len);  p += val_len;
+
+    size_t payload_len = LogEntry::kHeaderSize + key_len + val_len;
+    uint32_t checksum = crc32(buf, payload_len);
+    std::memcpy(p, &checksum, 4);
+
+    uint64_t offset;
+    Status s = log_file_.append(buf, entry_size, offset);
+    if (!s.ok()) return s;
+
+    data_size_ = offset + entry_size;
+    index_.put(key, static_cast<uint32_t>(offset),
+               static_cast<uint32_t>(version));
     return Status::OK();
 }
 
 // --- Read ---
 
-Status Segment::readAt(uint64_t offset, void* buf, size_t len) {
-    if (state_ != State::kReadable) {
-        return Status::InvalidArgument("Segment: readAt requires Readable state");
+Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {
+    // Read header to learn key/value lengths.
+    uint8_t hdr[LogEntry::kHeaderSize];
+    Status s = log_file_.readAt(offset, hdr, LogEntry::kHeaderSize);
+    if (!s.ok()) return s;
+
+    uint64_t pv_data;
+    uint32_t kl, vl;
+    std::memcpy(&pv_data, hdr, 8);
+    std::memcpy(&kl, hdr + 8, 4);
+    std::memcpy(&vl, hdr + 12, 4);
+
+    // Read full entry for CRC validation.
+    size_t entry_size = LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
+    uint8_t stack_buf[4096];
+    std::unique_ptr<uint8_t[]> heap_buf;
+    uint8_t* buf = stack_buf;
+    if (entry_size > sizeof(stack_buf)) {
+        heap_buf = std::make_unique<uint8_t[]>(entry_size);
+        buf = heap_buf.get();
     }
-    return log_file_.readAt(offset, buf, len);
+
+    s = log_file_.readAt(offset, buf, entry_size);
+    if (!s.ok()) return s;
+
+    // Validate CRC.
+    size_t payload_len = LogEntry::kHeaderSize + kl + vl;
+    uint32_t stored_crc;
+    std::memcpy(&stored_crc, buf + payload_len, 4);
+    uint32_t computed_crc = crc32(buf, payload_len);
+    if (stored_crc != computed_crc) {
+        return Status::Corruption("Segment: CRC mismatch at offset " +
+                                  std::to_string(offset));
+    }
+
+    entry.pv = PackedVersion(pv_data);
+    entry.key.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize), kl);
+    entry.value.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize + kl), vl);
+    return Status::OK();
 }
 
-// --- Index queries ---
-
-bool Segment::getLatest(const std::string& key,
-                        uint32_t& offset, uint32_t& version) const {
-    if (state_ != State::kReadable) return false;
-    return index_.getLatest(key, offset, version);
+Status Segment::getLatest(const std::string& key, LogEntry& entry) const {
+    if (state_ != State::kReadable) {
+        return Status::InvalidArgument("Segment: getLatest requires Readable state");
+    }
+    uint32_t offset, version;
+    if (!index_.getLatest(key, offset, version)) {
+        return Status::NotFound("key not found");
+    }
+    return readEntry(offset, entry);
 }
 
-bool Segment::get(const std::string& key,
-                  std::vector<uint32_t>& offsets,
-                  std::vector<uint32_t>& versions) const {
-    if (state_ != State::kReadable) return false;
-    return index_.get(key, offsets, versions);
+Status Segment::get(const std::string& key,
+                    std::vector<LogEntry>& entries) const {
+    if (state_ != State::kReadable) {
+        return Status::InvalidArgument("Segment: get requires Readable state");
+    }
+    std::vector<uint32_t> offsets, versions;
+    if (!index_.get(key, offsets, versions)) {
+        return Status::NotFound("key not found");
+    }
+    entries.clear();
+    entries.reserve(offsets.size());
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        LogEntry entry;
+        Status s = readEntry(offsets[i], entry);
+        if (!s.ok()) return s;
+        entries.push_back(std::move(entry));
+    }
+    return Status::OK();
 }
 
-bool Segment::get(const std::string& key, uint64_t upper_bound,
-                  uint64_t& offset, uint64_t& version) const {
-    if (state_ != State::kReadable) return false;
-    return index_.get(key, upper_bound, offset, version);
+Status Segment::get(const std::string& key, uint64_t upper_bound,
+                    LogEntry& entry) const {
+    if (state_ != State::kReadable) {
+        return Status::InvalidArgument("Segment: get requires Readable state");
+    }
+    uint64_t offset, version;
+    if (!index_.get(key, upper_bound, offset, version)) {
+        return Status::NotFound("key not found");
+    }
+    return readEntry(offset, entry);
 }
 
 bool Segment::contains(const std::string& key) const {

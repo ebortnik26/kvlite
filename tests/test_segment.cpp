@@ -29,49 +29,10 @@ protected:
         std::remove(path_.c_str());
     }
 
-    // Write a LogEntry into the segment and record it in the index.
-    uint64_t writeEntry(const std::string& key, uint64_t version,
-                        const std::string& value, bool tombstone) {
-        PackedVersion pv(version, tombstone);
-        uint32_t key_len = static_cast<uint32_t>(key.size());
-        uint32_t val_len = static_cast<uint32_t>(value.size());
-        size_t entry_size = LogEntry::kHeaderSize + key_len + val_len +
-                            LogEntry::kChecksumSize;
-
-        std::vector<uint8_t> buf(entry_size);
-        uint8_t* p = buf.data();
-        std::memcpy(p, &pv.data, 8);   p += 8;
-        std::memcpy(p, &key_len, 4);   p += 4;
-        std::memcpy(p, &val_len, 4);   p += 4;
-        std::memcpy(p, key.data(), key_len);   p += key_len;
-        std::memcpy(p, value.data(), val_len);  p += val_len;
-        uint32_t crc = 0;
-        std::memcpy(p, &crc, 4);
-
-        uint64_t offset;
-        EXPECT_TRUE(seg_.append(buf.data(), entry_size, offset).ok());
-        EXPECT_TRUE(seg_.addIndex(key, static_cast<uint32_t>(offset),
-                                  static_cast<uint32_t>(version)).ok());
-        return offset;
-    }
-
-    // Read back key and version from a raw offset.
-    void readBack(Segment& seg, uint64_t offset,
-                  std::string& key, uint64_t& version) {
-        uint8_t hdr[LogEntry::kHeaderSize];
-        ASSERT_TRUE(seg.readAt(offset, hdr, LogEntry::kHeaderSize).ok());
-
-        uint64_t pv_data;
-        uint32_t kl;
-        std::memcpy(&pv_data, hdr, 8);
-        std::memcpy(&kl, hdr + 8, 4);
-
-        version = PackedVersion(pv_data).version();
-        key.resize(kl);
-        if (kl > 0) {
-            ASSERT_TRUE(seg.readAt(offset + LogEntry::kHeaderSize,
-                                   key.data(), kl).ok());
-        }
+    // Write a LogEntry into the segment via the high-level put API.
+    void writeEntry(const std::string& key, uint64_t version,
+                    const std::string& value, bool tombstone) {
+        ASSERT_TRUE(seg_.put(key, version, value, tombstone).ok());
     }
 
     std::string path_;
@@ -158,50 +119,40 @@ TEST_F(SegmentTest, SealWhileReadableFails) {
     EXPECT_FALSE(seg_.seal().ok());
 }
 
-TEST_F(SegmentTest, AppendWhileClosedFails) {
-    uint64_t off;
-    EXPECT_FALSE(seg_.append("x", 1, off).ok());
+TEST_F(SegmentTest, PutWhileClosedFails) {
+    EXPECT_FALSE(seg_.put("x", 1, "", false).ok());
 }
 
-TEST_F(SegmentTest, AppendWhileReadableFails) {
+TEST_F(SegmentTest, PutWhileReadableFails) {
     ASSERT_TRUE(seg_.create(path_).ok());
     ASSERT_TRUE(seg_.seal().ok());
-    uint64_t off;
-    EXPECT_FALSE(seg_.append("x", 1, off).ok());
+    EXPECT_FALSE(seg_.put("k", 1, "", false).ok());
 }
 
-TEST_F(SegmentTest, AddIndexWhileReadableFails) {
+TEST_F(SegmentTest, GetLatestWhileWritingFails) {
     ASSERT_TRUE(seg_.create(path_).ok());
-    ASSERT_TRUE(seg_.seal().ok());
-    EXPECT_FALSE(seg_.addIndex("k", 0, 1).ok());
+    writeEntry("k", 1, "v", false);
+    LogEntry entry;
+    EXPECT_FALSE(seg_.getLatest("k", entry).ok());
 }
 
-TEST_F(SegmentTest, ReadAtWhileWritingFails) {
-    ASSERT_TRUE(seg_.create(path_).ok());
-    uint64_t off;
-    ASSERT_TRUE(seg_.append("hello", 5, off).ok());
-    char buf[5];
-    EXPECT_FALSE(seg_.readAt(0, buf, 5).ok());
+TEST_F(SegmentTest, GetLatestWhileClosedFails) {
+    LogEntry entry;
+    EXPECT_FALSE(seg_.getLatest("k", entry).ok());
 }
 
-TEST_F(SegmentTest, ReadAtWhileClosedFails) {
-    char buf[1];
-    EXPECT_FALSE(seg_.readAt(0, buf, 1).ok());
-}
-
-TEST_F(SegmentTest, QueriesWhileWritingReturnFalse) {
+TEST_F(SegmentTest, QueriesWhileWritingFail) {
     ASSERT_TRUE(seg_.create(path_).ok());
     writeEntry("k", 1, "v", false);
 
-    uint32_t off, ver;
-    EXPECT_FALSE(seg_.getLatest("k", off, ver));
+    LogEntry entry;
+    EXPECT_FALSE(seg_.getLatest("k", entry).ok());
     EXPECT_FALSE(seg_.contains("k"));
 
-    std::vector<uint32_t> offsets, versions;
-    EXPECT_FALSE(seg_.get("k", offsets, versions));
+    std::vector<LogEntry> entries;
+    EXPECT_FALSE(seg_.get("k", entries).ok());
 
-    uint64_t off64, ver64;
-    EXPECT_FALSE(seg_.get("k", 100u, off64, ver64));
+    EXPECT_FALSE(seg_.get("k", 100u, entry).ok());
 }
 
 // --- Create error ---
@@ -214,37 +165,33 @@ TEST_F(SegmentTest, CreateNonExistentDir) {
 
 // --- Write tests ---
 
-TEST_F(SegmentTest, AppendAndDataSize) {
+TEST_F(SegmentTest, PutAndDataSize) {
     ASSERT_TRUE(seg_.create(path_).ok());
-
-    uint64_t offset;
-    ASSERT_TRUE(seg_.append("hello", 5, offset).ok());
-    EXPECT_EQ(offset, 0u);
-    EXPECT_EQ(seg_.dataSize(), 5u);
+    ASSERT_TRUE(seg_.put("hello", 1, "world", false).ok());
+    EXPECT_GT(seg_.dataSize(), 0u);
 }
 
-TEST_F(SegmentTest, MultipleAppends) {
+TEST_F(SegmentTest, MultiplePuts) {
     ASSERT_TRUE(seg_.create(path_).ok());
 
-    uint64_t off1, off2;
-    ASSERT_TRUE(seg_.append("aaa", 3, off1).ok());
-    ASSERT_TRUE(seg_.append("bbb", 3, off2).ok());
-    EXPECT_EQ(off1, 0u);
-    EXPECT_EQ(off2, 3u);
-    EXPECT_EQ(seg_.dataSize(), 6u);
+    ASSERT_TRUE(seg_.put("aaa", 1, "v1", false).ok());
+    uint64_t size1 = seg_.dataSize();
+    ASSERT_TRUE(seg_.put("bbb", 2, "v2", false).ok());
+    EXPECT_GT(seg_.dataSize(), size1);
 }
 
 // --- Seal + read tests ---
 
-TEST_F(SegmentTest, SealThenReadAt) {
+TEST_F(SegmentTest, SealThenGetLatest) {
     ASSERT_TRUE(seg_.create(path_).ok());
-    uint64_t off;
-    ASSERT_TRUE(seg_.append("hello", 5, off).ok());
+    writeEntry("hello", 1, "world", false);
     ASSERT_TRUE(seg_.seal().ok());
 
-    char buf[5] = {};
-    ASSERT_TRUE(seg_.readAt(0, buf, 5).ok());
-    EXPECT_EQ(std::string(buf, 5), "hello");
+    LogEntry entry;
+    ASSERT_TRUE(seg_.getLatest("hello", entry).ok());
+    EXPECT_EQ(entry.key, "hello");
+    EXPECT_EQ(entry.value, "world");
+    EXPECT_EQ(entry.version(), 1u);
 }
 
 TEST_F(SegmentTest, SealThenQueryIndex) {
@@ -264,12 +211,14 @@ TEST_F(SegmentTest, SealThenQueryIndex) {
     EXPECT_TRUE(seg_.contains("key2"));
     EXPECT_FALSE(seg_.contains("key3"));
 
-    uint32_t off, ver;
-    ASSERT_TRUE(seg_.getLatest("key1", off, ver));
-    EXPECT_EQ(ver, 2u);
+    LogEntry entry;
+    ASSERT_TRUE(seg_.getLatest("key1", entry).ok());
+    EXPECT_EQ(entry.version(), 2u);
+    EXPECT_EQ(entry.value, "val2");
 
-    ASSERT_TRUE(seg_.getLatest("key2", off, ver));
-    EXPECT_EQ(ver, 5u);
+    ASSERT_TRUE(seg_.getLatest("key2", entry).ok());
+    EXPECT_EQ(entry.version(), 5u);
+    EXPECT_TRUE(entry.tombstone());
 }
 
 TEST_F(SegmentTest, GetAllVersionsAfterSeal) {
@@ -279,16 +228,12 @@ TEST_F(SegmentTest, GetAllVersionsAfterSeal) {
     writeEntry("k", 30, "c", false);
     ASSERT_TRUE(seg_.seal().ok());
 
-    std::vector<uint32_t> offsets, versions;
-    ASSERT_TRUE(seg_.get("k", offsets, versions));
-    ASSERT_EQ(versions.size(), 3u);
+    std::vector<LogEntry> entries;
+    ASSERT_TRUE(seg_.get("k", entries).ok());
+    ASSERT_EQ(entries.size(), 3u);
 
-    for (size_t i = 0; i < offsets.size(); ++i) {
-        std::string key;
-        uint64_t ver;
-        readBack(seg_, offsets[i], key, ver);
-        EXPECT_EQ(key, "k");
-        EXPECT_EQ(ver, versions[i]);
+    for (const auto& e : entries) {
+        EXPECT_EQ(e.key, "k");
     }
 }
 
@@ -299,14 +244,15 @@ TEST_F(SegmentTest, GetByUpperBoundAfterSeal) {
     writeEntry("k", 30, "c", false);
     ASSERT_TRUE(seg_.seal().ok());
 
-    uint64_t off, ver;
-    ASSERT_TRUE(seg_.get("k", 25u, off, ver));
-    EXPECT_EQ(ver, 20u);
+    LogEntry entry;
+    ASSERT_TRUE(seg_.get("k", 25u, entry).ok());
+    EXPECT_EQ(entry.version(), 20u);
+    EXPECT_EQ(entry.value, "b");
 
-    ASSERT_TRUE(seg_.get("k", 10u, off, ver));
-    EXPECT_EQ(ver, 10u);
+    ASSERT_TRUE(seg_.get("k", 10u, entry).ok());
+    EXPECT_EQ(entry.version(), 10u);
 
-    EXPECT_FALSE(seg_.get("k", 5u, off, ver));
+    EXPECT_FALSE(seg_.get("k", 5u, entry).ok());
 }
 
 // --- Seal + open round-trip ---
@@ -340,26 +286,21 @@ TEST_F(SegmentTest, SealAndOpenRoundTrip) {
     EXPECT_EQ(loaded.entryCount(), 3u);
     EXPECT_EQ(loaded.keyCount(), 2u);
 
-    uint32_t off, ver;
-    ASSERT_TRUE(loaded.getLatest("alpha", off, ver));
-    EXPECT_EQ(ver, 2u);
+    LogEntry entry;
+    ASSERT_TRUE(loaded.getLatest("alpha", entry).ok());
+    EXPECT_EQ(entry.version(), 2u);
+    EXPECT_EQ(entry.value, "v2");
 
-    ASSERT_TRUE(loaded.getLatest("beta", off, ver));
-    EXPECT_EQ(ver, 10u);
+    ASSERT_TRUE(loaded.getLatest("beta", entry).ok());
+    EXPECT_EQ(entry.version(), 10u);
+    EXPECT_EQ(entry.key, "beta");
+    EXPECT_TRUE(entry.tombstone());
 
-    std::string key;
-    uint64_t v;
-    readBack(loaded, off, key, v);
-    EXPECT_EQ(key, "beta");
-    EXPECT_EQ(v, 10u);
-
-    std::vector<uint32_t> offsets, versions;
-    ASSERT_TRUE(loaded.get("alpha", offsets, versions));
-    ASSERT_EQ(offsets.size(), 2u);
-    for (size_t i = 0; i < offsets.size(); ++i) {
-        readBack(loaded, offsets[i], key, v);
-        EXPECT_EQ(key, "alpha");
-        EXPECT_EQ(v, versions[i]);
+    std::vector<LogEntry> entries;
+    ASSERT_TRUE(loaded.get("alpha", entries).ok());
+    ASSERT_EQ(entries.size(), 2u);
+    for (const auto& e : entries) {
+        EXPECT_EQ(e.key, "alpha");
     }
 
     loaded.close();
@@ -375,8 +316,7 @@ TEST_F(SegmentTest, OpenMissingFile) {
 
 TEST_F(SegmentTest, OpenTruncatedFile) {
     ASSERT_TRUE(seg_.create(path_).ok());
-    uint64_t off;
-    ASSERT_TRUE(seg_.append("x", 1, off).ok());
+    ASSERT_TRUE(seg_.put("x", 1, "v", false).ok());
     seg_.close();
 
     Segment loaded;
@@ -385,11 +325,12 @@ TEST_F(SegmentTest, OpenTruncatedFile) {
 }
 
 TEST_F(SegmentTest, OpenBadMagic) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    // Write 12 zero bytes (invalid footer) directly via POSIX I/O.
+    int fd = ::open(path_.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
     uint8_t zeros[12] = {};
-    uint64_t off;
-    ASSERT_TRUE(seg_.append(zeros, 12, off).ok());
-    seg_.close();
+    ASSERT_EQ(::write(fd, zeros, 12), 12);
+    ::close(fd);
 
     Segment loaded;
     EXPECT_FALSE(loaded.open(path_).ok());
@@ -415,16 +356,19 @@ TEST_F(SegmentTest, OpenDataWrittenWithFakeFooter) {
     // the index_offset points into the data region (no real L2 index).
     ASSERT_TRUE(seg_.create(path_).ok());
     writeEntry("key1", 1, "val1", false);
-    // Append a footer that claims the index starts at offset 0
-    // (inside the data region — readFrom should fail).
+    seg_.close();
+
+    // Append a fake footer that claims the index starts at offset 0
+    // (inside the data region -- readFrom should fail).
+    int fd = ::open(path_.c_str(), O_WRONLY | O_APPEND);
+    ASSERT_GE(fd, 0);
     uint8_t footer[12];
     uint64_t fake_index_offset = 0;
     uint32_t magic = 0x53454746;  // "SEGF"
     std::memcpy(footer, &fake_index_offset, 8);
     std::memcpy(footer + 8, &magic, 4);
-    uint64_t off;
-    ASSERT_TRUE(seg_.append(footer, 12, off).ok());
-    seg_.close();
+    ASSERT_EQ(::write(fd, footer, 12), 12);
+    ::close(fd);
 
     Segment loaded;
     Status s = loaded.open(path_);
@@ -436,15 +380,18 @@ TEST_F(SegmentTest, OpenIndexOffsetBeyondFile) {
     // Footer is valid but index_offset points past the end of the file.
     ASSERT_TRUE(seg_.create(path_).ok());
     writeEntry("key1", 1, "val1", false);
+    seg_.close();
 
+    // Append a footer with an out-of-bounds index offset.
+    int fd = ::open(path_.c_str(), O_WRONLY | O_APPEND);
+    ASSERT_GE(fd, 0);
     uint8_t footer[12];
     uint64_t bad_offset = 999999;
     uint32_t magic = 0x53454746;
     std::memcpy(footer, &bad_offset, 8);
     std::memcpy(footer + 8, &magic, 4);
-    uint64_t off;
-    ASSERT_TRUE(seg_.append(footer, 12, off).ok());
-    seg_.close();
+    ASSERT_EQ(::write(fd, footer, 12), 12);
+    ::close(fd);
 
     Segment loaded;
     Status s = loaded.open(path_);
@@ -495,9 +442,9 @@ TEST_F(SegmentTest, MoveConstructReadable) {
     Segment moved(std::move(seg_));
     EXPECT_EQ(moved.state(), Segment::State::kReadable);
 
-    uint32_t off, ver;
-    ASSERT_TRUE(moved.getLatest("k", off, ver));
-    EXPECT_EQ(ver, 1u);
+    LogEntry entry;
+    ASSERT_TRUE(moved.getLatest("k", entry).ok());
+    EXPECT_EQ(entry.version(), 1u);
     moved.close();
 }
 
@@ -510,8 +457,8 @@ TEST_F(SegmentTest, MoveAssign) {
     other = std::move(seg_);
     EXPECT_EQ(other.state(), Segment::State::kReadable);
 
-    uint32_t off, ver;
-    ASSERT_TRUE(other.getLatest("k", off, ver));
-    EXPECT_EQ(ver, 1u);
+    LogEntry entry;
+    ASSERT_TRUE(other.getLatest("k", entry).ok());
+    EXPECT_EQ(entry.version(), 1u);
     other.close();
 }

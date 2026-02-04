@@ -116,7 +116,7 @@ Status LogFile::append(const void* data, size_t len, uint64_t& offset) {
     return Status::OK();
 }
 
-Status LogFile::readAt(uint64_t offset, void* buf, size_t len) {
+Status LogFile::readAt(uint64_t offset, void* buf, size_t len) const {
     if (!isOpen()) {
         return Status::IOError("file not open");
     }

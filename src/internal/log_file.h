@@ -40,8 +40,8 @@ public:
     // Not thread-safe; caller must serialize.
     Status append(const void* data, size_t len, uint64_t& offset);
 
-    // Read bytes at a given offset (pread).
-    Status readAt(uint64_t offset, void* buf, size_t len);
+    // Read bytes at a given offset (pread). Const: pread doesn't mutate state.
+    Status readAt(uint64_t offset, void* buf, size_t len) const;
 
     // Sync data to disk (fdatasync).
     Status sync();

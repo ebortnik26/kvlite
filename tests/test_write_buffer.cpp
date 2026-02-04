@@ -2,8 +2,10 @@
 
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "internal/crc32.h"
@@ -265,10 +267,19 @@ protected:
         std::remove(path_.c_str());
     }
 
+    // Read raw bytes from the segment file via pread.
+    void rawRead(uint64_t offset, void* buf, size_t len) {
+        int fd = ::open(path_.c_str(), O_RDONLY);
+        ASSERT_GE(fd, 0);
+        ssize_t n = ::pread(fd, buf, len, static_cast<off_t>(offset));
+        ::close(fd);
+        ASSERT_EQ(static_cast<size_t>(n), len);
+    }
+
     // Read one LogEntry from a given offset, return bytes consumed.
     size_t readEntry(uint64_t offset, LogEntry& out) {
         uint8_t hdr[LogEntry::kHeaderSize];
-        EXPECT_TRUE(seg_.readAt(offset, hdr, LogEntry::kHeaderSize).ok());
+        rawRead(offset, hdr, LogEntry::kHeaderSize);
 
         uint64_t pv_data;
         uint32_t kl, vl;
@@ -281,10 +292,10 @@ protected:
         out.value.resize(vl);
 
         if (kl > 0) {
-            EXPECT_TRUE(seg_.readAt(offset + LogEntry::kHeaderSize, out.key.data(), kl).ok());
+            rawRead(offset + LogEntry::kHeaderSize, out.key.data(), kl);
         }
         if (vl > 0) {
-            EXPECT_TRUE(seg_.readAt(offset + LogEntry::kHeaderSize + kl, out.value.data(), vl).ok());
+            rawRead(offset + LogEntry::kHeaderSize + kl, out.value.data(), vl);
         }
 
         return LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
@@ -293,7 +304,7 @@ protected:
     // Verify CRC of an entry at a given offset with known total size.
     void verifyCrc(uint64_t offset, size_t total_size) {
         std::vector<uint8_t> buf(total_size);
-        ASSERT_TRUE(seg_.readAt(offset, buf.data(), total_size).ok());
+        rawRead(offset, buf.data(), total_size);
         size_t payload_len = total_size - LogEntry::kChecksumSize;
         uint32_t expected;
         std::memcpy(&expected, buf.data() + payload_len, 4);
@@ -335,10 +346,9 @@ TEST_F(FlushTest, SingleEntry) {
 
     // Verify L2 index
     EXPECT_EQ(seg_.entryCount(), 1u);
-    uint32_t off32, ver32;
-    ASSERT_TRUE(seg_.getLatest("hello", off32, ver32));
-    EXPECT_EQ(off32, 0u);
-    EXPECT_EQ(ver32, 42u);
+    LogEntry latest;
+    ASSERT_TRUE(seg_.getLatest("hello", latest).ok());
+    EXPECT_EQ(latest.version(), 42u);
 }
 
 TEST_F(FlushTest, TombstoneEntry) {
@@ -437,23 +447,20 @@ TEST_F(FlushTest, RoundTrip) {
     EXPECT_EQ(seg_.keyCount(), 2u);
 
     // key1 should have 2 entries; latest version is 2
-    uint32_t off32, ver32;
-    ASSERT_TRUE(seg_.getLatest("key1", off32, ver32));
-    EXPECT_EQ(ver32, 2u);
+    LogEntry latest;
+    ASSERT_TRUE(seg_.getLatest("key1", latest).ok());
+    EXPECT_EQ(latest.version(), 2u);
 
     // key2 should have 1 entry
-    ASSERT_TRUE(seg_.getLatest("key2", off32, ver32));
-    EXPECT_EQ(ver32, 3u);
+    ASSERT_TRUE(seg_.getLatest("key2", latest).ok());
+    EXPECT_EQ(latest.version(), 3u);
 
-    // L2 offsets should point to valid entries we can read back
-    std::vector<uint32_t> offsets, versions;
-    ASSERT_TRUE(seg_.get("key1", offsets, versions));
-    ASSERT_EQ(offsets.size(), 2u);
-    for (size_t i = 0; i < offsets.size(); ++i) {
-        LogEntry le;
-        readEntry(offsets[i], le);
-        EXPECT_EQ(le.key, "key1");
-        EXPECT_EQ(le.version(), versions[i]);
+    // Verify all entries for key1 via get
+    std::vector<LogEntry> key1_entries;
+    ASSERT_TRUE(seg_.get("key1", key1_entries).ok());
+    ASSERT_EQ(key1_entries.size(), 2u);
+    for (const auto& e : key1_entries) {
+        EXPECT_EQ(e.key, "key1");
     }
 }
 
@@ -477,33 +484,22 @@ TEST_F(FlushTest, SealAndOpen) {
     EXPECT_EQ(loaded.keyCount(), 2u);
 
     // Verify index lookups work.
-    uint32_t off32, ver32;
-    ASSERT_TRUE(loaded.getLatest("alpha", off32, ver32));
-    EXPECT_EQ(ver32, 2u);
+    LogEntry latest;
+    ASSERT_TRUE(loaded.getLatest("alpha", latest).ok());
+    EXPECT_EQ(latest.version(), 2u);
+    EXPECT_EQ(latest.value, "v2");
 
-    ASSERT_TRUE(loaded.getLatest("beta", off32, ver32));
-    EXPECT_EQ(ver32, 10u);
+    ASSERT_TRUE(loaded.getLatest("beta", latest).ok());
+    EXPECT_EQ(latest.version(), 10u);
+    EXPECT_EQ(latest.key, "beta");
+    EXPECT_TRUE(latest.tombstone());
 
-    // Verify data can be read back through the loaded segment.
-    uint8_t hdr[LogEntry::kHeaderSize];
-    ASSERT_TRUE(loaded.readAt(off32, hdr, LogEntry::kHeaderSize).ok());
-    uint32_t kl;
-    std::memcpy(&kl, hdr + 8, 4);
-    std::string key(kl, '\0');
-    ASSERT_TRUE(loaded.readAt(off32 + LogEntry::kHeaderSize, key.data(), kl).ok());
-    EXPECT_EQ(key, "beta");
-
-    // Verify round-trip through index offsets.
-    std::vector<uint32_t> offsets, versions;
-    ASSERT_TRUE(loaded.get("alpha", offsets, versions));
-    ASSERT_EQ(offsets.size(), 2u);
-    for (size_t i = 0; i < offsets.size(); ++i) {
-        uint8_t h[LogEntry::kHeaderSize];
-        ASSERT_TRUE(loaded.readAt(offsets[i], h, LogEntry::kHeaderSize).ok());
-        uint64_t pv_data;
-        std::memcpy(&pv_data, h, 8);
-        PackedVersion pv(pv_data);
-        EXPECT_EQ(pv.version(), versions[i]);
+    // Verify round-trip through get.
+    std::vector<LogEntry> alpha_entries;
+    ASSERT_TRUE(loaded.get("alpha", alpha_entries).ok());
+    ASSERT_EQ(alpha_entries.size(), 2u);
+    for (const auto& e : alpha_entries) {
+        EXPECT_EQ(e.key, "alpha");
     }
 
     loaded.close();

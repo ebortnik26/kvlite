@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <unordered_map>
 
-#include "internal/crc32.h"
 #include "internal/segment.h"
 
 namespace kvlite {
@@ -331,36 +330,7 @@ Status WriteBuffer::flush(const std::string& path, Segment& out) {
                   });
 
         for (const auto& e : bucket_entries) {
-            uint32_t key_len = static_cast<uint32_t>(e.key.size());
-            uint32_t val_len = static_cast<uint32_t>(e.value.size());
-            size_t entry_size = LogEntry::kHeaderSize + key_len + val_len + LogEntry::kChecksumSize;
-
-            uint8_t stack_buf[4096];
-            std::unique_ptr<uint8_t[]> heap_buf;
-            uint8_t* buf = stack_buf;
-            if (entry_size > sizeof(stack_buf)) {
-                heap_buf = std::make_unique<uint8_t[]>(entry_size);
-                buf = heap_buf.get();
-            }
-
-            uint8_t* p = buf;
-            std::memcpy(p, &e.pv.data, 8);   p += 8;
-            std::memcpy(p, &key_len, 4);      p += 4;
-            std::memcpy(p, &val_len, 4);      p += 4;
-
-            std::memcpy(p, e.key.data(), key_len);   p += key_len;
-            std::memcpy(p, e.value.data(), val_len);  p += val_len;
-
-            size_t payload_len = LogEntry::kHeaderSize + key_len + val_len;
-            uint32_t checksum = crc32(buf, payload_len);
-            std::memcpy(p, &checksum, 4);
-
-            uint64_t offset;
-            s = out.append(buf, entry_size, offset);
-            if (!s.ok()) return s;
-
-            s = out.addIndex(e.key, static_cast<uint32_t>(offset),
-                             static_cast<uint32_t>(e.version));
+            s = out.put(e.key, e.version, e.value, e.pv.tombstone());
             if (!s.ok()) return s;
         }
     }

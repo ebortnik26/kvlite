@@ -5,7 +5,9 @@
 #include <string>
 #include <vector>
 
+#include "internal/crc32.h"
 #include "internal/l2_index.h"
+#include "internal/log_entry.h"
 #include "internal/log_file.h"
 
 namespace kvlite {
@@ -20,14 +22,14 @@ namespace internal {
 //   [footer_magic: 4 bytes]
 //
 // State machine:
-//   Closed  → Writing   (create)
-//   Closed  → Readable  (open)
-//   Writing → Readable  (seal)
-//   Writing → Closed    (close)
-//   Readable → Closed   (close)
+//   Closed  -> Writing   (create)
+//   Closed  -> Readable  (open)
+//   Writing -> Readable  (seal)
+//   Writing -> Closed    (close)
+//   Readable -> Closed   (close)
 //
-// Writing state:  append, addIndex, seal, close, stats
-// Readable state: readAt, index queries, close, stats
+// Writing state:  put, seal, close, stats
+// Readable state: getLatest, get, contains, close, stats
 class Segment {
 public:
     Segment();
@@ -42,16 +44,16 @@ public:
 
     // --- Lifecycle ---
 
-    // Create a new segment file for writing. Closed → Writing.
+    // Create a new segment file for writing. Closed -> Writing.
     Status create(const std::string& path);
 
-    // Open an existing segment file. Closed → Readable.
+    // Open an existing segment file. Closed -> Readable.
     Status open(const std::string& path);
 
-    // Append the L2 index and footer. Writing → Readable.
+    // Append the L2 index and footer. Writing -> Readable.
     Status seal();
 
-    // Close the file. Writing|Readable → Closed.
+    // Close the file. Writing|Readable -> Closed.
     Status close();
 
     State state() const { return state_; }
@@ -59,25 +61,24 @@ public:
 
     // --- Write (Writing only) ---
 
-    Status append(const void* data, size_t len, uint64_t& offset);
-    Status addIndex(const std::string& key, uint32_t offset, uint32_t version);
+    // Serialize a LogEntry (header + key + value + CRC), append to file,
+    // and update the L2 index.
+    Status put(const std::string& key, uint64_t version,
+               const std::string& value, bool tombstone);
 
     // --- Read (Readable only) ---
 
-    Status readAt(uint64_t offset, void* buf, size_t len);
+    // Get the latest entry for a key.
+    Status getLatest(const std::string& key, LogEntry& entry) const;
 
-    // --- Index queries (Readable only) ---
+    // Get all entries for a key.
+    Status get(const std::string& key, std::vector<LogEntry>& entries) const;
 
-    bool getLatest(const std::string& key,
-                   uint32_t& offset, uint32_t& version) const;
+    // Get the entry for a key with the highest version <= upper_bound.
+    Status get(const std::string& key, uint64_t upper_bound,
+               LogEntry& entry) const;
 
-    bool get(const std::string& key,
-             std::vector<uint32_t>& offsets,
-             std::vector<uint32_t>& versions) const;
-
-    bool get(const std::string& key, uint64_t upper_bound,
-             uint64_t& offset, uint64_t& version) const;
-
+    // Check if a key exists.
     bool contains(const std::string& key) const;
 
     // --- Stats (any state) ---
@@ -89,6 +90,9 @@ public:
 private:
     static constexpr uint32_t kFooterMagic = 0x53454746;  // "SEGF"
     static constexpr size_t kFooterSize = 12;  // index_offset(8) + magic(4)
+
+    // Read and CRC-validate a LogEntry at the given file offset.
+    Status readEntry(uint64_t offset, LogEntry& entry) const;
 
     LogFile log_file_;
     L2Index index_;

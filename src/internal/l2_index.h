@@ -57,7 +57,7 @@ public:
     Status writeTo(LogFile& file);
 
     // Deserialize from a LogFile starting at the given byte offset.
-    Status readFrom(LogFile& file, uint64_t offset = 0);
+    Status readFrom(const LogFile& file, uint64_t offset = 0);
 
     size_t keyCount() const;
     size_t entryCount() const;

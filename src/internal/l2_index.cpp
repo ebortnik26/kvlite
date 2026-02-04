@@ -113,7 +113,7 @@ Status L2Index::writeTo(LogFile& file) {
     return file.append(buf.data(), total_size, write_offset);
 }
 
-Status L2Index::readFrom(LogFile& file, uint64_t offset) {
+Status L2Index::readFrom(const LogFile& file, uint64_t offset) {
     // Read header.
     L2IndexHeader header;
     Status s = file.readAt(offset, &header, sizeof(header));
