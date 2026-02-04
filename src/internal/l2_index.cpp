@@ -113,10 +113,10 @@ Status L2Index::writeTo(LogFile& file) {
     return file.append(buf.data(), total_size, write_offset);
 }
 
-Status L2Index::readFrom(LogFile& file) {
+Status L2Index::readFrom(LogFile& file, uint64_t offset) {
     // Read header.
     L2IndexHeader header;
-    Status s = file.readAt(0, &header, sizeof(header));
+    Status s = file.readAt(offset, &header, sizeof(header));
     if (!s.ok()) return s;
 
     if (header.magic != kL2IndexMagic) {
@@ -129,7 +129,7 @@ Status L2Index::readFrom(LogFile& file) {
     const size_t total_size = payload_size + sizeof(uint32_t);
 
     std::vector<uint8_t> buf(total_size);
-    s = file.readAt(0, buf.data(), total_size);
+    s = file.readAt(offset, buf.data(), total_size);
     if (!s.ok()) return s;
 
     // Verify CRC32.

@@ -218,11 +218,6 @@ TEST(LogFileStaticTest, MakeDataPath) {
     EXPECT_EQ(LogFile::makeDataPath("/db", 99999999), "/db/log_99999999.data");
 }
 
-TEST(LogFileStaticTest, MakeIndexPath) {
-    EXPECT_EQ(LogFile::makeIndexPath("/db", 1), "/db/log_00000001.idx");
-    EXPECT_EQ(LogFile::makeIndexPath("/db", 42), "/db/log_00000042.idx");
-}
-
 TEST(LogFileStaticTest, ParseFileId) {
     EXPECT_EQ(LogFile::parseFileId("log_00000001.data"), 1u);
     EXPECT_EQ(LogFile::parseFileId("log_00000042.idx"), 42u);

@@ -166,14 +166,8 @@ std::string LogFile::makeDataPath(const std::string& dir, uint32_t file_id) {
     return dir + "/" + buf;
 }
 
-std::string LogFile::makeIndexPath(const std::string& dir, uint32_t file_id) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "log_%08u.idx", file_id);
-    return dir + "/" + buf;
-}
-
 uint32_t LogFile::parseFileId(const std::string& filename) {
-    // Expect format: log_NNNNNNNN.data or log_NNNNNNNN.idx
+    // Expect format: log_NNNNNNNN.data
     uint32_t id = 0;
     if (std::sscanf(filename.c_str(), "log_%08u", &id) == 1) {
         return id;

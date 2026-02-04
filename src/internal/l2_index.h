@@ -56,8 +56,8 @@ public:
     // Serialize to a LogFile.
     Status writeTo(LogFile& file);
 
-    // Deserialize from a LogFile (reads from current position to end).
-    Status readFrom(LogFile& file);
+    // Deserialize from a LogFile starting at the given byte offset.
+    Status readFrom(LogFile& file, uint64_t offset = 0);
 
     size_t keyCount() const;
     size_t entryCount() const;

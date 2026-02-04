@@ -359,12 +359,13 @@ Status WriteBuffer::flush(const std::string& path, Segment& out) {
             s = out.append(buf, entry_size, offset);
             if (!s.ok()) return s;
 
-            out.addIndex(e.key, static_cast<uint32_t>(offset),
-                         static_cast<uint32_t>(e.version));
+            s = out.addIndex(e.key, static_cast<uint32_t>(offset),
+                             static_cast<uint32_t>(e.version));
+            if (!s.ok()) return s;
         }
     }
 
-    return Status::OK();
+    return out.seal();
 }
 
 } // namespace internal

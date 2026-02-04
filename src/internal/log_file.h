@@ -12,7 +12,6 @@ namespace internal {
 // Thin file descriptor wrapper providing raw byte-level I/O.
 //
 // File naming: log_NNNNNNNN.data (e.g., log_00000001.data)
-// Each log file has a corresponding L2 index: log_NNNNNNNN.idx
 //
 // Thread-safety: not thread-safe. append() is intended to be called
 // from a single-threaded context (e.g. WriteBuffer::flush).
@@ -58,7 +57,6 @@ public:
 
     // Static file naming helpers.
     static std::string makeDataPath(const std::string& dir, uint32_t file_id);
-    static std::string makeIndexPath(const std::string& dir, uint32_t file_id);
     static uint32_t parseFileId(const std::string& filename);
 
 private:

@@ -309,9 +309,8 @@ protected:
 
 TEST_F(FlushTest, EmptyBuffer) {
     WriteBuffer wb;
-    Status s = wb.flush(path_, seg_);
-    EXPECT_TRUE(s.ok());
-    EXPECT_EQ(seg_.size(), 0u);
+    ASSERT_TRUE(wb.flush(path_, seg_).ok());
+    EXPECT_EQ(seg_.dataSize(), 0u);
     EXPECT_EQ(seg_.entryCount(), 0u);
 }
 
@@ -319,11 +318,10 @@ TEST_F(FlushTest, SingleEntry) {
     WriteBuffer wb;
     wb.put("hello", 42, "world", false);
 
-    Status s = wb.flush(path_, seg_);
-    ASSERT_TRUE(s.ok());
+    ASSERT_TRUE(wb.flush(path_, seg_).ok());
 
     size_t expected_size = LogEntry::kHeaderSize + 5 + 5 + LogEntry::kChecksumSize;
-    EXPECT_EQ(seg_.size(), expected_size);
+    EXPECT_EQ(seg_.dataSize(), expected_size);
 
     LogEntry entry;
     size_t consumed = readEntry(0, entry);
@@ -371,7 +369,7 @@ TEST_F(FlushTest, SortOrderHashThenVersion) {
     // Read all entries back
     std::vector<std::pair<uint64_t, uint64_t>> order; // (hash, version)
     uint64_t offset = 0;
-    while (offset < seg_.size()) {
+    while (offset < seg_.dataSize()) {
         LogEntry entry;
         size_t sz = readEntry(offset, entry);
         uint64_t h = dhtHashBytes(entry.key.data(), entry.key.size());
@@ -402,7 +400,7 @@ TEST_F(FlushTest, RoundTrip) {
     // Read all entries back and verify contents
     std::vector<LogEntry> entries;
     uint64_t offset = 0;
-    while (offset < seg_.size()) {
+    while (offset < seg_.dataSize()) {
         LogEntry entry;
         size_t sz = readEntry(offset, entry);
         verifyCrc(offset, sz);
@@ -459,24 +457,22 @@ TEST_F(FlushTest, RoundTrip) {
     }
 }
 
-TEST_F(FlushTest, SaveAndLoad) {
+TEST_F(FlushTest, SealAndOpen) {
     WriteBuffer wb;
     wb.put("alpha", 1, "v1", false);
     wb.put("alpha", 2, "v2", false);
     wb.put("beta", 10, "vb", true);
 
     ASSERT_TRUE(wb.flush(path_, seg_).ok());
-
-    // Save the index to a separate file.
-    std::string idx_path = path_ + ".idx";
-    ASSERT_TRUE(seg_.saveIndex(idx_path).ok());
+    uint64_t data_size = seg_.dataSize();
     seg_.close();
 
-    // Load into a fresh Segment.
+    // Open into a fresh Segment.
     Segment loaded;
-    ASSERT_TRUE(loaded.load(path_, idx_path).ok());
+    ASSERT_TRUE(loaded.open(path_).ok());
 
-    // Verify stats match the original.
+    // Verify data size matches (excludes index + footer).
+    EXPECT_EQ(loaded.dataSize(), data_size);
     EXPECT_EQ(loaded.entryCount(), 3u);
     EXPECT_EQ(loaded.keyCount(), 2u);
 
@@ -511,5 +507,4 @@ TEST_F(FlushTest, SaveAndLoad) {
     }
 
     loaded.close();
-    std::remove(idx_path.c_str());
 }

@@ -519,7 +519,8 @@ TEST_F(L2IndexSerializationTest, CorruptedChecksum) {
         // Directly corrupt via POSIX write.
         int fd = ::open(path_.c_str(), O_WRONLY);
         ASSERT_GE(fd, 0);
-        (void)::pwrite(fd, &byte, 1, 4);
+        ssize_t w = ::pwrite(fd, &byte, 1, 4);
+        ASSERT_EQ(w, 1);
         ::close(fd);
     }
 
