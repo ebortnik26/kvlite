@@ -20,7 +20,7 @@ class L1WAL;
 // L1 Index Manager: Manages the in-memory L1 index with persistence.
 //
 // Encapsulates:
-// - L1Index: in-memory hash map (key → [(version, file_id), ...])
+// - L1Index: in-memory map (key → [(segment_id, version), ...])
 // - L1WAL: write-ahead log for crash recovery
 // - Snapshotting: periodic full dumps to reduce WAL replay time
 //
@@ -75,15 +75,24 @@ public:
     // Insert a new entry for a key.
     // Logs to WAL, then updates in-memory index.
     // May trigger auto-snapshot if snapshot_interval is reached.
-    Status put(const std::string& key, uint32_t file_id);
+    Status put(const std::string& key, uint64_t version, uint32_t segment_id);
 
-    // Get all file_ids for a key. Returns false if key doesn't exist.
-    // File IDs are ordered latest-first.
-    bool getFileIds(const std::string& key, std::vector<uint32_t>& out) const;
+    // Get all (segment_id, version) pairs for a key.
+    // Returns false if key doesn't exist.
+    // Pairs are ordered latest-first (highest version first).
+    bool get(const std::string& key,
+             std::vector<uint32_t>& segment_ids,
+             std::vector<uint64_t>& versions) const;
 
-    // Get the latest file_id for a key. O(1).
+    // Get the latest entry for a key with version <= upper_bound.
+    // Returns false if no matching entry exists.
+    bool get(const std::string& key, uint64_t upper_bound,
+             uint64_t& version, uint32_t& segment_id) const;
+
+    // Get the latest (highest version) entry for a key.
     // Returns NotFound if key doesn't exist.
-    Status getLatest(const std::string& key, uint32_t& file_id) const;
+    Status getLatest(const std::string& key,
+                     uint64_t& version, uint32_t& segment_id) const;
 
     // Check if a key exists (has any version)
     bool contains(const std::string& key) const;
@@ -92,14 +101,9 @@ public:
     // Logs to WAL, then updates in-memory index.
     Status remove(const std::string& key);
 
-    // Remove a specific file_id from a key's list.
+    // Remove all entries pointing to a specific segment_id from a key's list.
     // Note: This is an in-memory-only operation, not logged to WAL.
-    void removeFile(const std::string& key, uint32_t file_id);
-
-    // --- Iteration ---
-
-    // Iterate over all file_id lists (no key available)
-    void forEach(const std::function<void(const std::vector<uint32_t>&)>& fn) const;
+    void removeSegment(const std::string& key, uint32_t segment_id);
 
     // --- Maintenance ---
 

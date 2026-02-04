@@ -3,86 +3,96 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <functional>
 
 #include "kvlite/status.h"
-#include "delta_hash_table.h"
 
 namespace kvlite {
 namespace internal {
 
-// L1 Index: In-memory index mapping keys to file_id lists.
+// L1 Index: In-memory index mapping keys to (segment_id, version) lists.
 //
-// Structure: key → [file_id₁, file_id₂, ...]
-//            sorted by value desc (latest/highest first)
-//
-// Version resolution is delegated to L2 indexes.
+// Structure: key → [(segment_id₁, version₁), (segment_id₂, version₂), ...]
+//            sorted by version desc (latest/highest first)
 //
 // The L1 index is always fully loaded in memory. It is persisted via:
 // 1. WAL (append-only delta log for crash recovery)
 // 2. Periodic snapshots (full dump every N updates + on shutdown)
 //
-// Thread-safety: Concurrency is managed at per-bucket level in the DHT.
+// Thread-safety: external synchronization required (L1IndexManager provides it).
 class L1Index {
 public:
     L1Index();
     ~L1Index();
 
-    // Prepend file_id to key's list (if not already at front).
-    // Latest file_id is always at index 0.
-    void put(const std::string& key, uint32_t file_id);
+    // Append (segment_id, version) to key's list.
+    void put(const std::string& key, uint64_t version, uint32_t segment_id);
 
-    // Get all file_ids for a key. Returns false if key doesn't exist.
-    // File IDs are ordered latest-first.
-    bool getFileIds(const std::string& key, std::vector<uint32_t>& out) const;
+    // Get all (segment_id, version) pairs for a key. Returns false if key
+    // doesn't exist. Pairs are ordered latest-first (highest version first).
+    bool get(const std::string& key,
+             std::vector<uint32_t>& segment_ids,
+             std::vector<uint64_t>& versions) const;
 
-    // Get the latest file_id for a key (index 0). O(1).
+    // Get the latest entry for a key with version <= upper_bound.
+    // Returns false if no matching entry exists.
+    bool get(const std::string& key, uint64_t upper_bound,
+             uint64_t& version, uint32_t& segment_id) const;
+
+    // Get the latest (highest version) entry for a key.
     // Returns false if key doesn't exist.
-    bool getLatest(const std::string& key, uint32_t& file_id) const;
+    bool getLatest(const std::string& key,
+                   uint64_t& version, uint32_t& segment_id) const;
 
-    // Check if a key exists (has any file_ids)
+    // Check if a key exists.
     bool contains(const std::string& key) const;
 
-    // Remove all file_ids for a key (used during GC compaction)
+    // Remove all entries for a key (used during GC compaction).
     void remove(const std::string& key);
 
-    // Remove a specific file_id from a key's list
-    void removeFile(const std::string& key, uint32_t file_id);
+    // Remove all entries pointing to a specific segment_id from a key's list.
+    void removeSegment(const std::string& key, uint32_t segment_id);
 
-    // Iterate over all file_id lists
-    void forEach(const std::function<void(const std::vector<uint32_t>&)>& fn) const;
-
-    // Get statistics
+    // Get statistics.
     size_t keyCount() const;
-    size_t entryCount() const;  // total file_id refs across all keys
+    size_t entryCount() const;  // total (segment_id, version) refs across all keys
     size_t memoryUsage() const;
 
-    // Clear all entries
+    // Clear all entries.
     void clear();
 
     // --- Persistence ---
 
-    // Save full snapshot to file
+    // Save full snapshot to file.
     Status saveSnapshot(const std::string& path) const;
 
-    // Load snapshot from file
+    // Load snapshot from file.
     Status loadSnapshot(const std::string& path);
 
-    // Snapshot file format (v4):
+    // Snapshot file format (v5):
     // [magic: 4 bytes]["L1IX"]
-    // [version: 4 bytes][4]
-    // [num_records: 8 bytes]
-    // For each record:
-    //   [hash: 8 bytes]
-    //   [num_file_ids: 4 bytes]
-    //   For each file_id:
-    //     [file_id: 4 bytes]
+    // [version: 4 bytes][5]
+    // [num_keys: 8 bytes]
+    // For each key:
+    //   [key_len: 4 bytes]
+    //   [key: key_len bytes]
+    //   [num_entries: 4 bytes]
+    //   For each entry:
+    //     [segment_id: 4 bytes]
+    //     [version: 8 bytes]
     // [checksum: 4 bytes]
 
 private:
-    DeltaHashTable dht_;
+    struct Entry {
+        uint32_t segment_id;
+        uint64_t version;
+    };
+
+    std::unordered_map<std::string, std::vector<Entry>> index_;
     size_t key_count_ = 0;
+    size_t entry_count_ = 0;
 };
 
 } // namespace internal

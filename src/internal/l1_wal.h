@@ -13,7 +13,7 @@ namespace internal {
 
 // WAL operation types for L1 index
 enum class WalOp : uint8_t {
-    kPut = 1,     // Add entry: key, version, file_id
+    kPut = 1,     // Add entry: key, version, segment_id
     kRemove = 2,  // Remove key (all versions) - used during GC
 };
 
@@ -25,7 +25,7 @@ enum class WalOp : uint8_t {
 //
 // WAL entry format:
 // ┌────┬─────────┬─────────┬─────┬─────────┬──────────┐
-// │ op │ version │ file_id │ len │   key   │ checksum │
+// │ op │ version │ segment_id │ len │   key   │ checksum │
 // │ 1  │    8    │    4    │  4  │   var   │    4     │
 // └────┴─────────┴─────────┴─────┴─────────┴──────────┘
 //
@@ -42,7 +42,8 @@ public:
     Status close();
 
     // Append a put operation
-    Status appendPut(const std::string& key, uint32_t file_id);
+    Status appendPut(const std::string& key, uint64_t version,
+                     uint32_t segment_id);
 
     // Append a remove operation (for GC)
     Status appendRemove(const std::string& key);
@@ -71,9 +72,9 @@ public:
 
 private:
     Status writeEntry(WalOp op, const std::string& key,
-                      uint64_t version, uint32_t file_id);
+                      uint64_t version, uint32_t segment_id);
     Status readEntry(WalOp& op, std::string& key,
-                     uint64_t& version, uint32_t& file_id);
+                     uint64_t& version, uint32_t& segment_id);
 
     int fd_ = -1;
     std::string path_;

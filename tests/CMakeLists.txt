@@ -96,6 +96,7 @@ add_executable(kvlite_wb_test
     ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l1_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/l2_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/l2_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/l2_lslot_codec.cpp

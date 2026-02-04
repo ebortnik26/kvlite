@@ -80,7 +80,7 @@ class DB::Iterator::Impl {
 public:
     Impl(DB* db, uint64_t snapshot_version)
         : db_(db), snapshot_version_(snapshot_version) {
-        // Get file IDs sorted by file_id (ascending = oldest to newest)
+        // Get segment IDs sorted ascending (oldest to newest)
         file_ids_ = db_->storage_->getFileIds();
         // Reverse to iterate newest to oldest
         std::reverse(file_ids_.begin(), file_ids_.end());
@@ -173,8 +173,9 @@ private:
             }
 
             // Check L1 index: is this file the latest for this key?
+            uint64_t latest_ver;
             uint32_t latest_fid;
-            if (!db_->l1_index_->getLatest(log_entry.key, latest_fid).ok()) {
+            if (!db_->l1_index_->getLatest(log_entry.key, latest_ver, latest_fid).ok()) {
                 l2_entry_idx_++;
                 continue;
             }
@@ -383,13 +384,13 @@ Status DB::put(const std::string& key, const std::string& value,
 
     uint64_t version = versions_->allocateVersion();
 
-    uint32_t file_id;
-    Status s = storage_->writeEntry(key, value, version, false, file_id);
+    uint32_t segment_id;
+    Status s = storage_->writeEntry(key, value, version, false, segment_id);
     if (!s.ok()) {
         return s;
     }
 
-    s = l1_index_->put(key, file_id);
+    s = l1_index_->put(key, version, segment_id);
     if (!s.ok()) {
         return s;
     }
@@ -412,15 +413,16 @@ Status DB::get(const std::string& key, std::string& value, uint64_t& version,
         return Status::InvalidArgument("Database not open");
     }
 
-    std::vector<uint32_t> file_ids;
-    if (!l1_index_->getFileIds(key, file_ids)) {
+    std::vector<uint32_t> segment_ids;
+    std::vector<uint64_t> versions;
+    if (!l1_index_->get(key, segment_ids, versions)) {
         return Status::NotFound(key);
     }
 
-    // Iterate file_ids (latest first). On fingerprint collision,
+    // Iterate segment_ids (latest first). On fingerprint collision,
     // readValue returns NotFound for non-matching keys; try the next.
-    for (uint32_t fid : file_ids) {
-        Status s = storage_->readValue(fid, key, version, value);
+    for (uint32_t sid : segment_ids) {
+        Status s = storage_->readValue(sid, key, version, value);
         if (s.ok()) {
             return s;
         }
@@ -444,18 +446,19 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
         return Status::InvalidArgument("Database not open");
     }
 
-    std::vector<uint32_t> file_ids;
-    if (!l1_index_->getFileIds(key, file_ids)) {
+    std::vector<uint32_t> segment_ids;
+    std::vector<uint64_t> versions;
+    if (!l1_index_->get(key, segment_ids, versions)) {
         return Status::NotFound(key);
     }
 
-    // file_ids are latest-first; scan each file's L2 for the version
-    for (uint32_t fid : file_ids) {
-        internal::L2Index* l2 = storage_->getL2Index(fid);
+    // segment_ids are latest-first; scan each segment's L2 for the version
+    for (uint32_t sid : segment_ids) {
+        internal::L2Index* l2 = storage_->getL2Index(sid);
         if (!l2) continue;
         uint64_t offset;
         if (l2->get(key, upper_bound, offset, entry_version)) {
-            return storage_->readValue(fid, key, entry_version, value);
+            return storage_->readValue(sid, key, entry_version, value);
         }
     }
     return Status::NotFound(key);
@@ -468,13 +471,13 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
 
     uint64_t version = versions_->allocateVersion();
 
-    uint32_t file_id;
-    Status s = storage_->writeEntry(key, "", version, true, file_id);
+    uint32_t segment_id;
+    Status s = storage_->writeEntry(key, "", version, true, segment_id);
     if (!s.ok()) {
         return s;
     }
 
-    s = l1_index_->put(key, file_id);
+    s = l1_index_->put(key, version, segment_id);
     if (!s.ok()) {
         return s;
     }
@@ -514,14 +517,14 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
     uint64_t version = versions_->allocateVersion();
 
     for (const auto& op : batch.operations()) {
-        uint32_t file_id;
+        uint32_t segment_id;
         bool tombstone = (op.type == WriteBatch::OpType::kDelete);
-        Status s = storage_->writeEntry(op.key, op.value, version, tombstone, file_id);
+        Status s = storage_->writeEntry(op.key, op.value, version, tombstone, segment_id);
         if (!s.ok()) {
             return s;
         }
 
-        s = l1_index_->put(op.key, file_id);
+        s = l1_index_->put(op.key, static_cast<uint32_t>(version), segment_id);
         if (!s.ok()) {
             return s;
         }

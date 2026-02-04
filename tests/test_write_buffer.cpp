@@ -10,6 +10,7 @@
 
 #include "internal/crc32.h"
 #include "internal/delta_hash_table_base.h"
+#include "internal/l1_index.h"
 #include "internal/segment.h"
 #include "internal/write_buffer.h"
 
@@ -246,6 +247,7 @@ TEST(WriteBuffer, ConcurrentPutsSameKey) {
 
 // --- Flush tests ---------------------------------------------------------
 
+using kvlite::internal::L1Index;
 using kvlite::internal::LogEntry;
 using kvlite::internal::PackedVersion;
 using kvlite::internal::Segment;
@@ -314,13 +316,14 @@ protected:
 
     std::string path_;
     Segment seg_;
+    L1Index l1_;
 };
 
 } // namespace
 
 TEST_F(FlushTest, EmptyBuffer) {
     WriteBuffer wb;
-    ASSERT_TRUE(wb.flush(path_, 1, seg_).ok());
+    ASSERT_TRUE(wb.flush(path_, 1, seg_, l1_).ok());
     EXPECT_EQ(seg_.dataSize(), 0u);
     EXPECT_EQ(seg_.entryCount(), 0u);
 }
@@ -329,7 +332,7 @@ TEST_F(FlushTest, SingleEntry) {
     WriteBuffer wb;
     wb.put("hello", 42, "world", false);
 
-    ASSERT_TRUE(wb.flush(path_, 1, seg_).ok());
+    ASSERT_TRUE(wb.flush(path_, 1, seg_, l1_).ok());
 
     size_t expected_size = LogEntry::kHeaderSize + 5 + 5 + LogEntry::kChecksumSize;
     EXPECT_EQ(seg_.dataSize(), expected_size);
@@ -355,7 +358,7 @@ TEST_F(FlushTest, TombstoneEntry) {
     WriteBuffer wb;
     wb.put("deleted", 7, "", true);
 
-    ASSERT_TRUE(wb.flush(path_, 1, seg_).ok());
+    ASSERT_TRUE(wb.flush(path_, 1, seg_, l1_).ok());
 
     LogEntry entry;
     readEntry(0, entry);
@@ -374,7 +377,7 @@ TEST_F(FlushTest, SortOrderHashThenVersion) {
     wb.put("bbb", 1, "v1", false);
     wb.put("ccc", 20, "v20", false);
 
-    ASSERT_TRUE(wb.flush(path_, 1, seg_).ok());
+    ASSERT_TRUE(wb.flush(path_, 1, seg_, l1_).ok());
 
     // Read all entries back
     std::vector<std::pair<uint64_t, uint64_t>> order; // (hash, version)
@@ -405,7 +408,7 @@ TEST_F(FlushTest, RoundTrip) {
     wb.put("key1", 2, "val2", false);
     wb.put("key2", 3, "val3", true);
 
-    ASSERT_TRUE(wb.flush(path_, 1, seg_).ok());
+    ASSERT_TRUE(wb.flush(path_, 1, seg_, l1_).ok());
 
     // Read all entries back and verify contents
     std::vector<LogEntry> entries;
@@ -470,7 +473,7 @@ TEST_F(FlushTest, SealAndOpen) {
     wb.put("alpha", 2, "v2", false);
     wb.put("beta", 10, "vb", true);
 
-    ASSERT_TRUE(wb.flush(path_, 1, seg_).ok());
+    ASSERT_TRUE(wb.flush(path_, 1, seg_, l1_).ok());
     uint64_t data_size = seg_.dataSize();
     seg_.close();
 
@@ -503,4 +506,53 @@ TEST_F(FlushTest, SealAndOpen) {
     }
 
     loaded.close();
+}
+
+TEST_F(FlushTest, L1IndexPopulated) {
+    WriteBuffer wb;
+    wb.put("key1", 1, "val1", false);
+    wb.put("key1", 2, "val2", false);
+    wb.put("key2", 3, "val3", true);
+    wb.put("key3", 4, "val4", false);
+
+    ASSERT_TRUE(wb.flush(path_, 77, seg_, l1_).ok());
+
+    // Every entry should be registered in L1 with segment_id and version.
+    uint64_t version;
+    uint32_t segment_id;
+    ASSERT_TRUE(l1_.getLatest("key1", version, segment_id));
+    EXPECT_EQ(version, 2u);  // latest version for key1
+    EXPECT_EQ(segment_id, 77u);
+
+    ASSERT_TRUE(l1_.getLatest("key2", version, segment_id));
+    EXPECT_EQ(version, 3u);
+    EXPECT_EQ(segment_id, 77u);
+
+    ASSERT_TRUE(l1_.getLatest("key3", version, segment_id));
+    EXPECT_EQ(version, 4u);
+    EXPECT_EQ(segment_id, 77u);
+
+    EXPECT_FALSE(l1_.getLatest("missing", version, segment_id));
+
+    EXPECT_EQ(l1_.keyCount(), 3u);
+    EXPECT_EQ(l1_.entryCount(), 4u);  // 4 total entries (key1 has 2 versions)
+
+    // Verify all versions for key1.
+    std::vector<uint32_t> seg_ids;
+    std::vector<uint64_t> versions;
+    ASSERT_TRUE(l1_.get("key1", seg_ids, versions));
+    ASSERT_EQ(seg_ids.size(), 2u);
+    // Latest first.
+    EXPECT_EQ(versions[0], 2u);
+    EXPECT_EQ(versions[1], 1u);
+    EXPECT_EQ(seg_ids[0], 77u);
+    EXPECT_EQ(seg_ids[1], 77u);
+
+    // Verify version-bounded get.
+    uint64_t ver64;
+    ASSERT_TRUE(l1_.get("key1", 1u, ver64, segment_id));
+    EXPECT_EQ(ver64, 1u);
+    EXPECT_EQ(segment_id, 77u);
+
+    ASSERT_FALSE(l1_.get("key1", 0u, ver64, segment_id));
 }
