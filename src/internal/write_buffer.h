@@ -65,7 +65,7 @@ public:
     // Flush all entries to a new Segment.
     // Creates a LogFile at path, writes entries sorted by (hash, version)
     // ascending, and records each in the Segment's L2 index.
-    Status flush(const std::string& path, Segment& out);
+    Status flush(const std::string& path, uint32_t segment_id, Segment& out);
 
     size_t keyCount() const { return key_count_.load(std::memory_order_relaxed); }
     size_t entryCount() const { return size_.load(std::memory_order_relaxed); }

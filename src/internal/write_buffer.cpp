@@ -287,8 +287,9 @@ void WriteBuffer::clear() {
     key_count_.store(0, std::memory_order_relaxed);
 }
 
-Status WriteBuffer::flush(const std::string& path, Segment& out) {
-    Status s = out.create(path);
+Status WriteBuffer::flush(const std::string& path, uint32_t segment_id,
+                          Segment& out) {
+    Status s = out.create(path, segment_id);
     if (!s.ok()) return s;
 
     struct FlatEntry {

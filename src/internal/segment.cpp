@@ -13,12 +13,13 @@ Segment& Segment::operator=(Segment&&) noexcept = default;
 
 // --- Lifecycle ---
 
-Status Segment::create(const std::string& path) {
+Status Segment::create(const std::string& path, uint32_t id) {
     if (state_ != State::kClosed) {
         return Status::InvalidArgument("Segment: create requires Closed state");
     }
     Status s = log_file_.create(path);
     if (s.ok()) {
+        id_ = id;
         data_size_ = 0;
         state_ = State::kWriting;
     }
@@ -38,7 +39,7 @@ Status Segment::open(const std::string& path) {
         return Status::Corruption("Segment: file too small for footer");
     }
 
-    // Read footer: [index_offset:8][magic:4]
+    // Read footer: [segment_id:4][index_offset:8][magic:4]
     uint8_t footer[kFooterSize];
     s = log_file_.readAt(file_size - kFooterSize, footer, kFooterSize);
     if (!s.ok()) {
@@ -46,10 +47,12 @@ Status Segment::open(const std::string& path) {
         return s;
     }
 
+    uint32_t id;
     uint64_t index_offset;
     uint32_t magic;
-    std::memcpy(&index_offset, footer, 8);
-    std::memcpy(&magic, footer + 8, 4);
+    std::memcpy(&id, footer, 4);
+    std::memcpy(&index_offset, footer + 4, 8);
+    std::memcpy(&magic, footer + 12, 4);
 
     if (magic != kFooterMagic) {
         log_file_.close();
@@ -67,6 +70,7 @@ Status Segment::open(const std::string& path) {
         return s;
     }
 
+    id_ = id;
     data_size_ = index_offset;
     state_ = State::kReadable;
     return Status::OK();
@@ -84,11 +88,12 @@ Status Segment::seal() {
     Status s = index_.writeTo(log_file_);
     if (!s.ok()) return s;
 
-    // Append footer: [index_offset:8][magic:4]
+    // Append footer: [segment_id:4][index_offset:8][magic:4]
     uint8_t footer[kFooterSize];
-    std::memcpy(footer, &data_size_, 8);
+    std::memcpy(footer, &id_, 4);
+    std::memcpy(footer + 4, &data_size_, 8);
     uint32_t magic = kFooterMagic;
-    std::memcpy(footer + 8, &magic, 4);
+    std::memcpy(footer + 12, &magic, 4);
 
     uint64_t footer_offset;
     s = log_file_.append(footer, kFooterSize, footer_offset);

@@ -52,19 +52,19 @@ TEST_F(SegmentTest, DefaultState) {
 }
 
 TEST_F(SegmentTest, CreateTransitionsToWriting) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     EXPECT_EQ(seg_.state(), Segment::State::kWriting);
     EXPECT_TRUE(seg_.isOpen());
 }
 
 TEST_F(SegmentTest, SealTransitionsToReadable) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.seal().ok());
     EXPECT_EQ(seg_.state(), Segment::State::kReadable);
 }
 
 TEST_F(SegmentTest, OpenTransitionsToReadable) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.seal().ok());
     seg_.close();
 
@@ -75,13 +75,13 @@ TEST_F(SegmentTest, OpenTransitionsToReadable) {
 }
 
 TEST_F(SegmentTest, CloseTransitionsToClosed) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     seg_.close();
     EXPECT_EQ(seg_.state(), Segment::State::kClosed);
 }
 
 TEST_F(SegmentTest, CloseSealedTransitionsToClosed) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.seal().ok());
     seg_.close();
     EXPECT_EQ(seg_.state(), Segment::State::kClosed);
@@ -94,18 +94,18 @@ TEST_F(SegmentTest, CloseWhenAlreadyClosed) {
 // --- State violations ---
 
 TEST_F(SegmentTest, CreateWhileWritingFails) {
-    ASSERT_TRUE(seg_.create(path_).ok());
-    EXPECT_FALSE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
+    EXPECT_FALSE(seg_.create(path_, 1).ok());
 }
 
 TEST_F(SegmentTest, CreateWhileReadableFails) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.seal().ok());
-    EXPECT_FALSE(seg_.create(path_).ok());
+    EXPECT_FALSE(seg_.create(path_, 1).ok());
 }
 
 TEST_F(SegmentTest, OpenWhileWritingFails) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     EXPECT_FALSE(seg_.open(path_).ok());
 }
 
@@ -114,7 +114,7 @@ TEST_F(SegmentTest, SealWhileClosedFails) {
 }
 
 TEST_F(SegmentTest, SealWhileReadableFails) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.seal().ok());
     EXPECT_FALSE(seg_.seal().ok());
 }
@@ -124,13 +124,13 @@ TEST_F(SegmentTest, PutWhileClosedFails) {
 }
 
 TEST_F(SegmentTest, PutWhileReadableFails) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.seal().ok());
     EXPECT_FALSE(seg_.put("k", 1, "", false).ok());
 }
 
 TEST_F(SegmentTest, GetLatestWhileWritingFails) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("k", 1, "v", false);
     LogEntry entry;
     EXPECT_FALSE(seg_.getLatest("k", entry).ok());
@@ -142,7 +142,7 @@ TEST_F(SegmentTest, GetLatestWhileClosedFails) {
 }
 
 TEST_F(SegmentTest, QueriesWhileWritingFail) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("k", 1, "v", false);
 
     LogEntry entry;
@@ -158,7 +158,7 @@ TEST_F(SegmentTest, QueriesWhileWritingFail) {
 // --- Create error ---
 
 TEST_F(SegmentTest, CreateNonExistentDir) {
-    Status s = seg_.create("/nonexistent_dir_xyz/file.data");
+    Status s = seg_.create("/nonexistent_dir_xyz/file.data", 1);
     EXPECT_FALSE(s.ok());
     EXPECT_EQ(seg_.state(), Segment::State::kClosed);
 }
@@ -166,13 +166,13 @@ TEST_F(SegmentTest, CreateNonExistentDir) {
 // --- Write tests ---
 
 TEST_F(SegmentTest, PutAndDataSize) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.put("hello", 1, "world", false).ok());
     EXPECT_GT(seg_.dataSize(), 0u);
 }
 
 TEST_F(SegmentTest, MultiplePuts) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
 
     ASSERT_TRUE(seg_.put("aaa", 1, "v1", false).ok());
     uint64_t size1 = seg_.dataSize();
@@ -183,7 +183,7 @@ TEST_F(SegmentTest, MultiplePuts) {
 // --- Seal + read tests ---
 
 TEST_F(SegmentTest, SealThenGetLatest) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("hello", 1, "world", false);
     ASSERT_TRUE(seg_.seal().ok());
 
@@ -195,7 +195,7 @@ TEST_F(SegmentTest, SealThenGetLatest) {
 }
 
 TEST_F(SegmentTest, SealThenQueryIndex) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("key1", 1, "val1", false);
     writeEntry("key1", 2, "val2", false);
     writeEntry("key2", 5, "val5", true);
@@ -222,7 +222,7 @@ TEST_F(SegmentTest, SealThenQueryIndex) {
 }
 
 TEST_F(SegmentTest, GetAllVersionsAfterSeal) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("k", 10, "a", false);
     writeEntry("k", 20, "b", false);
     writeEntry("k", 30, "c", false);
@@ -238,7 +238,7 @@ TEST_F(SegmentTest, GetAllVersionsAfterSeal) {
 }
 
 TEST_F(SegmentTest, GetByUpperBoundAfterSeal) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("k", 10, "a", false);
     writeEntry("k", 20, "b", false);
     writeEntry("k", 30, "c", false);
@@ -258,7 +258,7 @@ TEST_F(SegmentTest, GetByUpperBoundAfterSeal) {
 // --- Seal + open round-trip ---
 
 TEST_F(SegmentTest, SealAndOpenEmpty) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.seal().ok());
     seg_.close();
 
@@ -270,7 +270,7 @@ TEST_F(SegmentTest, SealAndOpenEmpty) {
 }
 
 TEST_F(SegmentTest, SealAndOpenRoundTrip) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("alpha", 1, "v1", false);
     writeEntry("alpha", 2, "v2", false);
     writeEntry("beta", 10, "vb", true);
@@ -306,6 +306,21 @@ TEST_F(SegmentTest, SealAndOpenRoundTrip) {
     loaded.close();
 }
 
+TEST_F(SegmentTest, GetIdAfterCreateAndOpenRoundTrip) {
+    ASSERT_TRUE(seg_.create(path_, 42).ok());
+    EXPECT_EQ(seg_.getId(), 42u);
+
+    writeEntry("k", 1, "v", false);
+    ASSERT_TRUE(seg_.seal().ok());
+    EXPECT_EQ(seg_.getId(), 42u);
+    seg_.close();
+
+    Segment loaded;
+    ASSERT_TRUE(loaded.open(path_).ok());
+    EXPECT_EQ(loaded.getId(), 42u);
+    loaded.close();
+}
+
 // --- Open error paths ---
 
 TEST_F(SegmentTest, OpenMissingFile) {
@@ -315,7 +330,7 @@ TEST_F(SegmentTest, OpenMissingFile) {
 }
 
 TEST_F(SegmentTest, OpenTruncatedFile) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.put("x", 1, "v", false).ok());
     seg_.close();
 
@@ -325,11 +340,11 @@ TEST_F(SegmentTest, OpenTruncatedFile) {
 }
 
 TEST_F(SegmentTest, OpenBadMagic) {
-    // Write 12 zero bytes (invalid footer) directly via POSIX I/O.
+    // Write 16 zero bytes (invalid footer) directly via POSIX I/O.
     int fd = ::open(path_.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
     ASSERT_GE(fd, 0);
-    uint8_t zeros[12] = {};
-    ASSERT_EQ(::write(fd, zeros, 12), 12);
+    uint8_t zeros[16] = {};
+    ASSERT_EQ(::write(fd, zeros, 16), 16);
     ::close(fd);
 
     Segment loaded;
@@ -340,7 +355,7 @@ TEST_F(SegmentTest, OpenBadMagic) {
 TEST_F(SegmentTest, OpenDataWrittenButNoIndex) {
     // Simulate a crash after data was flushed but before seal() ran:
     // the file contains valid log entries but no L2 index or footer.
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("key1", 1, "val1", false);
     writeEntry("key2", 2, "val2", false);
     seg_.close();  // close without seal
@@ -354,7 +369,7 @@ TEST_F(SegmentTest, OpenDataWrittenButNoIndex) {
 TEST_F(SegmentTest, OpenDataWrittenWithFakeFooter) {
     // Data was flushed, then a valid-looking footer was written but
     // the index_offset points into the data region (no real L2 index).
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("key1", 1, "val1", false);
     seg_.close();
 
@@ -362,12 +377,14 @@ TEST_F(SegmentTest, OpenDataWrittenWithFakeFooter) {
     // (inside the data region -- readFrom should fail).
     int fd = ::open(path_.c_str(), O_WRONLY | O_APPEND);
     ASSERT_GE(fd, 0);
-    uint8_t footer[12];
+    uint8_t footer[16];
+    uint32_t fake_id = 0;
     uint64_t fake_index_offset = 0;
     uint32_t magic = 0x53454746;  // "SEGF"
-    std::memcpy(footer, &fake_index_offset, 8);
-    std::memcpy(footer + 8, &magic, 4);
-    ASSERT_EQ(::write(fd, footer, 12), 12);
+    std::memcpy(footer, &fake_id, 4);
+    std::memcpy(footer + 4, &fake_index_offset, 8);
+    std::memcpy(footer + 12, &magic, 4);
+    ASSERT_EQ(::write(fd, footer, 16), 16);
     ::close(fd);
 
     Segment loaded;
@@ -378,19 +395,21 @@ TEST_F(SegmentTest, OpenDataWrittenWithFakeFooter) {
 
 TEST_F(SegmentTest, OpenIndexOffsetBeyondFile) {
     // Footer is valid but index_offset points past the end of the file.
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("key1", 1, "val1", false);
     seg_.close();
 
     // Append a footer with an out-of-bounds index offset.
     int fd = ::open(path_.c_str(), O_WRONLY | O_APPEND);
     ASSERT_GE(fd, 0);
-    uint8_t footer[12];
+    uint8_t footer[16];
+    uint32_t fake_id = 0;
     uint64_t bad_offset = 999999;
     uint32_t magic = 0x53454746;
-    std::memcpy(footer, &bad_offset, 8);
-    std::memcpy(footer + 8, &magic, 4);
-    ASSERT_EQ(::write(fd, footer, 12), 12);
+    std::memcpy(footer, &fake_id, 4);
+    std::memcpy(footer + 4, &bad_offset, 8);
+    std::memcpy(footer + 12, &magic, 4);
+    ASSERT_EQ(::write(fd, footer, 16), 16);
     ::close(fd);
 
     Segment loaded;
@@ -402,7 +421,7 @@ TEST_F(SegmentTest, OpenIndexOffsetBeyondFile) {
 TEST_F(SegmentTest, OpenTruncatedIndex) {
     // Seal a valid segment, then truncate the file mid-index to simulate
     // a crash during seal (index partially written).
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("key1", 1, "val1", false);
     writeEntry("key2", 2, "val2", false);
     ASSERT_TRUE(seg_.seal().ok());
@@ -425,7 +444,7 @@ TEST_F(SegmentTest, OpenTruncatedIndex) {
 // --- Move semantics ---
 
 TEST_F(SegmentTest, MoveConstructWriting) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("k", 1, "v", false);
 
     Segment moved(std::move(seg_));
@@ -435,7 +454,7 @@ TEST_F(SegmentTest, MoveConstructWriting) {
 }
 
 TEST_F(SegmentTest, MoveConstructReadable) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("k", 1, "v", false);
     ASSERT_TRUE(seg_.seal().ok());
 
@@ -449,7 +468,7 @@ TEST_F(SegmentTest, MoveConstructReadable) {
 }
 
 TEST_F(SegmentTest, MoveAssign) {
-    ASSERT_TRUE(seg_.create(path_).ok());
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("k", 1, "v", false);
     ASSERT_TRUE(seg_.seal().ok());
 

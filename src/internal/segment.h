@@ -18,6 +18,7 @@ namespace internal {
 // File layout:
 //   [LogEntry 0] ... [LogEntry N-1]  (data region)
 //   [L2 Index: magic + entries + crc]
+//   [segment_id: 4 bytes]
 //   [index_offset: 8 bytes]
 //   [footer_magic: 4 bytes]
 //
@@ -45,7 +46,7 @@ public:
     // --- Lifecycle ---
 
     // Create a new segment file for writing. Closed -> Writing.
-    Status create(const std::string& path);
+    Status create(const std::string& path, uint32_t id);
 
     // Open an existing segment file. Closed -> Readable.
     Status open(const std::string& path);
@@ -58,6 +59,7 @@ public:
 
     State state() const { return state_; }
     bool isOpen() const { return state_ != State::kClosed; }
+    uint32_t getId() const { return id_; }
 
     // --- Write (Writing only) ---
 
@@ -89,13 +91,14 @@ public:
 
 private:
     static constexpr uint32_t kFooterMagic = 0x53454746;  // "SEGF"
-    static constexpr size_t kFooterSize = 12;  // index_offset(8) + magic(4)
+    static constexpr size_t kFooterSize = 16;  // segment_id(4) + index_offset(8) + magic(4)
 
     // Read and CRC-validate a LogEntry at the given file offset.
     Status readEntry(uint64_t offset, LogEntry& entry) const;
 
     LogFile log_file_;
     L2Index index_;
+    uint32_t id_ = 0;
     uint64_t data_size_ = 0;
     State state_ = State::kClosed;
 };
