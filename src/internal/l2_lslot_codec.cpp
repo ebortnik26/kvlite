@@ -30,10 +30,10 @@ L2LSlotCodec::LSlotContents L2LSlotCodec::decode(
                 uint32_t delta = reader.readEliasGamma();
                 entry.offsets[v] = entry.offsets[v - 1] - delta;
             }
-            // Versions: 32-bit raw first, gamma deltas for rest (desc)
+            // Versions: 32-bit raw first, gamma(delta+1) for rest (desc, zero-delta safe)
             entry.versions[0] = static_cast<uint32_t>(reader.read(32));
             for (uint64_t v = 1; v < num_entries; ++v) {
-                uint32_t delta = reader.readEliasGamma();
+                uint32_t delta = reader.readEliasGamma() - 1;
                 entry.versions[v] = entry.versions[v - 1] - delta;
             }
         }
@@ -66,11 +66,11 @@ size_t L2LSlotCodec::encode(
                 uint32_t delta = entry.offsets[v - 1] - entry.offsets[v];
                 writer.writeEliasGamma(delta);
             }
-            // Versions: 32-bit raw first, gamma deltas for rest (desc)
+            // Versions: 32-bit raw first, gamma(delta+1) for rest (desc, zero-delta safe)
             writer.write(entry.versions[0], 32);
             for (uint64_t v = 1; v < num_entries; ++v) {
                 uint32_t delta = entry.versions[v - 1] - entry.versions[v];
-                writer.writeEliasGamma(delta);
+                writer.writeEliasGamma(delta + 1);
             }
         }
     }
@@ -97,11 +97,11 @@ size_t L2LSlotCodec::bitsNeeded(const LSlotContents& contents,
                 uint32_t delta = entry.offsets[v - 1] - entry.offsets[v];
                 bits += eliasGammaBits(delta);
             }
-            // Versions: 32-bit raw first + gamma deltas
+            // Versions: 32-bit raw first + gamma(delta+1) deltas
             bits += 32;
             for (size_t v = 1; v < entry.versions.size(); ++v) {
                 uint32_t delta = entry.versions[v - 1] - entry.versions[v];
-                bits += eliasGammaBits(delta);
+                bits += eliasGammaBits(delta + 1);
             }
         }
     }

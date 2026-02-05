@@ -66,42 +66,40 @@ L1Index::L1Index() = default;
 L1Index::~L1Index() = default;
 
 void L1Index::put(const std::string& key, uint64_t version, uint32_t segment_id) {
-    auto& entries = index_[key];
-    if (entries.empty()) {
+    if (!dht_.contains(key)) {
         ++key_count_;
     }
-    // Insert maintaining version descending order.
-    auto pos = std::lower_bound(entries.begin(), entries.end(), version,
-        [](const Entry& e, uint64_t v) { return e.version > v; });
-    entries.insert(pos, {segment_id, version});
-    ++entry_count_;
+    // DHT "offsets" field = version, "versions" field = segment_id
+    dht_.addEntry(key, static_cast<uint32_t>(version), segment_id);
 }
 
 bool L1Index::get(const std::string& key,
                   std::vector<uint32_t>& segment_ids,
                   std::vector<uint64_t>& versions) const {
-    auto it = index_.find(key);
-    if (it == index_.end() || it->second.empty()) return false;
+    std::vector<uint32_t> raw_vers;   // DHT "offsets" = versions
+    std::vector<uint32_t> raw_segs;   // DHT "versions" = segment_ids
+    if (!dht_.findAll(key, raw_vers, raw_segs)) return false;
     segment_ids.clear();
     versions.clear();
-    segment_ids.reserve(it->second.size());
-    versions.reserve(it->second.size());
-    for (const auto& e : it->second) {
-        segment_ids.push_back(e.segment_id);
-        versions.push_back(e.version);
+    segment_ids.reserve(raw_segs.size());
+    versions.reserve(raw_vers.size());
+    for (size_t i = 0; i < raw_vers.size(); ++i) {
+        versions.push_back(static_cast<uint64_t>(raw_vers[i]));
+        segment_ids.push_back(raw_segs[i]);
     }
     return true;
 }
 
 bool L1Index::get(const std::string& key, uint64_t upper_bound,
                   uint64_t& version, uint32_t& segment_id) const {
-    auto it = index_.find(key);
-    if (it == index_.end()) return false;
+    std::vector<uint32_t> raw_vers;
+    std::vector<uint32_t> raw_segs;
+    if (!dht_.findAll(key, raw_vers, raw_segs)) return false;
     // Entries are sorted by version descending; find the first <= upper_bound.
-    for (const auto& e : it->second) {
-        if (e.version <= upper_bound) {
-            segment_id = e.segment_id;
-            version = e.version;
+    for (size_t i = 0; i < raw_vers.size(); ++i) {
+        if (static_cast<uint64_t>(raw_vers[i]) <= upper_bound) {
+            version = static_cast<uint64_t>(raw_vers[i]);
+            segment_id = raw_segs[i];
             return true;
         }
     }
@@ -110,42 +108,28 @@ bool L1Index::get(const std::string& key, uint64_t upper_bound,
 
 bool L1Index::getLatest(const std::string& key,
                         uint64_t& version, uint32_t& segment_id) const {
-    auto it = index_.find(key);
-    if (it == index_.end() || it->second.empty()) return false;
-    version = it->second.front().version;
-    segment_id = it->second.front().segment_id;
+    uint32_t raw_ver, raw_seg;
+    if (!dht_.findFirst(key, raw_ver, raw_seg)) return false;
+    version = static_cast<uint64_t>(raw_ver);
+    segment_id = raw_seg;
     return true;
 }
 
 bool L1Index::contains(const std::string& key) const {
-    auto it = index_.find(key);
-    return it != index_.end() && !it->second.empty();
+    return dht_.contains(key);
 }
 
 void L1Index::remove(const std::string& key) {
-    auto it = index_.find(key);
-    if (it != index_.end() && !it->second.empty()) {
-        entry_count_ -= it->second.size();
-        it->second.clear();
-        index_.erase(it);
+    size_t removed = dht_.removeAll(key);
+    if (removed > 0) {
         --key_count_;
     }
 }
 
 void L1Index::removeSegment(const std::string& key, uint32_t segment_id) {
-    auto it = index_.find(key);
-    if (it == index_.end()) return;
-    auto& entries = it->second;
-    size_t old_size = entries.size();
-    entries.erase(
-        std::remove_if(entries.begin(), entries.end(),
-                        [segment_id](const Entry& e) {
-                            return e.segment_id == segment_id;
-                        }),
-        entries.end());
-    entry_count_ -= (old_size - entries.size());
-    if (entries.empty()) {
-        index_.erase(it);
+    // removeBySecond removes entries where DHT "versions" field = segment_id
+    size_t removed = dht_.removeBySecond(key, segment_id);
+    if (removed > 0 && !dht_.contains(key)) {
         --key_count_;
     }
 }
@@ -155,28 +139,22 @@ size_t L1Index::keyCount() const {
 }
 
 size_t L1Index::entryCount() const {
-    return entry_count_;
+    return dht_.size();
 }
 
 size_t L1Index::memoryUsage() const {
-    size_t usage = sizeof(*this);
-    for (const auto& kv : index_) {
-        usage += kv.first.capacity() + sizeof(kv.first);
-        usage += kv.second.capacity() * sizeof(Entry) + sizeof(kv.second);
-    }
-    return usage;
+    return dht_.memoryUsage();
 }
 
 void L1Index::clear() {
-    index_.clear();
+    dht_.clear();
     key_count_ = 0;
-    entry_count_ = 0;
 }
 
 // --- Persistence ---
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
-static constexpr uint32_t kVersion = 5;
+static constexpr uint32_t kVersion = 6;
 
 Status L1Index::saveSnapshot(const std::string& path) const {
     std::ofstream file(path, std::ios::binary);
@@ -190,21 +168,18 @@ Status L1Index::saveSnapshot(const std::string& path) const {
     writer.write(kMagic, 4);
     writer.writeVal(kVersion);
 
-    uint64_t num_keys = key_count_;
-    writer.writeVal(num_keys);
+    uint64_t num_entries = dht_.size();
+    writer.writeVal(num_entries);
 
-    for (const auto& kv : index_) {
-        uint32_t key_len = static_cast<uint32_t>(kv.first.size());
-        writer.writeVal(key_len);
-        writer.write(kv.first.data(), key_len);
-        uint32_t num_entries = static_cast<uint32_t>(kv.second.size());
-        writer.writeVal(num_entries);
-        for (const auto& e : kv.second) {
-            writer.writeVal(e.segment_id);
-            uint64_t ver = e.version;
-            writer.writeVal(ver);
-        }
-    }
+    uint64_t key_count = key_count_;
+    writer.writeVal(key_count);
+
+    // Per entry: [hash:8][version:4][segment_id:4]
+    dht_.forEach([&writer](uint64_t hash, uint32_t version, uint32_t segment_id) {
+        writer.writeVal(hash);
+        writer.writeVal(version);
+        writer.writeVal(segment_id);
+    });
 
     // Checksum
     uint32_t checksum = writer.finalize();
@@ -237,45 +212,31 @@ Status L1Index::loadSnapshot(const std::string& path) {
         return Status::Corruption("Unsupported snapshot version");
     }
 
-    // Number of keys
-    uint64_t num_keys;
-    if (!reader.readVal(num_keys)) {
+    // Number of entries
+    uint64_t num_entries;
+    if (!reader.readVal(num_entries)) {
+        return Status::Corruption("Failed to read entry count");
+    }
+
+    // Key count
+    uint64_t key_count;
+    if (!reader.readVal(key_count)) {
         return Status::Corruption("Failed to read key count");
     }
 
     // Clear current state and rebuild
     clear();
 
-    for (uint64_t k = 0; k < num_keys; ++k) {
-        uint32_t key_len;
-        if (!reader.readVal(key_len)) {
-            return Status::Corruption("Failed to read key length");
+    for (uint64_t i = 0; i < num_entries; ++i) {
+        uint64_t hash;
+        uint32_t ver, seg;
+        if (!reader.readVal(hash) || !reader.readVal(ver) || !reader.readVal(seg)) {
+            return Status::Corruption("Failed to read entry");
         }
-
-        std::string key(key_len, '\0');
-        if (!reader.read(key.data(), key_len)) {
-            return Status::Corruption("Failed to read key");
-        }
-
-        uint32_t num_entries;
-        if (!reader.readVal(num_entries)) {
-            return Status::Corruption("Failed to read entry count");
-        }
-
-        auto& entries = index_[key];
-        entries.reserve(num_entries);
-        for (uint32_t e = 0; e < num_entries; ++e) {
-            uint32_t segment_id;
-            uint64_t ver;
-            if (!reader.readVal(segment_id) || !reader.readVal(ver)) {
-                return Status::Corruption("Failed to read entry");
-            }
-            entries.push_back({segment_id, ver});
-        }
-
-        ++key_count_;
-        entry_count_ += num_entries;
+        dht_.addEntryByHash(hash, ver, seg);
     }
+
+    key_count_ = static_cast<size_t>(key_count);
 
     // Verify checksum
     uint32_t expected_crc = reader.finalize();

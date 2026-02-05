@@ -12,11 +12,10 @@
 namespace kvlite {
 namespace internal {
 
-// L2 Delta Hash Table: compact hash table for per-file indexes.
+// L2 Delta Hash Table: compact hash table for paired indexes.
 //
 // Stores (offset, version) pairs per fingerprint.
-// Append-only, write-once: no remove, update, or concurrency control.
-// Writes are assumed to arrive in sorted hash order (no bucket contention).
+// No concurrency control — external synchronization required.
 //
 // Bucket format (managed by L2LSlotCodec header protocol):
 //   [32 bits: base_offset] [lslot 0] [lslot 1] ... [lslot N-1] [8 bytes: ext_ptr]
@@ -56,6 +55,13 @@ public:
                    uint32_t& offset, uint32_t& version) const;
 
     bool contains(const std::string& key) const;
+
+    // Remove all entries for a key. Returns number of entries removed.
+    size_t removeAll(const std::string& key);
+
+    // Remove entries where the second field (version) matches value.
+    // Returns number of entries removed.
+    size_t removeBySecond(const std::string& key, uint32_t value);
 
     // Iterate over all entries.
     void forEach(const std::function<void(uint64_t hash,

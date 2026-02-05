@@ -64,6 +64,87 @@ bool L2DeltaHashTable::contains(const std::string& key) const {
     return findFirst(key, off, ver);
 }
 
+// --- Remove ---
+
+size_t L2DeltaHashTable::removeAll(const std::string& key) {
+    uint64_t h = hashKey(key);
+    uint32_t bi = bucketIndex(h);
+    uint32_t li = lslotIndex(h);
+    uint64_t fp = fingerprint(h);
+
+    Bucket* bucket = &buckets_[bi];
+    size_t total_removed = 0;
+
+    while (bucket) {
+        auto all_slots = decodeAllLSlots(*bucket);
+        auto& entries = all_slots[li].entries;
+        size_t removed = 0;
+
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it->fingerprint == fp) {
+                removed = it->offsets.size();
+                entries.erase(it);
+                break;
+            }
+        }
+
+        if (removed > 0) {
+            total_removed += removed;
+            reencodeAllLSlots(*bucket, all_slots);
+        }
+
+        bucket = nextBucketMut(*bucket);
+    }
+
+    size_ -= total_removed;
+    return total_removed;
+}
+
+size_t L2DeltaHashTable::removeBySecond(const std::string& key, uint32_t value) {
+    uint64_t h = hashKey(key);
+    uint32_t bi = bucketIndex(h);
+    uint32_t li = lslotIndex(h);
+    uint64_t fp = fingerprint(h);
+
+    Bucket* bucket = &buckets_[bi];
+    size_t total_removed = 0;
+
+    while (bucket) {
+        auto all_slots = decodeAllLSlots(*bucket);
+        auto& entries = all_slots[li].entries;
+        bool modified = false;
+
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it->fingerprint == fp) {
+                size_t i = 0;
+                while (i < it->versions.size()) {
+                    if (it->versions[i] == value) {
+                        it->offsets.erase(it->offsets.begin() + i);
+                        it->versions.erase(it->versions.begin() + i);
+                        ++total_removed;
+                        modified = true;
+                    } else {
+                        ++i;
+                    }
+                }
+                if (it->offsets.empty()) {
+                    entries.erase(it);
+                }
+                break;
+            }
+        }
+
+        if (modified) {
+            reencodeAllLSlots(*bucket, all_slots);
+        }
+
+        bucket = nextBucketMut(*bucket);
+    }
+
+    size_ -= total_removed;
+    return total_removed;
+}
+
 // --- Add ---
 
 void L2DeltaHashTable::addEntry(const std::string& key,

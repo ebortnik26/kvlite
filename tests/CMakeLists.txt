@@ -51,6 +51,8 @@ add_executable(kvlite_dht_test
     ${CMAKE_SOURCE_DIR}/src/internal/lslot_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/l1_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_lslot_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/l2_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 

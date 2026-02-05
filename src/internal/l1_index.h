@@ -3,10 +3,10 @@
 
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include <functional>
 
+#include "internal/l2_delta_hash_table.h"
 #include "kvlite/status.h"
 
 namespace kvlite {
@@ -16,6 +16,10 @@ namespace internal {
 //
 // Structure: key → [(segment_id₁, version₁), (segment_id₂, version₂), ...]
 //            sorted by version desc (latest/highest first)
+//
+// Backed by L2DeltaHashTable with swapped field mapping:
+//   DHT "offsets" → versions (sorted desc, so findFirst returns latest)
+//   DHT "versions" → segment_ids (parallel)
 //
 // The L1 index is always fully loaded in memory. It is persisted via:
 // 1. WAL (append-only delta log for crash recovery)
@@ -71,28 +75,20 @@ public:
     // Load snapshot from file.
     Status loadSnapshot(const std::string& path);
 
-    // Snapshot file format (v5):
+    // Snapshot file format (v6, hash-based):
     // [magic: 4 bytes]["L1IX"]
-    // [version: 4 bytes][5]
-    // [num_keys: 8 bytes]
-    // For each key:
-    //   [key_len: 4 bytes]
-    //   [key: key_len bytes]
-    //   [num_entries: 4 bytes]
-    //   For each entry:
-    //     [segment_id: 4 bytes]
-    //     [version: 8 bytes]
+    // [version: 4 bytes][6]
+    // [num_entries: 8 bytes]
+    // [key_count: 8 bytes]
+    // Per entry (via forEach):
+    //   [hash: 8 bytes]
+    //   [version: 4 bytes]
+    //   [segment_id: 4 bytes]
     // [checksum: 4 bytes]
 
 private:
-    struct Entry {
-        uint32_t segment_id;
-        uint64_t version;
-    };
-
-    std::unordered_map<std::string, std::vector<Entry>> index_;
+    L2DeltaHashTable dht_;
     size_t key_count_ = 0;
-    size_t entry_count_ = 0;
 };
 
 } // namespace internal

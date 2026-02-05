@@ -467,65 +467,94 @@ TEST(DeltaHashTable, AddEntryByHash) {
 }
 
 // --- L1Index via DHT Tests ---
+//
+// New API: put(key, version, segment_id), get(key, segment_ids, versions),
+// getLatest(key, version, segment_id), removeSegment(key, segment_id).
+// Versions sorted descending (latest first).
 
 using kvlite::Status;
 
 TEST(L1IndexDHT, PutAndGetLatest) {
     L1Index index;
 
-    index.put("key1", 100);
-    index.put("key1", 200);
-    index.put("key1", 300);
+    // version=100 in seg 1, version=200 in seg 2, version=300 in seg 3
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
+    index.put("key1", 300, 3);
 
-    uint32_t file_id;
-    EXPECT_TRUE(index.getLatest("key1", file_id));
-    EXPECT_EQ(file_id, 300u);
+    uint64_t ver;
+    uint32_t seg;
+    EXPECT_TRUE(index.getLatest("key1", ver, seg));
+    EXPECT_EQ(ver, 300u);
+    EXPECT_EQ(seg, 3u);
 
-    std::vector<uint32_t> fids;
-    ASSERT_TRUE(index.getFileIds("key1", fids));
-    ASSERT_EQ(fids.size(), 3u);
-    EXPECT_EQ(fids[0], 300u);
-    EXPECT_EQ(fids[1], 200u);
-    EXPECT_EQ(fids[2], 100u);
+    std::vector<uint32_t> seg_ids;
+    std::vector<uint64_t> vers;
+    ASSERT_TRUE(index.get("key1", seg_ids, vers));
+    ASSERT_EQ(seg_ids.size(), 3u);
+    EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
+    EXPECT_EQ(vers[1], 200u);  EXPECT_EQ(seg_ids[1], 2u);
+    EXPECT_EQ(vers[2], 100u);  EXPECT_EQ(seg_ids[2], 1u);
 }
 
-TEST(L1IndexDHT, PutDuplicateFileId) {
+TEST(L1IndexDHT, PutMultipleVersions) {
     L1Index index;
 
-    index.put("key1", 100);
-    index.put("key1", 200);
-    // Putting 200 again should be a no-op (already at front)
-    index.put("key1", 200);
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
+    index.put("key1", 300, 3);
 
-    std::vector<uint32_t> fids;
-    ASSERT_TRUE(index.getFileIds("key1", fids));
-    ASSERT_EQ(fids.size(), 2u);
-    EXPECT_EQ(index.entryCount(), 2u);
+    EXPECT_EQ(index.entryCount(), 3u);
+    EXPECT_EQ(index.keyCount(), 1u);
 }
 
 TEST(L1IndexDHT, GetLatest) {
     L1Index index;
-    index.put("key1", 100);
-    index.put("key1", 200);
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
 
-    uint32_t file_id;
-    EXPECT_TRUE(index.getLatest("key1", file_id));
-    EXPECT_EQ(file_id, 200u);
+    uint64_t ver;
+    uint32_t seg;
+    EXPECT_TRUE(index.getLatest("key1", ver, seg));
+    EXPECT_EQ(ver, 200u);
+    EXPECT_EQ(seg, 2u);
 
-    EXPECT_FALSE(index.getLatest("missing", file_id));
+    EXPECT_FALSE(index.getLatest("missing", ver, seg));
+}
+
+TEST(L1IndexDHT, GetWithUpperBound) {
+    L1Index index;
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
+    index.put("key1", 300, 3);
+
+    uint64_t ver;
+    uint32_t seg;
+    // Upper bound 250 → should get version 200
+    EXPECT_TRUE(index.get("key1", 250, ver, seg));
+    EXPECT_EQ(ver, 200u);
+    EXPECT_EQ(seg, 2u);
+
+    // Upper bound 300 → should get version 300
+    EXPECT_TRUE(index.get("key1", 300, ver, seg));
+    EXPECT_EQ(ver, 300u);
+    EXPECT_EQ(seg, 3u);
+
+    // Upper bound 50 → nothing
+    EXPECT_FALSE(index.get("key1", 50, ver, seg));
 }
 
 TEST(L1IndexDHT, Contains) {
     L1Index index;
     EXPECT_FALSE(index.contains("key1"));
-    index.put("key1", 100);
+    index.put("key1", 100, 1);
     EXPECT_TRUE(index.contains("key1"));
 }
 
 TEST(L1IndexDHT, Remove) {
     L1Index index;
-    index.put("key1", 100);
-    index.put("key1", 200);
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
     EXPECT_EQ(index.entryCount(), 2u);
 
     index.remove("key1");
@@ -534,117 +563,88 @@ TEST(L1IndexDHT, Remove) {
     EXPECT_EQ(index.entryCount(), 0u);
 }
 
-TEST(L1IndexDHT, RemoveFile) {
+TEST(L1IndexDHT, RemoveSegment) {
     L1Index index;
-    index.put("key1", 100);
-    index.put("key1", 200);
-    index.put("key1", 300);
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
+    index.put("key1", 300, 3);
 
-    index.removeFile("key1", 200);
+    index.removeSegment("key1", 2);
 
-    std::vector<uint32_t> fids;
-    ASSERT_TRUE(index.getFileIds("key1", fids));
-    ASSERT_EQ(fids.size(), 2u);
-    EXPECT_EQ(fids[0], 300u);
-    EXPECT_EQ(fids[1], 100u);
+    std::vector<uint32_t> seg_ids;
+    std::vector<uint64_t> vers;
+    ASSERT_TRUE(index.get("key1", seg_ids, vers));
+    ASSERT_EQ(seg_ids.size(), 2u);
+    EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
+    EXPECT_EQ(vers[1], 100u);  EXPECT_EQ(seg_ids[1], 1u);
     EXPECT_EQ(index.entryCount(), 2u);
 }
 
-TEST(L1IndexDHT, RemoveFileRemovesKey) {
+TEST(L1IndexDHT, RemoveSegmentRemovesKey) {
     L1Index index;
-    index.put("key1", 100);
-    index.removeFile("key1", 100);
+    index.put("key1", 100, 1);
+    index.removeSegment("key1", 1);
     EXPECT_FALSE(index.contains("key1"));
     EXPECT_EQ(index.keyCount(), 0u);
     EXPECT_EQ(index.entryCount(), 0u);
 }
 
-TEST(L1IndexDHT, RemoveFileFromMultiple) {
+TEST(L1IndexDHT, RemoveSegmentFromMultiple) {
     L1Index index;
-    index.put("key1", 100);
-    index.put("key1", 200);
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
 
-    // Remove second (older)
-    index.removeFile("key1", 100);
+    // Remove older segment
+    index.removeSegment("key1", 1);
 
-    std::vector<uint32_t> fids;
-    ASSERT_TRUE(index.getFileIds("key1", fids));
-    ASSERT_EQ(fids.size(), 1u);
-    EXPECT_EQ(fids[0], 200u);
+    std::vector<uint32_t> seg_ids;
+    std::vector<uint64_t> vers;
+    ASSERT_TRUE(index.get("key1", seg_ids, vers));
+    ASSERT_EQ(seg_ids.size(), 1u);
+    EXPECT_EQ(seg_ids[0], 2u);
     EXPECT_EQ(index.entryCount(), 1u);
 
-    // Remove first (latest)
-    index.removeFile("key1", 200);
+    // Remove latest segment
+    index.removeSegment("key1", 2);
     EXPECT_FALSE(index.contains("key1"));
     EXPECT_EQ(index.entryCount(), 0u);
 }
 
-TEST(L1IndexDHT, RemoveFileFromThree) {
+TEST(L1IndexDHT, RemoveSegmentFromThree) {
     L1Index index;
 
-    index.put("key1", 100);
-    index.put("key1", 200);
-    index.put("key1", 300);
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
+    index.put("key1", 300, 3);
     EXPECT_EQ(index.entryCount(), 3u);
 
-    index.removeFile("key1", 200);
+    index.removeSegment("key1", 2);
     EXPECT_EQ(index.entryCount(), 2u);
 
-    std::vector<uint32_t> fids;
-    ASSERT_TRUE(index.getFileIds("key1", fids));
-    ASSERT_EQ(fids.size(), 2u);
-    EXPECT_EQ(fids[0], 300u);
-    EXPECT_EQ(fids[1], 100u);
+    std::vector<uint32_t> seg_ids;
+    std::vector<uint64_t> vers;
+    ASSERT_TRUE(index.get("key1", seg_ids, vers));
+    ASSERT_EQ(seg_ids.size(), 2u);
+    EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
+    EXPECT_EQ(vers[1], 100u);  EXPECT_EQ(seg_ids[1], 1u);
 
-    index.removeFile("key1", 100);
+    index.removeSegment("key1", 1);
     EXPECT_EQ(index.entryCount(), 1u);
 
-    ASSERT_TRUE(index.getFileIds("key1", fids));
-    ASSERT_EQ(fids.size(), 1u);
-    EXPECT_EQ(fids[0], 300u);
+    ASSERT_TRUE(index.get("key1", seg_ids, vers));
+    ASSERT_EQ(seg_ids.size(), 1u);
+    EXPECT_EQ(seg_ids[0], 3u);
 
-    index.removeFile("key1", 300);
+    index.removeSegment("key1", 3);
     EXPECT_EQ(index.entryCount(), 0u);
     EXPECT_FALSE(index.contains("key1"));
 }
 
-TEST(L1IndexDHT, ForEach) {
+TEST(L1IndexDHT, GetNonExistent) {
     L1Index index;
-    index.put("a", 10);
-    index.put("b", 20);
-
-    size_t count = 0;
-    index.forEach([&](const std::vector<uint32_t>& file_ids) {
-        EXPECT_EQ(file_ids.size(), 1u);
-        ++count;
-    });
-
-    EXPECT_EQ(count, 2u);
-}
-
-TEST(L1IndexDHT, ForEachMixed) {
-    L1Index index;
-    index.put("a", 10);
-    index.put("b", 20);
-    index.put("b", 30);
-    index.put("c", 40);
-    index.put("c", 50);
-    index.put("c", 60);
-
-    std::set<size_t> sizes;
-    index.forEach([&](const std::vector<uint32_t>& file_ids) {
-        sizes.insert(file_ids.size());
-    });
-
-    EXPECT_EQ(sizes.count(1u), 1u);
-    EXPECT_EQ(sizes.count(2u), 1u);
-    EXPECT_EQ(sizes.count(3u), 1u);
-}
-
-TEST(L1IndexDHT, GetFileIdsNonExistent) {
-    L1Index index;
-    std::vector<uint32_t> fids;
-    EXPECT_FALSE(index.getFileIds("missing", fids));
+    std::vector<uint32_t> seg_ids;
+    std::vector<uint64_t> vers;
+    EXPECT_FALSE(index.get("missing", seg_ids, vers));
 }
 
 #include <filesystem>
@@ -654,9 +654,9 @@ TEST(L1IndexDHT, Snapshot) {
 
     {
         L1Index index;
-        index.put("key1", 100);
-        index.put("key1", 200);
-        index.put("key2", 300);
+        index.put("key1", 100, 1);
+        index.put("key1", 200, 2);
+        index.put("key2", 300, 3);
 
         Status s = index.saveSnapshot(path);
         ASSERT_TRUE(s.ok()) << s.toString();
@@ -670,26 +670,29 @@ TEST(L1IndexDHT, Snapshot) {
         EXPECT_EQ(index.keyCount(), 2u);
         EXPECT_EQ(index.entryCount(), 3u);
 
-        uint32_t file_id;
-        EXPECT_TRUE(index.getLatest("key1", file_id));
-        EXPECT_EQ(file_id, 200u);
+        uint64_t ver;
+        uint32_t seg;
+        EXPECT_TRUE(index.getLatest("key1", ver, seg));
+        EXPECT_EQ(ver, 200u);
+        EXPECT_EQ(seg, 2u);
 
-        EXPECT_TRUE(index.getLatest("key2", file_id));
-        EXPECT_EQ(file_id, 300u);
+        EXPECT_TRUE(index.getLatest("key2", ver, seg));
+        EXPECT_EQ(ver, 300u);
+        EXPECT_EQ(seg, 3u);
     }
 
     std::filesystem::remove(path);
 }
 
-TEST(L1IndexDHT, SnapshotWithManyFileIds) {
+TEST(L1IndexDHT, SnapshotWithManyEntries) {
     std::string path = "/tmp/test_l1_snapshot_many.dat";
 
     {
         L1Index index;
-        index.put("key1", 100);
-        index.put("key1", 200);
-        index.put("key1", 300);
-        index.put("key2", 400);
+        index.put("key1", 100, 1);
+        index.put("key1", 200, 2);
+        index.put("key1", 300, 3);
+        index.put("key2", 400, 4);
 
         Status s = index.saveSnapshot(path);
         ASSERT_TRUE(s.ok()) << s.toString();
@@ -703,16 +706,19 @@ TEST(L1IndexDHT, SnapshotWithManyFileIds) {
         EXPECT_EQ(index.keyCount(), 2u);
         EXPECT_EQ(index.entryCount(), 4u);
 
-        std::vector<uint32_t> fids;
-        ASSERT_TRUE(index.getFileIds("key1", fids));
-        ASSERT_EQ(fids.size(), 3u);
-        EXPECT_EQ(fids[0], 300u);
-        EXPECT_EQ(fids[1], 200u);
-        EXPECT_EQ(fids[2], 100u);
+        std::vector<uint32_t> seg_ids;
+        std::vector<uint64_t> vers;
+        ASSERT_TRUE(index.get("key1", seg_ids, vers));
+        ASSERT_EQ(seg_ids.size(), 3u);
+        EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
+        EXPECT_EQ(vers[1], 200u);  EXPECT_EQ(seg_ids[1], 2u);
+        EXPECT_EQ(vers[2], 100u);  EXPECT_EQ(seg_ids[2], 1u);
 
-        uint32_t file_id;
-        EXPECT_TRUE(index.getLatest("key2", file_id));
-        EXPECT_EQ(file_id, 400u);
+        uint64_t ver;
+        uint32_t seg;
+        EXPECT_TRUE(index.getLatest("key2", ver, seg));
+        EXPECT_EQ(ver, 400u);
+        EXPECT_EQ(seg, 4u);
     }
 
     std::filesystem::remove(path);
@@ -721,7 +727,8 @@ TEST(L1IndexDHT, SnapshotWithManyFileIds) {
 TEST(L1IndexDHT, Clear) {
     L1Index index;
     for (int i = 0; i < 50; ++i) {
-        index.put("key" + std::to_string(i), i * 10);
+        index.put("key" + std::to_string(i), static_cast<uint64_t>(i * 10),
+                  static_cast<uint32_t>(i));
     }
     EXPECT_EQ(index.keyCount(), 50u);
 
@@ -851,15 +858,17 @@ TEST(L1IndexDHT, LargeScale) {
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        index.put(key, static_cast<uint32_t>(i * 10));
+        index.put(key, static_cast<uint64_t>(i * 10), static_cast<uint32_t>(i));
     }
 
     EXPECT_EQ(index.keyCount(), static_cast<size_t>(N));
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        uint32_t file_id;
-        ASSERT_TRUE(index.getLatest(key, file_id));
-        EXPECT_EQ(file_id, static_cast<uint32_t>(i * 10));
+        uint64_t ver;
+        uint32_t seg;
+        ASSERT_TRUE(index.getLatest(key, ver, seg));
+        EXPECT_EQ(ver, static_cast<uint64_t>(i * 10));
+        EXPECT_EQ(seg, static_cast<uint32_t>(i));
     }
 }
