@@ -119,11 +119,15 @@ Status Segment::put(const std::string& key, uint64_t version,
     if (state_ != State::kWriting) {
         return Status::InvalidArgument("Segment: put requires Writing state");
     }
+    if (key.size() > LogEntry::kMaxKeyLen) {
+        return Status::InvalidArgument("Segment: key too long");
+    }
 
-    PackedVersion pv(version, tombstone);
-    uint32_t key_len = static_cast<uint32_t>(key.size());
+    uint16_t key_len = static_cast<uint16_t>(key.size());
+    if (tombstone) key_len |= LogEntry::kTombstoneBit;
     uint32_t val_len = static_cast<uint32_t>(value.size());
-    size_t entry_size = LogEntry::kHeaderSize + key_len + val_len +
+    size_t raw_key_len = key.size();
+    size_t entry_size = LogEntry::kHeaderSize + raw_key_len + val_len +
                         LogEntry::kChecksumSize;
 
     uint8_t stack_buf[4096];
@@ -135,13 +139,13 @@ Status Segment::put(const std::string& key, uint64_t version,
     }
 
     uint8_t* p = buf;
-    std::memcpy(p, &pv.data, 8);   p += 8;
-    std::memcpy(p, &key_len, 4);   p += 4;
+    std::memcpy(p, &version, 8);   p += 8;
+    std::memcpy(p, &key_len, 2);   p += 2;
     std::memcpy(p, &val_len, 4);   p += 4;
-    std::memcpy(p, key.data(), key_len);   p += key_len;
+    std::memcpy(p, key.data(), raw_key_len);   p += raw_key_len;
     std::memcpy(p, value.data(), val_len);  p += val_len;
 
-    size_t payload_len = LogEntry::kHeaderSize + key_len + val_len;
+    size_t payload_len = LogEntry::kHeaderSize + raw_key_len + val_len;
     uint32_t checksum = crc32(buf, payload_len);
     std::memcpy(p, &checksum, 4);
 
@@ -163,11 +167,15 @@ Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {
     Status s = log_file_.readAt(offset, hdr, LogEntry::kHeaderSize);
     if (!s.ok()) return s;
 
-    uint64_t pv_data;
-    uint32_t kl, vl;
-    std::memcpy(&pv_data, hdr, 8);
-    std::memcpy(&kl, hdr + 8, 4);
-    std::memcpy(&vl, hdr + 12, 4);
+    uint64_t version;
+    uint16_t key_len_raw;
+    uint32_t vl;
+    std::memcpy(&version, hdr, 8);
+    std::memcpy(&key_len_raw, hdr + 8, 2);
+    std::memcpy(&vl, hdr + 10, 4);
+
+    bool tombstone = (key_len_raw & LogEntry::kTombstoneBit) != 0;
+    uint32_t kl = key_len_raw & ~LogEntry::kTombstoneBit;
 
     // Read full entry for CRC validation.
     size_t entry_size = LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
@@ -192,7 +200,7 @@ Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {
                                   std::to_string(offset));
     }
 
-    entry.pv = PackedVersion(pv_data);
+    entry.pv = PackedVersion(version, tombstone);
     entry.key.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize), kl);
     entry.value.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize + kl), vl);
     return Status::OK();

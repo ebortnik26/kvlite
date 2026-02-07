@@ -31,12 +31,13 @@ struct PackedVersion {
 // Log entry stored in data files.
 //
 // On-disk format:
-// ┌──────────────────┬─────────┬───────────┬─────┬───────┬──────────┐
-// │ version|tombstone│ key_len │ value_len │ key │ value │ checksum │
-// │      8 bytes     │ 4 bytes │  4 bytes  │ var │  var  │ 4 bytes  │
-// └──────────────────┴─────────┴───────────┴─────┴───────┴──────────┘
+// ┌─────────┬─────────────────┬───────────┬─────┬───────┬──────────┐
+// │ version │ key_len|tombst. │ value_len │ key │ value │ checksum │
+// │ 8 bytes │     2 bytes     │  4 bytes  │ var │  var  │ 4 bytes  │
+// └─────────┴─────────────────┴───────────┴─────┴───────┴──────────┘
 //
-// Total header size: 16 bytes (before key/value)
+// key_len field: 15 bits for length (max 32767), 1 bit (MSB) for tombstone.
+// Total header size: 14 bytes (before key/value)
 // Checksum: CRC32 of all preceding bytes
 struct LogEntry {
     PackedVersion pv;
@@ -50,8 +51,10 @@ struct LogEntry {
         return kHeaderSize + key.size() + value.size() + kChecksumSize;
     }
 
-    static constexpr size_t kHeaderSize = 8 + 4 + 4;  // packed_version + key_len + value_len
+    static constexpr size_t kHeaderSize = 8 + 2 + 4;  // version + key_len|tombstone + value_len
     static constexpr size_t kChecksumSize = 4;
+    static constexpr size_t kMaxKeyLen = 0x7FFF;      // 15 bits = 32767
+    static constexpr uint16_t kTombstoneBit = 0x8000; // MSB of key_len field
 };
 
 // Index entry stored in the L2 index.

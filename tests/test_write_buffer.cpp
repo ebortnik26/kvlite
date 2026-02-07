@@ -283,13 +283,17 @@ protected:
         uint8_t hdr[LogEntry::kHeaderSize];
         rawRead(offset, hdr, LogEntry::kHeaderSize);
 
-        uint64_t pv_data;
-        uint32_t kl, vl;
-        std::memcpy(&pv_data, hdr, 8);
-        std::memcpy(&kl, hdr + 8, 4);
-        std::memcpy(&vl, hdr + 12, 4);
+        uint64_t version;
+        uint16_t key_len_raw;
+        uint32_t vl;
+        std::memcpy(&version, hdr, 8);
+        std::memcpy(&key_len_raw, hdr + 8, 2);
+        std::memcpy(&vl, hdr + 10, 4);
 
-        out.pv = PackedVersion(pv_data);
+        bool tombstone = (key_len_raw & LogEntry::kTombstoneBit) != 0;
+        uint32_t kl = key_len_raw & ~LogEntry::kTombstoneBit;
+
+        out.pv = PackedVersion(version, tombstone);
         out.key.resize(kl);
         out.value.resize(vl);
 

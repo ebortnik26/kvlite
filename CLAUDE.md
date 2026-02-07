@@ -73,8 +73,8 @@ Both indexes use `DeltaHashTable` — a compact hash table with per-bucket spinl
 ### Key Types
 
 - **Status**: Returned by all fallible operations. Codes: OK, NotFound, Corruption, IOError, InvalidArgument, etc. Check with `.ok()`, `.isNotFound()`, etc.
-- **PackedVersion** (`log_entry.h`): 8-byte value encoding version (63 bits) + tombstone flag (MSB).
-- **LogEntry** (`log_entry.h`): `{ PackedVersion pv; string key; string value; }`. On-disk format: `[pv:8][key_len:4][val_len:4][key][value][crc32:4]`.
+- **PackedVersion** (`log_entry.h`): In-memory 8-byte value encoding version (63 bits) + tombstone flag (MSB).
+- **LogEntry** (`log_entry.h`): `{ PackedVersion pv; string key; string value; }`. On-disk format: `[version:8][key_len|tombstone:2][val_len:4][key][value][crc32:4]`. Header is 14 bytes. The key_len field uses 15 bits for length (max 32767) and 1 bit (MSB) for tombstone.
 
 ### Naming Conventions
 
