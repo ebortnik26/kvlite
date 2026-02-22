@@ -6,22 +6,22 @@
 #include <mutex>
 
 #include "kvlite/status.h"
-#include "l1_index.h"
+#include "global_index.h"
 
 namespace kvlite {
 namespace internal {
 
-// WAL operation types for L1 index
+// WAL operation types for GlobalIndex
 enum class WalOp : uint8_t {
     kPut = 1,     // Add entry: key, version, segment_id
     kRemove = 2,  // Remove key (all versions) - used during GC
 };
 
-// Write-Ahead Log for L1 Index.
+// Write-Ahead Log for GlobalIndex.
 //
-// The WAL records all changes to the L1 index as append-only entries.
+// The WAL records all changes to the GlobalIndex as append-only entries.
 // On recovery, the WAL is replayed on top of the last snapshot to
-// reconstruct the L1 index.
+// reconstruct the GlobalIndex.
 //
 // WAL entry format:
 // ┌────┬─────────┬─────────┬─────┬─────────┬──────────┐
@@ -30,10 +30,10 @@ enum class WalOp : uint8_t {
 // └────┴─────────┴─────────┴─────┴─────────┴──────────┘
 //
 // Thread-safety: All operations are thread-safe.
-class L1WAL {
+class GlobalIndexWAL {
 public:
-    L1WAL();
-    ~L1WAL();
+    GlobalIndexWAL();
+    ~GlobalIndexWAL();
 
     // Open or create WAL file
     Status open(const std::string& path);
@@ -51,9 +51,9 @@ public:
     // Sync WAL to disk
     Status sync();
 
-    // Replay WAL entries into an L1 index
+    // Replay WAL entries into a GlobalIndex
     // This is called during recovery to rebuild the index
-    Status replay(L1Index& index);
+    Status replay(GlobalIndex& index);
 
     // Truncate WAL (called after successful snapshot)
     Status truncate();

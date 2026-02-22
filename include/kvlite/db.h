@@ -14,7 +14,7 @@ namespace kvlite {
 
 // Forward declarations for internal components
 namespace internal {
-class L1IndexManager;
+class GlobalIndexManager;
 class StorageManager;
 class VersionManager;
 }  // namespace internal
@@ -25,9 +25,9 @@ struct DBStats {
     uint64_t total_log_size = 0;
     uint64_t num_live_entries = 0;
     uint64_t num_historical_entries = 0;
-    uint64_t l1_index_size = 0;
-    uint64_t l2_cache_size = 0;
-    uint64_t l2_cached_count = 0;
+    uint64_t global_index_size = 0;
+    uint64_t segment_index_cache_size = 0;
+    uint64_t segment_index_cached_count = 0;
     uint64_t current_version = 0;
     uint64_t oldest_version = 0;
     uint64_t active_snapshots = 0;
@@ -81,7 +81,7 @@ public:
         Status next(std::string& key, std::string& value);
         Status next(std::string& key, std::string& value, uint64_t& version);
 
-        uint64_t snapshotVersion() const;
+        const Snapshot& snapshot() const;
 
     private:
         friend class DB;
@@ -148,6 +148,7 @@ public:
     // --- Iteration ---
 
     Status createIterator(std::unique_ptr<Iterator>& iterator);
+    Status createIterator(const Snapshot& snapshot, std::unique_ptr<Iterator>& iterator);
 
     // --- Maintenance ---
 
@@ -167,7 +168,7 @@ private:
     std::string db_path_;
     Options options_;
     std::unique_ptr<internal::VersionManager> versions_;
-    std::unique_ptr<internal::L1IndexManager> l1_index_;
+    std::unique_ptr<internal::GlobalIndexManager> global_index_;
     std::unique_ptr<internal::StorageManager> storage_;
 };
 

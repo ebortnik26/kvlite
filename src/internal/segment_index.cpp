@@ -1,4 +1,4 @@
-#include "internal/l2_index.h"
+#include "internal/segment_index.h"
 
 #include <cstring>
 #include <vector>
@@ -9,36 +9,36 @@
 namespace kvlite {
 namespace internal {
 
-static const uint32_t kL2IndexMagic = 0x4C324958;  // "L2IX"
+static const uint32_t kSegmentIndexMagic = 0x4C324958;  // "L2IX" (legacy)
 
-struct L2IndexHeader {
+struct SegmentIndexHeader {
     uint32_t magic;
     uint32_t entry_count;
     uint32_t key_count;
     uint32_t reserved;
 };
 
-struct L2IndexEntry {
+struct SegmentIndexEntry {
     uint64_t hash;
     uint32_t offset;
     uint32_t version;
 };
 
-static L2DeltaHashTable::Config defaultDHTConfig() {
-    L2DeltaHashTable::Config config;
+static SegmentDeltaHashTable::Config defaultDHTConfig() {
+    SegmentDeltaHashTable::Config config;
     config.bucket_bits = 16;
     config.lslot_bits = 4;
     config.bucket_bytes = 256;
     return config;
 }
 
-L2Index::L2Index() : dht_(defaultDHTConfig()) {}
+SegmentIndex::SegmentIndex() : dht_(defaultDHTConfig()) {}
 
-L2Index::~L2Index() = default;
-L2Index::L2Index(L2Index&&) noexcept = default;
-L2Index& L2Index::operator=(L2Index&&) noexcept = default;
+SegmentIndex::~SegmentIndex() = default;
+SegmentIndex::SegmentIndex(SegmentIndex&&) noexcept = default;
+SegmentIndex& SegmentIndex::operator=(SegmentIndex&&) noexcept = default;
 
-void L2Index::put(const std::string& key, uint32_t offset, uint32_t version) {
+void SegmentIndex::put(const std::string& key, uint32_t offset, uint32_t version) {
     bool is_new = !dht_.contains(key);
     dht_.addEntry(key, offset, version);
     if (is_new) {
@@ -46,13 +46,13 @@ void L2Index::put(const std::string& key, uint32_t offset, uint32_t version) {
     }
 }
 
-bool L2Index::get(const std::string& key,
+bool SegmentIndex::get(const std::string& key,
                   std::vector<uint32_t>& offsets,
                   std::vector<uint32_t>& versions) const {
     return dht_.findAll(key, offsets, versions);
 }
 
-bool L2Index::get(const std::string& key, uint64_t upper_bound,
+bool SegmentIndex::get(const std::string& key, uint64_t upper_bound,
                   uint64_t& offset, uint64_t& version) const {
     std::vector<uint32_t> offsets, versions;
     if (!dht_.findAll(key, offsets, versions)) return false;
@@ -68,33 +68,33 @@ bool L2Index::get(const std::string& key, uint64_t upper_bound,
     return false;
 }
 
-bool L2Index::getLatest(const std::string& key,
+bool SegmentIndex::getLatest(const std::string& key,
                         uint32_t& offset, uint32_t& version) const {
     return dht_.findFirst(key, offset, version);
 }
 
-bool L2Index::contains(const std::string& key) const {
+bool SegmentIndex::contains(const std::string& key) const {
     return dht_.contains(key);
 }
 
-Status L2Index::writeTo(LogFile& file) {
+Status SegmentIndex::writeTo(LogFile& file) {
     // Collect all entries via DHT-level forEach (has hash).
-    std::vector<L2IndexEntry> entries;
+    std::vector<SegmentIndexEntry> entries;
     dht_.forEach([&entries](uint64_t hash, uint32_t offset, uint32_t version) {
         entries.push_back({hash, offset, version});
     });
 
     // Build the serialized buffer: header + entries + crc32.
-    const size_t header_size = sizeof(L2IndexHeader);
-    const size_t entries_size = entries.size() * sizeof(L2IndexEntry);
+    const size_t header_size = sizeof(SegmentIndexHeader);
+    const size_t entries_size = entries.size() * sizeof(SegmentIndexEntry);
     const size_t payload_size = header_size + entries_size;
     const size_t total_size = payload_size + sizeof(uint32_t);
 
     std::vector<uint8_t> buf(total_size);
 
     // Write header.
-    L2IndexHeader header;
-    header.magic = kL2IndexMagic;
+    SegmentIndexHeader header;
+    header.magic = kSegmentIndexMagic;
     header.entry_count = static_cast<uint32_t>(entries.size());
     header.key_count = static_cast<uint32_t>(key_count_);
     header.reserved = 0;
@@ -113,19 +113,19 @@ Status L2Index::writeTo(LogFile& file) {
     return file.append(buf.data(), total_size, write_offset);
 }
 
-Status L2Index::readFrom(const LogFile& file, uint64_t offset) {
+Status SegmentIndex::readFrom(const LogFile& file, uint64_t offset) {
     // Read header.
-    L2IndexHeader header;
+    SegmentIndexHeader header;
     Status s = file.readAt(offset, &header, sizeof(header));
     if (!s.ok()) return s;
 
-    if (header.magic != kL2IndexMagic) {
-        return Status::Corruption("L2Index: bad magic");
+    if (header.magic != kSegmentIndexMagic) {
+        return Status::Corruption("SegmentIndex: bad magic");
     }
 
     // Read entries.
-    const size_t entries_size = header.entry_count * sizeof(L2IndexEntry);
-    const size_t payload_size = sizeof(L2IndexHeader) + entries_size;
+    const size_t entries_size = header.entry_count * sizeof(SegmentIndexEntry);
+    const size_t payload_size = sizeof(SegmentIndexHeader) + entries_size;
     const size_t total_size = payload_size + sizeof(uint32_t);
 
     std::vector<uint8_t> buf(total_size);
@@ -137,13 +137,13 @@ Status L2Index::readFrom(const LogFile& file, uint64_t offset) {
     std::memcpy(&stored_crc, buf.data() + payload_size, sizeof(uint32_t));
     uint32_t computed_crc = crc32(buf.data(), payload_size);
     if (stored_crc != computed_crc) {
-        return Status::ChecksumMismatch("L2Index: checksum mismatch");
+        return Status::ChecksumMismatch("SegmentIndex: checksum mismatch");
     }
 
     // Rebuild the index.
     clear();
-    const L2IndexEntry* entries = reinterpret_cast<const L2IndexEntry*>(
-        buf.data() + sizeof(L2IndexHeader));
+    const SegmentIndexEntry* entries = reinterpret_cast<const SegmentIndexEntry*>(
+        buf.data() + sizeof(SegmentIndexHeader));
     for (uint32_t i = 0; i < header.entry_count; ++i) {
         dht_.addEntryByHash(entries[i].hash, entries[i].offset, entries[i].version);
     }
@@ -152,19 +152,25 @@ Status L2Index::readFrom(const LogFile& file, uint64_t offset) {
     return Status::OK();
 }
 
-size_t L2Index::keyCount() const {
+void SegmentIndex::forEach(const std::function<void(uint32_t offset, uint32_t version)>& fn) const {
+    dht_.forEach([&fn](uint64_t /*hash*/, uint32_t offset, uint32_t version) {
+        fn(offset, version);
+    });
+}
+
+size_t SegmentIndex::keyCount() const {
     return key_count_;
 }
 
-size_t L2Index::entryCount() const {
+size_t SegmentIndex::entryCount() const {
     return dht_.size();
 }
 
-size_t L2Index::memoryUsage() const {
+size_t SegmentIndex::memoryUsage() const {
     return dht_.memoryUsage();
 }
 
-void L2Index::clear() {
+void SegmentIndex::clear() {
     dht_.clear();
     key_count_ = 0;
 }

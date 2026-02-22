@@ -1,13 +1,13 @@
-#include "internal/l2_lslot_codec.h"
+#include "internal/segment_lslot_codec.h"
 #include "internal/bit_stream.h"
 
 namespace kvlite {
 namespace internal {
 
-L2LSlotCodec::L2LSlotCodec(uint8_t fingerprint_bits)
+SegmentLSlotCodec::SegmentLSlotCodec(uint8_t fingerprint_bits)
     : fingerprint_bits_(fingerprint_bits) {}
 
-L2LSlotCodec::LSlotContents L2LSlotCodec::decode(
+SegmentLSlotCodec::LSlotContents SegmentLSlotCodec::decode(
     const uint8_t* data, size_t bit_offset,
     size_t* end_bit_offset) const {
 
@@ -45,7 +45,7 @@ L2LSlotCodec::LSlotContents L2LSlotCodec::decode(
     return contents;
 }
 
-size_t L2LSlotCodec::encode(
+size_t SegmentLSlotCodec::encode(
     uint8_t* data, size_t bit_offset,
     const LSlotContents& contents) const {
 
@@ -84,7 +84,7 @@ static uint8_t eliasGammaBits(uint32_t n) {
     return 2 * k + 1;
 }
 
-size_t L2LSlotCodec::bitsNeeded(const LSlotContents& contents,
+size_t SegmentLSlotCodec::bitsNeeded(const LSlotContents& contents,
                                  uint8_t fp_bits) {
     size_t bits = contents.entries.size() + 1;  // unary(K)
     for (const auto& entry : contents.entries) {
@@ -108,7 +108,7 @@ size_t L2LSlotCodec::bitsNeeded(const LSlotContents& contents,
     return bits;
 }
 
-size_t L2LSlotCodec::bitOffset(const uint8_t* data,
+size_t SegmentLSlotCodec::bitOffset(const uint8_t* data,
                                 uint32_t target_lslot) const {
     size_t offset = 0;
     for (uint32_t s = 0; s < target_lslot; ++s) {
@@ -117,7 +117,7 @@ size_t L2LSlotCodec::bitOffset(const uint8_t* data,
     return offset;
 }
 
-size_t L2LSlotCodec::totalBits(const uint8_t* data,
+size_t SegmentLSlotCodec::totalBits(const uint8_t* data,
                                 uint32_t num_lslots) const {
     return bitOffset(data, num_lslots);
 }

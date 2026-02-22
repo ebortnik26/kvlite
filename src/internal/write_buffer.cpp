@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <unordered_map>
 
-#include "internal/l1_index.h"
+#include "internal/global_index.h"
 #include "internal/segment.h"
 
 namespace kvlite {
@@ -289,7 +289,7 @@ void WriteBuffer::clear() {
 }
 
 Status WriteBuffer::flush(const std::string& path, uint32_t segment_id,
-                          Segment& out, L1Index& l1) {
+                          Segment& out, GlobalIndex& global_index) {
     Status s = out.create(path, segment_id);
     if (!s.ok()) return s;
 
@@ -301,13 +301,13 @@ Status WriteBuffer::flush(const std::string& path, uint32_t segment_id,
         std::string value;
     };
 
-    // Collect every (key, version) to register in L1 after seal.
-    struct L1Entry {
+    // Collect every (key, version) to register in GlobalIndex after seal.
+    struct GlobalIndexEntry {
         std::string key;
         uint64_t version;
     };
-    std::vector<L1Entry> l1_entries;
-    l1_entries.reserve(size_.load(std::memory_order_relaxed));
+    std::vector<GlobalIndexEntry> global_index_entries;
+    global_index_entries.reserve(size_.load(std::memory_order_relaxed));
 
     // Process one bucket at a time. Iterating buckets 0..N gives hash-prefix
     // order; we only need to sort within each bucket by (hash, version).
@@ -342,16 +342,16 @@ Status WriteBuffer::flush(const std::string& path, uint32_t segment_id,
         for (const auto& e : bucket_entries) {
             s = out.put(e.key, e.version, e.value, e.pv.tombstone());
             if (!s.ok()) return s;
-            l1_entries.push_back({e.key, e.version});
+            global_index_entries.push_back({e.key, e.version});
         }
     }
 
     s = out.seal();
     if (!s.ok()) return s;
 
-    // Register every flushed entry in L1.
-    for (const auto& e : l1_entries) {
-        l1.put(e.key, e.version, segment_id);
+    // Register every flushed entry in GlobalIndex.
+    for (const auto& e : global_index_entries) {
+        global_index.put(e.key, e.version, segment_id);
     }
 
     return Status::OK();

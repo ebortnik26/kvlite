@@ -1,4 +1,4 @@
-#include "internal/l2_delta_hash_table.h"
+#include "internal/segment_delta_hash_table.h"
 
 #include <algorithm>
 #include <functional>
@@ -6,18 +6,18 @@
 namespace kvlite {
 namespace internal {
 
-L2DeltaHashTable::L2DeltaHashTable() : L2DeltaHashTable(Config{}) {}
+SegmentDeltaHashTable::SegmentDeltaHashTable() : SegmentDeltaHashTable(Config{}) {}
 
-L2DeltaHashTable::L2DeltaHashTable(const Config& config)
+SegmentDeltaHashTable::SegmentDeltaHashTable(const Config& config)
     : Base(config) {}
 
-L2DeltaHashTable::~L2DeltaHashTable() = default;
-L2DeltaHashTable::L2DeltaHashTable(L2DeltaHashTable&&) noexcept = default;
-L2DeltaHashTable& L2DeltaHashTable::operator=(L2DeltaHashTable&&) noexcept = default;
+SegmentDeltaHashTable::~SegmentDeltaHashTable() = default;
+SegmentDeltaHashTable::SegmentDeltaHashTable(SegmentDeltaHashTable&&) noexcept = default;
+SegmentDeltaHashTable& SegmentDeltaHashTable::operator=(SegmentDeltaHashTable&&) noexcept = default;
 
 // --- Find ---
 
-bool L2DeltaHashTable::findAll(const std::string& key,
+bool SegmentDeltaHashTable::findAll(const std::string& key,
                                 std::vector<uint32_t>& offsets,
                                 std::vector<uint32_t>& versions) const {
     uint64_t h = hashKey(key);
@@ -35,7 +35,7 @@ bool L2DeltaHashTable::findAll(const std::string& key,
     return !offsets.empty();
 }
 
-bool L2DeltaHashTable::findFirst(const std::string& key,
+bool SegmentDeltaHashTable::findFirst(const std::string& key,
                                   uint32_t& offset, uint32_t& version) const {
     uint64_t h = hashKey(key);
     uint32_t bi = bucketIndex(h);
@@ -59,14 +59,14 @@ bool L2DeltaHashTable::findFirst(const std::string& key,
     return false;
 }
 
-bool L2DeltaHashTable::contains(const std::string& key) const {
+bool SegmentDeltaHashTable::contains(const std::string& key) const {
     uint32_t off, ver;
     return findFirst(key, off, ver);
 }
 
 // --- Remove ---
 
-size_t L2DeltaHashTable::removeAll(const std::string& key) {
+size_t SegmentDeltaHashTable::removeAll(const std::string& key) {
     uint64_t h = hashKey(key);
     uint32_t bi = bucketIndex(h);
     uint32_t li = lslotIndex(h);
@@ -100,7 +100,7 @@ size_t L2DeltaHashTable::removeAll(const std::string& key) {
     return total_removed;
 }
 
-size_t L2DeltaHashTable::removeBySecond(const std::string& key, uint32_t value) {
+size_t SegmentDeltaHashTable::removeBySecond(const std::string& key, uint32_t value) {
     uint64_t h = hashKey(key);
     uint32_t bi = bucketIndex(h);
     uint32_t li = lslotIndex(h);
@@ -147,7 +147,7 @@ size_t L2DeltaHashTable::removeBySecond(const std::string& key, uint32_t value) 
 
 // --- Add ---
 
-void L2DeltaHashTable::addEntry(const std::string& key,
+void SegmentDeltaHashTable::addEntry(const std::string& key,
                                  uint32_t offset, uint32_t version) {
     uint64_t h = hashKey(key);
     uint32_t bi = bucketIndex(h);
@@ -202,7 +202,7 @@ void L2DeltaHashTable::addEntry(const std::string& key,
     ++size_;
 }
 
-void L2DeltaHashTable::addEntryByHash(uint64_t hash,
+void SegmentDeltaHashTable::addEntryByHash(uint64_t hash,
                                        uint32_t offset, uint32_t version) {
     uint32_t bi = bucketIndex(hash);
     uint32_t li = lslotIndex(hash);
@@ -258,7 +258,7 @@ void L2DeltaHashTable::addEntryByHash(uint64_t hash,
 
 // --- Iteration ---
 
-void L2DeltaHashTable::forEach(
+void SegmentDeltaHashTable::forEach(
     const std::function<void(uint64_t hash, uint32_t offset,
                              uint32_t version)>& fn) const {
     forEachEntryImpl([&fn](uint64_t hash, const TrieEntry& entry) {
@@ -268,7 +268,7 @@ void L2DeltaHashTable::forEach(
     });
 }
 
-void L2DeltaHashTable::forEachGroup(
+void SegmentDeltaHashTable::forEachGroup(
     const std::function<void(uint64_t hash,
                              const std::vector<uint32_t>& offsets,
                              const std::vector<uint32_t>& versions)>& fn) const {
@@ -325,15 +325,15 @@ void L2DeltaHashTable::forEachGroup(
 
 // --- Stats ---
 
-size_t L2DeltaHashTable::size() const {
+size_t SegmentDeltaHashTable::size() const {
     return size_;
 }
 
-size_t L2DeltaHashTable::memoryUsage() const {
+size_t SegmentDeltaHashTable::memoryUsage() const {
     return bucketMemoryUsage();
 }
 
-void L2DeltaHashTable::clear() {
+void SegmentDeltaHashTable::clear() {
     clearBuckets();
     size_ = 0;
 }

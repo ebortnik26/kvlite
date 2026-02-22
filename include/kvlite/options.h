@@ -37,17 +37,17 @@ struct Options {
 
     // --- L1 Index Options ---
 
-    // Number of updates before persisting L1 index snapshot
+    // Number of updates before persisting GlobalIndex snapshot
     // L1 WAL is truncated after successful snapshot
     // Default: 10 million
-    uint64_t l1_snapshot_interval = 10'000'000;
+    uint64_t global_index_snapshot_interval = 10'000'000;
 
     // --- L2 Index Cache Options ---
 
-    // Size of the LRU cache for L2 indices in bytes
+    // Size of the LRU cache for SegmentIndex instances in bytes
     // Hot log file indices are kept in memory
     // Default: 256MB
-    size_t l2_cache_size = 256 * 1024 * 1024;
+    size_t segment_index_cache_size = 256 * 1024 * 1024;
 
     // --- Garbage Collection Options ---
 
@@ -84,7 +84,7 @@ struct ReadOptions {
     // If true, verify checksum of data read from disk
     bool verify_checksums = false;
 
-    // If true, cache the L2 index if not already cached
+    // If true, cache the SegmentIndex if not already cached
     bool fill_cache = true;
 };
 

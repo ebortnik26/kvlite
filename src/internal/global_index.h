@@ -6,30 +6,30 @@
 #include <vector>
 #include <functional>
 
-#include "internal/l2_delta_hash_table.h"
+#include "internal/segment_delta_hash_table.h"
 #include "kvlite/status.h"
 
 namespace kvlite {
 namespace internal {
 
-// L1 Index: In-memory index mapping keys to (segment_id, version) lists.
+// GlobalIndex: In-memory index mapping keys to (segment_id, version) lists.
 //
 // Structure: key → [(segment_id₁, version₁), (segment_id₂, version₂), ...]
 //            sorted by version desc (latest/highest first)
 //
-// Backed by L2DeltaHashTable with swapped field mapping:
+// Backed by SegmentDeltaHashTable with swapped field mapping:
 //   DHT "offsets" → versions (sorted desc, so findFirst returns latest)
 //   DHT "versions" → segment_ids (parallel)
 //
-// The L1 index is always fully loaded in memory. It is persisted via:
+// The GlobalIndex is always fully loaded in memory. It is persisted via:
 // 1. WAL (append-only delta log for crash recovery)
 // 2. Periodic snapshots (full dump every N updates + on shutdown)
 //
-// Thread-safety: external synchronization required (L1IndexManager provides it).
-class L1Index {
+// Thread-safety: external synchronization required (GlobalIndexManager provides it).
+class GlobalIndex {
 public:
-    L1Index();
-    ~L1Index();
+    GlobalIndex();
+    ~GlobalIndex();
 
     // Append (segment_id, version) to key's list.
     void put(const std::string& key, uint64_t version, uint32_t segment_id);
@@ -76,7 +76,7 @@ public:
     Status loadSnapshot(const std::string& path);
 
     // Snapshot file format (v6, hash-based):
-    // [magic: 4 bytes]["L1IX"]
+    // [magic: 4 bytes]["L1IX" (legacy)]
     // [version: 4 bytes][6]
     // [num_entries: 8 bytes]
     // [key_count: 8 bytes]
@@ -87,7 +87,7 @@ public:
     // [checksum: 4 bytes]
 
 private:
-    L2DeltaHashTable dht_;
+    SegmentDeltaHashTable dht_;
     size_t key_count_ = 0;
 };
 

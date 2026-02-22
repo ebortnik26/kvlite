@@ -3,10 +3,10 @@
 #include <algorithm>
 
 #include "internal/version_manager.h"
-#include "internal/l1_index_manager.h"
+#include "internal/global_index_manager.h"
 #include "internal/storage_manager.h"
 #include "internal/log_entry.h"
-#include "internal/l2_index.h"
+#include "internal/segment_index.h"
 
 namespace kvlite {
 
@@ -72,29 +72,28 @@ void DB::Snapshot::detach() { db_ = nullptr; }
 
 // --- DB::Iterator Implementation ---
 //
-// Scans L2 files from newest to oldest. For each entry, consults L1 index
+// Scans segment files from newest to oldest. For each entry, consults GlobalIndex
 // to check if it's the latest version at the snapshot. Only returns entries
 // that are the current (non-tombstone) value for their key.
 
 class DB::Iterator::Impl {
 public:
-    Impl(DB* db, uint64_t snapshot_version)
-        : db_(db), snapshot_version_(snapshot_version) {
-        // Get segment IDs sorted ascending (oldest to newest)
-        file_ids_ = db_->storage_->getFileIds();
-        // Reverse to iterate newest to oldest
-        std::reverse(file_ids_.begin(), file_ids_.end());
-
-        if (!file_ids_.empty()) {
-            current_file_idx_ = 0;
-            loadCurrentFile();
-            findNextValid();
-        }
+    // Owned snapshot: iterator manages its own snapshot lifetime
+    Impl(DB* db, std::unique_ptr<Snapshot> owned_snapshot)
+        : db_(db),
+          owned_snapshot_(std::move(owned_snapshot)),
+          snapshot_(owned_snapshot_.get()) {
+        init();
     }
 
-    ~Impl() {
-        db_->versions_->releaseSnapshot(snapshot_version_);
+    // Borrowed snapshot: caller manages snapshot lifetime
+    Impl(DB* db, const Snapshot* borrowed_snapshot)
+        : db_(db),
+          snapshot_(borrowed_snapshot) {
+        init();
     }
+
+    ~Impl() = default;
 
     Status next(std::string& key, std::string& value, uint64_t& version) {
         if (!valid_) {
@@ -109,45 +108,60 @@ public:
         return Status::OK();
     }
 
-    uint64_t snapshotVersion() const { return snapshot_version_; }
+    const Snapshot& snapshot() const { return *snapshot_; }
 
 private:
+    void init() {
+        // Get segment IDs sorted ascending (oldest to newest)
+        file_ids_ = db_->storage_->getFileIds();
+        // Reverse to iterate newest to oldest
+        std::reverse(file_ids_.begin(), file_ids_.end());
+
+        if (!file_ids_.empty()) {
+            current_file_idx_ = 0;
+            loadCurrentFile();
+            findNextValid();
+        }
+    }
+
     void loadCurrentFile() {
         if (current_file_idx_ >= file_ids_.size()) {
-            current_l2_ = nullptr;
-            l2_entries_.clear();
-            l2_entry_idx_ = 0;
+            current_seg_index_ = nullptr;
+            seg_index_entries_.clear();
+            seg_index_entry_idx_ = 0;
             return;
         }
 
         current_file_id_ = file_ids_[current_file_idx_];
-        current_l2_ = db_->storage_->getL2Index(current_file_id_);
+        current_seg_index_ = db_->storage_->getSegmentIndex(current_file_id_);
 
-        // Collect all entries from this L2 index
-        l2_entries_.clear();
-        if (current_l2_) {
-            current_l2_->forEach([this](uint32_t offset, uint32_t version) {
+        uint64_t snap_ver = snapshot_->version();
+
+        // Collect all entries from this SegmentIndex
+        seg_index_entries_.clear();
+        if (current_seg_index_) {
+            current_seg_index_->forEach([this, snap_ver](uint32_t offset, uint32_t version) {
                 // Only consider entries within our snapshot
-                if (version <= snapshot_version_) {
-                    L2Entry e;
+                if (version <= snap_ver) {
+                    SegIndexEntry e;
                     e.version = version;
                     e.offset = offset;
-                    l2_entries_.push_back(std::move(e));
+                    seg_index_entries_.push_back(std::move(e));
                 }
             });
         }
-        l2_entry_idx_ = 0;
+        seg_index_entry_idx_ = 0;
     }
 
     void advanceAndFindNext() {
-        l2_entry_idx_++;
+        seg_index_entry_idx_++;
         findNextValid();
     }
 
     void findNextValid() {
         while (true) {
             // Move to next file if needed
-            while (l2_entry_idx_ >= l2_entries_.size()) {
+            while (seg_index_entry_idx_ >= seg_index_entries_.size()) {
                 current_file_idx_++;
                 if (current_file_idx_ >= file_ids_.size()) {
                     valid_ = false;
@@ -156,40 +170,40 @@ private:
                 loadCurrentFile();
             }
 
-            const auto& entry = l2_entries_[l2_entry_idx_];
+            const auto& entry = seg_index_entries_[seg_index_entry_idx_];
 
             // Read the log entry to get key and value
             internal::LogEntry log_entry;
             Status s = db_->storage_->readLogEntry(current_file_id_, entry.offset, log_entry);
             if (!s.ok()) {
-                l2_entry_idx_++;
+                seg_index_entry_idx_++;
                 continue;
             }
 
             // Skip if we've already returned this key
             if (seen_keys_.count(log_entry.key)) {
-                l2_entry_idx_++;
+                seg_index_entry_idx_++;
                 continue;
             }
 
-            // Check L1 index: is this file the latest for this key?
+            // Check GlobalIndex: is this file the latest for this key?
             uint64_t latest_ver;
             uint32_t latest_fid;
-            if (!db_->l1_index_->getLatest(log_entry.key, latest_ver, latest_fid).ok()) {
-                l2_entry_idx_++;
+            if (!db_->global_index_->getLatest(log_entry.key, latest_ver, latest_fid).ok()) {
+                seg_index_entry_idx_++;
                 continue;
             }
 
             if (latest_fid != current_file_id_) {
                 // This file is not the latest for this key, skip
-                l2_entry_idx_++;
+                seg_index_entry_idx_++;
                 continue;
             }
 
             // Skip tombstones
             if (log_entry.tombstone()) {
                 seen_keys_.insert(log_entry.key);
-                l2_entry_idx_++;
+                seg_index_entry_idx_++;
                 continue;
             }
 
@@ -203,21 +217,22 @@ private:
         }
     }
 
-    struct L2Entry {
+    struct SegIndexEntry {
         uint32_t version;
         uint32_t offset;
     };
 
     DB* db_;
-    uint64_t snapshot_version_;
+    std::unique_ptr<Snapshot> owned_snapshot_;  // non-null when iterator owns its snapshot
+    const Snapshot* snapshot_;                  // always valid — points to owned or borrowed
 
     std::vector<uint32_t> file_ids_;
     size_t current_file_idx_ = 0;
     uint32_t current_file_id_ = 0;
-    internal::L2Index* current_l2_ = nullptr;
+    internal::SegmentIndex* current_seg_index_ = nullptr;
 
-    std::vector<L2Entry> l2_entries_;
-    size_t l2_entry_idx_ = 0;
+    std::vector<SegIndexEntry> seg_index_entries_;
+    size_t seg_index_entry_idx_ = 0;
 
     std::set<std::string> seen_keys_;
 
@@ -242,8 +257,8 @@ Status DB::Iterator::next(std::string& key, std::string& value, uint64_t& versio
     return impl_->next(key, value, version);
 }
 
-uint64_t DB::Iterator::snapshotVersion() const {
-    return impl_->snapshotVersion();
+const DB::Snapshot& DB::Iterator::snapshot() const {
+    return impl_->snapshot();
 }
 
 // --- DB Implementation ---
@@ -259,7 +274,7 @@ DB::DB(DB&& other) noexcept = default;
 DB& DB::operator=(DB&& other) noexcept = default;
 
 Status DB::open(const std::string& path, const Options& options) {
-    if (versions_ || l1_index_ || storage_) {
+    if (versions_ || global_index_ || storage_) {
         return Status::InvalidArgument("Database already open");
     }
 
@@ -277,26 +292,26 @@ Status DB::open(const std::string& path, const Options& options) {
         return s;
     }
 
-    // Initialize L1 index manager
-    l1_index_ = std::make_unique<internal::L1IndexManager>();
-    internal::L1IndexManager::Options l1_opts;
-    l1_opts.snapshot_interval = options.l1_snapshot_interval;
-    l1_opts.sync_writes = options.sync_writes;
+    // Initialize GlobalIndex manager
+    global_index_ = std::make_unique<internal::GlobalIndexManager>();
+    internal::GlobalIndexManager::Options global_index_opts;
+    global_index_opts.snapshot_interval = options.global_index_snapshot_interval;
+    global_index_opts.sync_writes = options.sync_writes;
 
-    s = l1_index_->open(path, l1_opts);
+    s = global_index_->open(path, global_index_opts);
     if (!s.ok()) {
         versions_->close();
         versions_.reset();
-        l1_index_.reset();
+        global_index_.reset();
         return s;
     }
 
-    s = l1_index_->recover();
+    s = global_index_->recover();
     if (!s.ok()) {
         versions_->close();
-        l1_index_->close();
+        global_index_->close();
         versions_.reset();
-        l1_index_.reset();
+        global_index_.reset();
         return s;
     }
 
@@ -305,7 +320,7 @@ Status DB::open(const std::string& path, const Options& options) {
     internal::StorageManager::Options storage_opts;
     storage_opts.log_file_size = options.log_file_size;
     storage_opts.write_buffer_size = options.write_buffer_size;
-    storage_opts.l2_cache_size = options.l2_cache_size;
+    storage_opts.segment_index_cache_size = options.segment_index_cache_size;
     storage_opts.gc_policy = options.gc_policy;
     storage_opts.gc_threshold = options.gc_threshold;
     storage_opts.gc_max_files = options.gc_max_files;
@@ -319,9 +334,9 @@ Status DB::open(const std::string& path, const Options& options) {
     s = storage_->open(path, storage_opts, oldest_version_fn);
     if (!s.ok()) {
         versions_->close();
-        l1_index_->close();
+        global_index_->close();
         versions_.reset();
-        l1_index_.reset();
+        global_index_.reset();
         storage_.reset();
         return s;
     }
@@ -329,10 +344,10 @@ Status DB::open(const std::string& path, const Options& options) {
     s = storage_->recover();
     if (!s.ok()) {
         versions_->close();
-        l1_index_->close();
+        global_index_->close();
         storage_->close();
         versions_.reset();
-        l1_index_.reset();
+        global_index_.reset();
         storage_.reset();
         return s;
     }
@@ -341,7 +356,7 @@ Status DB::open(const std::string& path, const Options& options) {
 }
 
 Status DB::close() {
-    if (!versions_ && !l1_index_ && !storage_) {
+    if (!versions_ && !global_index_ && !storage_) {
         return Status::OK();
     }
 
@@ -353,9 +368,9 @@ Status DB::close() {
         storage_.reset();
     }
 
-    if (l1_index_) {
-        s3 = l1_index_->close();
-        l1_index_.reset();
+    if (global_index_) {
+        s3 = global_index_->close();
+        global_index_.reset();
     }
 
     if (versions_) {
@@ -370,7 +385,7 @@ Status DB::close() {
 }
 
 bool DB::isOpen() const {
-    return versions_ != nullptr && l1_index_ != nullptr && storage_ != nullptr;
+    return versions_ != nullptr && global_index_ != nullptr && storage_ != nullptr;
 }
 
 
@@ -390,7 +405,7 @@ Status DB::put(const std::string& key, const std::string& value,
         return s;
     }
 
-    s = l1_index_->put(key, version, segment_id);
+    s = global_index_->put(key, version, segment_id);
     if (!s.ok()) {
         return s;
     }
@@ -415,7 +430,7 @@ Status DB::get(const std::string& key, std::string& value, uint64_t& version,
 
     std::vector<uint32_t> segment_ids;
     std::vector<uint64_t> versions;
-    if (!l1_index_->get(key, segment_ids, versions)) {
+    if (!global_index_->get(key, segment_ids, versions)) {
         return Status::NotFound(key);
     }
 
@@ -448,16 +463,16 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
 
     std::vector<uint32_t> segment_ids;
     std::vector<uint64_t> versions;
-    if (!l1_index_->get(key, segment_ids, versions)) {
+    if (!global_index_->get(key, segment_ids, versions)) {
         return Status::NotFound(key);
     }
 
-    // segment_ids are latest-first; scan each segment's L2 for the version
+    // segment_ids are latest-first; scan each segment's SegmentIndex for the version
     for (uint32_t sid : segment_ids) {
-        internal::L2Index* l2 = storage_->getL2Index(sid);
-        if (!l2) continue;
+        internal::SegmentIndex* seg_idx = storage_->getSegmentIndex(sid);
+        if (!seg_idx) continue;
         uint64_t offset;
-        if (l2->get(key, upper_bound, offset, entry_version)) {
+        if (seg_idx->get(key, upper_bound, offset, entry_version)) {
             return storage_->readValue(sid, key, entry_version, value);
         }
     }
@@ -477,7 +492,7 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
         return s;
     }
 
-    s = l1_index_->put(key, version, segment_id);
+    s = global_index_->put(key, version, segment_id);
     if (!s.ok()) {
         return s;
     }
@@ -524,7 +539,7 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
             return s;
         }
 
-        s = l1_index_->put(op.key, static_cast<uint32_t>(version), segment_id);
+        s = global_index_->put(op.key, static_cast<uint32_t>(version), segment_id);
         if (!s.ok()) {
             return s;
         }
@@ -591,8 +606,27 @@ Status DB::createIterator(std::unique_ptr<Iterator>& iterator) {
         return Status::InvalidArgument("Database not open");
     }
 
-    uint64_t snapshot_version = versions_->createSnapshot();
-    auto impl = std::make_unique<Iterator::Impl>(this, snapshot_version);
+    std::unique_ptr<Snapshot> snap;
+    Status s = createSnapshot(snap);
+    if (!s.ok()) {
+        return s;
+    }
+
+    auto impl = std::make_unique<Iterator::Impl>(this, std::move(snap));
+    iterator = std::unique_ptr<Iterator>(new Iterator(std::move(impl)));
+    return Status::OK();
+}
+
+Status DB::createIterator(const Snapshot& snapshot, std::unique_ptr<Iterator>& iterator) {
+    if (!isOpen()) {
+        return Status::InvalidArgument("Database not open");
+    }
+
+    if (!snapshot.isValid()) {
+        return Status::InvalidArgument("Snapshot is invalid");
+    }
+
+    auto impl = std::make_unique<Iterator::Impl>(this, &snapshot);
     iterator = std::unique_ptr<Iterator>(new Iterator(std::move(impl)));
     return Status::OK();
 }
@@ -615,17 +649,17 @@ Status DB::getStats(DBStats& stats) const {
 
     stats.num_log_files = storage_->numLogFiles();
     stats.total_log_size = storage_->totalLogSize();
-    stats.l1_index_size = l1_index_->memoryUsage();
-    stats.l2_cache_size = storage_->l2CacheSize();
-    stats.l2_cached_count = storage_->l2CachedCount();
+    stats.global_index_size = global_index_->memoryUsage();
+    stats.segment_index_cache_size = storage_->segmentIndexCacheSize();
+    stats.segment_index_cached_count = storage_->segmentIndexCachedCount();
     stats.current_version = versions_->latestVersion();
     stats.oldest_version = versions_->oldestSnapshotVersion();
 
     stats.active_snapshots = versions_->activeSnapshotCount();
 
-    // These would need L1 index iteration to compute accurately
-    stats.num_live_entries = l1_index_->keyCount();
-    stats.num_historical_entries = l1_index_->entryCount() - l1_index_->keyCount();
+    // These would need GlobalIndex iteration to compute accurately
+    stats.num_live_entries = global_index_->keyCount();
+    stats.num_historical_entries = global_index_->entryCount() - global_index_->keyCount();
 
     return Status::OK();
 }

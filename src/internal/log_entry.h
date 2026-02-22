@@ -57,7 +57,7 @@ struct LogEntry {
     static constexpr uint16_t kTombstoneBit = 0x8000; // MSB of key_len field
 };
 
-// Index entry stored in the L2 index.
+// Index entry stored in the SegmentIndex.
 // location = file_id (which log file), 32 bits is sufficient.
 struct IndexEntry {
     uint64_t version = 0;

@@ -354,7 +354,7 @@ TEST_F(SegmentTest, OpenBadMagic) {
 
 TEST_F(SegmentTest, OpenDataWrittenButNoIndex) {
     // Simulate a crash after data was flushed but before seal() ran:
-    // the file contains valid log entries but no L2 index or footer.
+    // the file contains valid log entries but no SegmentIndex or footer.
     ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("key1", 1, "val1", false);
     writeEntry("key2", 2, "val2", false);
@@ -368,7 +368,7 @@ TEST_F(SegmentTest, OpenDataWrittenButNoIndex) {
 
 TEST_F(SegmentTest, OpenDataWrittenWithFakeFooter) {
     // Data was flushed, then a valid-looking footer was written but
-    // the index_offset points into the data region (no real L2 index).
+    // the index_offset points into the data region (no real SegmentIndex).
     ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("key1", 1, "val1", false);
     seg_.close();

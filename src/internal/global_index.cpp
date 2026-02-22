@@ -1,4 +1,4 @@
-#include "internal/l1_index.h"
+#include "internal/global_index.h"
 
 #include <algorithm>
 #include <cstring>
@@ -61,11 +61,11 @@ struct CRC32Reader {
     uint32_t finalize() const { return ~crc; }
 };
 
-L1Index::L1Index() = default;
+GlobalIndex::GlobalIndex() = default;
 
-L1Index::~L1Index() = default;
+GlobalIndex::~GlobalIndex() = default;
 
-void L1Index::put(const std::string& key, uint64_t version, uint32_t segment_id) {
+void GlobalIndex::put(const std::string& key, uint64_t version, uint32_t segment_id) {
     if (!dht_.contains(key)) {
         ++key_count_;
     }
@@ -73,7 +73,7 @@ void L1Index::put(const std::string& key, uint64_t version, uint32_t segment_id)
     dht_.addEntry(key, static_cast<uint32_t>(version), segment_id);
 }
 
-bool L1Index::get(const std::string& key,
+bool GlobalIndex::get(const std::string& key,
                   std::vector<uint32_t>& segment_ids,
                   std::vector<uint64_t>& versions) const {
     std::vector<uint32_t> raw_vers;   // DHT "offsets" = versions
@@ -90,7 +90,7 @@ bool L1Index::get(const std::string& key,
     return true;
 }
 
-bool L1Index::get(const std::string& key, uint64_t upper_bound,
+bool GlobalIndex::get(const std::string& key, uint64_t upper_bound,
                   uint64_t& version, uint32_t& segment_id) const {
     std::vector<uint32_t> raw_vers;
     std::vector<uint32_t> raw_segs;
@@ -106,7 +106,7 @@ bool L1Index::get(const std::string& key, uint64_t upper_bound,
     return false;
 }
 
-bool L1Index::getLatest(const std::string& key,
+bool GlobalIndex::getLatest(const std::string& key,
                         uint64_t& version, uint32_t& segment_id) const {
     uint32_t raw_ver, raw_seg;
     if (!dht_.findFirst(key, raw_ver, raw_seg)) return false;
@@ -115,18 +115,18 @@ bool L1Index::getLatest(const std::string& key,
     return true;
 }
 
-bool L1Index::contains(const std::string& key) const {
+bool GlobalIndex::contains(const std::string& key) const {
     return dht_.contains(key);
 }
 
-void L1Index::remove(const std::string& key) {
+void GlobalIndex::remove(const std::string& key) {
     size_t removed = dht_.removeAll(key);
     if (removed > 0) {
         --key_count_;
     }
 }
 
-void L1Index::removeSegment(const std::string& key, uint32_t segment_id) {
+void GlobalIndex::removeSegment(const std::string& key, uint32_t segment_id) {
     // removeBySecond removes entries where DHT "versions" field = segment_id
     size_t removed = dht_.removeBySecond(key, segment_id);
     if (removed > 0 && !dht_.contains(key)) {
@@ -134,19 +134,19 @@ void L1Index::removeSegment(const std::string& key, uint32_t segment_id) {
     }
 }
 
-size_t L1Index::keyCount() const {
+size_t GlobalIndex::keyCount() const {
     return key_count_;
 }
 
-size_t L1Index::entryCount() const {
+size_t GlobalIndex::entryCount() const {
     return dht_.size();
 }
 
-size_t L1Index::memoryUsage() const {
+size_t GlobalIndex::memoryUsage() const {
     return dht_.memoryUsage();
 }
 
-void L1Index::clear() {
+void GlobalIndex::clear() {
     dht_.clear();
     key_count_ = 0;
 }
@@ -156,7 +156,7 @@ void L1Index::clear() {
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
 static constexpr uint32_t kVersion = 6;
 
-Status L1Index::saveSnapshot(const std::string& path) const {
+Status GlobalIndex::saveSnapshot(const std::string& path) const {
     std::ofstream file(path, std::ios::binary);
     if (!file) {
         return Status::IOError("Failed to create snapshot file: " + path);
@@ -192,7 +192,7 @@ Status L1Index::saveSnapshot(const std::string& path) const {
     return Status::OK();
 }
 
-Status L1Index::loadSnapshot(const std::string& path) {
+Status GlobalIndex::loadSnapshot(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         return Status::IOError("Failed to open snapshot file: " + path);

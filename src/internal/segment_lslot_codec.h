@@ -7,7 +7,7 @@
 namespace kvlite {
 namespace internal {
 
-// L2 LSlot codec: encodes and decodes logical slots for L2 (per-file) indexes.
+// SegmentIndex LSlot codec: encodes and decodes logical slots for per-file segment indexes.
 //
 // Format per lslot:
 //   unary(K)                         — K unique fingerprints
@@ -19,11 +19,11 @@ namespace internal {
 //     [32 bits]                      — first version (highest, raw)
 //     (M-1) x gamma(delta_version)  — version deltas (desc order)
 //
-// Same encoding pattern as L1 (LSlotCodec), applied to two parallel sequences
+// Same encoding pattern as GlobalIndex (LSlotCodec), applied to two parallel sequences
 // (offsets and versions) per fingerprint group.
 //
 // The codec operates on raw uint8_t* pointers and owns no memory.
-class L2LSlotCodec {
+class SegmentLSlotCodec {
 public:
     // A single fingerprint group with parallel offset and version lists.
     struct TrieEntry {
@@ -37,7 +37,7 @@ public:
         std::vector<TrieEntry> entries;  // sorted by fingerprint asc
     };
 
-    explicit L2LSlotCodec(uint8_t fingerprint_bits);
+    explicit SegmentLSlotCodec(uint8_t fingerprint_bits);
 
     LSlotContents decode(const uint8_t* data, size_t bit_offset,
                          size_t* end_bit_offset = nullptr) const;

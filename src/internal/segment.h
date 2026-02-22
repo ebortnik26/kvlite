@@ -6,18 +6,18 @@
 #include <vector>
 
 #include "internal/crc32.h"
-#include "internal/l2_index.h"
+#include "internal/segment_index.h"
 #include "internal/log_entry.h"
 #include "internal/log_file.h"
 
 namespace kvlite {
 namespace internal {
 
-// A Segment stores log entries and their L2 index in a single file.
+// A Segment stores log entries and their SegmentIndex in a single file.
 //
 // File layout:
 //   [LogEntry 0] ... [LogEntry N-1]  (data region)
-//   [L2 Index: magic + entries + crc]
+//   [SegmentIndex: magic + entries + crc]
 //   [segment_id: 4 bytes]
 //   [index_offset: 8 bytes]
 //   [footer_magic: 4 bytes]
@@ -51,7 +51,7 @@ public:
     // Open an existing segment file. Closed -> Readable.
     Status open(const std::string& path);
 
-    // Append the L2 index and footer. Writing -> Readable.
+    // Append the SegmentIndex and footer. Writing -> Readable.
     Status seal();
 
     // Close the file. Writing|Readable -> Closed.
@@ -64,7 +64,7 @@ public:
     // --- Write (Writing only) ---
 
     // Serialize a LogEntry (header + key + value + CRC), append to file,
-    // and update the L2 index.
+    // and update the SegmentIndex.
     Status put(const std::string& key, uint64_t version,
                const std::string& value, bool tombstone);
 
@@ -97,7 +97,7 @@ private:
     Status readEntry(uint64_t offset, LogEntry& entry) const;
 
     LogFile log_file_;
-    L2Index index_;
+    SegmentIndex index_;
     uint32_t id_ = 0;
     uint64_t data_size_ = 0;
     State state_ = State::kClosed;

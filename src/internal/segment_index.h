@@ -2,18 +2,19 @@
 #define KVLITE_INTERNAL_L2_INDEX_H
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "kvlite/status.h"
-#include "l2_delta_hash_table.h"
+#include "segment_delta_hash_table.h"
 
 namespace kvlite {
 namespace internal {
 
 class LogFile;
 
-// L2 Index: In-memory per-file index mapping keys to (offset, version) lists.
+// SegmentIndex: In-memory per-file index mapping keys to (offset, version) lists.
 //
 // Structure: key → [(offset₁, version₁), (offset₂, version₂), ...]
 //            sorted by offset desc (latest/highest first)
@@ -21,15 +22,15 @@ class LogFile;
 // All entries pertain to a single file. The index is append-only:
 // no remove or update operations are supported.
 // Write-once: no concurrency control or persistence needed.
-class L2Index {
+class SegmentIndex {
 public:
-    L2Index();
-    ~L2Index();
+    SegmentIndex();
+    ~SegmentIndex();
 
-    L2Index(const L2Index&) = delete;
-    L2Index& operator=(const L2Index&) = delete;
-    L2Index(L2Index&&) noexcept;
-    L2Index& operator=(L2Index&&) noexcept;
+    SegmentIndex(const SegmentIndex&) = delete;
+    SegmentIndex& operator=(const SegmentIndex&) = delete;
+    SegmentIndex(SegmentIndex&&) noexcept;
+    SegmentIndex& operator=(SegmentIndex&&) noexcept;
 
     // Append (offset, version) to key's list.
     void put(const std::string& key, uint32_t offset, uint32_t version);
@@ -59,13 +60,16 @@ public:
     // Deserialize from a LogFile starting at the given byte offset.
     Status readFrom(const LogFile& file, uint64_t offset = 0);
 
+    // Iterate over all entries, calling fn(offset, version) for each.
+    void forEach(const std::function<void(uint32_t offset, uint32_t version)>& fn) const;
+
     size_t keyCount() const;
     size_t entryCount() const;
     size_t memoryUsage() const;
     void clear();
 
 private:
-    L2DeltaHashTable dht_;
+    SegmentDeltaHashTable dht_;
     size_t key_count_ = 0;
 };
 

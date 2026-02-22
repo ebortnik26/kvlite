@@ -7,7 +7,7 @@
 #include "internal/bit_stream.h"
 #include "internal/lslot_codec.h"
 #include "internal/delta_hash_table.h"
-#include "internal/l1_index.h"
+#include "internal/global_index.h"
 
 using namespace kvlite::internal;
 
@@ -466,7 +466,7 @@ TEST(DeltaHashTable, AddEntryByHash) {
     EXPECT_EQ(count, 1u);
 }
 
-// --- L1Index via DHT Tests ---
+// --- GlobalIndex via DHT Tests ---
 //
 // New API: put(key, version, segment_id), get(key, segment_ids, versions),
 // getLatest(key, version, segment_id), removeSegment(key, segment_id).
@@ -474,8 +474,8 @@ TEST(DeltaHashTable, AddEntryByHash) {
 
 using kvlite::Status;
 
-TEST(L1IndexDHT, PutAndGetLatest) {
-    L1Index index;
+TEST(GlobalIndexDHT, PutAndGetLatest) {
+    GlobalIndex index;
 
     // version=100 in seg 1, version=200 in seg 2, version=300 in seg 3
     index.put("key1", 100, 1);
@@ -497,8 +497,8 @@ TEST(L1IndexDHT, PutAndGetLatest) {
     EXPECT_EQ(vers[2], 100u);  EXPECT_EQ(seg_ids[2], 1u);
 }
 
-TEST(L1IndexDHT, PutMultipleVersions) {
-    L1Index index;
+TEST(GlobalIndexDHT, PutMultipleVersions) {
+    GlobalIndex index;
 
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
@@ -508,8 +508,8 @@ TEST(L1IndexDHT, PutMultipleVersions) {
     EXPECT_EQ(index.keyCount(), 1u);
 }
 
-TEST(L1IndexDHT, GetLatest) {
-    L1Index index;
+TEST(GlobalIndexDHT, GetLatest) {
+    GlobalIndex index;
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
 
@@ -522,8 +522,8 @@ TEST(L1IndexDHT, GetLatest) {
     EXPECT_FALSE(index.getLatest("missing", ver, seg));
 }
 
-TEST(L1IndexDHT, GetWithUpperBound) {
-    L1Index index;
+TEST(GlobalIndexDHT, GetWithUpperBound) {
+    GlobalIndex index;
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
     index.put("key1", 300, 3);
@@ -544,15 +544,15 @@ TEST(L1IndexDHT, GetWithUpperBound) {
     EXPECT_FALSE(index.get("key1", 50, ver, seg));
 }
 
-TEST(L1IndexDHT, Contains) {
-    L1Index index;
+TEST(GlobalIndexDHT, Contains) {
+    GlobalIndex index;
     EXPECT_FALSE(index.contains("key1"));
     index.put("key1", 100, 1);
     EXPECT_TRUE(index.contains("key1"));
 }
 
-TEST(L1IndexDHT, Remove) {
-    L1Index index;
+TEST(GlobalIndexDHT, Remove) {
+    GlobalIndex index;
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
     EXPECT_EQ(index.entryCount(), 2u);
@@ -563,8 +563,8 @@ TEST(L1IndexDHT, Remove) {
     EXPECT_EQ(index.entryCount(), 0u);
 }
 
-TEST(L1IndexDHT, RemoveSegment) {
-    L1Index index;
+TEST(GlobalIndexDHT, RemoveSegment) {
+    GlobalIndex index;
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
     index.put("key1", 300, 3);
@@ -580,8 +580,8 @@ TEST(L1IndexDHT, RemoveSegment) {
     EXPECT_EQ(index.entryCount(), 2u);
 }
 
-TEST(L1IndexDHT, RemoveSegmentRemovesKey) {
-    L1Index index;
+TEST(GlobalIndexDHT, RemoveSegmentRemovesKey) {
+    GlobalIndex index;
     index.put("key1", 100, 1);
     index.removeSegment("key1", 1);
     EXPECT_FALSE(index.contains("key1"));
@@ -589,8 +589,8 @@ TEST(L1IndexDHT, RemoveSegmentRemovesKey) {
     EXPECT_EQ(index.entryCount(), 0u);
 }
 
-TEST(L1IndexDHT, RemoveSegmentFromMultiple) {
-    L1Index index;
+TEST(GlobalIndexDHT, RemoveSegmentFromMultiple) {
+    GlobalIndex index;
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
 
@@ -610,8 +610,8 @@ TEST(L1IndexDHT, RemoveSegmentFromMultiple) {
     EXPECT_EQ(index.entryCount(), 0u);
 }
 
-TEST(L1IndexDHT, RemoveSegmentFromThree) {
-    L1Index index;
+TEST(GlobalIndexDHT, RemoveSegmentFromThree) {
+    GlobalIndex index;
 
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
@@ -640,8 +640,8 @@ TEST(L1IndexDHT, RemoveSegmentFromThree) {
     EXPECT_FALSE(index.contains("key1"));
 }
 
-TEST(L1IndexDHT, GetNonExistent) {
-    L1Index index;
+TEST(GlobalIndexDHT, GetNonExistent) {
+    GlobalIndex index;
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> vers;
     EXPECT_FALSE(index.get("missing", seg_ids, vers));
@@ -649,11 +649,11 @@ TEST(L1IndexDHT, GetNonExistent) {
 
 #include <filesystem>
 
-TEST(L1IndexDHT, Snapshot) {
-    std::string path = "/tmp/test_l1_snapshot_dht.dat";
+TEST(GlobalIndexDHT, Snapshot) {
+    std::string path = "/tmp/test_global_index_snapshot_dht.dat";
 
     {
-        L1Index index;
+        GlobalIndex index;
         index.put("key1", 100, 1);
         index.put("key1", 200, 2);
         index.put("key2", 300, 3);
@@ -663,7 +663,7 @@ TEST(L1IndexDHT, Snapshot) {
     }
 
     {
-        L1Index index;
+        GlobalIndex index;
         Status s = index.loadSnapshot(path);
         ASSERT_TRUE(s.ok()) << s.toString();
 
@@ -684,11 +684,11 @@ TEST(L1IndexDHT, Snapshot) {
     std::filesystem::remove(path);
 }
 
-TEST(L1IndexDHT, SnapshotWithManyEntries) {
-    std::string path = "/tmp/test_l1_snapshot_many.dat";
+TEST(GlobalIndexDHT, SnapshotWithManyEntries) {
+    std::string path = "/tmp/test_global_index_snapshot_many.dat";
 
     {
-        L1Index index;
+        GlobalIndex index;
         index.put("key1", 100, 1);
         index.put("key1", 200, 2);
         index.put("key1", 300, 3);
@@ -699,7 +699,7 @@ TEST(L1IndexDHT, SnapshotWithManyEntries) {
     }
 
     {
-        L1Index index;
+        GlobalIndex index;
         Status s = index.loadSnapshot(path);
         ASSERT_TRUE(s.ok()) << s.toString();
 
@@ -724,8 +724,8 @@ TEST(L1IndexDHT, SnapshotWithManyEntries) {
     std::filesystem::remove(path);
 }
 
-TEST(L1IndexDHT, Clear) {
-    L1Index index;
+TEST(GlobalIndexDHT, Clear) {
+    GlobalIndex index;
     for (int i = 0; i < 50; ++i) {
         index.put("key" + std::to_string(i), static_cast<uint64_t>(i * 10),
                   static_cast<uint32_t>(i));
@@ -852,8 +852,8 @@ TEST(DeltaHashTable, ConcurrentAddAndRemove) {
     }
 }
 
-TEST(L1IndexDHT, LargeScale) {
-    L1Index index;
+TEST(GlobalIndexDHT, LargeScale) {
+    GlobalIndex index;
     const int N = 1000;
 
     for (int i = 0; i < N; ++i) {

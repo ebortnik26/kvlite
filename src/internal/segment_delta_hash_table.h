@@ -7,36 +7,36 @@
 #include <vector>
 
 #include "internal/delta_hash_table_base.h"
-#include "internal/l2_lslot_codec.h"
+#include "internal/segment_lslot_codec.h"
 
 namespace kvlite {
 namespace internal {
 
-// L2 Delta Hash Table: compact hash table for paired indexes.
+// Segment Delta Hash Table: compact hash table for paired indexes.
 //
 // Stores (offset, version) pairs per fingerprint.
 // No concurrency control — external synchronization required.
 //
-// Bucket format (managed by L2LSlotCodec header protocol):
+// Bucket format (managed by SegmentLSlotCodec header protocol):
 //   [32 bits: base_offset] [lslot 0] [lslot 1] ... [lslot N-1] [8 bytes: ext_ptr]
 //
 // All offsets within a bucket are encoded as gamma(offset - base_offset + 1).
-class L2DeltaHashTable : private DeltaHashTableBase<L2LSlotCodec> {
-    using Base = DeltaHashTableBase<L2LSlotCodec>;
+class SegmentDeltaHashTable : private DeltaHashTableBase<SegmentLSlotCodec> {
+    using Base = DeltaHashTableBase<SegmentLSlotCodec>;
 
 public:
     using Base::Config;
-    using TrieEntry = L2LSlotCodec::TrieEntry;
-    using LSlotContents = L2LSlotCodec::LSlotContents;
+    using TrieEntry = SegmentLSlotCodec::TrieEntry;
+    using LSlotContents = SegmentLSlotCodec::LSlotContents;
 
-    L2DeltaHashTable();
-    explicit L2DeltaHashTable(const Config& config);
-    ~L2DeltaHashTable();
+    SegmentDeltaHashTable();
+    explicit SegmentDeltaHashTable(const Config& config);
+    ~SegmentDeltaHashTable();
 
-    L2DeltaHashTable(const L2DeltaHashTable&) = delete;
-    L2DeltaHashTable& operator=(const L2DeltaHashTable&) = delete;
-    L2DeltaHashTable(L2DeltaHashTable&&) noexcept;
-    L2DeltaHashTable& operator=(L2DeltaHashTable&&) noexcept;
+    SegmentDeltaHashTable(const SegmentDeltaHashTable&) = delete;
+    SegmentDeltaHashTable& operator=(const SegmentDeltaHashTable&) = delete;
+    SegmentDeltaHashTable(SegmentDeltaHashTable&&) noexcept;
+    SegmentDeltaHashTable& operator=(SegmentDeltaHashTable&&) noexcept;
 
     // Add an (offset, version) pair for a key's fingerprint.
     void addEntry(const std::string& key, uint32_t offset, uint32_t version);

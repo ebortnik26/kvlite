@@ -84,7 +84,7 @@ Status Segment::seal() {
     // Record where the data region ends / index begins.
     data_size_ = log_file_.size();
 
-    // Append serialized L2 index.
+    // Append serialized SegmentIndex.
     Status s = index_.writeTo(log_file_);
     if (!s.ok()) return s;
 

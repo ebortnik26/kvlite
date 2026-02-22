@@ -30,10 +30,10 @@ set(KVLITE_SOURCES
     src/status.cpp
     src/internal/lslot_codec.cpp
     src/internal/delta_hash_table.cpp
-    src/internal/l1_index.cpp
-    src/internal/l2_lslot_codec.cpp
-    src/internal/l2_delta_hash_table.cpp
-    src/internal/l2_index.cpp
+    src/internal/global_index.cpp
+    src/internal/segment_lslot_codec.cpp
+    src/internal/segment_delta_hash_table.cpp
+    src/internal/segment_index.cpp
     src/internal/write_buffer.cpp
     src/internal/log_file.cpp
 )

@@ -14,14 +14,14 @@ namespace kvlite {
 namespace internal {
 
 // Forward declarations
-class L1Index;
-class L1WAL;
+class GlobalIndex;
+class GlobalIndexWAL;
 
-// L1 Index Manager: Manages the in-memory L1 index with persistence.
+// GlobalIndex Manager: Manages the in-memory GlobalIndex with persistence.
 //
 // Encapsulates:
-// - L1Index: in-memory map (key → [(segment_id, version), ...])
-// - L1WAL: write-ahead log for crash recovery
+// - GlobalIndex: in-memory map (key → [(segment_id, version), ...])
+// - GlobalIndexWAL: write-ahead log for crash recovery
 // - Snapshotting: periodic full dumps to reduce WAL replay time
 //
 // Recovery sequence:
@@ -35,7 +35,7 @@ class L1WAL;
 // - After successful snapshot, WAL is truncated
 //
 // Thread-safety: All public methods are thread-safe.
-class L1IndexManager {
+class GlobalIndexManager {
 public:
     struct Options {
         // Number of updates before auto-snapshot (0 = disabled)
@@ -45,12 +45,12 @@ public:
         bool sync_writes = false;
     };
 
-    L1IndexManager();
-    ~L1IndexManager();
+    GlobalIndexManager();
+    ~GlobalIndexManager();
 
     // Non-copyable
-    L1IndexManager(const L1IndexManager&) = delete;
-    L1IndexManager& operator=(const L1IndexManager&) = delete;
+    GlobalIndexManager(const GlobalIndexManager&) = delete;
+    GlobalIndexManager& operator=(const GlobalIndexManager&) = delete;
 
     // --- Lifecycle ---
 
@@ -130,8 +130,8 @@ private:
     Options options_;
     bool is_open_ = false;
 
-    std::unique_ptr<L1Index> index_;
-    std::unique_ptr<L1WAL> wal_;
+    std::unique_ptr<GlobalIndex> index_;
+    std::unique_ptr<GlobalIndexWAL> wal_;
 
     uint64_t updates_since_snapshot_ = 0;
     mutable std::mutex mutex_;
