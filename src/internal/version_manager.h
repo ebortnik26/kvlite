@@ -6,6 +6,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "kvlite/status.h"
 
@@ -68,6 +69,21 @@ public:
 
     // Get number of active snapshots.
     size_t activeSnapshotCount() const;
+
+    // Returns all observation points: active snapshot versions + latestVersion(),
+    // sorted ascending.
+    std::vector<uint64_t> snapshotVersions() const {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        std::vector<uint64_t> result(active_snapshots_.begin(),
+                                     active_snapshots_.end());
+        uint64_t latest = current_version_.load(std::memory_order_acquire);
+        // active_snapshots_ is a std::set, so result is already sorted ascending.
+        // Append latestVersion() if it's not already the last element.
+        if (result.empty() || result.back() < latest) {
+            result.push_back(latest);
+        }
+        return result;
+    }
 
 private:
     Status readManifest();

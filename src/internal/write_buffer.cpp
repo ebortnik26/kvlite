@@ -336,7 +336,7 @@ Status WriteBuffer::flush(const std::string& path, uint32_t segment_id,
         std::sort(bucket_entries.begin(), bucket_entries.end(),
                   [](const FlatEntry& a, const FlatEntry& b) {
                       if (a.hash != b.hash) return a.hash < b.hash;
-                      return a.version < b.version;
+                      return a.version > b.version;
                   });
 
         for (const auto& e : bucket_entries) {

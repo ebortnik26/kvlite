@@ -10,7 +10,11 @@
 #include "internal/segment_lslot_codec.h"
 #include "internal/segment_delta_hash_table.h"
 #include "internal/segment_index.h"
+#include "internal/global_index.h"
+#include "internal/gc_manager.h"
 #include "internal/log_file.h"
+#include "internal/segment.h"
+#include "internal/delta_hash_table_base.h"
 
 using namespace kvlite::internal;
 using kvlite::Status;
@@ -557,4 +561,351 @@ TEST_F(SegmentIndexSerializationTest, BadMagic) {
     rf.close();
 
     EXPECT_TRUE(s.isCorruption());
+}
+
+// --- GCManager Visible Count Tests ---
+
+// One key, one version in seg1, snapshot >= version → 1.
+TEST(VisibleCount, AllVisible) {
+    GlobalIndex gi;
+    gi.put("key1", /*version=*/10, /*segment_id=*/1);
+
+    SegmentIndex si;
+    si.put("key1", /*offset=*/0, /*version=*/10);
+
+    std::vector<uint64_t> snapshots = {10};  // current version
+    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    EXPECT_EQ(count, 1u);
+}
+
+// Key has v1(seg1), v2(seg2). Only current snapshot at v2 → seg1 gets 0.
+TEST(VisibleCount, Superseded) {
+    GlobalIndex gi;
+    gi.put("key1", /*version=*/1, /*segment_id=*/1);
+    gi.put("key1", /*version=*/2, /*segment_id=*/2);
+
+    SegmentIndex si;
+    si.put("key1", /*offset=*/0, /*version=*/1);
+
+    std::vector<uint64_t> snapshots = {2};  // current version
+    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    EXPECT_EQ(count, 0u);
+}
+
+// Key has v1(seg1), v2(seg2). Snapshot at v1, current at v2 → seg1 gets 1.
+TEST(VisibleCount, SnapshotPins) {
+    GlobalIndex gi;
+    gi.put("key1", /*version=*/1, /*segment_id=*/1);
+    gi.put("key1", /*version=*/2, /*segment_id=*/2);
+
+    SegmentIndex si;
+    si.put("key1", /*offset=*/0, /*version=*/1);
+
+    std::vector<uint64_t> snapshots = {1, 2};  // snapshot at v1, current at v2
+    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    EXPECT_EQ(count, 1u);
+}
+
+// Multiple keys, mixed visibility across segments.
+TEST(VisibleCount, MultipleKeys) {
+    GlobalIndex gi;
+    // key1: v1 in seg1, v2 in seg2
+    gi.put("key1", 1, 1);
+    gi.put("key1", 2, 2);
+    // key2: v3 in seg1 (latest)
+    gi.put("key2", 3, 1);
+    // key3: v4 in seg2
+    gi.put("key3", 4, 2);
+
+    SegmentIndex si;
+    si.put("key1", 0, 1);
+    si.put("key2", 100, 3);
+
+    std::vector<uint64_t> snapshots = {4};  // current version
+    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    // key1: latest is v2 in seg2, not seg1 → 0
+    // key2: latest is v3 in seg1 → 1
+    EXPECT_EQ(count, 1u);
+}
+
+// SegmentIndex entries not in GlobalIndex → 0.
+TEST(VisibleCount, NoOverlap) {
+    GlobalIndex gi;
+    gi.put("other_key", 1, 2);
+
+    SegmentIndex si;
+    si.put("lonely_key", 0, 1);
+
+    std::vector<uint64_t> snapshots = {1};
+    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    EXPECT_EQ(count, 0u);
+}
+
+// Several snapshots pin different versions in the same segment.
+TEST(VisibleCount, MultipleSnapshots) {
+    GlobalIndex gi;
+    // key1: v1(seg1), v3(seg1), v5(seg2)
+    gi.put("key1", 1, 1);
+    gi.put("key1", 3, 1);
+    gi.put("key1", 5, 2);
+
+    SegmentIndex si;
+    si.put("key1", 0, 1);
+    si.put("key1", 100, 3);
+
+    // Snapshots at v2, v4, v5:
+    //   snap=2: latest <= 2 is v1(seg1) → pinned
+    //   snap=4: latest <= 4 is v3(seg1) → pinned
+    //   snap=5: latest <= 5 is v5(seg2) → not in seg1
+    std::vector<uint64_t> snapshots = {2, 4, 5};
+    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    EXPECT_EQ(count, 2u);  // v1 and v3 are pinned
+}
+
+// Verify merge-join works correctly when GlobalIndex and SegmentIndex
+// have different DHT bucket configurations (different bucket_bits).
+// The reconstructed 64-bit hash is lossless in both cases
+// (bucket_bits + lslot_bits + fingerprint_bits = 64), so hashes match.
+TEST(VisibleCount, DifferentBucketCounts) {
+    // GlobalIndex uses default Config (bucket_bits=20, lslot_bits=5)
+    // SegmentIndex uses its own config (bucket_bits=16, lslot_bits=4)
+    // Both produce the same 64-bit hash for the same key.
+
+    GlobalIndex gi;
+    SegmentIndex si;
+
+    // Insert many keys to exercise different bucket assignments.
+    const int N = 100;
+    for (int i = 0; i < N; ++i) {
+        std::string key = "dbc_key_" + std::to_string(i);
+        gi.put(key, static_cast<uint64_t>(i + 1), /*segment_id=*/1);
+        si.put(key, static_cast<uint32_t>(i * 64), static_cast<uint32_t>(i + 1));
+    }
+
+    // All keys have their latest version in seg1, snapshot covers all.
+    std::vector<uint64_t> snapshots = {static_cast<uint64_t>(N)};
+    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    EXPECT_EQ(count, static_cast<size_t>(N));
+}
+
+// Visible count setter/getter on SegmentIndex.
+TEST(SegmentIndex, VisibleCount) {
+    SegmentIndex si;
+    EXPECT_EQ(si.visibleCount(), 0u);
+    si.setVisibleCount(42);
+    EXPECT_EQ(si.visibleCount(), 42u);
+}
+
+// --- VisibleVersionIterator Tests ---
+
+class VisibleVersionIteratorTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        base_ = "/tmp/vvi_test_" + std::to_string(getpid()) + "_";
+    }
+    void TearDown() override {
+        for (auto& seg : segments_) {
+            seg.close();
+        }
+        for (auto& path : paths_) {
+            ::unlink(path.c_str());
+        }
+    }
+
+    // Create a segment, write entries, seal it, and register in GlobalIndex.
+    // Returns the segment index in segments_.
+    size_t createSegment(
+        uint32_t segment_id,
+        const std::vector<std::tuple<std::string, uint64_t, std::string, bool>>& entries) {
+        std::string path = base_ + std::to_string(segment_id) + ".data";
+        paths_.push_back(path);
+        segments_.emplace_back();
+        size_t idx = segments_.size() - 1;
+        auto& seg = segments_[idx];
+
+        EXPECT_TRUE(seg.create(path, segment_id).ok());
+        for (const auto& [key, version, value, tombstone] : entries) {
+            EXPECT_TRUE(seg.put(key, version, value, tombstone).ok());
+            gi_.put(key, version, segment_id);
+        }
+        EXPECT_TRUE(seg.seal().ok());
+        return idx;
+    }
+
+    GlobalIndex gi_;
+    std::vector<Segment> segments_;
+    std::string base_;
+    std::vector<std::string> paths_;
+};
+
+// 1 key, 1 version, snapshot covers it → yields 1 entry with correct key/value.
+TEST_F(VisibleVersionIteratorTest, IteratorAllVisible) {
+    size_t idx = createSegment(1, {{"key1", 10, "val1", false}});
+    auto& seg = segments_[idx];
+
+    SegmentIndex si;
+    si.put("key1", 0, 10);
+
+    std::vector<uint64_t> snapshots = {10};
+    auto iter = GCManager::getVisibleVersions(
+        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
+
+    ASSERT_TRUE(iter.valid());
+    EXPECT_EQ(iter.entry().log_entry.key, "key1");
+    EXPECT_EQ(iter.entry().log_entry.value, "val1");
+    EXPECT_EQ(iter.entry().log_entry.version(), 10u);
+    EXPECT_FALSE(iter.entry().log_entry.tombstone());
+
+    ASSERT_TRUE(iter.next().ok());
+    EXPECT_FALSE(iter.valid());
+}
+
+// key v1(seg1), v2(seg2). Only current snapshot at v2 → seg1 yields 0.
+TEST_F(VisibleVersionIteratorTest, IteratorSuperseded) {
+    size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
+    createSegment(2, {{"key1", 2, "val2", false}});
+    auto& seg = segments_[idx];
+
+    SegmentIndex si;
+    si.put("key1", 0, 1);
+
+    std::vector<uint64_t> snapshots = {2};
+    auto iter = GCManager::getVisibleVersions(
+        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
+
+    EXPECT_FALSE(iter.valid());
+}
+
+// key v1(seg1), v2(seg2). Snapshot at v1 → seg1 yields v1.
+TEST_F(VisibleVersionIteratorTest, IteratorSnapshotPins) {
+    size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
+    createSegment(2, {{"key1", 2, "val2", false}});
+    auto& seg = segments_[idx];
+
+    SegmentIndex si;
+    si.put("key1", 0, 1);
+
+    std::vector<uint64_t> snapshots = {1, 2};
+    auto iter = GCManager::getVisibleVersions(
+        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
+
+    ASSERT_TRUE(iter.valid());
+    EXPECT_EQ(iter.entry().log_entry.key, "key1");
+    EXPECT_EQ(iter.entry().log_entry.version(), 1u);
+
+    ASSERT_TRUE(iter.next().ok());
+    EXPECT_FALSE(iter.valid());
+}
+
+// key v1,v3 in seg1, v5 in seg2. Snapshots pin both v1 and v3.
+// File order is (hash asc, version desc), so yields v3 then v1.
+TEST_F(VisibleVersionIteratorTest, IteratorMultipleVersionsDesc) {
+    // Segment::put writes entries in call order; we write v3, v1
+    // so file order = v3, v1 (version desc for same hash).
+    size_t idx = createSegment(1, {
+        {"key1", 3, "val3", false},
+        {"key1", 1, "val1", false},
+    });
+    createSegment(2, {{"key1", 5, "val5", false}});
+    auto& seg = segments_[idx];
+
+    SegmentIndex si;
+    si.put("key1", 0, 3);   // offset doesn't matter for visible-set check
+    si.put("key1", 100, 1);
+
+    // snap=2 → latest <= 2 is v1(seg1) → pinned
+    // snap=4 → latest <= 4 is v3(seg1) → pinned
+    // snap=5 → latest <= 5 is v5(seg2) → not in seg1
+    std::vector<uint64_t> snapshots = {2, 4, 5};
+    auto iter = GCManager::getVisibleVersions(
+        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
+
+    ASSERT_TRUE(iter.valid());
+    EXPECT_EQ(iter.entry().log_entry.version(), 3u);
+    EXPECT_EQ(iter.entry().log_entry.value, "val3");
+
+    ASSERT_TRUE(iter.next().ok());
+    ASSERT_TRUE(iter.valid());
+    EXPECT_EQ(iter.entry().log_entry.version(), 1u);
+    EXPECT_EQ(iter.entry().log_entry.value, "val1");
+
+    ASSERT_TRUE(iter.next().ok());
+    EXPECT_FALSE(iter.valid());
+}
+
+// Multiple keys: verifies hash-asc then version-desc order.
+TEST_F(VisibleVersionIteratorTest, IteratorMultipleKeys) {
+    // We need two keys with known hash ordering. Write them
+    // in hash-ascending order to the segment.
+    std::string keyA = "key1";
+    std::string keyB = "key2";
+    uint64_t hashA = dhtHashBytes(keyA.data(), keyA.size());
+    uint64_t hashB = dhtHashBytes(keyB.data(), keyB.size());
+
+    // Ensure we know which hash is smaller; swap if needed.
+    if (hashA > hashB) {
+        std::swap(keyA, keyB);
+        std::swap(hashA, hashB);
+    }
+
+    // Write entries: keyA(v2), keyA(v1), keyB(v4), keyB(v3)
+    // File order: hash-asc, version-desc within same hash.
+    size_t idx = createSegment(1, {
+        {keyA, 2, "A_v2", false},
+        {keyA, 1, "A_v1", false},
+        {keyB, 4, "B_v4", false},
+        {keyB, 3, "B_v3", false},
+    });
+    auto& seg = segments_[idx];
+
+    SegmentIndex si;
+    si.put(keyA, 0, 2);
+    si.put(keyA, 100, 1);
+    si.put(keyB, 200, 4);
+    si.put(keyB, 300, 3);
+
+    // Snapshots pin all versions.
+    std::vector<uint64_t> snapshots = {1, 2, 3, 4};
+    auto iter = GCManager::getVisibleVersions(
+        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
+
+    // Expect: keyA v2, keyA v1, keyB v4, keyB v3
+    ASSERT_TRUE(iter.valid());
+    EXPECT_EQ(iter.entry().log_entry.key, keyA);
+    EXPECT_EQ(iter.entry().log_entry.version(), 2u);
+
+    ASSERT_TRUE(iter.next().ok());
+    ASSERT_TRUE(iter.valid());
+    EXPECT_EQ(iter.entry().log_entry.key, keyA);
+    EXPECT_EQ(iter.entry().log_entry.version(), 1u);
+
+    ASSERT_TRUE(iter.next().ok());
+    ASSERT_TRUE(iter.valid());
+    EXPECT_EQ(iter.entry().log_entry.key, keyB);
+    EXPECT_EQ(iter.entry().log_entry.version(), 4u);
+
+    ASSERT_TRUE(iter.next().ok());
+    ASSERT_TRUE(iter.valid());
+    EXPECT_EQ(iter.entry().log_entry.key, keyB);
+    EXPECT_EQ(iter.entry().log_entry.version(), 3u);
+
+    ASSERT_TRUE(iter.next().ok());
+    EXPECT_FALSE(iter.valid());
+}
+
+// No visible entries → valid() false immediately.
+TEST_F(VisibleVersionIteratorTest, IteratorEmpty) {
+    size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
+    createSegment(2, {{"key1", 2, "val2", false}});
+    auto& seg = segments_[idx];
+
+    SegmentIndex si;
+    si.put("key1", 0, 1);
+
+    // Only snapshot at v2 → latest is v2(seg2), nothing visible in seg1.
+    std::vector<uint64_t> snapshots = {2};
+    auto iter = GCManager::getVisibleVersions(
+        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
+
+    EXPECT_FALSE(iter.valid());
 }

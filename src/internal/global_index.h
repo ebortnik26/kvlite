@@ -64,6 +64,15 @@ public:
     size_t entryCount() const;  // total (segment_id, version) refs across all keys
     size_t memoryUsage() const;
 
+    // Iterate over all groups (hash-sorted). Callback receives:
+    //   hash: the FNV-1a hash
+    //   versions: sorted desc (latest first, mapped from DHT "offsets")
+    //   segment_ids: parallel array (mapped from DHT "versions")
+    void forEachGroup(
+        const std::function<void(uint64_t hash,
+                                 const std::vector<uint32_t>& versions,
+                                 const std::vector<uint32_t>& segment_ids)>& fn) const;
+
     // Clear all entries.
     void clear();
 

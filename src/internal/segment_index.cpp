@@ -158,6 +158,21 @@ void SegmentIndex::forEach(const std::function<void(uint32_t offset, uint32_t ve
     });
 }
 
+void SegmentIndex::forEachGroup(
+    const std::function<void(uint64_t hash,
+                             const std::vector<uint32_t>& offsets,
+                             const std::vector<uint32_t>& versions)>& fn) const {
+    dht_.forEachGroup(fn);
+}
+
+void SegmentIndex::setVisibleCount(size_t count) {
+    visible_count_ = count;
+}
+
+size_t SegmentIndex::visibleCount() const {
+    return visible_count_;
+}
+
 size_t SegmentIndex::keyCount() const {
     return key_count_;
 }

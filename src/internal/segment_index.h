@@ -63,6 +63,20 @@ public:
     // Iterate over all entries, calling fn(offset, version) for each.
     void forEach(const std::function<void(uint32_t offset, uint32_t version)>& fn) const;
 
+    // Iterate over all groups (hash-sorted). Callback receives:
+    //   hash: the FNV-1a hash
+    //   offsets: sorted desc (latest first)
+    //   versions: parallel array
+    void forEachGroup(
+        const std::function<void(uint64_t hash,
+                                 const std::vector<uint32_t>& offsets,
+                                 const std::vector<uint32_t>& versions)>& fn) const;
+
+    // Visible count: number of entries reachable by some active snapshot.
+    // Computed externally (e.g. by GCManager) and stored here.
+    void setVisibleCount(size_t count);
+    size_t visibleCount() const;
+
     size_t keyCount() const;
     size_t entryCount() const;
     size_t memoryUsage() const;
@@ -71,6 +85,7 @@ public:
 private:
     SegmentDeltaHashTable dht_;
     size_t key_count_ = 0;
+    size_t visible_count_ = 0;
 };
 
 }  // namespace internal

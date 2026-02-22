@@ -85,6 +85,8 @@ public:
 
     // --- Stats (any state) ---
 
+    const LogFile& logFile() const { return log_file_; }
+
     uint64_t dataSize() const;
     size_t keyCount() const;
     size_t entryCount() const;

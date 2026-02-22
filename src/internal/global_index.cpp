@@ -146,6 +146,18 @@ size_t GlobalIndex::memoryUsage() const {
     return dht_.memoryUsage();
 }
 
+void GlobalIndex::forEachGroup(
+    const std::function<void(uint64_t hash,
+                             const std::vector<uint32_t>& versions,
+                             const std::vector<uint32_t>& segment_ids)>& fn) const {
+    // DHT "offsets" = versions, DHT "versions" = segment_ids
+    dht_.forEachGroup([&fn](uint64_t hash,
+                            const std::vector<uint32_t>& offsets,
+                            const std::vector<uint32_t>& versions) {
+        fn(hash, offsets, versions);
+    });
+}
+
 void GlobalIndex::clear() {
     dht_.clear();
     key_count_ = 0;
