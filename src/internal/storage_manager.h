@@ -14,6 +14,8 @@
 namespace kvlite {
 namespace internal {
 
+class Manifest;
+
 // Storage Manager: Segment registry that owns the segment lifecycle.
 //
 // Provides:
@@ -34,7 +36,7 @@ public:
     // --- Lifecycle ---
 
     // Open storage at the given path.
-    Status open(const std::string& db_path);
+    Status open(const std::string& db_path, Manifest& manifest);
 
     // Recover storage state from disk.
     Status recover();
@@ -67,6 +69,7 @@ public:
 
 private:
     std::string db_path_;
+    Manifest* manifest_ = nullptr;
     bool is_open_ = false;
     std::atomic<uint32_t> next_segment_id_{1};
 

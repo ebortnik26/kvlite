@@ -39,6 +39,7 @@ set(KVLITE_SOURCES
     src/internal/log_file.cpp
     src/internal/segment.cpp
     src/internal/storage_manager.cpp
+    src/internal/manifest.cpp
     src/internal/global_index_manager.cpp
     src/internal/global_index_wal.cpp
     src/batch.cpp

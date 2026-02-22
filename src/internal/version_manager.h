@@ -13,6 +13,8 @@
 namespace kvlite {
 namespace internal {
 
+class Manifest;
+
 // Version Manager: Manages version allocation and snapshot tracking.
 //
 // Responsibilities:
@@ -41,7 +43,8 @@ public:
 
     // --- Lifecycle ---
 
-    Status open(const std::string& db_path, const Options& options);
+    Status open(const Options& options, Manifest& manifest);
+    Status recover();
     Status close();
     bool isOpen() const;
 
@@ -86,12 +89,8 @@ public:
     }
 
 private:
-    Status readManifest();
-    Status writeManifest(uint64_t counter);
-    std::string manifestPath() const;
-
-    std::string db_path_;
     Options options_;
+    Manifest* manifest_ = nullptr;
     bool is_open_ = false;
 
     std::atomic<uint64_t> current_version_{0};

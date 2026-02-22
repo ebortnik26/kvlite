@@ -500,3 +500,44 @@ TEST_F(DBTest, DoubleOpenFails) {
     opts.create_if_missing = true;
     EXPECT_FALSE(db_.open(test_dir_.string(), opts).ok());
 }
+
+// ── Recovery ────────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, RecoverAfterFlush) {
+    // Open, put, flush, close.
+    ASSERT_TRUE(openDB().ok());
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.put("k2", "v2").ok());
+    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k3", "v3").ok());
+    // close() flushes the write buffer, so k3 will be in a segment too.
+    ASSERT_TRUE(db_.close().ok());
+
+    // Reopen and verify data survives.
+    ASSERT_TRUE(openDB().ok());
+    std::string val;
+    ASSERT_TRUE(db_.get("k1", val).ok());
+    EXPECT_EQ(val, "v1");
+    ASSERT_TRUE(db_.get("k2", val).ok());
+    EXPECT_EQ(val, "v2");
+    ASSERT_TRUE(db_.get("k3", val).ok());
+    EXPECT_EQ(val, "v3");
+}
+
+TEST_F(DBTest, RecoverMultipleFlushes) {
+    ASSERT_TRUE(openDB().ok());
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(db_.put("key" + std::to_string(i),
+                            "val" + std::to_string(i)).ok());
+        ASSERT_TRUE(db_.flush().ok());
+    }
+    ASSERT_TRUE(db_.close().ok());
+
+    // Reopen and verify all data.
+    ASSERT_TRUE(openDB().ok());
+    for (int i = 0; i < 5; ++i) {
+        std::string val;
+        ASSERT_TRUE(db_.get("key" + std::to_string(i), val).ok());
+        EXPECT_EQ(val, "val" + std::to_string(i));
+    }
+}

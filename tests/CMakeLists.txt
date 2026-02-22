@@ -81,6 +81,7 @@ add_executable(kvlite_segment_index_test
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/storage_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 
@@ -171,6 +172,7 @@ target_link_libraries(kvlite_lf_test
 add_executable(kvlite_vm_test
     test_version_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/version_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 
@@ -187,6 +189,26 @@ target_link_libraries(kvlite_vm_test
         pthread
 )
 
+# Manifest tests
+add_executable(kvlite_manifest_test
+    test_manifest.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
+    ${CMAKE_SOURCE_DIR}/src/status.cpp
+)
+
+target_include_directories(kvlite_manifest_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_manifest_test
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
 # Register tests with CTest
 include(GoogleTest)
 gtest_discover_tests(kvlite_test)
@@ -197,3 +219,4 @@ gtest_discover_tests(kvlite_wb_test)
 gtest_discover_tests(kvlite_seg_test)
 gtest_discover_tests(kvlite_lf_test)
 gtest_discover_tests(kvlite_vm_test)
+gtest_discover_tests(kvlite_manifest_test)

@@ -118,7 +118,6 @@ TEST_F(VersioningTest, GetByVersionAfterDelete) {
     ASSERT_TRUE(db_.get("key", tmp, ver1).ok());
 
     ASSERT_TRUE(db_.remove("key").ok());
-    uint64_t ver_del;
     bool exists;
     db_.exists("key", exists);  // Get current version somehow
 
@@ -261,7 +260,6 @@ TEST_F(VersioningTest, SnapshotIsValid) {
     EXPECT_TRUE(snapshot->isValid());
 
     // After release, snapshot should be invalid (moved from)
-    auto* raw_ptr = snapshot.get();
     db_.releaseSnapshot(std::move(snapshot));
 
     // snapshot is now nullptr after move

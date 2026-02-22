@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "internal/manifest.h"
 #include "internal/version_manager.h"
 #include "internal/global_index_manager.h"
 #include "internal/storage_manager.h"
@@ -283,20 +284,44 @@ DB::DB(DB&& other) noexcept = default;
 DB& DB::operator=(DB&& other) noexcept = default;
 
 Status DB::open(const std::string& path, const Options& options) {
-    if (versions_ || global_index_ || storage_) {
+    if (is_open_) {
         return Status::InvalidArgument("Database already open");
     }
 
     db_path_ = path;
     options_ = options;
 
+    // Initialize manifest
+    manifest_ = std::make_unique<internal::Manifest>();
+    Status s = manifest_->open(path);
+    if (!s.ok()) {
+        if (s.isNotFound() && options.create_if_missing) {
+            s = manifest_->create(path);
+        }
+        if (!s.ok()) {
+            manifest_.reset();
+            return s;
+        }
+    }
+
     // Initialize version manager
     versions_ = std::make_unique<internal::VersionManager>();
     internal::VersionManager::Options ver_opts;
 
-    Status s = versions_->open(path, ver_opts);
+    s = versions_->open(ver_opts, *manifest_);
     if (!s.ok()) {
+        manifest_->close();
+        manifest_.reset();
         versions_.reset();
+        return s;
+    }
+
+    s = versions_->recover();
+    if (!s.ok()) {
+        versions_->close();
+        versions_.reset();
+        manifest_->close();
+        manifest_.reset();
         return s;
     }
 
@@ -310,6 +335,8 @@ Status DB::open(const std::string& path, const Options& options) {
     if (!s.ok()) {
         versions_->close();
         versions_.reset();
+        manifest_->close();
+        manifest_.reset();
         global_index_.reset();
         return s;
     }
@@ -320,19 +347,23 @@ Status DB::open(const std::string& path, const Options& options) {
         global_index_->close();
         versions_.reset();
         global_index_.reset();
+        manifest_->close();
+        manifest_.reset();
         return s;
     }
 
     // Initialize storage manager
     storage_ = std::make_unique<internal::StorageManager>();
 
-    s = storage_->open(path);
+    s = storage_->open(path, *manifest_);
     if (!s.ok()) {
         versions_->close();
         global_index_->close();
         versions_.reset();
         global_index_.reset();
         storage_.reset();
+        manifest_->close();
+        manifest_.reset();
         return s;
     }
 
@@ -344,6 +375,8 @@ Status DB::open(const std::string& path, const Options& options) {
         versions_.reset();
         global_index_.reset();
         storage_.reset();
+        manifest_->close();
+        manifest_.reset();
         return s;
     }
 
@@ -351,21 +384,24 @@ Status DB::open(const std::string& path, const Options& options) {
     write_buffer_ = std::make_unique<internal::WriteBuffer>();
     current_segment_id_ = storage_->allocateSegmentId();
 
+    is_open_ = true;
     return Status::OK();
 }
 
 Status DB::close() {
-    if (!versions_ && !global_index_ && !storage_) {
+    if (!is_open_) {
         return Status::OK();
     }
 
     Status s1;
 
-    // Flush write buffer before closing
+    // Flush write buffer before closing (must happen while is_open_ is true)
     if (write_buffer_ && !write_buffer_->empty()) {
         s1 = flush();
     }
     write_buffer_.reset();
+
+    is_open_ = false;
 
     Status s2;
     if (storage_) {
@@ -385,14 +421,23 @@ Status DB::close() {
         versions_.reset();
     }
 
+    // Compact manifest for fast recovery, then close.
+    Status s5;
+    if (manifest_) {
+        s5 = manifest_->compact();
+        manifest_->close();
+        manifest_.reset();
+    }
+
     if (!s1.ok()) return s1;
     if (!s2.ok()) return s2;
     if (!s3.ok()) return s3;
-    return s4;
+    if (!s4.ok()) return s4;
+    return s5;
 }
 
 bool DB::isOpen() const {
-    return versions_ != nullptr && global_index_ != nullptr && storage_ != nullptr;
+    return is_open_;
 }
 
 
