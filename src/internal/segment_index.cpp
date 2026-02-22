@@ -165,14 +165,6 @@ void SegmentIndex::forEachGroup(
     dht_.forEachGroup(fn);
 }
 
-void SegmentIndex::setVisibleCount(size_t count) {
-    visible_count_ = count;
-}
-
-size_t SegmentIndex::visibleCount() const {
-    return visible_count_;
-}
-
 size_t SegmentIndex::keyCount() const {
     return key_count_;
 }

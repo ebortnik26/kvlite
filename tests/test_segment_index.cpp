@@ -12,6 +12,7 @@
 #include "internal/segment_index.h"
 #include "internal/global_index.h"
 #include "internal/visibility_filter.h"
+#include "internal/gc.h"
 #include "internal/log_file.h"
 #include "internal/segment.h"
 #include "internal/delta_hash_table_base.h"
@@ -563,139 +564,6 @@ TEST_F(SegmentIndexSerializationTest, BadMagic) {
     EXPECT_TRUE(s.isCorruption());
 }
 
-// --- VisibilityFilter Visible Count Tests ---
-
-// One key, one version in seg1, snapshot >= version → 1.
-TEST(VisibleCount, AllVisible) {
-    GlobalIndex gi;
-    gi.put("key1", /*version=*/10, /*segment_id=*/1);
-
-    SegmentIndex si;
-    si.put("key1", /*offset=*/0, /*version=*/10);
-
-    std::vector<uint64_t> snapshots = {10};  // current version
-    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
-    EXPECT_EQ(count, 1u);
-}
-
-// Key has v1(seg1), v2(seg2). Only current snapshot at v2 → seg1 gets 0.
-TEST(VisibleCount, Superseded) {
-    GlobalIndex gi;
-    gi.put("key1", /*version=*/1, /*segment_id=*/1);
-    gi.put("key1", /*version=*/2, /*segment_id=*/2);
-
-    SegmentIndex si;
-    si.put("key1", /*offset=*/0, /*version=*/1);
-
-    std::vector<uint64_t> snapshots = {2};  // current version
-    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
-    EXPECT_EQ(count, 0u);
-}
-
-// Key has v1(seg1), v2(seg2). Snapshot at v1, current at v2 → seg1 gets 1.
-TEST(VisibleCount, SnapshotPins) {
-    GlobalIndex gi;
-    gi.put("key1", /*version=*/1, /*segment_id=*/1);
-    gi.put("key1", /*version=*/2, /*segment_id=*/2);
-
-    SegmentIndex si;
-    si.put("key1", /*offset=*/0, /*version=*/1);
-
-    std::vector<uint64_t> snapshots = {1, 2};  // snapshot at v1, current at v2
-    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
-    EXPECT_EQ(count, 1u);
-}
-
-// Multiple keys, mixed visibility across segments.
-TEST(VisibleCount, MultipleKeys) {
-    GlobalIndex gi;
-    // key1: v1 in seg1, v2 in seg2
-    gi.put("key1", 1, 1);
-    gi.put("key1", 2, 2);
-    // key2: v3 in seg1 (latest)
-    gi.put("key2", 3, 1);
-    // key3: v4 in seg2
-    gi.put("key3", 4, 2);
-
-    SegmentIndex si;
-    si.put("key1", 0, 1);
-    si.put("key2", 100, 3);
-
-    std::vector<uint64_t> snapshots = {4};  // current version
-    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
-    // key1: latest is v2 in seg2, not seg1 → 0
-    // key2: latest is v3 in seg1 → 1
-    EXPECT_EQ(count, 1u);
-}
-
-// SegmentIndex entries not in GlobalIndex → 0.
-TEST(VisibleCount, NoOverlap) {
-    GlobalIndex gi;
-    gi.put("other_key", 1, 2);
-
-    SegmentIndex si;
-    si.put("lonely_key", 0, 1);
-
-    std::vector<uint64_t> snapshots = {1};
-    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
-    EXPECT_EQ(count, 0u);
-}
-
-// Several snapshots pin different versions in the same segment.
-TEST(VisibleCount, MultipleSnapshots) {
-    GlobalIndex gi;
-    // key1: v1(seg1), v3(seg1), v5(seg2)
-    gi.put("key1", 1, 1);
-    gi.put("key1", 3, 1);
-    gi.put("key1", 5, 2);
-
-    SegmentIndex si;
-    si.put("key1", 0, 1);
-    si.put("key1", 100, 3);
-
-    // Snapshots at v2, v4, v5:
-    //   snap=2: latest <= 2 is v1(seg1) → pinned
-    //   snap=4: latest <= 4 is v3(seg1) → pinned
-    //   snap=5: latest <= 5 is v5(seg2) → not in seg1
-    std::vector<uint64_t> snapshots = {2, 4, 5};
-    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
-    EXPECT_EQ(count, 2u);  // v1 and v3 are pinned
-}
-
-// Verify merge-join works correctly when GlobalIndex and SegmentIndex
-// have different DHT bucket configurations (different bucket_bits).
-// The reconstructed 64-bit hash is lossless in both cases
-// (bucket_bits + lslot_bits + fingerprint_bits = 64), so hashes match.
-TEST(VisibleCount, DifferentBucketCounts) {
-    // GlobalIndex uses default Config (bucket_bits=20, lslot_bits=5)
-    // SegmentIndex uses its own config (bucket_bits=16, lslot_bits=4)
-    // Both produce the same 64-bit hash for the same key.
-
-    GlobalIndex gi;
-    SegmentIndex si;
-
-    // Insert many keys to exercise different bucket assignments.
-    const int N = 100;
-    for (int i = 0; i < N; ++i) {
-        std::string key = "dbc_key_" + std::to_string(i);
-        gi.put(key, static_cast<uint64_t>(i + 1), /*segment_id=*/1);
-        si.put(key, static_cast<uint32_t>(i * 64), static_cast<uint32_t>(i + 1));
-    }
-
-    // All keys have their latest version in seg1, snapshot covers all.
-    std::vector<uint64_t> snapshots = {static_cast<uint64_t>(N)};
-    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
-    EXPECT_EQ(count, static_cast<size_t>(N));
-}
-
-// Visible count setter/getter on SegmentIndex.
-TEST(SegmentIndex, VisibleCount) {
-    SegmentIndex si;
-    EXPECT_EQ(si.visibleCount(), 0u);
-    si.setVisibleCount(42);
-    EXPECT_EQ(si.visibleCount(), 42u);
-}
-
 // --- VisibleVersionIterator Tests ---
 
 class VisibleVersionIteratorTest : public ::testing::Test {
@@ -908,4 +776,317 @@ TEST_F(VisibleVersionIteratorTest, IteratorEmpty) {
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     EXPECT_FALSE(iter.valid());
+}
+
+// --- GC Merge Tests ---
+
+class GCMergeTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        base_ = "/tmp/gc_test_" + std::to_string(getpid()) + "_";
+        next_id_ = 100;
+    }
+    void TearDown() override {
+        for (auto& seg : segments_) {
+            seg.close();
+        }
+        for (auto& path : paths_) {
+            ::unlink(path.c_str());
+        }
+        for (auto& out : last_result_.outputs) {
+            out.segment.close();
+        }
+        for (auto& path : output_paths_) {
+            ::unlink(path.c_str());
+        }
+    }
+
+    // Create a segment, write entries, seal it, and register in GlobalIndex.
+    // Returns the segment index in segments_.
+    size_t createSegment(
+        uint32_t segment_id,
+        const std::vector<std::tuple<std::string, uint64_t, std::string, bool>>& entries) {
+        std::string path = base_ + "input_" + std::to_string(segment_id) + ".data";
+        paths_.push_back(path);
+        segments_.emplace_back();
+        size_t idx = segments_.size() - 1;
+        auto& seg = segments_[idx];
+
+        EXPECT_TRUE(seg.create(path, segment_id).ok());
+        for (const auto& [key, version, value, tombstone] : entries) {
+            EXPECT_TRUE(seg.put(key, version, value, tombstone).ok());
+            gi_.put(key, version, segment_id);
+        }
+        EXPECT_TRUE(seg.seal().ok());
+        return idx;
+    }
+
+    std::string pathForOutput(uint32_t id) {
+        std::string path = base_ + "output_" + std::to_string(id) + ".data";
+        output_paths_.push_back(path);
+        return path;
+    }
+
+    uint32_t allocateId() {
+        return next_id_++;
+    }
+
+    GlobalIndex gi_;
+    std::vector<Segment> segments_;
+    std::string base_;
+    std::vector<std::string> paths_;
+    std::vector<std::string> output_paths_;
+    uint32_t next_id_ = 100;
+    GC::Result last_result_;
+};
+
+// 1 segment, 3 keys, all visible → 1 output with all 3 entries.
+TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
+    size_t idx = createSegment(1, {
+        {"key1", 1, "val1", false},
+        {"key2", 2, "val2", false},
+        {"key3", 3, "val3", false},
+    });
+    auto& seg = segments_[idx];
+
+    SegmentIndex si;
+    si.put("key1", 0, 1);
+    si.put("key2", 100, 2);
+    si.put("key3", 200, 3);
+
+    std::vector<uint64_t> snapshots = {3};
+    std::vector<GC::InputSegment> inputs = {
+        {1, si, seg.logFile(), seg.dataSize()},
+    };
+
+    Status s = GC::merge(
+        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(last_result_.entries_written, 3u);
+    ASSERT_EQ(last_result_.outputs.size(), 1u);
+
+    // Verify entries are readable from the output segment.
+    auto& out = last_result_.outputs[0].segment;
+    ASSERT_EQ(out.state(), Segment::State::kReadable);
+
+    LogEntry entry;
+    ASSERT_TRUE(out.getLatest("key1", entry).ok());
+    EXPECT_EQ(entry.value, "val1");
+    EXPECT_EQ(entry.version(), 1u);
+
+    ASSERT_TRUE(out.getLatest("key2", entry).ok());
+    EXPECT_EQ(entry.value, "val2");
+    EXPECT_EQ(entry.version(), 2u);
+
+    ASSERT_TRUE(out.getLatest("key3", entry).ok());
+    EXPECT_EQ(entry.value, "val3");
+    EXPECT_EQ(entry.version(), 3u);
+}
+
+// 2 segments, key has v1(seg1) + v2(seg2), only latest snapshot → output has only v2.
+TEST_F(GCMergeTest, MergeEliminatesInvisible) {
+    size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
+    size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
+    auto& seg1 = segments_[idx1];
+    auto& seg2 = segments_[idx2];
+
+    SegmentIndex si1;
+    si1.put("key1", 0, 1);
+    SegmentIndex si2;
+    si2.put("key1", 0, 2);
+
+    std::vector<uint64_t> snapshots = {2};
+    std::vector<GC::InputSegment> inputs = {
+        {1, si1, seg1.logFile(), seg1.dataSize()},
+        {2, si2, seg2.logFile(), seg2.dataSize()},
+    };
+
+    Status s = GC::merge(
+        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(last_result_.entries_written, 1u);
+    ASSERT_EQ(last_result_.outputs.size(), 1u);
+
+    LogEntry entry;
+    ASSERT_TRUE(last_result_.outputs[0].segment.getLatest("key1", entry).ok());
+    EXPECT_EQ(entry.value, "new");
+    EXPECT_EQ(entry.version(), 2u);
+}
+
+// 2 segments with interleaved keys → output entries in (hash asc, version desc).
+TEST_F(GCMergeTest, MergePreservesOrder) {
+    // Determine hash ordering of keys.
+    std::string keyA = "alpha";
+    std::string keyB = "beta";
+    uint64_t hashA = dhtHashBytes(keyA.data(), keyA.size());
+    uint64_t hashB = dhtHashBytes(keyB.data(), keyB.size());
+    if (hashA > hashB) {
+        std::swap(keyA, keyB);
+        std::swap(hashA, hashB);
+    }
+
+    // seg1 has keyA v2, seg2 has keyB v1.
+    size_t idx1 = createSegment(1, {{keyA, 2, "A_v2", false}});
+    size_t idx2 = createSegment(2, {{keyB, 1, "B_v1", false}});
+    auto& seg1 = segments_[idx1];
+    auto& seg2 = segments_[idx2];
+
+    SegmentIndex si1;
+    si1.put(keyA, 0, 2);
+    SegmentIndex si2;
+    si2.put(keyB, 0, 1);
+
+    std::vector<uint64_t> snapshots = {2};
+    std::vector<GC::InputSegment> inputs = {
+        {1, si1, seg1.logFile(), seg1.dataSize()},
+        {2, si2, seg2.logFile(), seg2.dataSize()},
+    };
+
+    Status s = GC::merge(
+        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(last_result_.entries_written, 2u);
+    ASSERT_EQ(last_result_.outputs.size(), 1u);
+
+    // Both keys should be present.
+    auto& out = last_result_.outputs[0].segment;
+    LogEntry entry;
+    ASSERT_TRUE(out.getLatest(keyA, entry).ok());
+    EXPECT_EQ(entry.value, "A_v2");
+    ASSERT_TRUE(out.getLatest(keyB, entry).ok());
+    EXPECT_EQ(entry.value, "B_v1");
+}
+
+// 1 segment with entries totaling > max_segment_size → 2+ output segments.
+TEST_F(GCMergeTest, MergeSplitsOnSize) {
+    // Create a segment with several entries. Use large values to control size.
+    std::string big_val(200, 'x');  // ~218 bytes per entry serialized
+    size_t idx = createSegment(1, {
+        {"k1", 1, big_val, false},
+        {"k2", 2, big_val, false},
+        {"k3", 3, big_val, false},
+        {"k4", 4, big_val, false},
+    });
+    auto& seg = segments_[idx];
+
+    SegmentIndex si;
+    si.put("k1", 0, 1);
+    si.put("k2", 100, 2);
+    si.put("k3", 200, 3);
+    si.put("k4", 300, 4);
+
+    std::vector<uint64_t> snapshots = {4};
+    std::vector<GC::InputSegment> inputs = {
+        {1, si, seg.logFile(), seg.dataSize()},
+    };
+
+    // Set max_segment_size small enough that we need multiple outputs.
+    // Each entry is ~220 bytes (14 header + 2 key + 200 value + 4 crc).
+    // Set limit to ~450 bytes so ~2 entries per output.
+    Status s = GC::merge(
+        gi_, snapshots, inputs, /*max_segment_size=*/450,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(last_result_.entries_written, 4u);
+    EXPECT_GE(last_result_.outputs.size(), 2u);
+
+    // Verify all entries are findable across outputs.
+    size_t found = 0;
+    for (auto& out : last_result_.outputs) {
+        ASSERT_EQ(out.segment.state(), Segment::State::kReadable);
+        LogEntry entry;
+        if (out.segment.getLatest("k1", entry).ok()) found++;
+        if (out.segment.getLatest("k2", entry).ok()) found++;
+        if (out.segment.getLatest("k3", entry).ok()) found++;
+        if (out.segment.getLatest("k4", entry).ok()) found++;
+    }
+    EXPECT_EQ(found, 4u);
+}
+
+// All entries invisible → 0 output segments, entries_written = 0.
+TEST_F(GCMergeTest, MergeEmpty) {
+    // seg1 has key1 v1, seg2 has key1 v2. Only snapshot at v2 → seg1 invisible.
+    size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
+    createSegment(2, {{"key1", 2, "new", false}});
+    auto& seg1 = segments_[idx1];
+
+    SegmentIndex si1;
+    si1.put("key1", 0, 1);
+
+    std::vector<uint64_t> snapshots = {2};
+    std::vector<GC::InputSegment> inputs = {
+        {1, si1, seg1.logFile(), seg1.dataSize()},
+    };
+
+    Status s = GC::merge(
+        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(last_result_.entries_written, 0u);
+    EXPECT_EQ(last_result_.outputs.size(), 0u);
+}
+
+// Snapshot pins old version in seg1 while newer exists in seg2 → both versions in output.
+TEST_F(GCMergeTest, MergeSnapshotPins) {
+    size_t idx1 = createSegment(1, {{"key1", 1, "v1", false}});
+    size_t idx2 = createSegment(2, {{"key1", 2, "v2", false}});
+    auto& seg1 = segments_[idx1];
+    auto& seg2 = segments_[idx2];
+
+    SegmentIndex si1;
+    si1.put("key1", 0, 1);
+    SegmentIndex si2;
+    si2.put("key1", 0, 2);
+
+    // Snapshot at v1 pins v1 in seg1, current at v2 pins v2 in seg2.
+    std::vector<uint64_t> snapshots = {1, 2};
+    std::vector<GC::InputSegment> inputs = {
+        {1, si1, seg1.logFile(), seg1.dataSize()},
+        {2, si2, seg2.logFile(), seg2.dataSize()},
+    };
+
+    Status s = GC::merge(
+        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(last_result_.entries_written, 2u);
+    ASSERT_EQ(last_result_.outputs.size(), 1u);
+
+    // The output should contain both versions.
+    auto& out = last_result_.outputs[0].segment;
+    std::vector<LogEntry> entries;
+    ASSERT_TRUE(out.get("key1", entries).ok());
+    ASSERT_EQ(entries.size(), 2u);
+    // Verify both versions are present (order depends on SegmentIndex internals).
+    std::set<uint64_t> versions;
+    std::set<std::string> values;
+    for (const auto& e : entries) {
+        versions.insert(e.version());
+        values.insert(e.value);
+    }
+    EXPECT_EQ(versions.count(1u), 1u);
+    EXPECT_EQ(versions.count(2u), 1u);
+    EXPECT_EQ(values.count("v1"), 1u);
+    EXPECT_EQ(values.count("v2"), 1u);
 }

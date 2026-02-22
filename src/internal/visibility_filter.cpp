@@ -101,25 +101,6 @@ static std::unordered_map<uint64_t, std::set<uint32_t>> computeVisibleSet(
 }
 
 // ---------------------------------------------------------------------------
-// VisibilityFilter::computeVisibleCount
-// ---------------------------------------------------------------------------
-
-size_t VisibilityFilter::computeVisibleCount(
-    const GlobalIndex& global_index,
-    const SegmentIndex& segment_index,
-    uint32_t segment_id,
-    const std::vector<uint64_t>& snapshot_versions) {
-
-    auto visible = computeVisibleSet(global_index, segment_index,
-                                     segment_id, snapshot_versions);
-    size_t count = 0;
-    for (const auto& kv : visible) {
-        count += kv.second.size();
-    }
-    return count;
-}
-
-// ---------------------------------------------------------------------------
 // VisibleVersionIterator
 // ---------------------------------------------------------------------------
 

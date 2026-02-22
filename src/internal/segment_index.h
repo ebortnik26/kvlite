@@ -72,11 +72,6 @@ public:
                                  const std::vector<uint32_t>& offsets,
                                  const std::vector<uint32_t>& versions)>& fn) const;
 
-    // Visible count: number of entries reachable by some active snapshot.
-    // Computed externally (e.g. by VisibilityFilter) and stored here.
-    void setVisibleCount(size_t count);
-    size_t visibleCount() const;
-
     size_t keyCount() const;
     size_t entryCount() const;
     size_t memoryUsage() const;
@@ -85,7 +80,6 @@ public:
 private:
     SegmentDeltaHashTable dht_;
     size_t key_count_ = 0;
-    size_t visible_count_ = 0;
 };
 
 }  // namespace internal

@@ -61,18 +61,6 @@ private:
 // merge-join with zero random lookups.
 class VisibilityFilter {
 public:
-    // Compute visible version count for a segment by merge-joining
-    // the GlobalIndex and SegmentIndex DHTs in parallel.
-    //
-    // snapshot_versions: all observation points (active snapshots +
-    // latestVersion), sorted ascending. Obtain from
-    // VersionManager::snapshotVersions().
-    static size_t computeVisibleCount(
-        const GlobalIndex& global_index,
-        const SegmentIndex& segment_index,
-        uint32_t segment_id,
-        const std::vector<uint64_t>& snapshot_versions);
-
     // Create a streaming iterator over the visible entries in a segment.
     static VisibleVersionIterator getVisibleVersions(
         const GlobalIndex& global_index,

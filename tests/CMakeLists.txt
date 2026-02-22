@@ -77,6 +77,7 @@ add_executable(kvlite_segment_index_test
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/visibility_filter.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
