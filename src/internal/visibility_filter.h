@@ -1,5 +1,5 @@
-#ifndef KVLITE_INTERNAL_GC_MANAGER_H
-#define KVLITE_INTERNAL_GC_MANAGER_H
+#ifndef KVLITE_INTERNAL_VISIBILITY_FILTER_H
+#define KVLITE_INTERNAL_VISIBILITY_FILTER_H
 
 #include <cstdint>
 #include <set>
@@ -33,7 +33,7 @@ public:
     Status next();
 
 private:
-    friend class GCManager;
+    friend class VisibilityFilter;
     VisibleVersionIterator(
         std::unordered_map<uint64_t, std::set<uint32_t>> visible_set,
         const LogFile& log_file, uint64_t data_size);
@@ -49,7 +49,7 @@ private:
     bool valid_ = false;
 };
 
-// GCManager: Computes visible version counts for segments.
+// VisibilityFilter: Computes visible version counts for segments.
 //
 // A version V for key-hash H in segment S is "visible" if some snapshot
 // pins it — i.e., V is the latest version <= that snapshot and the
@@ -59,7 +59,7 @@ private:
 // expose forEachGroup which iterates in hash-ascending order (the
 // reconstructed 64-bit hash is lossless). This enables an O(G+L)
 // merge-join with zero random lookups.
-class GCManager {
+class VisibilityFilter {
 public:
     // Compute visible version count for a segment by merge-joining
     // the GlobalIndex and SegmentIndex DHTs in parallel.
@@ -86,4 +86,4 @@ public:
 }  // namespace internal
 }  // namespace kvlite
 
-#endif  // KVLITE_INTERNAL_GC_MANAGER_H
+#endif  // KVLITE_INTERNAL_VISIBILITY_FILTER_H

@@ -73,7 +73,7 @@ public:
                                  const std::vector<uint32_t>& versions)>& fn) const;
 
     // Visible count: number of entries reachable by some active snapshot.
-    // Computed externally (e.g. by GCManager) and stored here.
+    // Computed externally (e.g. by VisibilityFilter) and stored here.
     void setVisibleCount(size_t count);
     size_t visibleCount() const;
 

@@ -1,4 +1,4 @@
-#include "internal/gc_manager.h"
+#include "internal/visibility_filter.h"
 
 #include <algorithm>
 #include <cstring>
@@ -101,10 +101,10 @@ static std::unordered_map<uint64_t, std::set<uint32_t>> computeVisibleSet(
 }
 
 // ---------------------------------------------------------------------------
-// GCManager::computeVisibleCount
+// VisibilityFilter::computeVisibleCount
 // ---------------------------------------------------------------------------
 
-size_t GCManager::computeVisibleCount(
+size_t VisibilityFilter::computeVisibleCount(
     const GlobalIndex& global_index,
     const SegmentIndex& segment_index,
     uint32_t segment_id,
@@ -210,10 +210,10 @@ Status VisibleVersionIterator::next() {
 }
 
 // ---------------------------------------------------------------------------
-// GCManager::getVisibleVersions
+// VisibilityFilter::getVisibleVersions
 // ---------------------------------------------------------------------------
 
-VisibleVersionIterator GCManager::getVisibleVersions(
+VisibleVersionIterator VisibilityFilter::getVisibleVersions(
     const GlobalIndex& global_index,
     const SegmentIndex& segment_index,
     uint32_t segment_id,

@@ -34,7 +34,7 @@ set(KVLITE_SOURCES
     src/internal/segment_lslot_codec.cpp
     src/internal/segment_delta_hash_table.cpp
     src/internal/segment_index.cpp
-    src/internal/gc_manager.cpp
+    src/internal/visibility_filter.cpp
     src/internal/version_manager.cpp
     src/internal/write_buffer.cpp
     src/internal/log_file.cpp

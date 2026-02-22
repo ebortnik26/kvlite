@@ -11,7 +11,7 @@
 #include "internal/segment_delta_hash_table.h"
 #include "internal/segment_index.h"
 #include "internal/global_index.h"
-#include "internal/gc_manager.h"
+#include "internal/visibility_filter.h"
 #include "internal/log_file.h"
 #include "internal/segment.h"
 #include "internal/delta_hash_table_base.h"
@@ -563,7 +563,7 @@ TEST_F(SegmentIndexSerializationTest, BadMagic) {
     EXPECT_TRUE(s.isCorruption());
 }
 
-// --- GCManager Visible Count Tests ---
+// --- VisibilityFilter Visible Count Tests ---
 
 // One key, one version in seg1, snapshot >= version → 1.
 TEST(VisibleCount, AllVisible) {
@@ -574,7 +574,7 @@ TEST(VisibleCount, AllVisible) {
     si.put("key1", /*offset=*/0, /*version=*/10);
 
     std::vector<uint64_t> snapshots = {10};  // current version
-    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
     EXPECT_EQ(count, 1u);
 }
 
@@ -588,7 +588,7 @@ TEST(VisibleCount, Superseded) {
     si.put("key1", /*offset=*/0, /*version=*/1);
 
     std::vector<uint64_t> snapshots = {2};  // current version
-    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
     EXPECT_EQ(count, 0u);
 }
 
@@ -602,7 +602,7 @@ TEST(VisibleCount, SnapshotPins) {
     si.put("key1", /*offset=*/0, /*version=*/1);
 
     std::vector<uint64_t> snapshots = {1, 2};  // snapshot at v1, current at v2
-    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
     EXPECT_EQ(count, 1u);
 }
 
@@ -622,7 +622,7 @@ TEST(VisibleCount, MultipleKeys) {
     si.put("key2", 100, 3);
 
     std::vector<uint64_t> snapshots = {4};  // current version
-    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
     // key1: latest is v2 in seg2, not seg1 → 0
     // key2: latest is v3 in seg1 → 1
     EXPECT_EQ(count, 1u);
@@ -637,7 +637,7 @@ TEST(VisibleCount, NoOverlap) {
     si.put("lonely_key", 0, 1);
 
     std::vector<uint64_t> snapshots = {1};
-    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
     EXPECT_EQ(count, 0u);
 }
 
@@ -658,7 +658,7 @@ TEST(VisibleCount, MultipleSnapshots) {
     //   snap=4: latest <= 4 is v3(seg1) → pinned
     //   snap=5: latest <= 5 is v5(seg2) → not in seg1
     std::vector<uint64_t> snapshots = {2, 4, 5};
-    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
     EXPECT_EQ(count, 2u);  // v1 and v3 are pinned
 }
 
@@ -684,7 +684,7 @@ TEST(VisibleCount, DifferentBucketCounts) {
 
     // All keys have their latest version in seg1, snapshot covers all.
     std::vector<uint64_t> snapshots = {static_cast<uint64_t>(N)};
-    size_t count = GCManager::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
+    size_t count = VisibilityFilter::computeVisibleCount(gi, si, /*segment_id=*/1, snapshots);
     EXPECT_EQ(count, static_cast<size_t>(N));
 }
 
@@ -747,7 +747,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorAllVisible) {
     si.put("key1", 0, 10);
 
     std::vector<uint64_t> snapshots = {10};
-    auto iter = GCManager::getVisibleVersions(
+    auto iter = VisibilityFilter::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(iter.valid());
@@ -770,7 +770,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorSuperseded) {
     si.put("key1", 0, 1);
 
     std::vector<uint64_t> snapshots = {2};
-    auto iter = GCManager::getVisibleVersions(
+    auto iter = VisibilityFilter::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     EXPECT_FALSE(iter.valid());
@@ -786,7 +786,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorSnapshotPins) {
     si.put("key1", 0, 1);
 
     std::vector<uint64_t> snapshots = {1, 2};
-    auto iter = GCManager::getVisibleVersions(
+    auto iter = VisibilityFilter::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(iter.valid());
@@ -817,7 +817,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorMultipleVersionsDesc) {
     // snap=4 → latest <= 4 is v3(seg1) → pinned
     // snap=5 → latest <= 5 is v5(seg2) → not in seg1
     std::vector<uint64_t> snapshots = {2, 4, 5};
-    auto iter = GCManager::getVisibleVersions(
+    auto iter = VisibilityFilter::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(iter.valid());
@@ -866,7 +866,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorMultipleKeys) {
 
     // Snapshots pin all versions.
     std::vector<uint64_t> snapshots = {1, 2, 3, 4};
-    auto iter = GCManager::getVisibleVersions(
+    auto iter = VisibilityFilter::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     // Expect: keyA v2, keyA v1, keyB v4, keyB v3
@@ -904,7 +904,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorEmpty) {
 
     // Only snapshot at v2 → latest is v2(seg2), nothing visible in seg1.
     std::vector<uint64_t> snapshots = {2};
-    auto iter = GCManager::getVisibleVersions(
+    auto iter = VisibilityFilter::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     EXPECT_FALSE(iter.valid());
