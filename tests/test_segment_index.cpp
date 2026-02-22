@@ -11,7 +11,6 @@
 #include "internal/segment_delta_hash_table.h"
 #include "internal/segment_index.h"
 #include "internal/global_index.h"
-#include "internal/visibility_filter.h"
 #include "internal/gc.h"
 #include "internal/log_file.h"
 #include "internal/segment.h"
@@ -615,7 +614,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorAllVisible) {
     si.put("key1", 0, 10);
 
     std::vector<uint64_t> snapshots = {10};
-    auto iter = VisibilityFilter::getVisibleVersions(
+    auto iter = GC::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(iter.valid());
@@ -638,7 +637,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorSuperseded) {
     si.put("key1", 0, 1);
 
     std::vector<uint64_t> snapshots = {2};
-    auto iter = VisibilityFilter::getVisibleVersions(
+    auto iter = GC::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     EXPECT_FALSE(iter.valid());
@@ -654,7 +653,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorSnapshotPins) {
     si.put("key1", 0, 1);
 
     std::vector<uint64_t> snapshots = {1, 2};
-    auto iter = VisibilityFilter::getVisibleVersions(
+    auto iter = GC::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(iter.valid());
@@ -685,7 +684,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorMultipleVersionsDesc) {
     // snap=4 → latest <= 4 is v3(seg1) → pinned
     // snap=5 → latest <= 5 is v5(seg2) → not in seg1
     std::vector<uint64_t> snapshots = {2, 4, 5};
-    auto iter = VisibilityFilter::getVisibleVersions(
+    auto iter = GC::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(iter.valid());
@@ -734,7 +733,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorMultipleKeys) {
 
     // Snapshots pin all versions.
     std::vector<uint64_t> snapshots = {1, 2, 3, 4};
-    auto iter = VisibilityFilter::getVisibleVersions(
+    auto iter = GC::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     // Expect: keyA v2, keyA v1, keyB v4, keyB v3
@@ -772,7 +771,7 @@ TEST_F(VisibleVersionIteratorTest, IteratorEmpty) {
 
     // Only snapshot at v2 → latest is v2(seg2), nothing visible in seg1.
     std::vector<uint64_t> snapshots = {2};
-    auto iter = VisibilityFilter::getVisibleVersions(
+    auto iter = GC::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     EXPECT_FALSE(iter.valid());

@@ -114,6 +114,11 @@ public:
     // Sync WAL to disk (if not using sync_writes option)
     Status sync();
 
+    // --- Index Access ---
+
+    GlobalIndex& index() { return *index_; }
+    const GlobalIndex& index() const { return *index_; }
+
     // --- Statistics ---
 
     size_t keyCount() const;

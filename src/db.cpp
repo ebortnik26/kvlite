@@ -5,7 +5,9 @@
 #include "internal/version_manager.h"
 #include "internal/global_index_manager.h"
 #include "internal/storage_manager.h"
+#include "internal/write_buffer.h"
 #include "internal/log_entry.h"
+#include "internal/segment.h"
 #include "internal/segment_index.h"
 
 namespace kvlite {
@@ -113,7 +115,7 @@ public:
 private:
     void init() {
         // Get segment IDs sorted ascending (oldest to newest)
-        file_ids_ = db_->storage_->getFileIds();
+        file_ids_ = db_->storage_->getSegmentIds();
         // Reverse to iterate newest to oldest
         std::reverse(file_ids_.begin(), file_ids_.end());
 
@@ -133,7 +135,8 @@ private:
         }
 
         current_file_id_ = file_ids_[current_file_idx_];
-        current_seg_index_ = db_->storage_->getSegmentIndex(current_file_id_);
+        auto* seg = db_->storage_->getSegment(current_file_id_);
+        current_seg_index_ = seg ? &seg->index() : nullptr;
 
         uint64_t snap_ver = snapshot_->version();
 
@@ -173,8 +176,14 @@ private:
             const auto& entry = seg_index_entries_[seg_index_entry_idx_];
 
             // Read the log entry to get key and value
+            auto* seg = db_->storage_->getSegment(current_file_id_);
+            if (!seg) {
+                seg_index_entry_idx_++;
+                continue;
+            }
+
             internal::LogEntry log_entry;
-            Status s = db_->storage_->readLogEntry(current_file_id_, entry.offset, log_entry);
+            Status s = seg->readEntry(entry.offset, log_entry);
             if (!s.ok()) {
                 seg_index_entry_idx_++;
                 continue;
@@ -229,7 +238,7 @@ private:
     std::vector<uint32_t> file_ids_;
     size_t current_file_idx_ = 0;
     uint32_t current_file_id_ = 0;
-    internal::SegmentIndex* current_seg_index_ = nullptr;
+    const internal::SegmentIndex* current_seg_index_ = nullptr;
 
     std::vector<SegIndexEntry> seg_index_entries_;
     size_t seg_index_entry_idx_ = 0;
@@ -284,7 +293,6 @@ Status DB::open(const std::string& path, const Options& options) {
     // Initialize version manager
     versions_ = std::make_unique<internal::VersionManager>();
     internal::VersionManager::Options ver_opts;
-    // ver_opts.version_jump = options.version_jump;  // if configurable
 
     Status s = versions_->open(path, ver_opts);
     if (!s.ok()) {
@@ -317,21 +325,8 @@ Status DB::open(const std::string& path, const Options& options) {
 
     // Initialize storage manager
     storage_ = std::make_unique<internal::StorageManager>();
-    internal::StorageManager::Options storage_opts;
-    storage_opts.log_file_size = options.log_file_size;
-    storage_opts.write_buffer_size = options.write_buffer_size;
-    storage_opts.segment_index_cache_size = options.segment_index_cache_size;
-    storage_opts.gc_policy = options.gc_policy;
-    storage_opts.gc_threshold = options.gc_threshold;
-    storage_opts.gc_max_files = options.gc_max_files;
-    storage_opts.sync_writes = options.sync_writes;
-    storage_opts.verify_checksums = options.verify_checksums;
 
-    auto oldest_version_fn = [this]() {
-        return versions_->oldestSnapshotVersion();
-    };
-
-    s = storage_->open(path, storage_opts, oldest_version_fn);
+    s = storage_->open(path);
     if (!s.ok()) {
         versions_->close();
         global_index_->close();
@@ -352,6 +347,10 @@ Status DB::open(const std::string& path, const Options& options) {
         return s;
     }
 
+    // Initialize write buffer and allocate first segment ID
+    write_buffer_ = std::make_unique<internal::WriteBuffer>();
+    current_segment_id_ = storage_->allocateSegmentId();
+
     return Status::OK();
 }
 
@@ -360,19 +359,27 @@ Status DB::close() {
         return Status::OK();
     }
 
-    Status s1, s2, s3, s4;
+    Status s1;
 
+    // Flush write buffer before closing
+    if (write_buffer_ && !write_buffer_->empty()) {
+        s1 = flush();
+    }
+    write_buffer_.reset();
+
+    Status s2;
     if (storage_) {
-        s1 = storage_->flush();
         s2 = storage_->close();
         storage_.reset();
     }
 
+    Status s3;
     if (global_index_) {
         s3 = global_index_->close();
         global_index_.reset();
     }
 
+    Status s4;
     if (versions_) {
         s4 = versions_->close();
         versions_.reset();
@@ -398,20 +405,11 @@ Status DB::put(const std::string& key, const std::string& value,
     }
 
     uint64_t version = versions_->allocateVersion();
+    write_buffer_->put(key, version, value, false);
 
-    uint32_t segment_id;
-    Status s = storage_->writeEntry(key, value, version, false, segment_id);
-    if (!s.ok()) {
-        return s;
-    }
-
-    s = global_index_->put(key, version, segment_id);
-    if (!s.ok()) {
-        return s;
-    }
-
-    if (options.sync) {
-        return storage_->sync();
+    if (options.sync ||
+        write_buffer_->memoryUsage() >= options_.write_buffer_size) {
+        return flush();
     }
     return Status::OK();
 }
@@ -428,18 +426,37 @@ Status DB::get(const std::string& key, std::string& value, uint64_t& version,
         return Status::InvalidArgument("Database not open");
     }
 
+    // 1. Check WriteBuffer first (covers unflushed entries).
+    {
+        std::string wval;
+        uint64_t wver;
+        bool tombstone;
+        if (write_buffer_->get(key, wval, wver, tombstone)) {
+            if (tombstone) return Status::NotFound(key);
+            value = std::move(wval);
+            version = wver;
+            return Status::OK();
+        }
+    }
+
+    // 2. Fall through to GlobalIndex -> Segment (flushed entries).
     std::vector<uint32_t> segment_ids;
     std::vector<uint64_t> versions;
     if (!global_index_->get(key, segment_ids, versions)) {
         return Status::NotFound(key);
     }
 
-    // Iterate segment_ids (latest first). On fingerprint collision,
-    // readValue returns NotFound for non-matching keys; try the next.
     for (uint32_t sid : segment_ids) {
-        Status s = storage_->readValue(sid, key, version, value);
+        auto* seg = storage_->getSegment(sid);
+        if (!seg) continue;
+
+        internal::LogEntry entry;
+        Status s = seg->getLatest(key, entry);
         if (s.ok()) {
-            return s;
+            if (entry.tombstone()) return Status::NotFound(key);
+            value = std::move(entry.value);
+            version = entry.version();
+            return Status::OK();
         }
         if (!s.isNotFound()) {
             return s;  // propagate non-NotFound errors
@@ -461,19 +478,40 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
         return Status::InvalidArgument("Database not open");
     }
 
+    // 1. Check WriteBuffer first.
+    {
+        std::string wval;
+        uint64_t wver;
+        bool tombstone;
+        if (write_buffer_->getByVersion(key, upper_bound, wval, wver, tombstone)) {
+            if (tombstone) return Status::NotFound(key);
+            value = std::move(wval);
+            entry_version = wver;
+            return Status::OK();
+        }
+    }
+
+    // 2. Fall through to GlobalIndex -> Segment.
     std::vector<uint32_t> segment_ids;
     std::vector<uint64_t> versions;
     if (!global_index_->get(key, segment_ids, versions)) {
         return Status::NotFound(key);
     }
 
-    // segment_ids are latest-first; scan each segment's SegmentIndex for the version
     for (uint32_t sid : segment_ids) {
-        internal::SegmentIndex* seg_idx = storage_->getSegmentIndex(sid);
-        if (!seg_idx) continue;
-        uint64_t offset;
-        if (seg_idx->get(key, upper_bound, offset, entry_version)) {
-            return storage_->readValue(sid, key, entry_version, value);
+        auto* seg = storage_->getSegment(sid);
+        if (!seg) continue;
+
+        internal::LogEntry entry;
+        Status s = seg->get(key, upper_bound, entry);
+        if (s.ok()) {
+            if (entry.tombstone()) return Status::NotFound(key);
+            value = std::move(entry.value);
+            entry_version = entry.version();
+            return Status::OK();
+        }
+        if (!s.isNotFound()) {
+            return s;
         }
     }
     return Status::NotFound(key);
@@ -485,20 +523,11 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
     }
 
     uint64_t version = versions_->allocateVersion();
+    write_buffer_->put(key, version, "", true);
 
-    uint32_t segment_id;
-    Status s = storage_->writeEntry(key, "", version, true, segment_id);
-    if (!s.ok()) {
-        return s;
-    }
-
-    s = global_index_->put(key, version, segment_id);
-    if (!s.ok()) {
-        return s;
-    }
-
-    if (options.sync) {
-        return storage_->sync();
+    if (options.sync ||
+        write_buffer_->memoryUsage() >= options_.write_buffer_size) {
+        return flush();
     }
     return Status::OK();
 }
@@ -532,21 +561,13 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
     uint64_t version = versions_->allocateVersion();
 
     for (const auto& op : batch.operations()) {
-        uint32_t segment_id;
         bool tombstone = (op.type == WriteBatch::OpType::kDelete);
-        Status s = storage_->writeEntry(op.key, op.value, version, tombstone, segment_id);
-        if (!s.ok()) {
-            return s;
-        }
-
-        s = global_index_->put(op.key, static_cast<uint32_t>(version), segment_id);
-        if (!s.ok()) {
-            return s;
-        }
+        write_buffer_->put(op.key, version, op.value, tombstone);
     }
 
-    if (options.sync) {
-        return storage_->sync();
+    if (options.sync ||
+        write_buffer_->memoryUsage() >= options_.write_buffer_size) {
+        return flush();
     }
     return Status::OK();
 }
@@ -637,7 +658,22 @@ Status DB::flush() {
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
-    return storage_->flush();
+
+    if (write_buffer_->empty()) {
+        return Status::OK();
+    }
+
+    internal::Segment seg;
+    Status s = write_buffer_->flush(
+        storage_->segmentPath(current_segment_id_),
+        current_segment_id_, seg, global_index_->index());
+    if (!s.ok()) {
+        return s;
+    }
+
+    storage_->addSegment(current_segment_id_, seg);
+    current_segment_id_ = storage_->allocateSegmentId();
+    return Status::OK();
 }
 
 // --- Statistics ---
@@ -647,11 +683,11 @@ Status DB::getStats(DBStats& stats) const {
         return Status::InvalidArgument("Database not open");
     }
 
-    stats.num_log_files = storage_->numLogFiles();
-    stats.total_log_size = storage_->totalLogSize();
+    stats.num_log_files = storage_->segmentCount();
+    stats.total_log_size = storage_->totalDataSize();
     stats.global_index_size = global_index_->memoryUsage();
-    stats.segment_index_cache_size = storage_->segmentIndexCacheSize();
-    stats.segment_index_cached_count = storage_->segmentIndexCachedCount();
+    stats.segment_index_cache_size = 0;   // no separate cache
+    stats.segment_index_cached_count = 0; // no separate cache
     stats.current_version = versions_->latestVersion();
     stats.oldest_version = versions_->oldestSnapshotVersion();
 

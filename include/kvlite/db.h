@@ -17,6 +17,7 @@ namespace internal {
 class GlobalIndexManager;
 class StorageManager;
 class VersionManager;
+class WriteBuffer;
 }  // namespace internal
 
 // Database statistics
@@ -170,6 +171,8 @@ private:
     std::unique_ptr<internal::VersionManager> versions_;
     std::unique_ptr<internal::GlobalIndexManager> global_index_;
     std::unique_ptr<internal::StorageManager> storage_;
+    std::unique_ptr<internal::WriteBuffer> write_buffer_;
+    uint32_t current_segment_id_ = 0;
 };
 
 }  // namespace kvlite

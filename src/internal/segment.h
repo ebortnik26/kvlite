@@ -86,17 +86,18 @@ public:
     // --- Stats (any state) ---
 
     const LogFile& logFile() const { return log_file_; }
+    const SegmentIndex& index() const { return index_; }
 
     uint64_t dataSize() const;
     size_t keyCount() const;
     size_t entryCount() const;
 
+    // Read and CRC-validate a LogEntry at the given file offset.
+    Status readEntry(uint64_t offset, LogEntry& entry) const;
+
 private:
     static constexpr uint32_t kFooterMagic = 0x53454746;  // "SEGF"
     static constexpr size_t kFooterSize = 16;  // segment_id(4) + index_offset(8) + magic(4)
-
-    // Read and CRC-validate a LogEntry at the given file offset.
-    Status readEntry(uint64_t offset, LogEntry& entry) const;
 
     LogFile log_file_;
     SegmentIndex index_;

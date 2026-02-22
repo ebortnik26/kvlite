@@ -14,6 +14,7 @@ add_executable(kvlite_test
     test_versioning.cpp
     test_iterator.cpp
     test_concurrency.cpp
+    test_db.cpp
 )
 
 target_include_directories(kvlite_test
@@ -76,10 +77,10 @@ add_executable(kvlite_segment_index_test
     ${CMAKE_SOURCE_DIR}/src/internal/segment_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/visibility_filter.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/storage_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 

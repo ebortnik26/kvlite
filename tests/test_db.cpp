@@ -1,0 +1,502 @@
+// DB tests: buffer-first reads, auto-flush, explicit flush, stats, getByVersion,
+//           remove with buffer, batch operations, snapshots, iterators.
+#include <gtest/gtest.h>
+#include <kvlite/kvlite.h>
+#include <filesystem>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+
+namespace fs = std::filesystem;
+
+class DBTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        test_dir_ = fs::temp_directory_path() / "kvlite_test_db";
+        fs::remove_all(test_dir_);
+        fs::create_directories(test_dir_);
+    }
+
+    void TearDown() override {
+        if (db_.isOpen()) {
+            db_.close();
+        }
+        fs::remove_all(test_dir_);
+    }
+
+    kvlite::Status openDB(kvlite::Options opts = {}) {
+        opts.create_if_missing = true;
+        return db_.open(test_dir_.string(), opts);
+    }
+
+    fs::path test_dir_;
+    kvlite::DB db_;
+};
+
+// ── Buffer-first reads ──────────────────────────────────────────────────────
+
+TEST_F(DBTest, UnflushedPutIsVisibleViaGet) {
+    ASSERT_TRUE(openDB().ok());
+
+    // put without sync -> stays in WriteBuffer
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+
+    // get should find it in the buffer
+    std::string val;
+    ASSERT_TRUE(db_.get("k1", val).ok());
+    EXPECT_EQ(val, "v1");
+}
+
+TEST_F(DBTest, UnflushedRemoveIsVisibleViaGet) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.remove("k1").ok());
+
+    std::string val;
+    EXPECT_TRUE(db_.get("k1", val).isNotFound());
+}
+
+TEST_F(DBTest, UnflushedOverwriteReturnsLatest) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.put("k1", "v2").ok());
+
+    std::string val;
+    ASSERT_TRUE(db_.get("k1", val).ok());
+    EXPECT_EQ(val, "v2");
+}
+
+TEST_F(DBTest, GetWithVersionFromBuffer) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+
+    std::string val;
+    uint64_t ver;
+    ASSERT_TRUE(db_.get("k1", val, ver).ok());
+    EXPECT_EQ(val, "v1");
+    EXPECT_GT(ver, 0u);
+}
+
+// ── Explicit flush ──────────────────────────────────────────────────────────
+
+TEST_F(DBTest, ExplicitFlushMovesDataToSegment) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    // Data should still be readable after flush (now from segment)
+    std::string val;
+    ASSERT_TRUE(db_.get("k1", val).ok());
+    EXPECT_EQ(val, "v1");
+}
+
+TEST_F(DBTest, FlushEmptyBufferIsNoOp) {
+    ASSERT_TRUE(openDB().ok());
+    ASSERT_TRUE(db_.flush().ok());  // should succeed with no data
+}
+
+TEST_F(DBTest, FlushThenPutThenGet) {
+    ASSERT_TRUE(openDB().ok());
+
+    // First batch -> segment
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    // Second batch -> buffer
+    ASSERT_TRUE(db_.put("k2", "v2").ok());
+
+    // Both should be readable
+    std::string val;
+    ASSERT_TRUE(db_.get("k1", val).ok());
+    EXPECT_EQ(val, "v1");
+
+    ASSERT_TRUE(db_.get("k2", val).ok());
+    EXPECT_EQ(val, "v2");
+}
+
+TEST_F(DBTest, OverwriteAcrossFlush) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "old").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    // Overwrite in new buffer
+    ASSERT_TRUE(db_.put("k1", "new").ok());
+
+    std::string val;
+    ASSERT_TRUE(db_.get("k1", val).ok());
+    EXPECT_EQ(val, "new");
+}
+
+// ── Auto-flush ──────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, AutoFlushTriggersOnLargeWrite) {
+    kvlite::Options opts;
+    opts.write_buffer_size = 256;  // tiny buffer -> auto-flush quickly
+    ASSERT_TRUE(openDB(opts).ok());
+
+    // Write enough data to exceed the tiny buffer
+    std::string big_val(128, 'x');
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "k" + std::to_string(i);
+        ASSERT_TRUE(db_.put(key, big_val).ok());
+    }
+
+    // Verify stats show segments were created
+    kvlite::DBStats stats;
+    ASSERT_TRUE(db_.getStats(stats).ok());
+    EXPECT_GT(stats.num_log_files, 0u);
+
+    // All data should be readable
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "k" + std::to_string(i);
+        std::string val;
+        ASSERT_TRUE(db_.get(key, val).ok());
+        EXPECT_EQ(val, big_val);
+    }
+}
+
+// ── Sync write ──────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, SyncWriteForcesFlush) {
+    ASSERT_TRUE(openDB().ok());
+
+    kvlite::WriteOptions wopts;
+    wopts.sync = true;
+
+    ASSERT_TRUE(db_.put("k1", "v1", wopts).ok());
+
+    // After sync write, data should be in a segment
+    kvlite::DBStats stats;
+    ASSERT_TRUE(db_.getStats(stats).ok());
+    EXPECT_GE(stats.num_log_files, 1u);
+}
+
+// ── getByVersion ────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, GetByVersionFromBuffer) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    uint64_t ver1 = db_.getLatestVersion();
+
+    ASSERT_TRUE(db_.put("k1", "v2").ok());
+
+    // upper_bound is inclusive (version <= upper_bound)
+    std::string val;
+    uint64_t entry_ver;
+    ASSERT_TRUE(db_.getByVersion("k1", ver1, val, entry_ver).ok());
+    EXPECT_EQ(val, "v1");
+    EXPECT_EQ(entry_ver, ver1);
+}
+
+TEST_F(DBTest, GetByVersionFromSegment) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    uint64_t ver1 = db_.getLatestVersion();
+    ASSERT_TRUE(db_.flush().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v2").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    // upper_bound is inclusive (version <= upper_bound)
+    std::string val;
+    uint64_t entry_ver;
+    ASSERT_TRUE(db_.getByVersion("k1", ver1, val, entry_ver).ok());
+    EXPECT_EQ(val, "v1");
+}
+
+// ── Remove ──────────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, RemoveInBufferThenFlush) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.remove("k1").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    std::string val;
+    EXPECT_TRUE(db_.get("k1", val).isNotFound());
+}
+
+TEST_F(DBTest, RemoveAfterFlush) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    ASSERT_TRUE(db_.remove("k1").ok());
+
+    std::string val;
+    EXPECT_TRUE(db_.get("k1", val).isNotFound());
+}
+
+// ── Batch operations ────────────────────────────────────────────────────────
+
+TEST_F(DBTest, WriteBatchInBuffer) {
+    ASSERT_TRUE(openDB().ok());
+
+    kvlite::WriteBatch batch;
+    batch.put("k1", "v1");
+    batch.put("k2", "v2");
+    batch.remove("k3");
+
+    ASSERT_TRUE(db_.write(batch).ok());
+
+    std::string val;
+    ASSERT_TRUE(db_.get("k1", val).ok());
+    EXPECT_EQ(val, "v1");
+    ASSERT_TRUE(db_.get("k2", val).ok());
+    EXPECT_EQ(val, "v2");
+    EXPECT_TRUE(db_.get("k3", val).isNotFound());
+}
+
+TEST_F(DBTest, WriteBatchThenFlush) {
+    ASSERT_TRUE(openDB().ok());
+
+    kvlite::WriteBatch batch;
+    batch.put("k1", "v1");
+    batch.put("k2", "v2");
+    ASSERT_TRUE(db_.write(batch).ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    std::string val;
+    ASSERT_TRUE(db_.get("k1", val).ok());
+    EXPECT_EQ(val, "v1");
+    ASSERT_TRUE(db_.get("k2", val).ok());
+    EXPECT_EQ(val, "v2");
+}
+
+TEST_F(DBTest, ReadBatch) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.put("k2", "v2").ok());
+    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k3", "v3").ok());  // in buffer
+
+    kvlite::ReadBatch rbatch;
+    rbatch.get("k1");
+    rbatch.get("k2");
+    rbatch.get("k3");
+    rbatch.get("missing");
+    ASSERT_TRUE(db_.read(rbatch).ok());
+
+    const auto& results = rbatch.results();
+    ASSERT_EQ(results.size(), 4u);
+    EXPECT_TRUE(results[0].status.ok());
+    EXPECT_EQ(results[0].value, "v1");
+    EXPECT_TRUE(results[1].status.ok());
+    EXPECT_EQ(results[1].value, "v2");
+    EXPECT_TRUE(results[2].status.ok());
+    EXPECT_EQ(results[2].value, "v3");
+    EXPECT_TRUE(results[3].status.isNotFound());
+}
+
+// ── Stats ───────────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, StatsAfterFlush) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    kvlite::DBStats stats;
+    ASSERT_TRUE(db_.getStats(stats).ok());
+    EXPECT_EQ(stats.num_log_files, 1u);
+    EXPECT_GT(stats.total_log_size, 0u);
+    EXPECT_GT(stats.current_version, 0u);
+}
+
+TEST_F(DBTest, StatsMultipleSegments) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k2", "v2").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    kvlite::DBStats stats;
+    ASSERT_TRUE(db_.getStats(stats).ok());
+    EXPECT_EQ(stats.num_log_files, 2u);
+    EXPECT_GT(stats.total_log_size, 0u);
+}
+
+// ── Exists ──────────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, ExistsInBuffer) {
+    ASSERT_TRUE(openDB().ok());
+
+    bool e;
+    ASSERT_TRUE(db_.exists("k1", e).ok());
+    EXPECT_FALSE(e);
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.exists("k1", e).ok());
+    EXPECT_TRUE(e);
+}
+
+TEST_F(DBTest, ExistsAfterRemove) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.remove("k1").ok());
+
+    bool e;
+    ASSERT_TRUE(db_.exists("k1", e).ok());
+    EXPECT_FALSE(e);
+}
+
+// ── Close flushes buffer ────────────────────────────────────────────────────
+
+TEST_F(DBTest, CloseFlushesBuffer) {
+    ASSERT_TRUE(openDB().ok());
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+
+    // Verify data is readable before close (from buffer)
+    std::string val;
+    ASSERT_TRUE(db_.get("k1", val).ok());
+    EXPECT_EQ(val, "v1");
+
+    // Close should flush buffer to segment (no crash)
+    ASSERT_TRUE(db_.close().ok());
+    EXPECT_FALSE(db_.isOpen());
+}
+
+// ── Snapshots ───────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, SnapshotReadsExistingData) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    std::unique_ptr<kvlite::DB::Snapshot> snap;
+    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+    EXPECT_GT(snap->version(), 0u);
+
+    // Snapshot should see existing data
+    std::string val;
+    ASSERT_TRUE(snap->get("k1", val).ok());
+    EXPECT_EQ(val, "v1");
+
+    db_.releaseSnapshot(std::move(snap));
+}
+
+TEST_F(DBTest, SnapshotReadsMultipleKeys) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1").ok());
+    ASSERT_TRUE(db_.put("k2", "v2").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    std::unique_ptr<kvlite::DB::Snapshot> snap;
+    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+
+    // Snapshot should see all flushed data
+    std::string val;
+    ASSERT_TRUE(snap->get("k1", val).ok());
+    EXPECT_EQ(val, "v1");
+    ASSERT_TRUE(snap->get("k2", val).ok());
+    EXPECT_EQ(val, "v2");
+
+    // Non-existent key
+    EXPECT_TRUE(snap->get("missing", val).isNotFound());
+
+    db_.releaseSnapshot(std::move(snap));
+}
+
+// ── Iterator ────────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, IteratorOverFlushedData) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("a", "1").ok());
+    ASSERT_TRUE(db_.put("b", "2").ok());
+    ASSERT_TRUE(db_.put("c", "3").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    std::unique_ptr<kvlite::DB::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter).ok());
+
+    std::set<std::string> keys;
+    std::string key, val;
+    while (iter->next(key, val).ok()) {
+        keys.insert(key);
+    }
+
+    EXPECT_EQ(keys.size(), 3u);
+    EXPECT_TRUE(keys.count("a"));
+    EXPECT_TRUE(keys.count("b"));
+    EXPECT_TRUE(keys.count("c"));
+}
+
+TEST_F(DBTest, MultiSegmentGetWorks) {
+    ASSERT_TRUE(openDB().ok());
+
+    // Put to segment 1
+    ASSERT_TRUE(db_.put("a", "1").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    // Put to segment 2
+    ASSERT_TRUE(db_.put("b", "2").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    // Put to segment 3
+    ASSERT_TRUE(db_.put("c", "3").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    kvlite::DBStats stats;
+    ASSERT_TRUE(db_.getStats(stats).ok());
+    EXPECT_EQ(stats.num_log_files, 3u);
+
+    // All keys should be readable across segments
+    std::string val;
+    ASSERT_TRUE(db_.get("a", val).ok());
+    EXPECT_EQ(val, "1");
+    ASSERT_TRUE(db_.get("b", val).ok());
+    EXPECT_EQ(val, "2");
+    ASSERT_TRUE(db_.get("c", val).ok());
+    EXPECT_EQ(val, "3");
+}
+
+TEST_F(DBTest, IteratorSnapshotVersion) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("a", "1").ok());
+    ASSERT_TRUE(db_.put("b", "2").ok());
+    ASSERT_TRUE(db_.flush().ok());
+
+    std::unique_ptr<kvlite::DB::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter).ok());
+
+    // Iterator should have a valid snapshot
+    EXPECT_GT(iter->snapshot().version(), 0u);
+    EXPECT_TRUE(iter->snapshot().isValid());
+}
+
+// ── Error paths ─────────────────────────────────────────────────────────────
+
+TEST_F(DBTest, OperationsOnClosedDBFail) {
+    ASSERT_TRUE(openDB().ok());
+    ASSERT_TRUE(db_.close().ok());
+
+    std::string val;
+    EXPECT_FALSE(db_.put("k", "v").ok());
+    EXPECT_FALSE(db_.get("k", val).ok());
+    EXPECT_FALSE(db_.remove("k").ok());
+    EXPECT_FALSE(db_.flush().ok());
+}
+
+TEST_F(DBTest, DoubleOpenFails) {
+    ASSERT_TRUE(openDB().ok());
+    kvlite::Options opts;
+    opts.create_if_missing = true;
+    EXPECT_FALSE(db_.open(test_dir_.string(), opts).ok());
+}

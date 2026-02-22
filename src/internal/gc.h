@@ -3,9 +3,12 @@
 
 #include <cstdint>
 #include <functional>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "internal/log_entry.h"
 #include "internal/segment.h"
 #include "kvlite/status.h"
 
@@ -15,6 +18,39 @@ namespace internal {
 class GlobalIndex;
 class LogFile;
 class SegmentIndex;
+
+// Streaming iterator over visible entries in a segment file.
+//
+// Scans the data region sequentially, yielding only entries whose
+// (hash, version) pair is in the visible set. Output order matches the
+// on-disk order: (hash asc, version desc) — same as WriteBuffer::flush.
+class VisibleVersionIterator {
+public:
+    struct Entry {
+        uint64_t hash;
+        LogEntry log_entry;
+    };
+
+    bool valid() const { return valid_; }
+    const Entry& entry() const { return current_; }
+    Status next();
+
+private:
+    friend class GC;
+    VisibleVersionIterator(
+        std::unordered_map<uint64_t, std::set<uint32_t>> visible_set,
+        const LogFile& log_file, uint64_t data_size);
+
+    Status readNextEntry(LogEntry& out);
+    Status advance();
+
+    const LogFile& log_file_;
+    uint64_t data_size_;
+    uint64_t file_offset_ = 0;
+    std::unordered_map<uint64_t, std::set<uint32_t>> visible_set_;
+    Entry current_;
+    bool valid_ = false;
+};
 
 // GC: K-way merge compaction of N input segments into M output segments.
 //
@@ -61,6 +97,15 @@ public:
         const std::function<std::string(uint32_t)>& path_fn,
         const std::function<uint32_t()>& id_fn,
         Result& result);
+
+    // Create a streaming iterator over the visible entries in a segment.
+    static VisibleVersionIterator getVisibleVersions(
+        const GlobalIndex& global_index,
+        const SegmentIndex& segment_index,
+        uint32_t segment_id,
+        const std::vector<uint64_t>& snapshot_versions,
+        const LogFile& log_file,
+        uint64_t data_size);
 };
 
 }  // namespace internal
