@@ -210,6 +210,7 @@ options.gc_max_files = 10;                           // Max files per GC run
 - WriteBatch: all operations get the same version (atomic snapshot)
 - Single put/remove: gets its own version
 - Tombstones have versions (enables "key not found at version X")
+- Version counter persisted to MANIFEST using block-aligned write-ahead: advances in fixed blocks (default 2^20), bounding crash-recovery waste to one block
 
 ### Index Structure
 
@@ -223,7 +224,19 @@ L1: location = file_id
 L2: location = offset within file
 ```
 
+### Snapshots
+
+- Lightweight: a snapshot is just a pinned version number (~8 bytes), no data is copied
+- Reads through a snapshot (`get`, `exists`) return the value visible at that version (highest version <= snapshot version)
+- Keys written after the snapshot are invisible; keys deleted after are still visible
+- Multiple snapshots can coexist at different versions
+- Iterators use snapshots internally: `createIterator()` creates an owned snapshot, or an iterator can borrow an existing one
+- `ReadBatch` acquires an implicit snapshot (records the version used, but does not pin it for GC)
+- Releasing a snapshot allows GC to reclaim the versions it was protecting
+
 ### Snapshot & GC Interaction
+
+GC retains exactly **one version per key per observation point** (each active snapshot + latest). All intermediate versions between observation points are dropped.
 
 ```
 Snapshots:    S1(v=100)              S2(v=200)
@@ -231,11 +244,18 @@ Snapshots:    S1(v=100)              S2(v=200)
 Versions:  ──────┼───────────────────────┼───────────▶
            50   100   120   150   180   200   250
 
-GC can collect: versions < 100 (oldest snapshot)
-GC cannot collect: versions ≥ 100 (protected by S1)
+For a key with versions 50, 120, 180, 250:
+  - S1 sees v100 → keeps v50 (highest <= 100)
+  - S2 sees v200 → keeps v180 (highest <= 200)
+  - Latest       → keeps v250
+  - v120 dropped (not visible at any observation point)
 
 After S1 released:
-GC can collect: versions < 200 (now S2 is oldest)
+  - v50 dropped (no longer needed)
+  - v180, v250 retained
+
+No active snapshots:
+  - Only the latest version per key survives GC
 ```
 
 ### Write Path

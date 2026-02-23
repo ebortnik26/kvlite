@@ -19,7 +19,7 @@ class Manifest;
 //
 // Responsibilities:
 // - Allocate monotonically increasing versions
-// - Persist version counter to MANIFEST (in configurable jumps)
+// - Persist version counter to MANIFEST (in configurable blocks)
 // - Track active snapshots for GC safety
 // - Provide oldest snapshot version for GC
 //
@@ -51,7 +51,7 @@ public:
     // --- Version Allocation ---
 
     // Allocate and return the next version.
-    // Persists counter when crossing jump boundaries.
+    // Persists counter when crossing block boundaries.
     uint64_t allocateVersion();
 
     // Get latest version (most recently allocated).

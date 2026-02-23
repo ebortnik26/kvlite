@@ -33,6 +33,7 @@ cd build && ctest
 | `kvlite_wb_test` | `test_write_buffer.cpp` | WriteBuffer + flush to Segment |
 | `kvlite_segment_index_test` | `test_segment_index.cpp` | SegmentIndex serialization/queries |
 | `kvlite_dht_test` | `test_delta_hash_table.cpp` | DeltaHashTable |
+| `kvlite_vm_test` | `test_version_manager.cpp` | VersionManager persistence/snapshots |
 | `kvlite_lf_test` | `test_log_file.cpp` | LogFile POSIX I/O |
 | `kvlite_bitstream_test` | `test_bit_stream.cpp` | BitStream encoding |
 
@@ -58,6 +59,10 @@ Both indexes use `DeltaHashTable` — a compact hash table with per-bucket spinl
 ### Write Path
 
 `DB::put` → `VersionManager::allocateVersion` → `StorageManager::writeEntry` (buffers in WriteBuffer) → on capacity: `WriteBuffer::flush` → Segment → `GlobalIndexManager::put` (updates GlobalIndex + WAL).
+
+### Version Persistence
+
+`VersionManager` (`version_manager.h`): Block-aligned write-ahead persistence. In-memory counter increments by 1 per allocation. Persisted counter advances in fixed blocks of `block_size` (default 2^20) — when in-memory counter exceeds `persisted_counter_`, persists `persisted_counter_ + block_size` to Manifest. On crash recovery, resumes from persisted value (wastes at most `block_size - 1` versions). On clean close, persists exact counter.
 
 ### Read Path
 
