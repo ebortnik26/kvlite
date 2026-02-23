@@ -355,23 +355,12 @@ Status DB::open(const std::string& path, const Options& options) {
     // Initialize storage manager
     storage_ = std::make_unique<internal::StorageManager>(*manifest_);
 
-    s = storage_->open(path);
+    internal::StorageManager::Options sm_opts;
+    sm_opts.purge_untracked_files = options.purge_untracked_files;
+    s = storage_->open(path, sm_opts);
     if (!s.ok()) {
         versions_->close();
         global_index_->close();
-        versions_.reset();
-        global_index_.reset();
-        storage_.reset();
-        manifest_->close();
-        manifest_.reset();
-        return s;
-    }
-
-    s = storage_->recover();
-    if (!s.ok()) {
-        versions_->close();
-        global_index_->close();
-        storage_->close();
         versions_.reset();
         global_index_.reset();
         storage_.reset();
@@ -710,15 +699,15 @@ Status DB::flush() {
         return Status::OK();
     }
 
-    internal::Segment seg;
-    Status s = write_buffer_->flush(
-        storage_->segmentPath(current_segment_id_),
-        current_segment_id_, seg, global_index_->index());
+    Status s = storage_->createSegment(current_segment_id_);
+    if (!s.ok()) return s;
+
+    auto* seg = storage_->getSegment(current_segment_id_);
+    s = write_buffer_->flush(*seg, current_segment_id_, global_index_->index());
     if (!s.ok()) {
         return s;
     }
 
-    storage_->addSegment(current_segment_id_, seg);
     current_segment_id_ = storage_->allocateSegmentId();
     return Status::OK();
 }

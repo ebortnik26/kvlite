@@ -63,12 +63,12 @@ public:
 
     void clear();
 
-    // Flush all entries to a new Segment.
-    // Creates a LogFile at path, writes entries sorted by (hash, version)
-    // ascending, records each in the Segment's SegmentIndex, and registers
-    // every flushed key in the GlobalIndex under segment_id.
-    Status flush(const std::string& path, uint32_t segment_id,
-                 Segment& out, GlobalIndex& global_index);
+    // Flush all entries to a Segment that is already in Writing state.
+    // Writes entries sorted by (hash, version) ascending, records each
+    // in the Segment's SegmentIndex, seals it, and registers every
+    // flushed key in the GlobalIndex under segment_id.
+    Status flush(Segment& out, uint32_t segment_id,
+                 GlobalIndex& global_index);
 
     size_t keyCount() const { return key_count_.load(std::memory_order_relaxed); }
     size_t entryCount() const { return size_.load(std::memory_order_relaxed); }

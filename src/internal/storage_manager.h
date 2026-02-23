@@ -19,13 +19,17 @@ class Manifest;
 // Storage Manager: Segment registry that owns the segment lifecycle.
 //
 // Provides:
-// - Segment lifecycle: add, remove, lookup by ID
+// - Segment lifecycle: create, remove, lookup by ID
 // - Segment ID allocation (monotonically increasing)
 // - File path generation from segment ID
 //
 // Thread-safety: All public methods are thread-safe.
 class StorageManager {
 public:
+    struct Options {
+        bool purge_untracked_files = false;
+    };
+
     explicit StorageManager(Manifest& manifest);
     ~StorageManager();
 
@@ -35,11 +39,9 @@ public:
 
     // --- Lifecycle ---
 
-    // Open storage at the given path.
+    // Open storage at the given path and recover state from disk.
     Status open(const std::string& db_path);
-
-    // Recover storage state from disk.
-    Status recover();
+    Status open(const std::string& db_path, const Options& options);
 
     // Close storage.
     Status close();
@@ -48,8 +50,11 @@ public:
 
     // --- Segment Registry ---
 
-    void addSegment(uint32_t id, Segment& segment);
-    void removeSegment(uint32_t id);
+    // Create a new segment file in Writing state and register it.
+    Status createSegment(uint32_t id);
+
+    // Close and unregister a segment, deleting its file from disk.
+    Status removeSegment(uint32_t id);
 
     Segment* getSegment(uint32_t id);
     const Segment* getSegment(uint32_t id) const;
@@ -68,7 +73,10 @@ public:
     std::string segmentPath(uint32_t segment_id) const;
 
 private:
+    Status recover();
+
     std::string db_path_;
+    Options options_;
     Manifest& manifest_;
     bool is_open_ = false;
     std::atomic<uint32_t> next_segment_id_{1};

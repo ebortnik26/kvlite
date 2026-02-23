@@ -77,6 +77,10 @@ struct Options {
 
     // Enable checksums for data integrity verification
     bool verify_checksums = true;
+
+    // Delete segment files on disk that are not tracked by the manifest.
+    // When true, recover() removes orphan segment_*.data files left by crashes.
+    bool purge_untracked_files = false;
 };
 
 // Options for read operations

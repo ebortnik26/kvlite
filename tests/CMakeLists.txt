@@ -209,8 +209,35 @@ target_link_libraries(kvlite_manifest_test
         pthread
 )
 
+# StorageManager tests
+add_executable(kvlite_sm_test
+    test_storage_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/storage_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_delta_hash_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_lslot_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
+    ${CMAKE_SOURCE_DIR}/src/status.cpp
+)
+
+target_include_directories(kvlite_sm_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_sm_test
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
 # Register tests with CTest
 include(GoogleTest)
+gtest_discover_tests(kvlite_sm_test)
 gtest_discover_tests(kvlite_test)
 gtest_discover_tests(kvlite_bitstream_test)
 gtest_discover_tests(kvlite_dht_test)
