@@ -10,12 +10,11 @@ namespace internal {
 static constexpr char kNextSegmentIdKey[] = "next_segment_id";
 static constexpr char kSegmentPrefix[] = "segment.";
 
-StorageManager::StorageManager() = default;
+StorageManager::StorageManager(Manifest& manifest) : manifest_(manifest) {}
 StorageManager::~StorageManager() = default;
 
-Status StorageManager::open(const std::string& db_path, Manifest& manifest) {
+Status StorageManager::open(const std::string& db_path) {
     db_path_ = db_path;
-    manifest_ = &manifest;
     is_open_ = true;
     return Status::OK();
 }
@@ -23,13 +22,13 @@ Status StorageManager::open(const std::string& db_path, Manifest& manifest) {
 Status StorageManager::recover() {
     // Read next_segment_id from manifest.
     std::string val;
-    if (manifest_->get(kNextSegmentIdKey, val)) {
+    if (manifest_.get(kNextSegmentIdKey, val)) {
         next_segment_id_.store(static_cast<uint32_t>(std::stoul(val)),
                                std::memory_order_relaxed);
     }
 
     // Reopen segments listed in manifest.
-    auto keys = manifest_->getKeysWithPrefix(kSegmentPrefix);
+    auto keys = manifest_.getKeysWithPrefix(kSegmentPrefix);
     for (const auto& key : keys) {
         // Parse segment ID from "segment.<id>".
         std::string id_str = key.substr(std::strlen(kSegmentPrefix));
@@ -57,7 +56,6 @@ Status StorageManager::close() {
     }
     segments_.clear();
     is_open_ = false;
-    manifest_ = nullptr;
     return Status::OK();
 }
 
@@ -70,7 +68,7 @@ void StorageManager::addSegment(uint32_t id, Segment& segment) {
     segments_.emplace(id, std::move(segment));
     lock.unlock();
 
-    manifest_->set(std::string(kSegmentPrefix) + std::to_string(id), "");
+    manifest_.set(std::string(kSegmentPrefix) + std::to_string(id), "");
 }
 
 void StorageManager::removeSegment(uint32_t id) {
@@ -82,7 +80,7 @@ void StorageManager::removeSegment(uint32_t id) {
     }
     lock.unlock();
 
-    manifest_->remove(std::string(kSegmentPrefix) + std::to_string(id));
+    manifest_.remove(std::string(kSegmentPrefix) + std::to_string(id));
 }
 
 Segment* StorageManager::getSegment(uint32_t id) {
@@ -123,7 +121,7 @@ uint64_t StorageManager::totalDataSize() const {
 
 uint32_t StorageManager::allocateSegmentId() {
     uint32_t id = next_segment_id_.fetch_add(1, std::memory_order_relaxed);
-    manifest_->set(kNextSegmentIdKey, std::to_string(id + 1));
+    manifest_.set(kNextSegmentIdKey, std::to_string(id + 1));
     return id;
 }
 

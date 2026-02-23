@@ -10,7 +10,7 @@ namespace internal {
 
 static constexpr char kNextVersionIdKey[] = "next_version_id";
 
-VersionManager::VersionManager() = default;
+VersionManager::VersionManager(Manifest& manifest) : manifest_(manifest) {}
 
 VersionManager::~VersionManager() {
     if (is_open_) {
@@ -18,13 +18,12 @@ VersionManager::~VersionManager() {
     }
 }
 
-Status VersionManager::open(const Options& options, Manifest& manifest) {
+Status VersionManager::open(const Options& options) {
     if (is_open_) {
         return Status::InvalidArgument("VersionManager already open");
     }
 
     options_ = options;
-    manifest_ = &manifest;
     is_open_ = true;
     return Status::OK();
 }
@@ -32,7 +31,7 @@ Status VersionManager::open(const Options& options, Manifest& manifest) {
 Status VersionManager::recover() {
     // Read persisted counter from manifest.
     std::string val;
-    if (manifest_->get(kNextVersionIdKey, val)) {
+    if (manifest_.get(kNextVersionIdKey, val)) {
         persisted_counter_ = std::stoull(val);
         current_version_.store(persisted_counter_, std::memory_order_relaxed);
     } else {
@@ -50,10 +49,9 @@ Status VersionManager::close() {
 
     // Persist final counter.
     uint64_t current = current_version_.load(std::memory_order_acquire);
-    Status s = manifest_->set(kNextVersionIdKey, std::to_string(current));
+    Status s = manifest_.set(kNextVersionIdKey, std::to_string(current));
     is_open_ = false;
     active_snapshots_.clear();
-    manifest_ = nullptr;
     return s;
 }
 
@@ -70,7 +68,7 @@ uint64_t VersionManager::allocateVersion() {
         // Re-check under lock (another thread may have persisted).
         if (ver > persisted_counter_) {
             uint64_t new_persisted = persisted_counter_ + options_.block_size;
-            manifest_->set(kNextVersionIdKey, std::to_string(new_persisted));
+            manifest_.set(kNextVersionIdKey, std::to_string(new_persisted));
             persisted_counter_ = new_persisted;
         }
     }

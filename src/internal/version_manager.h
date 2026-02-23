@@ -35,7 +35,7 @@ public:
         uint64_t block_size = 1024 * 1024;
     };
 
-    VersionManager();
+    explicit VersionManager(Manifest& manifest);
     ~VersionManager();
 
     VersionManager(const VersionManager&) = delete;
@@ -43,7 +43,7 @@ public:
 
     // --- Lifecycle ---
 
-    Status open(const Options& options, Manifest& manifest);
+    Status open(const Options& options);
     Status recover();
     Status close();
     bool isOpen() const;
@@ -90,7 +90,7 @@ public:
 
 private:
     Options options_;
-    Manifest* manifest_ = nullptr;
+    Manifest& manifest_;
     bool is_open_ = false;
 
     std::atomic<uint64_t> current_version_{0};

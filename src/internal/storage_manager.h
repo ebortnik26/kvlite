@@ -26,7 +26,7 @@ class Manifest;
 // Thread-safety: All public methods are thread-safe.
 class StorageManager {
 public:
-    StorageManager();
+    explicit StorageManager(Manifest& manifest);
     ~StorageManager();
 
     // Non-copyable
@@ -36,7 +36,7 @@ public:
     // --- Lifecycle ---
 
     // Open storage at the given path.
-    Status open(const std::string& db_path, Manifest& manifest);
+    Status open(const std::string& db_path);
 
     // Recover storage state from disk.
     Status recover();
@@ -69,7 +69,7 @@ public:
 
 private:
     std::string db_path_;
-    Manifest* manifest_ = nullptr;
+    Manifest& manifest_;
     bool is_open_ = false;
     std::atomic<uint32_t> next_segment_id_{1};
 

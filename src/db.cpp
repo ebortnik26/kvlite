@@ -305,10 +305,10 @@ Status DB::open(const std::string& path, const Options& options) {
     }
 
     // Initialize version manager
-    versions_ = std::make_unique<internal::VersionManager>();
+    versions_ = std::make_unique<internal::VersionManager>(*manifest_);
     internal::VersionManager::Options ver_opts;
 
-    s = versions_->open(ver_opts, *manifest_);
+    s = versions_->open(ver_opts);
     if (!s.ok()) {
         manifest_->close();
         manifest_.reset();
@@ -353,9 +353,9 @@ Status DB::open(const std::string& path, const Options& options) {
     }
 
     // Initialize storage manager
-    storage_ = std::make_unique<internal::StorageManager>();
+    storage_ = std::make_unique<internal::StorageManager>(*manifest_);
 
-    s = storage_->open(path, *manifest_);
+    s = storage_->open(path);
     if (!s.ok()) {
         versions_->close();
         global_index_->close();
