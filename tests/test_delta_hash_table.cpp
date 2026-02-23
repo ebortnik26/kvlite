@@ -459,7 +459,7 @@ TEST(DeltaHashTable, AddEntryByHash) {
 
     // Can't find by key, but forEach should see it
     size_t count = 0;
-    dht.forEach([&](uint64_t h, uint32_t value) {
+    dht.forEach([&](uint64_t /*h*/, uint32_t value) {
         ++count;
         EXPECT_EQ(value, 42u);
     });
@@ -902,21 +902,20 @@ TEST(SegmentLSlotCodecTest, IdenticalVersionsRoundTrip) {
     EXPECT_EQ(decoded.entries[0].versions, entry.versions);
 }
 
-// Versions in ASCENDING order (anti-correlated with descending offsets).
-// This is the actual crash scenario: flush writes entries version-desc,
-// so higher versions get lower file offsets. Sorting by offset desc
-// puts versions in ascending order.
-TEST(SegmentLSlotCodecTest, AscendingVersionsRoundTrip) {
+// Versions in DESCENDING order (correlated with descending offsets).
+// After flipping flush to version-asc, higher versions get higher file offsets.
+// Sorting by offset desc yields versions in descending order.
+TEST(SegmentLSlotCodecTest, DescendingVersionsRoundTrip) {
     SegmentLSlotCodec codec(39);
     SegmentLSlotCodec::LSlotContents contents;
     SegmentLSlotCodec::TrieEntry entry;
     entry.fingerprint = 0x1;
     entry.offsets  = {300, 200, 100};  // desc
-    entry.versions = {1, 2, 3};        // asc (anti-correlated)
+    entry.versions = {3, 2, 1};        // desc (correlated)
     contents.entries.push_back(entry);
 
     uint8_t buf[256] = {};
-    size_t end = codec.encode(buf, 0, contents);
+    codec.encode(buf, 0, contents);
 
     auto decoded = codec.decode(buf, 0, nullptr);
     ASSERT_EQ(decoded.entries.size(), 1u);
@@ -924,20 +923,24 @@ TEST(SegmentLSlotCodecTest, AscendingVersionsRoundTrip) {
     EXPECT_EQ(decoded.entries[0].versions, entry.versions);
 }
 
-// Versions in arbitrary order (not sorted at all).
-TEST(SegmentLSlotCodecTest, ArbitraryVersionOrderRoundTrip) {
+// Consecutive versions [N, N-1, ..., 1]: all deltas are 1, verifying compact encoding.
+TEST(SegmentLSlotCodecTest, ConsecutiveVersionsRoundTrip) {
     SegmentLSlotCodec codec(39);
     SegmentLSlotCodec::LSlotContents contents;
     SegmentLSlotCodec::TrieEntry entry;
     entry.fingerprint = 0x1;
-    entry.offsets  = {400, 300, 200, 100};  // desc
-    entry.versions = {3, 1, 5, 2};          // arbitrary
+    const int N = 50;
+    for (int i = N; i >= 1; --i) {
+        entry.offsets.push_back(static_cast<uint32_t>(i * 100));  // desc
+        entry.versions.push_back(static_cast<uint32_t>(i));       // desc
+    }
     contents.entries.push_back(entry);
 
-    uint8_t buf[256] = {};
-    size_t end = codec.encode(buf, 0, contents);
+    std::vector<uint8_t> buf(4096, 0);
+    size_t end = codec.encode(buf.data(), 0, contents);
+    EXPECT_GT(end, 0u);
 
-    auto decoded = codec.decode(buf, 0, nullptr);
+    auto decoded = codec.decode(buf.data(), 0, nullptr);
     ASSERT_EQ(decoded.entries.size(), 1u);
     EXPECT_EQ(decoded.entries[0].offsets, entry.offsets);
     EXPECT_EQ(decoded.entries[0].versions, entry.versions);
@@ -975,18 +978,18 @@ TEST(LSlotCodec, ZeroDeltaRoundTrip) {
     EXPECT_EQ(decoded.entries[0].values, entry.values);
 }
 
-// Mixed: offsets with zero deltas, versions in arbitrary order.
+// Mixed: offsets with zero deltas, versions non-increasing (desc with repeats).
 TEST(SegmentLSlotCodecTest, MixedDeltasRoundTrip) {
     SegmentLSlotCodec codec(39);
     SegmentLSlotCodec::LSlotContents contents;
     SegmentLSlotCodec::TrieEntry entry;
     entry.fingerprint = 0xABC;
     entry.offsets  = {100, 100, 90, 90, 80};  // deltas: 0, 10, 0, 10
-    entry.versions = {1, 5, 2, 3, 4};         // arbitrary order
+    entry.versions = {5, 4, 4, 2, 1};         // non-increasing
     contents.entries.push_back(entry);
 
     uint8_t buf[256] = {};
-    size_t end = codec.encode(buf, 0, contents);
+    codec.encode(buf, 0, contents);
 
     auto decoded = codec.decode(buf, 0, nullptr);
     ASSERT_EQ(decoded.entries.size(), 1u);
@@ -995,7 +998,7 @@ TEST(SegmentLSlotCodecTest, MixedDeltasRoundTrip) {
 }
 
 // Many entries per fingerprint — stress-test the encoding.
-// Versions are anti-correlated with offsets (ascending while offsets are desc).
+// Versions are correlated with offsets (both descending).
 TEST(SegmentLSlotCodecTest, ManyEntriesRoundTrip) {
     SegmentLSlotCodec codec(39);
     SegmentLSlotCodec::LSlotContents contents;
@@ -1004,7 +1007,7 @@ TEST(SegmentLSlotCodecTest, ManyEntriesRoundTrip) {
     const int N = 500;
     for (int i = N; i >= 1; --i) {
         entry.offsets.push_back(static_cast<uint32_t>(i));
-        entry.versions.push_back(static_cast<uint32_t>(N - i + 1));  // ascending
+        entry.versions.push_back(static_cast<uint32_t>(i));  // descending
     }
     contents.entries.push_back(entry);
 
@@ -1032,7 +1035,7 @@ TEST(SegmentLSlotCodecTest, MultipleGroupsZeroDeltas) {
     }
 
     std::vector<uint8_t> buf(4096, 0);
-    size_t end = codec.encode(buf.data(), 0, contents);
+    codec.encode(buf.data(), 0, contents);
 
     auto decoded = codec.decode(buf.data(), 0, nullptr);
     ASSERT_EQ(decoded.entries.size(), 3u);

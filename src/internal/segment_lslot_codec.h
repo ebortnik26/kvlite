@@ -16,8 +16,8 @@ namespace internal {
 //     unary(M)                       — M entries
 //     [32 bits]                      — first offset (highest, raw)
 //     (M-1) x gamma(delta_offset+1) — offset deltas (desc order, zero-safe)
-//     [32 bits]                      — first version (raw)
-//     (M-1) x gamma(zigzag(delta)+1)— version deltas (zigzag-encoded, any order)
+//     [32 bits]                      — first version (highest, raw)
+//     (M-1) x gamma(delta_version+1)— version deltas (desc order, zero-safe)
 //
 // Same encoding pattern as GlobalIndex (LSlotCodec), applied to two parallel sequences
 // (offsets and versions) per fingerprint group.

@@ -213,12 +213,12 @@ VisibleVersionIterator GC::getVisibleVersions(
 // GC::merge
 // ---------------------------------------------------------------------------
 
-// Min-heap comparator: smaller hash first, then higher version first.
+// Min-heap comparator: smaller hash first, then lower version first.
 struct IterGreater {
     bool operator()(VisibleVersionIterator* a, VisibleVersionIterator* b) const {
         if (a->entry().hash != b->entry().hash)
             return a->entry().hash > b->entry().hash;
-        return a->entry().log_entry.version() < b->entry().log_entry.version();
+        return a->entry().log_entry.version() > b->entry().log_entry.version();
     }
 };
 

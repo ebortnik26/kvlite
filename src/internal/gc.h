@@ -23,7 +23,7 @@ class SegmentIndex;
 //
 // Scans the data region sequentially, yielding only entries whose
 // (hash, version) pair is in the visible set. Output order matches the
-// on-disk order: (hash asc, version desc) — same as WriteBuffer::flush.
+// on-disk order: (hash asc, version asc) — same as WriteBuffer::flush.
 class VisibleVersionIterator {
 public:
     struct Entry {
@@ -55,7 +55,7 @@ private:
 // GC: K-way merge compaction of N input segments into M output segments.
 //
 // Merges visible entries from N input segments using a min-heap over
-// VisibleVersionIterators. Output entries arrive in (hash asc, version desc)
+// VisibleVersionIterators. Output entries arrive in (hash asc, version asc)
 // order. Output segments are split by a max size limit and are
 // hash-partitioned by construction.
 //

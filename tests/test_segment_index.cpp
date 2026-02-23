@@ -665,20 +665,20 @@ TEST_F(VisibleVersionIteratorTest, IteratorSnapshotPins) {
 }
 
 // key v1,v3 in seg1, v5 in seg2. Snapshots pin both v1 and v3.
-// File order is (hash asc, version desc), so yields v3 then v1.
+// File order is (hash asc, version asc), so yields v1 then v3.
 TEST_F(VisibleVersionIteratorTest, IteratorMultipleVersionsDesc) {
-    // Segment::put writes entries in call order; we write v3, v1
-    // so file order = v3, v1 (version desc for same hash).
+    // Segment::put writes entries in call order; we write v1, v3
+    // so file order = v1, v3 (version asc for same hash).
     size_t idx = createSegment(1, {
-        {"key1", 3, "val3", false},
         {"key1", 1, "val1", false},
+        {"key1", 3, "val3", false},
     });
     createSegment(2, {{"key1", 5, "val5", false}});
     auto& seg = segments_[idx];
 
     SegmentIndex si;
-    si.put("key1", 0, 3);   // offset doesn't matter for visible-set check
-    si.put("key1", 100, 1);
+    si.put("key1", 0, 1);   // offset doesn't matter for visible-set check
+    si.put("key1", 100, 3);
 
     // snap=2 → latest <= 2 is v1(seg1) → pinned
     // snap=4 → latest <= 4 is v3(seg1) → pinned
@@ -688,19 +688,19 @@ TEST_F(VisibleVersionIteratorTest, IteratorMultipleVersionsDesc) {
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.version(), 3u);
-    EXPECT_EQ(iter.entry().log_entry.value, "val3");
+    EXPECT_EQ(iter.entry().log_entry.version(), 1u);
+    EXPECT_EQ(iter.entry().log_entry.value, "val1");
 
     ASSERT_TRUE(iter.next().ok());
     ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.version(), 1u);
-    EXPECT_EQ(iter.entry().log_entry.value, "val1");
+    EXPECT_EQ(iter.entry().log_entry.version(), 3u);
+    EXPECT_EQ(iter.entry().log_entry.value, "val3");
 
     ASSERT_TRUE(iter.next().ok());
     EXPECT_FALSE(iter.valid());
 }
 
-// Multiple keys: verifies hash-asc then version-desc order.
+// Multiple keys: verifies hash-asc then version-asc order.
 TEST_F(VisibleVersionIteratorTest, IteratorMultipleKeys) {
     // We need two keys with known hash ordering. Write them
     // in hash-ascending order to the segment.
@@ -715,46 +715,46 @@ TEST_F(VisibleVersionIteratorTest, IteratorMultipleKeys) {
         std::swap(hashA, hashB);
     }
 
-    // Write entries: keyA(v2), keyA(v1), keyB(v4), keyB(v3)
-    // File order: hash-asc, version-desc within same hash.
+    // Write entries: keyA(v1), keyA(v2), keyB(v3), keyB(v4)
+    // File order: hash-asc, version-asc within same hash.
     size_t idx = createSegment(1, {
-        {keyA, 2, "A_v2", false},
         {keyA, 1, "A_v1", false},
-        {keyB, 4, "B_v4", false},
+        {keyA, 2, "A_v2", false},
         {keyB, 3, "B_v3", false},
+        {keyB, 4, "B_v4", false},
     });
     auto& seg = segments_[idx];
 
     SegmentIndex si;
-    si.put(keyA, 0, 2);
-    si.put(keyA, 100, 1);
-    si.put(keyB, 200, 4);
-    si.put(keyB, 300, 3);
+    si.put(keyA, 0, 1);
+    si.put(keyA, 100, 2);
+    si.put(keyB, 200, 3);
+    si.put(keyB, 300, 4);
 
     // Snapshots pin all versions.
     std::vector<uint64_t> snapshots = {1, 2, 3, 4};
     auto iter = GC::getVisibleVersions(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
-    // Expect: keyA v2, keyA v1, keyB v4, keyB v3
-    ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.key, keyA);
-    EXPECT_EQ(iter.entry().log_entry.version(), 2u);
-
-    ASSERT_TRUE(iter.next().ok());
+    // Expect: keyA v1, keyA v2, keyB v3, keyB v4
     ASSERT_TRUE(iter.valid());
     EXPECT_EQ(iter.entry().log_entry.key, keyA);
     EXPECT_EQ(iter.entry().log_entry.version(), 1u);
 
     ASSERT_TRUE(iter.next().ok());
     ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.key, keyB);
-    EXPECT_EQ(iter.entry().log_entry.version(), 4u);
+    EXPECT_EQ(iter.entry().log_entry.key, keyA);
+    EXPECT_EQ(iter.entry().log_entry.version(), 2u);
 
     ASSERT_TRUE(iter.next().ok());
     ASSERT_TRUE(iter.valid());
     EXPECT_EQ(iter.entry().log_entry.key, keyB);
     EXPECT_EQ(iter.entry().log_entry.version(), 3u);
+
+    ASSERT_TRUE(iter.next().ok());
+    ASSERT_TRUE(iter.valid());
+    EXPECT_EQ(iter.entry().log_entry.key, keyB);
+    EXPECT_EQ(iter.entry().log_entry.version(), 4u);
 
     ASSERT_TRUE(iter.next().ok());
     EXPECT_FALSE(iter.valid());
@@ -920,7 +920,7 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     EXPECT_EQ(entry.version(), 2u);
 }
 
-// 2 segments with interleaved keys → output entries in (hash asc, version desc).
+// 2 segments with interleaved keys → output entries in (hash asc, version asc).
 TEST_F(GCMergeTest, MergePreservesOrder) {
     // Determine hash ordering of keys.
     std::string keyA = "alpha";

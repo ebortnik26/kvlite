@@ -4,16 +4,6 @@
 namespace kvlite {
 namespace internal {
 
-// Zigzag encode: map signed int32 to uint32 (small magnitudes → small values).
-//   0 → 0, -1 → 1, 1 → 2, -2 → 3, 2 → 4, ...
-static uint32_t zigzagEncode(int32_t n) {
-    return static_cast<uint32_t>((n << 1) ^ (n >> 31));
-}
-
-static int32_t zigzagDecode(uint32_t n) {
-    return static_cast<int32_t>((n >> 1) ^ -(n & 1));
-}
-
 SegmentLSlotCodec::SegmentLSlotCodec(uint8_t fingerprint_bits)
     : fingerprint_bits_(fingerprint_bits) {}
 
@@ -40,15 +30,11 @@ SegmentLSlotCodec::LSlotContents SegmentLSlotCodec::decode(
                 uint32_t delta = reader.readEliasGamma() - 1;
                 entry.offsets[v] = entry.offsets[v - 1] - delta;
             }
-            // Versions: 32-bit raw first, gamma(zigzag(delta)+1) for rest.
-            // Versions are parallel to offsets and NOT necessarily descending,
-            // so we use zigzag encoding to handle negative deltas.
+            // Versions: 32-bit raw first, gamma(delta+1) for rest (desc, zero-delta safe)
             entry.versions[0] = static_cast<uint32_t>(reader.read(32));
             for (uint64_t v = 1; v < num_entries; ++v) {
-                uint32_t zz = reader.readEliasGamma() - 1;
-                int32_t delta = zigzagDecode(zz);
-                entry.versions[v] = static_cast<uint32_t>(
-                    static_cast<int32_t>(entry.versions[v - 1]) - delta);
+                uint32_t delta = reader.readEliasGamma() - 1;
+                entry.versions[v] = entry.versions[v - 1] - delta;
             }
         }
     }
@@ -80,14 +66,11 @@ size_t SegmentLSlotCodec::encode(
                 uint32_t delta = entry.offsets[v - 1] - entry.offsets[v];
                 writer.writeEliasGamma(delta + 1);
             }
-            // Versions: 32-bit raw first, gamma(zigzag(delta)+1) for rest.
-            // Versions are parallel to offsets and NOT necessarily descending,
-            // so we use zigzag encoding to handle negative deltas.
+            // Versions: 32-bit raw first, gamma(delta+1) for rest (desc, zero-delta safe)
             writer.write(entry.versions[0], 32);
             for (uint64_t v = 1; v < num_entries; ++v) {
-                int32_t delta = static_cast<int32_t>(entry.versions[v - 1]) -
-                                static_cast<int32_t>(entry.versions[v]);
-                writer.writeEliasGamma(zigzagEncode(delta) + 1);
+                uint32_t delta = entry.versions[v - 1] - entry.versions[v];
+                writer.writeEliasGamma(delta + 1);
             }
         }
     }
@@ -114,12 +97,11 @@ size_t SegmentLSlotCodec::bitsNeeded(const LSlotContents& contents,
                 uint32_t delta = entry.offsets[v - 1] - entry.offsets[v];
                 bits += eliasGammaBits(delta + 1);
             }
-            // Versions: 32-bit raw first + gamma(zigzag(delta)+1) deltas
+            // Versions: 32-bit raw first + gamma(delta+1) deltas
             bits += 32;
             for (size_t v = 1; v < entry.versions.size(); ++v) {
-                int32_t delta = static_cast<int32_t>(entry.versions[v - 1]) -
-                                static_cast<int32_t>(entry.versions[v]);
-                bits += eliasGammaBits(zigzagEncode(delta) + 1);
+                uint32_t delta = entry.versions[v - 1] - entry.versions[v];
+                bits += eliasGammaBits(delta + 1);
             }
         }
     }

@@ -401,11 +401,11 @@ TEST_F(FlushTest, SortOrderHashThenVersion) {
 
     ASSERT_EQ(order.size(), 5u);
 
-    // Verify sorted by (hash ascending, version descending)
+    // Verify sorted by (hash ascending, version ascending)
     for (size_t i = 1; i < order.size(); ++i) {
         EXPECT_TRUE(order[i - 1].first < order[i].first ||
                     (order[i - 1].first == order[i].first &&
-                     order[i - 1].second >= order[i].second))
+                     order[i - 1].second <= order[i].second))
             << "Entry " << i << " is out of order";
     }
 }
@@ -440,8 +440,8 @@ TEST_F(FlushTest, RoundTrip) {
 
     ASSERT_EQ(by_key.count("key1"), 1u);
     ASSERT_EQ(by_key["key1"].size(), 2u);
-    // Versions should be sorted descending within same key (same hash)
-    EXPECT_GT(by_key["key1"][0], by_key["key1"][1]);
+    // Versions should be sorted ascending within same key (same hash)
+    EXPECT_LT(by_key["key1"][0], by_key["key1"][1]);
 
     ASSERT_EQ(by_key.count("key2"), 1u);
     ASSERT_EQ(by_key["key2"].size(), 1u);
