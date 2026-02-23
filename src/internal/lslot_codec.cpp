@@ -24,7 +24,7 @@ LSlotCodec::LSlotContents LSlotCodec::decode(
         if (num_values > 0) {
             contents.entries[i].values[0] = static_cast<uint32_t>(reader.read(32));
             for (uint64_t v = 1; v < num_values; ++v) {
-                uint32_t delta = reader.readEliasGamma();
+                uint32_t delta = reader.readEliasGamma() - 1;
                 contents.entries[i].values[v] =
                     contents.entries[i].values[v - 1] - delta;
             }
@@ -55,7 +55,7 @@ size_t LSlotCodec::encode(
             for (uint64_t v = 1; v < num_values; ++v) {
                 uint32_t delta =
                     contents.entries[i].values[v - 1] - contents.entries[i].values[v];
-                writer.writeEliasGamma(delta);
+                writer.writeEliasGamma(delta + 1);
             }
         }
     }
@@ -79,7 +79,7 @@ size_t LSlotCodec::bitsNeeded(const LSlotContents& contents,
             bits += 32;                          // first value raw
             for (size_t v = 1; v < entry.values.size(); ++v) {
                 uint32_t delta = entry.values[v - 1] - entry.values[v];
-                bits += eliasGammaBits(delta);
+                bits += eliasGammaBits(delta + 1);
             }
         }
     }

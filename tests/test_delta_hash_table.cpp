@@ -852,6 +852,420 @@ TEST(DeltaHashTable, ConcurrentAddAndRemove) {
     }
 }
 
+// ============================================================
+// Codec-level tests: SegmentLSlotCodec zero-delta safety
+// ============================================================
+
+#include "internal/segment_lslot_codec.h"
+
+// Zero offset deltas: entries with identical offsets (e.g. same version).
+// Before the fix, this would crash in writeEliasGamma(0).
+TEST(SegmentLSlotCodecTest, ZeroOffsetDeltaRoundTrip) {
+    SegmentLSlotCodec codec(39);
+    SegmentLSlotCodec::LSlotContents contents;
+    SegmentLSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0x42;
+    entry.offsets  = {100, 100, 100};  // zero deltas
+    entry.versions = {3, 2, 1};       // unique, delta=1
+    contents.entries.push_back(entry);
+
+    uint8_t buf[256] = {};
+    size_t end = codec.encode(buf, 0, contents);
+    EXPECT_GT(end, 0u);
+
+    size_t decoded_end;
+    auto decoded = codec.decode(buf, 0, &decoded_end);
+    EXPECT_EQ(decoded_end, end);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].offsets, entry.offsets);
+    EXPECT_EQ(decoded.entries[0].versions, entry.versions);
+}
+
+// Identical versions (e.g. same segment_id): raw encoding handles this.
+TEST(SegmentLSlotCodecTest, IdenticalVersionsRoundTrip) {
+    SegmentLSlotCodec codec(39);
+    SegmentLSlotCodec::LSlotContents contents;
+    SegmentLSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0x42;
+    entry.offsets  = {30, 20, 10};  // unique, delta=10
+    entry.versions = {5, 5, 5};    // all same
+    contents.entries.push_back(entry);
+
+    uint8_t buf[256] = {};
+    size_t end = codec.encode(buf, 0, contents);
+
+    size_t decoded_end;
+    auto decoded = codec.decode(buf, 0, &decoded_end);
+    EXPECT_EQ(decoded_end, end);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].offsets, entry.offsets);
+    EXPECT_EQ(decoded.entries[0].versions, entry.versions);
+}
+
+// Versions in ASCENDING order (anti-correlated with descending offsets).
+// This is the actual crash scenario: flush writes entries version-desc,
+// so higher versions get lower file offsets. Sorting by offset desc
+// puts versions in ascending order.
+TEST(SegmentLSlotCodecTest, AscendingVersionsRoundTrip) {
+    SegmentLSlotCodec codec(39);
+    SegmentLSlotCodec::LSlotContents contents;
+    SegmentLSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0x1;
+    entry.offsets  = {300, 200, 100};  // desc
+    entry.versions = {1, 2, 3};        // asc (anti-correlated)
+    contents.entries.push_back(entry);
+
+    uint8_t buf[256] = {};
+    size_t end = codec.encode(buf, 0, contents);
+
+    auto decoded = codec.decode(buf, 0, nullptr);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].offsets, entry.offsets);
+    EXPECT_EQ(decoded.entries[0].versions, entry.versions);
+}
+
+// Versions in arbitrary order (not sorted at all).
+TEST(SegmentLSlotCodecTest, ArbitraryVersionOrderRoundTrip) {
+    SegmentLSlotCodec codec(39);
+    SegmentLSlotCodec::LSlotContents contents;
+    SegmentLSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0x1;
+    entry.offsets  = {400, 300, 200, 100};  // desc
+    entry.versions = {3, 1, 5, 2};          // arbitrary
+    contents.entries.push_back(entry);
+
+    uint8_t buf[256] = {};
+    size_t end = codec.encode(buf, 0, contents);
+
+    auto decoded = codec.decode(buf, 0, nullptr);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].offsets, entry.offsets);
+    EXPECT_EQ(decoded.entries[0].versions, entry.versions);
+}
+
+// BitsNeeded must not crash on zero deltas (previously hit UB via __builtin_clz(0)).
+TEST(SegmentLSlotCodecTest, BitsNeededZeroDeltas) {
+    SegmentLSlotCodec::LSlotContents contents;
+    SegmentLSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0x1;
+    entry.offsets  = {10, 10};
+    entry.versions = {5, 5};
+    contents.entries.push_back(entry);
+
+    size_t bits = SegmentLSlotCodec::bitsNeeded(contents, 39);
+    EXPECT_GT(bits, 0u);  // must not crash
+}
+
+// LSlotCodec: zero deltas with duplicate values (before the fix, this was UB).
+TEST(LSlotCodec, ZeroDeltaRoundTrip) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
+    LSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0x42;
+    entry.values = {100, 100, 100};
+    contents.entries.push_back(entry);
+
+    uint8_t buf[256] = {};
+    size_t end = codec.encode(buf, 0, contents);
+
+    size_t decoded_end;
+    auto decoded = codec.decode(buf, 0, &decoded_end);
+    EXPECT_EQ(decoded_end, end);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].values, entry.values);
+}
+
+// Mixed: offsets with zero deltas, versions in arbitrary order.
+TEST(SegmentLSlotCodecTest, MixedDeltasRoundTrip) {
+    SegmentLSlotCodec codec(39);
+    SegmentLSlotCodec::LSlotContents contents;
+    SegmentLSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0xABC;
+    entry.offsets  = {100, 100, 90, 90, 80};  // deltas: 0, 10, 0, 10
+    entry.versions = {1, 5, 2, 3, 4};         // arbitrary order
+    contents.entries.push_back(entry);
+
+    uint8_t buf[256] = {};
+    size_t end = codec.encode(buf, 0, contents);
+
+    auto decoded = codec.decode(buf, 0, nullptr);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].offsets, entry.offsets);
+    EXPECT_EQ(decoded.entries[0].versions, entry.versions);
+}
+
+// Many entries per fingerprint — stress-test the encoding.
+// Versions are anti-correlated with offsets (ascending while offsets are desc).
+TEST(SegmentLSlotCodecTest, ManyEntriesRoundTrip) {
+    SegmentLSlotCodec codec(39);
+    SegmentLSlotCodec::LSlotContents contents;
+    SegmentLSlotCodec::TrieEntry entry;
+    entry.fingerprint = 0x1;
+    const int N = 500;
+    for (int i = N; i >= 1; --i) {
+        entry.offsets.push_back(static_cast<uint32_t>(i));
+        entry.versions.push_back(static_cast<uint32_t>(N - i + 1));  // ascending
+    }
+    contents.entries.push_back(entry);
+
+    std::vector<uint8_t> buf(65536, 0);
+    size_t end = codec.encode(buf.data(), 0, contents);
+    EXPECT_GT(end, 0u);
+
+    auto decoded = codec.decode(buf.data(), 0, nullptr);
+    ASSERT_EQ(decoded.entries.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].offsets, entry.offsets);
+    EXPECT_EQ(decoded.entries[0].versions, entry.versions);
+}
+
+// Multiple fingerprint groups in one lslot, each with zero deltas.
+TEST(SegmentLSlotCodecTest, MultipleGroupsZeroDeltas) {
+    SegmentLSlotCodec codec(39);
+    SegmentLSlotCodec::LSlotContents contents;
+
+    for (uint64_t fp = 1; fp <= 3; ++fp) {
+        SegmentLSlotCodec::TrieEntry entry;
+        entry.fingerprint = fp;
+        entry.offsets  = {50, 50, 50};
+        entry.versions = {10, 10, 10};
+        contents.entries.push_back(entry);
+    }
+
+    std::vector<uint8_t> buf(4096, 0);
+    size_t end = codec.encode(buf.data(), 0, contents);
+
+    auto decoded = codec.decode(buf.data(), 0, nullptr);
+    ASSERT_EQ(decoded.entries.size(), 3u);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(decoded.entries[i].offsets, contents.entries[i].offsets);
+        EXPECT_EQ(decoded.entries[i].versions, contents.entries[i].versions);
+    }
+}
+
+// ============================================================
+// DHT-level tests: bucket overflow with small buckets
+// ============================================================
+
+// Small-bucket config to force overflow quickly.
+static SegmentDeltaHashTable::Config smallBucketConfig() {
+    SegmentDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;      // 16 buckets
+    cfg.lslot_bits = 2;       // 4 lslots
+    cfg.bucket_bytes = 128;   // tiny buckets → fast overflow
+    return cfg;
+}
+
+// Write path: many entries for one key in small buckets forces overflow.
+// Verifies addEntry doesn't crash when bucket chains are created.
+TEST(SegmentDHTOverflow, WritePathManyEntries) {
+    SegmentDeltaHashTable dht(smallBucketConfig());
+    const int N = 200;
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry("key", static_cast<uint32_t>(i), /*version=*/1);
+    }
+    EXPECT_EQ(dht.size(), static_cast<size_t>(N));
+}
+
+// Read-back after overflow: verify all entries survive the chain.
+TEST(SegmentDHTOverflow, ReadBackAfterOverflow) {
+    SegmentDeltaHashTable dht(smallBucketConfig());
+    const int N = 100;
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry("key", static_cast<uint32_t>(i), static_cast<uint32_t>(i));
+    }
+
+    std::vector<uint32_t> offsets, versions;
+    ASSERT_TRUE(dht.findAll("key", offsets, versions));
+    EXPECT_EQ(offsets.size(), static_cast<size_t>(N));
+    EXPECT_EQ(versions.size(), static_cast<size_t>(N));
+
+    // Every offset 1..N should appear
+    std::set<uint32_t> offset_set(offsets.begin(), offsets.end());
+    for (int i = 1; i <= N; ++i) {
+        EXPECT_EQ(offset_set.count(static_cast<uint32_t>(i)), 1u)
+            << "missing offset " << i;
+    }
+}
+
+// Read-back with identical versions (segment_ids) — zero deltas in version field.
+TEST(SegmentDHTOverflow, ReadBackSameVersionOverflow) {
+    SegmentDeltaHashTable dht(smallBucketConfig());
+    const int N = 100;
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry("key", static_cast<uint32_t>(i), /*version=*/42);
+    }
+
+    std::vector<uint32_t> offsets, versions;
+    ASSERT_TRUE(dht.findAll("key", offsets, versions));
+    EXPECT_EQ(offsets.size(), static_cast<size_t>(N));
+
+    // All versions should be 42
+    for (size_t i = 0; i < versions.size(); ++i) {
+        EXPECT_EQ(versions[i], 42u);
+    }
+}
+
+// findFirst after overflow should return the highest offset.
+TEST(SegmentDHTOverflow, FindFirstAfterOverflow) {
+    SegmentDeltaHashTable dht(smallBucketConfig());
+    for (int i = 1; i <= 100; ++i) {
+        dht.addEntry("key", static_cast<uint32_t>(i), static_cast<uint32_t>(i));
+    }
+
+    uint32_t offset, version;
+    ASSERT_TRUE(dht.findFirst("key", offset, version));
+    // findFirst returns the entry with the highest version in the first bucket
+    // that contains the key — may or may not be the global max depending on
+    // which bucket the latest entry landed in.
+    EXPECT_GT(offset, 0u);
+}
+
+// Multiple keys all forcing overflow in the same bucket.
+TEST(SegmentDHTOverflow, MultipleKeysOverflowSameBucket) {
+    // Use very small config: 1 bucket, 1 lslot to force everything together.
+    SegmentDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 1;      // 2 buckets
+    cfg.lslot_bits = 1;       // 2 lslots
+    cfg.bucket_bytes = 64;    // very small
+    SegmentDeltaHashTable dht(cfg);
+
+    // Add many entries; they'll share the 2 buckets.
+    for (int k = 0; k < 10; ++k) {
+        std::string key = "k" + std::to_string(k);
+        for (int i = 1; i <= 10; ++i) {
+            dht.addEntry(key, static_cast<uint32_t>(i),
+                         static_cast<uint32_t>(k));
+        }
+    }
+
+    EXPECT_EQ(dht.size(), 100u);
+
+    // Verify read-back for each key.
+    for (int k = 0; k < 10; ++k) {
+        std::string key = "k" + std::to_string(k);
+        std::vector<uint32_t> offsets, versions;
+        ASSERT_TRUE(dht.findAll(key, offsets, versions))
+            << "key not found: " << key;
+        EXPECT_EQ(offsets.size(), 10u);
+    }
+}
+
+// removeAll after overflow should remove entries across the chain.
+TEST(SegmentDHTOverflow, RemoveAfterOverflow) {
+    SegmentDeltaHashTable dht(smallBucketConfig());
+    for (int i = 1; i <= 100; ++i) {
+        dht.addEntry("key", static_cast<uint32_t>(i), 1);
+    }
+    EXPECT_EQ(dht.size(), 100u);
+
+    size_t removed = dht.removeAll("key");
+    EXPECT_EQ(removed, 100u);
+    EXPECT_EQ(dht.size(), 0u);
+    EXPECT_FALSE(dht.contains("key"));
+}
+
+// removeBySecond after overflow: remove entries for a specific version.
+TEST(SegmentDHTOverflow, RemoveBySecondAfterOverflow) {
+    SegmentDeltaHashTable dht(smallBucketConfig());
+    // 50 entries with version=1, 50 with version=2
+    for (int i = 1; i <= 50; ++i) {
+        dht.addEntry("key", static_cast<uint32_t>(i), 1);
+    }
+    for (int i = 51; i <= 100; ++i) {
+        dht.addEntry("key", static_cast<uint32_t>(i), 2);
+    }
+    EXPECT_EQ(dht.size(), 100u);
+
+    size_t removed = dht.removeBySecond("key", 1);
+    EXPECT_EQ(removed, 50u);
+    EXPECT_EQ(dht.size(), 50u);
+
+    std::vector<uint32_t> offsets, versions;
+    ASSERT_TRUE(dht.findAll("key", offsets, versions));
+    for (size_t i = 0; i < versions.size(); ++i) {
+        EXPECT_EQ(versions[i], 2u);
+    }
+}
+
+// forEach traverses all entries across overflow chains.
+TEST(SegmentDHTOverflow, ForEachAcrossChain) {
+    SegmentDeltaHashTable dht(smallBucketConfig());
+    const int N = 100;
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry("key", static_cast<uint32_t>(i), static_cast<uint32_t>(i));
+    }
+
+    std::set<uint32_t> seen_offsets;
+    dht.forEach([&](uint64_t, uint32_t off, uint32_t) {
+        seen_offsets.insert(off);
+    });
+    EXPECT_EQ(seen_offsets.size(), static_cast<size_t>(N));
+}
+
+// forEachGroup merges entries from overflow chains.
+TEST(SegmentDHTOverflow, ForEachGroupMergesChain) {
+    SegmentDeltaHashTable dht(smallBucketConfig());
+    const int N = 100;
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry("key", static_cast<uint32_t>(i), static_cast<uint32_t>(i));
+    }
+
+    size_t total_entries = 0;
+    dht.forEachGroup([&](uint64_t, const std::vector<uint32_t>& offsets,
+                         const std::vector<uint32_t>&) {
+        total_entries += offsets.size();
+    });
+    EXPECT_EQ(total_entries, static_cast<size_t>(N));
+}
+
+// ============================================================
+// GlobalIndex-level overflow tests
+// ============================================================
+
+// Many versions of the same key, all in the same segment.
+TEST(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
+    GlobalIndex index;
+    for (int i = 1; i <= 200; ++i) {
+        index.put("key", static_cast<uint64_t>(i), /*segment_id=*/1);
+    }
+
+    EXPECT_EQ(index.entryCount(), 200u);
+    EXPECT_EQ(index.keyCount(), 1u);
+
+    uint64_t ver;
+    uint32_t seg;
+    ASSERT_TRUE(index.getLatest("key", ver, seg));
+    EXPECT_EQ(ver, 200u);
+    EXPECT_EQ(seg, 1u);
+
+    // Verify all versions are retrievable.
+    std::vector<uint32_t> seg_ids;
+    std::vector<uint64_t> vers;
+    ASSERT_TRUE(index.get("key", seg_ids, vers));
+    EXPECT_EQ(vers.size(), 200u);
+    EXPECT_EQ(vers[0], 200u);   // latest first
+    EXPECT_EQ(vers[199], 1u);   // earliest last
+}
+
+// Same key, different segments (unique segment_ids).
+TEST(GlobalIndexDHT, ManyVersionsDifferentSegments) {
+    GlobalIndex index;
+    for (int i = 1; i <= 200; ++i) {
+        index.put("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    uint64_t ver;
+    uint32_t seg;
+    ASSERT_TRUE(index.getLatest("key", ver, seg));
+    EXPECT_EQ(ver, 200u);
+    EXPECT_EQ(seg, 200u);
+
+    // Verify upper-bound query works across the full range.
+    ASSERT_TRUE(index.get("key", 150, ver, seg));
+    EXPECT_EQ(ver, 150u);
+    EXPECT_EQ(seg, 150u);
+}
+
 TEST(GlobalIndexDHT, LargeScale) {
     GlobalIndex index;
     const int N = 1000;

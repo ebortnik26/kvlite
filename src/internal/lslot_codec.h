@@ -15,7 +15,7 @@ namespace internal {
 //     [fingerprint_bits]           — fingerprint value
 //     unary(M)                     — M values for this fingerprint
 //     [32 bits]                    — first value (highest, stored raw)
-//     (M-1) x gamma(delta)        — deltas between consecutive desc values
+//     (M-1) x gamma(delta+1)      — deltas between consecutive desc values (zero-safe)
 //
 // The codec operates on raw uint8_t* pointers and owns no memory.
 class LSlotCodec {
