@@ -64,13 +64,12 @@ bool VersionManager::isOpen() const {
 uint64_t VersionManager::allocateVersion() {
     uint64_t ver = current_version_.fetch_add(1, std::memory_order_acq_rel) + 1;
 
-    // Persist when crossing jump boundaries.
-    uint64_t next_boundary = persisted_counter_ + options_.version_jump;
-    if (ver >= next_boundary) {
+    // Persist when crossing block boundaries.
+    if (ver > persisted_counter_) {
         std::lock_guard<std::mutex> lock(persist_mutex_);
         // Re-check under lock (another thread may have persisted).
-        if (ver >= persisted_counter_ + options_.version_jump) {
-            uint64_t new_persisted = ver + options_.version_jump;
+        if (ver > persisted_counter_) {
+            uint64_t new_persisted = persisted_counter_ + options_.block_size;
             manifest_->set(kNextVersionIdKey, std::to_string(new_persisted));
             persisted_counter_ = new_persisted;
         }

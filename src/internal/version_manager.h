@@ -24,7 +24,7 @@ class Manifest;
 // - Provide oldest snapshot version for GC
 //
 // Persistence model:
-// - Counter persisted in jumps (default 1M) to minimize I/O
+// - Counter persisted in blocks (default 1M) to minimize I/O
 // - On recovery, starts from persisted value (safe upper bound)
 // - On close, persists final counter
 //
@@ -32,7 +32,7 @@ class Manifest;
 class VersionManager {
 public:
     struct Options {
-        uint64_t version_jump = 1'000'000;
+        uint64_t block_size = 1024 * 1024;
     };
 
     VersionManager();
