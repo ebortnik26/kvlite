@@ -16,7 +16,7 @@ namespace kvlite {
 namespace internal {
 class GlobalIndexManager;
 class Manifest;
-class StorageManager;
+class SegmentStorageManager;
 class VersionManager;
 class WriteBuffer;
 }  // namespace internal
@@ -172,7 +172,7 @@ private:
     std::unique_ptr<internal::Manifest> manifest_;
     std::unique_ptr<internal::VersionManager> versions_;
     std::unique_ptr<internal::GlobalIndexManager> global_index_;
-    std::unique_ptr<internal::StorageManager> storage_;
+    std::unique_ptr<internal::SegmentStorageManager> storage_;
     std::unique_ptr<internal::WriteBuffer> write_buffer_;
     uint32_t current_segment_id_ = 0;
     bool is_open_ = false;

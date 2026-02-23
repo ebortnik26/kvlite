@@ -1,4 +1,4 @@
-#include "internal/storage_manager.h"
+#include "internal/segment_storage_manager.h"
 
 #include <filesystem>
 #include <set>
@@ -12,14 +12,14 @@ namespace internal {
 static constexpr char kNextSegmentIdKey[] = "next_segment_id";
 static constexpr char kSegmentPrefix[] = "segment.";
 
-StorageManager::StorageManager(Manifest& manifest) : manifest_(manifest) {}
-StorageManager::~StorageManager() = default;
+SegmentStorageManager::SegmentStorageManager(Manifest& manifest) : manifest_(manifest) {}
+SegmentStorageManager::~SegmentStorageManager() = default;
 
-Status StorageManager::open(const std::string& db_path) {
+Status SegmentStorageManager::open(const std::string& db_path) {
     return open(db_path, Options{});
 }
 
-Status StorageManager::open(const std::string& db_path,
+Status SegmentStorageManager::open(const std::string& db_path,
                             const Options& options) {
     db_path_ = db_path;
     options_ = options;
@@ -33,7 +33,7 @@ Status StorageManager::open(const std::string& db_path,
     return Status::OK();
 }
 
-Status StorageManager::recover() {
+Status SegmentStorageManager::recover() {
     // Read next_segment_id from manifest.
     std::string val;
     if (manifest_.get(kNextSegmentIdKey, val)) {
@@ -82,7 +82,7 @@ Status StorageManager::recover() {
     return Status::OK();
 }
 
-Status StorageManager::close() {
+Status SegmentStorageManager::close() {
     std::unique_lock lock(mutex_);
     for (auto& [id, seg] : segments_) {
         seg.close();
@@ -92,11 +92,11 @@ Status StorageManager::close() {
     return Status::OK();
 }
 
-bool StorageManager::isOpen() const {
+bool SegmentStorageManager::isOpen() const {
     return is_open_;
 }
 
-Status StorageManager::createSegment(uint32_t id) {
+Status SegmentStorageManager::createSegment(uint32_t id) {
     std::string path = segmentPath(id);
     Segment seg;
     Status s = seg.create(path, id);
@@ -110,7 +110,7 @@ Status StorageManager::createSegment(uint32_t id) {
     return Status::OK();
 }
 
-Status StorageManager::removeSegment(uint32_t id) {
+Status SegmentStorageManager::removeSegment(uint32_t id) {
     std::string path = segmentPath(id);
 
     std::unique_lock lock(mutex_);
@@ -131,19 +131,19 @@ Status StorageManager::removeSegment(uint32_t id) {
     return Status::OK();
 }
 
-Segment* StorageManager::getSegment(uint32_t id) {
+Segment* SegmentStorageManager::getSegment(uint32_t id) {
     std::shared_lock lock(mutex_);
     auto it = segments_.find(id);
     return it != segments_.end() ? &it->second : nullptr;
 }
 
-const Segment* StorageManager::getSegment(uint32_t id) const {
+const Segment* SegmentStorageManager::getSegment(uint32_t id) const {
     std::shared_lock lock(mutex_);
     auto it = segments_.find(id);
     return it != segments_.end() ? &it->second : nullptr;
 }
 
-std::vector<uint32_t> StorageManager::getSegmentIds() const {
+std::vector<uint32_t> SegmentStorageManager::getSegmentIds() const {
     std::shared_lock lock(mutex_);
     std::vector<uint32_t> ids;
     ids.reserve(segments_.size());
@@ -153,12 +153,12 @@ std::vector<uint32_t> StorageManager::getSegmentIds() const {
     return ids;
 }
 
-size_t StorageManager::segmentCount() const {
+size_t SegmentStorageManager::segmentCount() const {
     std::shared_lock lock(mutex_);
     return segments_.size();
 }
 
-uint64_t StorageManager::totalDataSize() const {
+uint64_t SegmentStorageManager::totalDataSize() const {
     std::shared_lock lock(mutex_);
     uint64_t total = 0;
     for (const auto& [id, seg] : segments_) {
@@ -167,13 +167,13 @@ uint64_t StorageManager::totalDataSize() const {
     return total;
 }
 
-uint32_t StorageManager::allocateSegmentId() {
+uint32_t SegmentStorageManager::allocateSegmentId() {
     uint32_t id = next_segment_id_.fetch_add(1, std::memory_order_relaxed);
     manifest_.set(kNextSegmentIdKey, std::to_string(id + 1));
     return id;
 }
 
-std::string StorageManager::segmentPath(uint32_t segment_id) const {
+std::string SegmentStorageManager::segmentPath(uint32_t segment_id) const {
     return db_path_ + "/segment_" + std::to_string(segment_id) + ".data";
 }
 

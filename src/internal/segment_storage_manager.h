@@ -1,5 +1,5 @@
-#ifndef KVLITE_INTERNAL_STORAGE_MANAGER_H
-#define KVLITE_INTERNAL_STORAGE_MANAGER_H
+#ifndef KVLITE_INTERNAL_SEGMENT_STORAGE_MANAGER_H
+#define KVLITE_INTERNAL_SEGMENT_STORAGE_MANAGER_H
 
 #include <atomic>
 #include <cstdint>
@@ -16,7 +16,7 @@ namespace internal {
 
 class Manifest;
 
-// Storage Manager: Segment registry that owns the segment lifecycle.
+// Segment Storage Manager: Segment registry that owns the segment lifecycle.
 //
 // Provides:
 // - Segment lifecycle: create, remove, lookup by ID
@@ -24,18 +24,18 @@ class Manifest;
 // - File path generation from segment ID
 //
 // Thread-safety: All public methods are thread-safe.
-class StorageManager {
+class SegmentStorageManager {
 public:
     struct Options {
         bool purge_untracked_files = false;
     };
 
-    explicit StorageManager(Manifest& manifest);
-    ~StorageManager();
+    explicit SegmentStorageManager(Manifest& manifest);
+    ~SegmentStorageManager();
 
     // Non-copyable
-    StorageManager(const StorageManager&) = delete;
-    StorageManager& operator=(const StorageManager&) = delete;
+    SegmentStorageManager(const SegmentStorageManager&) = delete;
+    SegmentStorageManager& operator=(const SegmentStorageManager&) = delete;
 
     // --- Lifecycle ---
 
@@ -88,4 +88,4 @@ private:
 }  // namespace internal
 }  // namespace kvlite
 
-#endif  // KVLITE_INTERNAL_STORAGE_MANAGER_H
+#endif  // KVLITE_INTERNAL_SEGMENT_STORAGE_MANAGER_H

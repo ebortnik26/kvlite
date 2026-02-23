@@ -80,7 +80,7 @@ add_executable(kvlite_segment_index_test
     ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/storage_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_storage_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
@@ -209,10 +209,10 @@ target_link_libraries(kvlite_manifest_test
         pthread
 )
 
-# StorageManager tests
+# SegmentStorageManager tests
 add_executable(kvlite_sm_test
-    test_storage_manager.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/storage_manager.cpp
+    test_segment_storage_manager.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_storage_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp

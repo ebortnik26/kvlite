@@ -6,12 +6,12 @@
 
 #include "internal/manifest.h"
 #include "internal/segment.h"
-#include "internal/storage_manager.h"
+#include "internal/segment_storage_manager.h"
 
 using namespace kvlite::internal;
 using kvlite::Status;
 
-class StorageManagerTest : public ::testing::Test {
+class SegmentStorageManagerTest : public ::testing::Test {
 protected:
     void SetUp() override {
         path_ = "/tmp/sm_test_" + std::to_string(getpid());
@@ -21,13 +21,13 @@ protected:
         std::filesystem::remove_all(path_);
     }
 
-    // Create manifest + StorageManager, open (which also recovers).
+    // Create manifest + SegmentStorageManager, open (which also recovers).
     Status openSM(bool create = true,
-                  StorageManager::Options opts = StorageManager::Options{}) {
+                  SegmentStorageManager::Options opts = SegmentStorageManager::Options{}) {
         manifest_ = std::make_unique<Manifest>();
         Status s = create ? manifest_->create(path_) : manifest_->open(path_);
         if (!s.ok()) return s;
-        sm_ = std::make_unique<StorageManager>(*manifest_);
+        sm_ = std::make_unique<SegmentStorageManager>(*manifest_);
         return sm_->open(path_, opts);
     }
 
@@ -36,7 +36,7 @@ protected:
         manifest_->close();
     }
 
-    // Helper: create a sealed segment via StorageManager so it is tracked.
+    // Helper: create a sealed segment via SegmentStorageManager so it is tracked.
     uint32_t createTrackedSegment(const std::string& key,
                                   const std::string& value) {
         uint32_t id = sm_->allocateSegmentId();
@@ -59,11 +59,11 @@ protected:
 
     std::string path_;
     std::unique_ptr<Manifest> manifest_;
-    std::unique_ptr<StorageManager> sm_;
+    std::unique_ptr<SegmentStorageManager> sm_;
 };
 
 // removeSegment() should delete the physical file from disk.
-TEST_F(StorageManagerTest, RemoveSegmentDeletesFile) {
+TEST_F(SegmentStorageManagerTest, RemoveSegmentDeletesFile) {
     ASSERT_TRUE(openSM().ok());
 
     uint32_t id = createTrackedSegment("k", "v");
@@ -82,7 +82,7 @@ TEST_F(StorageManagerTest, RemoveSegmentDeletesFile) {
 }
 
 // recover() with purge_untracked_files=true should delete orphan segment files.
-TEST_F(StorageManagerTest, RecoverPurgesOrphanFiles) {
+TEST_F(SegmentStorageManagerTest, RecoverPurgesOrphanFiles) {
     // Phase 1: create a tracked segment and an orphan file.
     {
         ASSERT_TRUE(openSM().ok());
@@ -97,7 +97,7 @@ TEST_F(StorageManagerTest, RecoverPurgesOrphanFiles) {
 
     // Phase 2: reopen with purge enabled.
     {
-        StorageManager::Options opts;
+        SegmentStorageManager::Options opts;
         opts.purge_untracked_files = true;
         ASSERT_TRUE(openSM(false, opts).ok());
 
@@ -113,7 +113,7 @@ TEST_F(StorageManagerTest, RecoverPurgesOrphanFiles) {
 }
 
 // recover() with purge_untracked_files=false (default) should keep orphan files.
-TEST_F(StorageManagerTest, RecoverKeepsOrphansByDefault) {
+TEST_F(SegmentStorageManagerTest, RecoverKeepsOrphansByDefault) {
     {
         ASSERT_TRUE(openSM().ok());
         createTrackedSegment("k1", "v1");
@@ -135,7 +135,7 @@ TEST_F(StorageManagerTest, RecoverKeepsOrphansByDefault) {
 
 // recover() should fail gracefully when a manifest-tracked segment file
 // is missing from disk.
-TEST_F(StorageManagerTest, RecoverMissingManifestFile) {
+TEST_F(SegmentStorageManagerTest, RecoverMissingManifestFile) {
     {
         ASSERT_TRUE(openSM().ok());
         uint32_t id = createTrackedSegment("k1", "v1");

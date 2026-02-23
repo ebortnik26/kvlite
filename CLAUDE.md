@@ -58,7 +58,7 @@ Both indexes use `DeltaHashTable` — a compact hash table with per-bucket spinl
 
 ### Write Path
 
-`DB::put` → `VersionManager::allocateVersion` → `StorageManager::writeEntry` (buffers in WriteBuffer) → on capacity: `WriteBuffer::flush` → Segment → `GlobalIndexManager::put` (updates GlobalIndex + WAL).
+`DB::put` → `VersionManager::allocateVersion` → `SegmentStorageManager::writeEntry` (buffers in WriteBuffer) → on capacity: `WriteBuffer::flush` → Segment → `GlobalIndexManager::put` (updates GlobalIndex + WAL).
 
 ### Version Persistence
 
@@ -66,7 +66,7 @@ Both indexes use `DeltaHashTable` — a compact hash table with per-bucket spinl
 
 ### Read Path
 
-`DB::get` → `GlobalIndexManager::getLatest` → file_id → `StorageManager::readValue` → `SegmentIndexCache` → SegmentIndex lookup → `DataCache` hit or LogFile read + CRC verify.
+`DB::get` → `GlobalIndexManager::getLatest` → file_id → `SegmentStorageManager::readValue` → `SegmentIndexCache` → SegmentIndex lookup → `DataCache` hit or LogFile read + CRC verify.
 
 ### Concurrency Model
 

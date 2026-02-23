@@ -5,7 +5,7 @@
 #include "internal/manifest.h"
 #include "internal/version_manager.h"
 #include "internal/global_index_manager.h"
-#include "internal/storage_manager.h"
+#include "internal/segment_storage_manager.h"
 #include "internal/write_buffer.h"
 #include "internal/log_entry.h"
 #include "internal/segment.h"
@@ -353,9 +353,9 @@ Status DB::open(const std::string& path, const Options& options) {
     }
 
     // Initialize storage manager
-    storage_ = std::make_unique<internal::StorageManager>(*manifest_);
+    storage_ = std::make_unique<internal::SegmentStorageManager>(*manifest_);
 
-    internal::StorageManager::Options sm_opts;
+    internal::SegmentStorageManager::Options sm_opts;
     sm_opts.purge_untracked_files = options.purge_untracked_files;
     s = storage_->open(path, sm_opts);
     if (!s.ok()) {
