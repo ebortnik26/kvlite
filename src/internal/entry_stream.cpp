@@ -1,6 +1,7 @@
 #include "internal/entry_stream.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -307,6 +308,7 @@ class TagSourceStream : public EntryStream {
 public:
     TagSourceStream(std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t base)
         : input_(std::move(input)), segment_id_(segment_id), base_(base) {
+        assert(base_ + TagSourceExt::kSize <= Entry::kMaxExt);
         if (input_->valid()) {
             stamp();
         }
@@ -348,6 +350,7 @@ public:
         : input_(std::move(input)),
           visible_set_(std::move(visible_set)),
           base_(base) {
+        assert(base_ + ClassifyExt::kSize <= Entry::kMaxExt);
         if (input_->valid()) {
             classify();
         }
