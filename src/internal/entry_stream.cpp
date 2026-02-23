@@ -300,6 +300,92 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// TagSourceStream — writes a value into ext[slot] for each entry
+// ---------------------------------------------------------------------------
+
+class TagSourceStream : public EntryStream {
+public:
+    TagSourceStream(std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t slot)
+        : input_(std::move(input)), segment_id_(segment_id), slot_(slot) {
+        if (input_->valid()) {
+            stamp();
+        }
+    }
+
+    bool valid() const override { return input_->valid(); }
+    const Entry& entry() const override { return current_; }
+
+    Status next() override {
+        Status s = input_->next();
+        if (!s.ok()) return s;
+        if (input_->valid()) {
+            stamp();
+        }
+        return Status::OK();
+    }
+
+private:
+    void stamp() {
+        current_ = input_->entry();
+        current_.ext[slot_] = segment_id_;
+    }
+
+    std::unique_ptr<EntryStream> input_;
+    uint32_t segment_id_;
+    size_t slot_;
+    Entry current_;
+};
+
+// ---------------------------------------------------------------------------
+// ClassifyStream — writes EntryAction into ext[slot] for each entry
+// ---------------------------------------------------------------------------
+
+class ClassifyStream : public EntryStream {
+public:
+    ClassifyStream(std::unique_ptr<EntryStream> input,
+                   std::unordered_map<uint64_t, std::set<uint32_t>> visible_set,
+                   size_t slot)
+        : input_(std::move(input)),
+          visible_set_(std::move(visible_set)),
+          slot_(slot) {
+        if (input_->valid()) {
+            classify();
+        }
+    }
+
+    bool valid() const override { return input_->valid(); }
+    const Entry& entry() const override { return current_; }
+
+    Status next() override {
+        Status s = input_->next();
+        if (!s.ok()) return s;
+        if (input_->valid()) {
+            classify();
+        }
+        return Status::OK();
+    }
+
+private:
+    void classify() {
+        current_ = input_->entry();
+        const auto it = visible_set_.find(current_.hash);
+        if (it != visible_set_.end()) {
+            uint32_t v = static_cast<uint32_t>(current_.version);
+            if (it->second.count(v) > 0) {
+                current_.ext[slot_] = static_cast<uint64_t>(EntryAction::kKeep);
+                return;
+            }
+        }
+        current_.ext[slot_] = static_cast<uint64_t>(EntryAction::kEliminate);
+    }
+
+    std::unique_ptr<EntryStream> input_;
+    std::unordered_map<uint64_t, std::set<uint32_t>> visible_set_;
+    size_t slot_;
+    Entry current_;
+};
+
+// ---------------------------------------------------------------------------
 // Factory functions
 // ---------------------------------------------------------------------------
 
@@ -315,6 +401,18 @@ std::unique_ptr<EntryStream> filter(std::unique_ptr<EntryStream> input, Predicat
 
 std::unique_ptr<EntryStream> merge(std::vector<std::unique_ptr<EntryStream>> inputs) {
     return std::make_unique<MergeStream>(std::move(inputs));
+}
+
+std::unique_ptr<EntryStream> tagSource(
+    std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t slot) {
+    return std::make_unique<TagSourceStream>(std::move(input), segment_id, slot);
+}
+
+std::unique_ptr<EntryStream> classify(
+    std::unique_ptr<EntryStream> input,
+    std::unordered_map<uint64_t, std::set<uint32_t>> visible_set,
+    size_t slot) {
+    return std::make_unique<ClassifyStream>(std::move(input), std::move(visible_set), slot);
 }
 
 std::unique_ptr<EntryStream> scanVisible(

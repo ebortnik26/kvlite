@@ -22,22 +22,40 @@ Status GC::merge(
     Result& result) {
 
     result.outputs.clear();
+    result.relocations.clear();
+    result.eliminations.clear();
     result.entries_written = 0;
+    result.entries_eliminated = 0;
 
-    // 1. Create scanVisible stream for each input.
+    // ext slot assignments for the GC pipeline.
+    constexpr size_t kSlotSegmentId = 0;
+    constexpr size_t kSlotAction    = 1;
+
+    // 1. Build unfiltered tagSource streams and compute the union visible set.
     std::vector<std::unique_ptr<EntryStream>> streams;
     streams.reserve(inputs.size());
+    std::unordered_map<uint64_t, std::set<uint32_t>> union_visible;
+
     for (const auto& input : inputs) {
-        streams.push_back(stream::scanVisible(
-            global_index, input.index, input.segment_id,
-            snapshot_versions, input.log_file, input.data_size));
+        streams.push_back(stream::tagSource(
+            stream::scan(input.log_file, input.data_size),
+            input.segment_id, kSlotSegmentId));
+
+        auto vs = computeVisibleSet(
+            global_index, input.index, input.segment_id, snapshot_versions);
+        for (auto& [hash, versions] : vs) {
+            auto& dst = union_visible[hash];
+            dst.insert(versions.begin(), versions.end());
+        }
     }
 
-    // 2. Create merged stream.
-    auto merged = stream::merge(std::move(streams));
+    // 2. Merge all streams, then classify.
+    auto pipeline = stream::classify(
+        stream::merge(std::move(streams)),
+        std::move(union_visible), kSlotAction);
 
     // 3. If empty, return OK.
-    if (!merged->valid()) {
+    if (!pipeline->valid()) {
         return Status::OK();
     }
 
@@ -47,11 +65,22 @@ Status GC::merge(
     Status s = output.create(path_fn(output_id), output_id);
     if (!s.ok()) return s;
 
-    // 5. Drain stream.
-    while (merged->valid()) {
-        const auto& entry = merged->entry();
+    // 5. Drain pipeline — read action and segment_id from ext slots.
+    while (pipeline->valid()) {
+        const auto& entry = pipeline->entry();
+        auto action = static_cast<EntryAction>(entry.ext[kSlotAction]);
+        auto old_seg_id = static_cast<uint32_t>(entry.ext[kSlotSegmentId]);
 
-        // Check if we need to split to a new output segment.
+        if (action == EntryAction::kEliminate) {
+            result.eliminations.push_back({
+                std::string(entry.key), entry.version, old_seg_id});
+            result.entries_eliminated++;
+            s = pipeline->next();
+            if (!s.ok()) return s;
+            continue;
+        }
+
+        // kKeep: write to output segment.
         size_t serialized_size = LogEntry::kHeaderSize + entry.key.size() +
                                  entry.value.size() + LogEntry::kChecksumSize;
         if (output.dataSize() > 0 &&
@@ -66,13 +95,14 @@ Status GC::merge(
             if (!s.ok()) return s;
         }
 
-        // Write entry to current output.
         s = output.put(entry.key, entry.version, entry.value, entry.tombstone);
         if (!s.ok()) return s;
+
+        result.relocations.push_back({
+            std::string(entry.key), entry.version, old_seg_id, output_id});
         result.entries_written++;
 
-        // Advance stream.
-        s = merged->next();
+        s = pipeline->next();
         if (!s.ok()) return s;
     }
 

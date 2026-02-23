@@ -869,6 +869,14 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
     EXPECT_EQ(last_result_.entries_written, 3u);
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
+    // Verify no eliminations and 3 relocations.
+    EXPECT_TRUE(last_result_.eliminations.empty());
+    EXPECT_EQ(last_result_.relocations.size(), 3u);
+    for (const auto& r : last_result_.relocations) {
+        EXPECT_EQ(r.old_segment_id, 1u);
+        EXPECT_EQ(r.new_segment_id, last_result_.outputs[0].segment_id);
+    }
+
     // Verify entries are readable from the output segment.
     auto& out = last_result_.outputs[0].segment;
     ASSERT_EQ(out.state(), Segment::State::kReadable);
@@ -914,6 +922,18 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     ASSERT_TRUE(s.ok());
     EXPECT_EQ(last_result_.entries_written, 1u);
     ASSERT_EQ(last_result_.outputs.size(), 1u);
+
+    // Verify elimination of key1 v1 from seg1.
+    ASSERT_EQ(last_result_.eliminations.size(), 1u);
+    EXPECT_EQ(last_result_.eliminations[0].key, "key1");
+    EXPECT_EQ(last_result_.eliminations[0].version, 1u);
+    EXPECT_EQ(last_result_.eliminations[0].old_segment_id, 1u);
+
+    // Verify relocation of key1 v2.
+    ASSERT_EQ(last_result_.relocations.size(), 1u);
+    EXPECT_EQ(last_result_.relocations[0].key, "key1");
+    EXPECT_EQ(last_result_.relocations[0].version, 2u);
+    EXPECT_EQ(last_result_.relocations[0].old_segment_id, 2u);
 
     LogEntry entry;
     ASSERT_TRUE(last_result_.outputs[0].segment.getLatest("key1", entry).ok());
@@ -1128,6 +1148,15 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
     ASSERT_TRUE(s.ok());
     EXPECT_EQ(last_result_.entries_written, 2u);
     ASSERT_EQ(last_result_.outputs.size(), 1u);
+
+    // Verify elimination of v1.
+    ASSERT_EQ(last_result_.eliminations.size(), 1u);
+    EXPECT_EQ(last_result_.eliminations[0].key, "key1");
+    EXPECT_EQ(last_result_.eliminations[0].version, 1u);
+    EXPECT_EQ(last_result_.eliminations[0].old_segment_id, 1u);
+
+    // Verify 2 relocations (v2 and v3).
+    EXPECT_EQ(last_result_.relocations.size(), 2u);
 
     // Output should contain v2 and v3, but not v1.
     auto& out = last_result_.outputs[0].segment;

@@ -40,9 +40,25 @@ public:
         Segment segment;  // sealed, Readable state
     };
 
+    struct Relocation {
+        std::string key;
+        uint64_t version;
+        uint32_t old_segment_id;
+        uint32_t new_segment_id;
+    };
+
+    struct Elimination {
+        std::string key;
+        uint64_t version;
+        uint32_t old_segment_id;
+    };
+
     struct Result {
         std::vector<OutputSegment> outputs;
+        std::vector<Relocation> relocations;
+        std::vector<Elimination> eliminations;
         size_t entries_written = 0;
+        size_t entries_eliminated = 0;
     };
 
     // Merge visible entries from input segments into new output segments.
