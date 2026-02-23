@@ -245,6 +245,206 @@ TEST(WriteBuffer, ConcurrentPutsSameKey) {
     EXPECT_EQ(wb.entryCount(), static_cast<size_t>(kThreads * kPerThread));
 }
 
+// --- putBatch tests ------------------------------------------------------
+
+TEST(WriteBuffer, PutBatchSameVersion) {
+    WriteBuffer wb;
+
+    std::string k1 = "alpha", k2 = "beta", k3 = "gamma";
+    std::string v1 = "a_val", v2 = "b_val", v3 = "g_val";
+
+    std::vector<WriteBuffer::BatchOp> ops = {
+        {&k1, &v1, false},
+        {&k2, &v2, false},
+        {&k3, &v3, true},
+    };
+    wb.putBatch(ops, 42);
+
+    EXPECT_EQ(wb.entryCount(), 3u);
+    EXPECT_EQ(wb.keyCount(), 3u);
+
+    // All entries should have version 42.
+    std::string value;
+    uint64_t version;
+    bool tombstone;
+
+    ASSERT_TRUE(wb.get("alpha", value, version, tombstone));
+    EXPECT_EQ(value, "a_val");
+    EXPECT_EQ(version, 42u);
+    EXPECT_FALSE(tombstone);
+
+    ASSERT_TRUE(wb.get("beta", value, version, tombstone));
+    EXPECT_EQ(value, "b_val");
+    EXPECT_EQ(version, 42u);
+    EXPECT_FALSE(tombstone);
+
+    ASSERT_TRUE(wb.get("gamma", value, version, tombstone));
+    EXPECT_EQ(value, "g_val");
+    EXPECT_EQ(version, 42u);
+    EXPECT_TRUE(tombstone);
+}
+
+TEST(WriteBuffer, PutBatchKeyCountWithExisting) {
+    WriteBuffer wb;
+    // Pre-populate a key.
+    wb.put("alpha", 1, "old", false);
+    EXPECT_EQ(wb.keyCount(), 1u);
+
+    // Batch re-inserts "alpha" and adds "beta".
+    std::string k1 = "alpha", k2 = "beta";
+    std::string v1 = "new", v2 = "b";
+
+    std::vector<WriteBuffer::BatchOp> ops = {
+        {&k1, &v1, false},
+        {&k2, &v2, false},
+    };
+    wb.putBatch(ops, 10);
+
+    EXPECT_EQ(wb.entryCount(), 3u);
+    EXPECT_EQ(wb.keyCount(), 2u);
+
+    // Latest version for "alpha" should be 10.
+    std::string value;
+    uint64_t version;
+    bool tombstone;
+    ASSERT_TRUE(wb.get("alpha", value, version, tombstone));
+    EXPECT_EQ(value, "new");
+    EXPECT_EQ(version, 10u);
+}
+
+TEST(WriteBuffer, PutBatchEmpty) {
+    WriteBuffer wb;
+    std::vector<WriteBuffer::BatchOp> ops;
+    wb.putBatch(ops, 1);  // should be a no-op
+    EXPECT_EQ(wb.entryCount(), 0u);
+}
+
+TEST(WriteBuffer, PutBatchConcurrentWritersSameVersion) {
+    // Multiple threads write batches to disjoint key sets concurrently.
+    // After all threads finish, verify that each batch's keys share one version.
+    WriteBuffer wb;
+    const int kThreads = 4;
+    const int kBatchesPerThread = 200;
+    const int kKeysPerBatch = 5;
+
+    std::atomic<uint64_t> next_version{1};
+
+    auto writer = [&](int tid) {
+        for (int b = 0; b < kBatchesPerThread; ++b) {
+            uint64_t ver = next_version.fetch_add(1, std::memory_order_relaxed);
+
+            std::string prefix = "t" + std::to_string(tid) +
+                                 "_b" + std::to_string(b) + "_";
+            std::vector<std::string> keys(kKeysPerBatch);
+            std::vector<std::string> vals(kKeysPerBatch);
+            for (int k = 0; k < kKeysPerBatch; ++k) {
+                keys[k] = prefix + "k" + std::to_string(k);
+                vals[k] = "v" + std::to_string(k);
+            }
+
+            std::vector<WriteBuffer::BatchOp> ops;
+            ops.reserve(kKeysPerBatch);
+            for (int k = 0; k < kKeysPerBatch; ++k) {
+                ops.push_back({&keys[k], &vals[k], false});
+            }
+            wb.putBatch(ops, ver);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back(writer, t);
+    }
+    for (auto& t : threads) t.join();
+
+    // Verify: each batch's keys share one version.
+    for (int tid = 0; tid < kThreads; ++tid) {
+        for (int b = 0; b < kBatchesPerThread; ++b) {
+            std::string prefix = "t" + std::to_string(tid) +
+                                 "_b" + std::to_string(b) + "_";
+            uint64_t expected_ver = 0;
+            for (int k = 0; k < kKeysPerBatch; ++k) {
+                std::string key = prefix + "k" + std::to_string(k);
+                std::string val;
+                uint64_t ver;
+                bool tomb;
+                ASSERT_TRUE(wb.get(key, val, ver, tomb))
+                    << "Missing key: " << key;
+                if (k == 0) {
+                    expected_ver = ver;
+                } else {
+                    EXPECT_EQ(ver, expected_ver)
+                        << "Version mismatch in batch " << prefix;
+                }
+            }
+        }
+    }
+}
+
+TEST(WriteBuffer, PutBatchMonotonicVisibility) {
+    // With two-phase locking, a concurrent reader doing sequential get()
+    // calls should see monotonically non-decreasing versions for keys
+    // from the same batch group, because putBatch makes all entries
+    // visible simultaneously.
+    WriteBuffer wb;
+
+    const int kIterations = 3000;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> violation{false};
+
+    std::thread writer([&]() {
+        std::string k1 = "x1", k2 = "x2", k3 = "x3";
+        for (int i = 1; i <= kIterations && !violation; ++i) {
+            std::string v = std::to_string(i);
+            std::vector<WriteBuffer::BatchOp> ops = {
+                {&k1, &v, false},
+                {&k2, &v, false},
+                {&k3, &v, false},
+            };
+            wb.putBatch(ops, static_cast<uint64_t>(i));
+        }
+        stop = true;
+    });
+
+    // Reader: reads x1, x2, x3 in order. Because putBatch makes all
+    // entries visible atomically, if x1 is at version V then x2 and x3
+    // must be at version >= V (never an older version).
+    std::thread reader([&]() {
+        while (!stop && !violation) {
+            std::string v1, v2, v3;
+            uint64_t ver1 = 0, ver2 = 0, ver3 = 0;
+            bool t1, t2, t3;
+
+            bool f1 = wb.get("x1", v1, ver1, t1);
+            bool f2 = wb.get("x2", v2, ver2, t2);
+            bool f3 = wb.get("x3", v3, ver3, t3);
+
+            if (!f1) continue;  // nothing written yet
+
+            // If x1 is visible at version V, x2 and x3 must also be visible
+            // (putBatch guarantees all entries appear simultaneously).
+            if (!f2 || !f3) {
+                violation = true;
+                break;
+            }
+
+            // Versions must be monotonically non-decreasing: ver2 >= ver1
+            // and ver3 >= ver2. A new putBatch may land between get() calls,
+            // but an older version can never appear after a newer one.
+            if (ver2 < ver1 || ver3 < ver2) {
+                violation = true;
+                break;
+            }
+        }
+    });
+
+    writer.join();
+    reader.join();
+
+    EXPECT_FALSE(violation.load())
+        << "Non-monotonic version visibility detected";
+}
+
 // --- Flush tests ---------------------------------------------------------
 
 using kvlite::internal::GlobalIndex;

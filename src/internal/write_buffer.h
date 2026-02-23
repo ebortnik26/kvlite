@@ -52,6 +52,15 @@ public:
     void put(const std::string& key, uint64_t version,
              const std::string& value, bool tombstone);
 
+    // Atomic batch insert: all operations share the same version.
+    // Two-phase locking with bucket-ordered acquisition prevents deadlocks.
+    struct BatchOp {
+        const std::string* key;
+        const std::string* value;
+        bool tombstone;
+    };
+    void putBatch(const std::vector<BatchOp>& ops, uint64_t version);
+
     bool get(const std::string& key,
              std::string& value, uint64_t& version, bool& tombstone) const;
 

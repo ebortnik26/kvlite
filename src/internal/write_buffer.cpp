@@ -166,6 +166,99 @@ void WriteBuffer::put(const std::string& key, uint64_t version,
     }
 }
 
+void WriteBuffer::putBatch(const std::vector<BatchOp>& ops, uint64_t version) {
+    if (ops.empty()) return;
+
+    // Pre-compute hashes and bucket indices for all operations.
+    struct Prepared {
+        uint32_t op_idx;     // index into ops
+        uint64_t hash;
+        uint32_t bi;         // bucket index
+        uint32_t fp;         // fingerprint
+        uint32_t offset;     // data buffer offset (filled after appendRecord)
+    };
+
+    std::vector<Prepared> items;
+    items.reserve(ops.size());
+    for (uint32_t i = 0; i < ops.size(); ++i) {
+        uint64_t h = dhtHashBytes(ops[i].key->data(), ops[i].key->size());
+        items.push_back({i, h, bucketIndex(h), fingerprint(h), 0});
+    }
+
+    // Sort by bucket index to acquire locks in order (deadlock avoidance).
+    std::sort(items.begin(), items.end(),
+              [](const Prepared& a, const Prepared& b) {
+                  return a.bi < b.bi;
+              });
+
+    // Append all records to data buffer (lock-free).
+    for (auto& item : items) {
+        const auto& op = ops[item.op_idx];
+        PackedVersion pv(version, op.tombstone);
+        item.offset = appendRecord(*op.key, pv, *op.value);
+    }
+
+    // Phase 1: acquire all distinct bucket locks in order.
+    std::vector<uint32_t> locked_buckets;
+    locked_buckets.reserve(items.size());
+    for (const auto& item : items) {
+        if (locked_buckets.empty() || locked_buckets.back() != item.bi) {
+            locks_[item.bi].lock();
+            locked_buckets.push_back(item.bi);
+        }
+    }
+
+    // Phase 2: insert all slots while holding all locks.
+    size_t new_entries = 0;
+    size_t new_keys = 0;
+
+    for (const auto& item : items) {
+        const auto& op = ops[item.op_idx];
+
+        // Check if key already exists in this bucket chain.
+        bool key_exists = false;
+        {
+            const Bucket* scan = &buckets_[item.bi];
+            while (scan) {
+                for (uint32_t i = 0; i < scan->count; ++i) {
+                    if (scan->slots[i].fingerprint == item.fp &&
+                        keyMatches(scan->slots[i].offset, *op.key)) {
+                        key_exists = true;
+                        break;
+                    }
+                }
+                if (key_exists) break;
+                scan = scan->overflow ? &getOverflowBucket(scan->overflow) : nullptr;
+            }
+        }
+
+        // Find a bucket with a free slot.
+        Bucket* b = &buckets_[item.bi];
+        while (b->count >= kSlotsPerBucket) {
+            if (b->overflow) {
+                b = &getOverflowBucket(b->overflow);
+            } else {
+                b->overflow = allocOverflowBucket();
+                b = &getOverflowBucket(b->overflow);
+            }
+        }
+
+        b->slots[b->count] = {item.fp, item.offset};
+        b->count++;
+
+        new_entries++;
+        if (!key_exists) new_keys++;
+    }
+
+    // Phase 3: release all locks.
+    for (uint32_t bi : locked_buckets) {
+        locks_[bi].unlock();
+    }
+
+    size_.fetch_add(new_entries, std::memory_order_relaxed);
+    key_count_.fetch_add(new_keys, std::memory_order_relaxed);
+}
+
 bool WriteBuffer::get(const std::string& key,
                       std::string& value, uint64_t& version, bool& tombstone) const {
     uint64_t hash = dhtHashBytes(key.data(), key.size());

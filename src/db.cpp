@@ -383,6 +383,7 @@ Status DB::close() {
     // Compact manifest for fast recovery, then close.
     Status s5;
     if (manifest_) {
+        manifest_->set("clean_close", "1");
         s5 = manifest_->compact();
         manifest_->close();
         manifest_.reset();
@@ -406,6 +407,11 @@ Status DB::put(const std::string& key, const std::string& value,
                const WriteOptions& options) {
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
+    }
+
+    if (clean_close_persisted_) {
+        manifest_->set("clean_close", "0");
+        clean_close_persisted_ = false;
     }
 
     uint64_t version = versions_->allocateVersion();
@@ -526,6 +532,11 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
         return Status::InvalidArgument("Database not open");
     }
 
+    if (clean_close_persisted_) {
+        manifest_->set("clean_close", "0");
+        clean_close_persisted_ = false;
+    }
+
     uint64_t version = versions_->allocateVersion();
     write_buffer_->put(key, version, "", true);
 
@@ -561,16 +572,27 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
         return Status::OK();
     }
 
+    if (clean_close_persisted_) {
+        manifest_->set("clean_close", "0");
+        clean_close_persisted_ = false;
+    }
+
     // All operations in batch get the same version.
     // Hold batch_mutex_ so that a concurrent ReadBatch snapshot
     // either sees all keys or none of them.
+    // Two-phase bucket locking inside putBatch() guarantees atomicity
+    // at the WriteBuffer level.
     {
         std::lock_guard<std::mutex> lock(batch_mutex_);
         uint64_t version = versions_->allocateVersion();
+
+        std::vector<internal::WriteBuffer::BatchOp> ops;
+        ops.reserve(batch.operations().size());
         for (const auto& op : batch.operations()) {
-            bool tombstone = (op.type == WriteBatch::OpType::kDelete);
-            write_buffer_->put(op.key, version, op.value, tombstone);
+            ops.push_back({&op.key, &op.value,
+                           op.type == WriteBatch::OpType::kDelete});
         }
+        write_buffer_->putBatch(ops, version);
     }
 
     if (options.sync ||
@@ -591,13 +613,15 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
         return Status::OK();
     }
 
-    // Create implicit snapshot for consistent reads.
-    // Hold batch_mutex_ briefly to ensure no WriteBatch is mid-write.
-    uint64_t snapshot_version;
+    // Create a snapshot for consistent reads.
+    std::unique_ptr<Snapshot> snap;
     {
         std::lock_guard<std::mutex> lock(batch_mutex_);
-        snapshot_version = versions_->latestVersion();
+        Status s = createSnapshot(snap);
+        if (!s.ok()) return s;
     }
+
+    uint64_t snapshot_version = snap->version();
     batch.setSnapshotVersion(snapshot_version);
     batch.reserveResults(batch.count());
 
@@ -606,12 +630,12 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
         result.key = key;
 
         uint64_t entry_version;
-        Status s = getByVersion(key, snapshot_version, result.value, entry_version);
+        result.status = snap->get(key, result.value, entry_version, options);
         result.version = snapshot_version;
-        result.status = s;
         batch.addResult(std::move(result));
     }
 
+    releaseSnapshot(std::move(snap));
     return Status::OK();
 }
 

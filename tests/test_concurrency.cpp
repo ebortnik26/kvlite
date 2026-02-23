@@ -508,3 +508,115 @@ TEST_F(ConcurrencyTest, ReadBatchAtomicity) {
 
     EXPECT_FALSE(inconsistency_found.load());
 }
+
+// --- WriteBatch All-or-Nothing Visibility ---
+
+TEST_F(ConcurrencyTest, WriteBatchAllOrNothingViaReadBatch) {
+    // A writer thread continuously writes 3-key batches.
+    // A reader thread uses ReadBatch (snapshot-isolated) to atomically
+    // read all 3 keys and verify they share the same version.
+    const int kBatches = 500;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> violation{false};
+
+    std::thread writer([&]() {
+        for (int i = 0; i < kBatches && !violation; ++i) {
+            kvlite::WriteBatch batch;
+            std::string val = std::to_string(i);
+            batch.put("atom_k1", val);
+            batch.put("atom_k2", val);
+            batch.put("atom_k3", val);
+            EXPECT_TRUE(db_.write(batch).ok());
+        }
+        stop = true;
+    });
+
+    std::thread reader([&]() {
+        while (!stop && !violation) {
+            kvlite::ReadBatch rbatch;
+            rbatch.get("atom_k1");
+            rbatch.get("atom_k2");
+            rbatch.get("atom_k3");
+            auto s = db_.read(rbatch);
+            if (!s.ok()) continue;
+
+            const auto& results = rbatch.results();
+            if (results.size() != 3) continue;
+
+            // Before the first batch lands, all may be NotFound.
+            if (results[0].notFound() && results[1].notFound() &&
+                results[2].notFound()) continue;
+
+            // All-or-nothing: if any key is found, all must be found.
+            if (results[0].notFound() || results[1].notFound() ||
+                results[2].notFound()) {
+                violation = true;
+                break;
+            }
+
+            // All found — values must match (same batch wrote them).
+            if (results[0].value != results[1].value ||
+                results[1].value != results[2].value) {
+                violation = true;
+                break;
+            }
+        }
+    });
+
+    writer.join();
+    reader.join();
+
+    EXPECT_FALSE(violation.load()) << "Partial batch visibility detected";
+}
+
+TEST_F(ConcurrencyTest, WriteBatchSameVersionUnderConcurrency) {
+    // Multiple threads write batches concurrently.
+    // After all threads finish, verify every batch's keys share one version.
+    const int kThreads = 4;
+    const int kBatchesPerThread = 200;
+    const int kKeysPerBatch = 5;
+
+    auto writer = [&](int tid) {
+        for (int b = 0; b < kBatchesPerThread; ++b) {
+            kvlite::WriteBatch batch;
+            std::string prefix = "t" + std::to_string(tid) +
+                                 "_b" + std::to_string(b) + "_";
+            for (int k = 0; k < kKeysPerBatch; ++k) {
+                batch.put(prefix + "k" + std::to_string(k),
+                          "v" + std::to_string(k));
+            }
+            EXPECT_TRUE(db_.write(batch).ok());
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back(writer, t);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // Verify: every batch's keys share one version.
+    for (int tid = 0; tid < kThreads; ++tid) {
+        for (int b = 0; b < kBatchesPerThread; ++b) {
+            std::string prefix = "t" + std::to_string(tid) +
+                                 "_b" + std::to_string(b) + "_";
+
+            uint64_t expected_ver = 0;
+            for (int k = 0; k < kKeysPerBatch; ++k) {
+                std::string key = prefix + "k" + std::to_string(k);
+                std::string val;
+                uint64_t ver;
+                ASSERT_TRUE(db_.get(key, val, ver).ok()) << "Missing: " << key;
+                if (k == 0) {
+                    expected_ver = ver;
+                } else {
+                    EXPECT_EQ(ver, expected_ver)
+                        << "Version mismatch in batch " << prefix
+                        << " key " << k;
+                }
+            }
+        }
+    }
+}
