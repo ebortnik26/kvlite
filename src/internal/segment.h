@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "internal/crc32.h"
@@ -65,8 +66,8 @@ public:
 
     // Serialize a LogEntry (header + key + value + CRC), append to file,
     // and update the SegmentIndex.
-    Status put(const std::string& key, uint64_t version,
-               const std::string& value, bool tombstone);
+    Status put(std::string_view key, uint64_t version,
+               std::string_view value, bool tombstone);
 
     // --- Read (Readable only) ---
 

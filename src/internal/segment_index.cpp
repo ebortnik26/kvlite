@@ -38,7 +38,7 @@ SegmentIndex::~SegmentIndex() = default;
 SegmentIndex::SegmentIndex(SegmentIndex&&) noexcept = default;
 SegmentIndex& SegmentIndex::operator=(SegmentIndex&&) noexcept = default;
 
-void SegmentIndex::put(const std::string& key, uint32_t offset, uint32_t version) {
+void SegmentIndex::put(std::string_view key, uint32_t offset, uint32_t version) {
     bool is_new = !dht_.contains(key);
     dht_.addEntry(key, offset, version);
     if (is_new) {

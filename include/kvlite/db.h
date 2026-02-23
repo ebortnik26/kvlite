@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -99,9 +100,8 @@ public:
 
     DB(const DB&) = delete;
     DB& operator=(const DB&) = delete;
-
-    DB(DB&& other) noexcept;
-    DB& operator=(DB&& other) noexcept;
+    DB(DB&&) = delete;
+    DB& operator=(DB&&) = delete;
 
     // --- Lifecycle ---
 
@@ -167,6 +167,8 @@ public:
     uint64_t getOldestVersion() const;
 
 private:
+    void cleanupRetiredBuffers();
+
     std::string db_path_;
     Options options_;
     std::unique_ptr<internal::Manifest> manifest_;
@@ -174,8 +176,10 @@ private:
     std::unique_ptr<internal::GlobalIndexManager> global_index_;
     std::unique_ptr<internal::SegmentStorageManager> storage_;
     std::unique_ptr<internal::WriteBuffer> write_buffer_;
+    std::vector<std::unique_ptr<internal::WriteBuffer>> retired_buffers_;
     uint32_t current_segment_id_ = 0;
     bool is_open_ = false;
+    std::mutex batch_mutex_;  // serializes batch write vs batch read snapshot
 };
 
 }  // namespace kvlite

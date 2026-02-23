@@ -31,7 +31,13 @@ Status GlobalIndexManager::open(const std::string& db_path, const Options& optio
 
 Status GlobalIndexManager::recover() {
     std::lock_guard<std::mutex> lock(mutex_);
-    // Stub: no WAL/snapshot persistence yet.
+    std::string path = snapshotPath();
+    Status s = index_->loadSnapshot(path);
+    if (s.ok()) {
+        return Status::OK();
+    }
+    // No snapshot or corrupted — start with empty index.
+    // Caller (DB::open) will rebuild from segments if needed.
     return Status::OK();
 }
 
@@ -39,6 +45,16 @@ Status GlobalIndexManager::close() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!is_open_) {
         return Status::OK();
+    }
+    // Persist index to snapshot before closing.
+    if (index_) {
+        Status s = index_->saveSnapshot(snapshotPath());
+        if (!s.ok()) {
+            index_.reset();
+            wal_.reset();
+            is_open_ = false;
+            return s;
+        }
     }
     index_.reset();
     wal_.reset();

@@ -6,6 +6,8 @@
 #include <shared_mutex>
 #include <string>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "internal/segment.h"
@@ -64,6 +66,11 @@ public:
     size_t segmentCount() const;
     uint64_t totalDataSize() const;
 
+    // --- Segment Pinning ---
+
+    void pinSegment(uint32_t id);
+    void unpinSegment(uint32_t id);
+
     // --- Segment Factory ---
 
     // Allocate a monotonically increasing segment ID.
@@ -83,6 +90,8 @@ private:
 
     mutable std::shared_mutex mutex_;
     std::map<uint32_t, Segment> segments_;
+    std::unordered_map<uint32_t, uint32_t> pin_counts_;
+    std::unordered_set<uint32_t> deferred_removals_;
 };
 
 }  // namespace internal

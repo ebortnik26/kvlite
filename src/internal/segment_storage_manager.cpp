@@ -111,16 +111,25 @@ Status SegmentStorageManager::createSegment(uint32_t id) {
 }
 
 Status SegmentStorageManager::removeSegment(uint32_t id) {
-    std::string path = segmentPath(id);
-
     std::unique_lock lock(mutex_);
+
+    // If pinned, defer removal.
+    auto pc = pin_counts_.find(id);
+    if (pc != pin_counts_.end() && pc->second > 0) {
+        deferred_removals_.insert(id);
+        return Status::OK();
+    }
+
+    // Proceed with actual removal.
     auto it = segments_.find(id);
     if (it != segments_.end()) {
         it->second.close();
         segments_.erase(it);
     }
+    deferred_removals_.erase(id);
     lock.unlock();
 
+    std::string path = segmentPath(id);
     manifest_.remove(std::string(kSegmentPrefix) + std::to_string(id));
 
     std::error_code ec;
@@ -129,6 +138,24 @@ Status SegmentStorageManager::removeSegment(uint32_t id) {
         return Status::IOError("Failed to delete segment file: " + ec.message());
     }
     return Status::OK();
+}
+
+void SegmentStorageManager::pinSegment(uint32_t id) {
+    std::unique_lock lock(mutex_);
+    pin_counts_[id]++;
+}
+
+void SegmentStorageManager::unpinSegment(uint32_t id) {
+    std::unique_lock lock(mutex_);
+    auto it = pin_counts_.find(id);
+    if (it == pin_counts_.end()) return;
+    if (--it->second == 0) {
+        pin_counts_.erase(it);
+        if (deferred_removals_.count(id)) {
+            lock.unlock();
+            removeSegment(id);
+        }
+    }
 }
 
 Segment* SegmentStorageManager::getSegment(uint32_t id) {

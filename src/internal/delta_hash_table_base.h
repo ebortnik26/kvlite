@@ -6,6 +6,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "internal/bit_stream.h"
@@ -84,7 +85,7 @@ protected:
 
     // --- Hash decomposition ---
 
-    uint64_t hashKey(const std::string& key) const {
+    uint64_t hashKey(std::string_view key) const {
         return dhtHashBytes(key.data(), key.size());
     }
 

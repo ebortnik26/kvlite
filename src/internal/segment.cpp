@@ -114,8 +114,8 @@ Status Segment::close() {
 
 // --- Write ---
 
-Status Segment::put(const std::string& key, uint64_t version,
-                    const std::string& value, bool tombstone) {
+Status Segment::put(std::string_view key, uint64_t version,
+                    std::string_view value, bool tombstone) {
     if (state_ != State::kWriting) {
         return Status::InvalidArgument("Segment: put requires Writing state");
     }

@@ -1,10 +1,12 @@
 #include "kvlite/db.h"
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 
 #include "internal/manifest.h"
 #include "internal/version_manager.h"
+#include "internal/global_index.h"
 #include "internal/global_index_manager.h"
 #include "internal/segment_storage_manager.h"
 #include "internal/write_buffer.h"
@@ -88,6 +90,8 @@ public:
         : db_(db),
           owned_snapshot_(std::move(owned_snapshot)),
           snapshot_(owned_snapshot_.get()) {
+        pinned_wb_ = db_->write_buffer_.get();
+        pinned_wb_->pin();
         init();
     }
 
@@ -95,18 +99,27 @@ public:
     Impl(DB* db, const Snapshot* borrowed_snapshot)
         : db_(db),
           snapshot_(borrowed_snapshot) {
+        pinned_wb_ = db_->write_buffer_.get();
+        pinned_wb_->pin();
         init();
     }
 
-    ~Impl() = default;
+    ~Impl() {
+        merged_.reset();
+        for (uint32_t id : pinned_segment_ids_) {
+            db_->storage_->unpinSegment(id);
+        }
+        pinned_wb_->unpin();
+        db_->cleanupRetiredBuffers();
+    }
 
     Status next(std::string& key, std::string& value, uint64_t& version) {
         if (!valid_) {
             return Status::NotFound("Iterator exhausted");
         }
 
-        key = current_key_;
-        value = current_value_;
+        key = std::move(current_key_);
+        value = std::move(current_value_);
         version = current_version_;
 
         findNextValid();
@@ -120,13 +133,21 @@ private:
         auto segment_ids = db_->storage_->getSegmentIds();
         uint64_t snap_ver = snapshot_->version();
 
-        // Create a scanLatestConsistent stream per segment.
-        // Pre-computes visibility at construction — immune to concurrent mutations.
         std::vector<std::unique_ptr<internal::EntryStream>> streams;
-        streams.reserve(segment_ids.size());
+
+        // Write buffer stream (captures in-memory entries at snapshot).
+        auto wb_stream = internal::stream::scanWriteBuffer(
+            *pinned_wb_, snap_ver);
+        if (wb_stream->valid()) {
+            streams.push_back(std::move(wb_stream));
+        }
+
+        // Per-segment streams. Pre-computes visibility at construction.
         for (uint32_t id : segment_ids) {
             auto* seg = db_->storage_->getSegment(id);
             if (!seg) continue;
+            db_->storage_->pinSegment(id);
+            pinned_segment_ids_.push_back(id);
             streams.push_back(internal::stream::scanLatestConsistent(
                 db_->global_index_->index(), id, snap_ver,
                 seg->logFile(), seg->dataSize()));
@@ -137,22 +158,37 @@ private:
     }
 
     void findNextValid() {
+        // MergeStream yields entries in (hash asc, version asc) order.
+        // For the same hash, advance to the last entry (highest version = latest).
+        // If the latest is a tombstone, skip the key.
+        //
+        // Zero-copy strategy: skip intermediate entries without reading
+        // key/value. Only assign from the final entry per hash.
         while (merged_->valid()) {
-            const auto& le = merged_->entry().log_entry;
+            uint64_t hash = merged_->entry().hash;
 
-            // Skip tombstones.
-            if (!le.tombstone()) {
-                current_key_ = le.key;
-                current_value_ = le.value;
-                current_version_ = le.version();
-                valid_ = true;
+            // Peek ahead: if the next entry has the same hash, skip this one.
+            // We want to find the last entry for this hash (latest version).
+            while (true) {
+                // Capture the current (possibly last) entry via string_view.
+                const auto& e = merged_->entry();
+                current_key_.assign(e.key.data(), e.key.size());
+                current_value_.assign(e.value.data(), e.value.size());
+                current_version_ = e.version;
+                bool tombstone = e.tombstone;
 
-                // Advance past this entry for the next call.
                 merged_->next();
-                return;
-            }
 
-            merged_->next();
+                if (!merged_->valid() || merged_->entry().hash != hash) {
+                    // This was the last entry for this hash.
+                    if (!tombstone) {
+                        valid_ = true;
+                        return;
+                    }
+                    break;  // Tombstone — skip this key, continue outer loop.
+                }
+                // More entries with the same hash — loop to overwrite with the next one.
+            }
         }
         valid_ = false;
     }
@@ -160,6 +196,9 @@ private:
     DB* db_;
     std::unique_ptr<Snapshot> owned_snapshot_;  // non-null when iterator owns its snapshot
     const Snapshot* snapshot_;                  // always valid — points to owned or borrowed
+
+    internal::WriteBuffer* pinned_wb_ = nullptr;
+    std::vector<uint32_t> pinned_segment_ids_;
 
     std::unique_ptr<internal::EntryStream> merged_;
 
@@ -197,8 +236,6 @@ DB::~DB() {
     }
 }
 
-DB::DB(DB&& other) noexcept = default;
-DB& DB::operator=(DB&& other) noexcept = default;
 
 Status DB::open(const std::string& path, const Options& options) {
     if (is_open_) {
@@ -284,6 +321,22 @@ Status DB::open(const std::string& path, const Options& options) {
         manifest_->close();
         manifest_.reset();
         return s;
+    }
+
+    // Rebuild GlobalIndex from recovered segments.
+    {
+        auto segment_ids = storage_->getSegmentIds();
+        for (uint32_t id : segment_ids) {
+            auto* seg = storage_->getSegment(id);
+            if (!seg) continue;
+            seg->index().forEach([&](uint32_t offset, uint32_t version) {
+                internal::LogEntry entry;
+                Status rs = seg->readEntry(offset, entry);
+                if (rs.ok()) {
+                    global_index_->index().put(entry.key, entry.version(), id);
+                }
+            });
+        }
     }
 
     // Initialize write buffer and allocate first segment ID
@@ -508,12 +561,16 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
         return Status::OK();
     }
 
-    // All operations in batch get the same version
-    uint64_t version = versions_->allocateVersion();
-
-    for (const auto& op : batch.operations()) {
-        bool tombstone = (op.type == WriteBatch::OpType::kDelete);
-        write_buffer_->put(op.key, version, op.value, tombstone);
+    // All operations in batch get the same version.
+    // Hold batch_mutex_ so that a concurrent ReadBatch snapshot
+    // either sees all keys or none of them.
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex_);
+        uint64_t version = versions_->allocateVersion();
+        for (const auto& op : batch.operations()) {
+            bool tombstone = (op.type == WriteBatch::OpType::kDelete);
+            write_buffer_->put(op.key, version, op.value, tombstone);
+        }
     }
 
     if (options.sync ||
@@ -534,8 +591,13 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
         return Status::OK();
     }
 
-    // Create implicit snapshot for consistent reads
-    uint64_t snapshot_version = versions_->latestVersion();
+    // Create implicit snapshot for consistent reads.
+    // Hold batch_mutex_ briefly to ensure no WriteBatch is mid-write.
+    uint64_t snapshot_version;
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex_);
+        snapshot_version = versions_->latestVersion();
+    }
     batch.setSnapshotVersion(snapshot_version);
     batch.reserveResults(batch.count());
 
@@ -580,12 +642,8 @@ Status DB::createIterator(std::unique_ptr<Iterator>& iterator) {
         return Status::InvalidArgument("Database not open");
     }
 
-    // Flush write buffer so the iterator can see all entries.
-    Status s = flush();
-    if (!s.ok()) return s;
-
     std::unique_ptr<Snapshot> snap;
-    s = createSnapshot(snap);
+    Status s = createSnapshot(snap);
     if (!s.ok()) {
         return s;
     }
@@ -599,10 +657,6 @@ Status DB::createIterator(const Snapshot& snapshot, std::unique_ptr<Iterator>& i
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
-
-    // Flush write buffer so the iterator can see all entries.
-    Status s = flush();
-    if (!s.ok()) return s;
 
     if (!snapshot.isValid()) {
         return Status::InvalidArgument("Snapshot is invalid");
@@ -634,7 +688,26 @@ Status DB::flush() {
     }
 
     current_segment_id_ = storage_->allocateSegmentId();
+
+    // Clear or retire the write buffer.
+    if (write_buffer_->pinCount() == 0) {
+        write_buffer_->clear();
+    } else {
+        // Iterators are pinning this buffer — retire it and allocate a fresh one.
+        retired_buffers_.push_back(std::move(write_buffer_));
+        write_buffer_ = std::make_unique<internal::WriteBuffer>();
+    }
+
     return Status::OK();
+}
+
+void DB::cleanupRetiredBuffers() {
+    retired_buffers_.erase(
+        std::remove_if(retired_buffers_.begin(), retired_buffers_.end(),
+                        [](const std::unique_ptr<internal::WriteBuffer>& wb) {
+                            return wb->pinCount() == 0;
+                        }),
+        retired_buffers_.end());
 }
 
 // --- Statistics ---

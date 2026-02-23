@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <string>
 
 #include "internal/crc32.h"
 #include "internal/delta_hash_table_base.h"
 #include "internal/global_index.h"
+#include "internal/log_entry.h"
 #include "internal/log_file.h"
 #include "internal/segment_index.h"
+#include "internal/write_buffer.h"
 
 namespace kvlite {
 namespace internal {
@@ -171,37 +174,32 @@ private:
         bool tombstone = (key_len_raw & LogEntry::kTombstoneBit) != 0;
         uint32_t kl = key_len_raw & ~LogEntry::kTombstoneBit;
 
-        // Read full entry for CRC validation.
+        // Read full entry for CRC validation into persistent buf_.
         size_t entry_size = LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
-        uint8_t stack_buf[4096];
-        std::unique_ptr<uint8_t[]> heap_buf;
-        uint8_t* buf = stack_buf;
-        if (entry_size > sizeof(stack_buf)) {
-            heap_buf = std::make_unique<uint8_t[]>(entry_size);
-            buf = heap_buf.get();
-        }
+        buf_.resize(entry_size);
 
-        s = log_file_.readAt(file_offset_, buf, entry_size);
+        s = log_file_.readAt(file_offset_, buf_.data(), entry_size);
         if (!s.ok()) { valid_ = false; return s; }
 
         // Validate CRC.
         size_t payload_len = LogEntry::kHeaderSize + kl + vl;
         uint32_t stored_crc;
-        std::memcpy(&stored_crc, buf + payload_len, 4);
-        uint32_t computed_crc = crc32(buf, payload_len);
+        std::memcpy(&stored_crc, buf_.data() + payload_len, 4);
+        uint32_t computed_crc = crc32(buf_.data(), payload_len);
         if (stored_crc != computed_crc) {
             valid_ = false;
             return Status::Corruption("ScanStream: CRC mismatch at offset " +
                                       std::to_string(file_offset_));
         }
 
-        LogEntry le;
-        le.pv = PackedVersion(version, tombstone);
-        le.key.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize), kl);
-        le.value.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize + kl), vl);
+        const char* key_ptr = reinterpret_cast<const char*>(buf_.data() + LogEntry::kHeaderSize);
+        const char* val_ptr = key_ptr + kl;
 
-        current_.hash = dhtHashBytes(le.key.data(), le.key.size());
-        current_.log_entry = std::move(le);
+        current_.hash = dhtHashBytes(key_ptr, kl);
+        current_.key = std::string_view(key_ptr, kl);
+        current_.value = std::string_view(val_ptr, vl);
+        current_.version = version;
+        current_.tombstone = tombstone;
         valid_ = true;
 
         file_offset_ += entry_size;
@@ -211,6 +209,7 @@ private:
     const LogFile& log_file_;
     uint64_t data_size_;
     uint64_t file_offset_ = 0;
+    std::vector<uint8_t> buf_;  // persistent buffer — string_views point into it
     Entry current_;
     bool valid_ = false;
 };
@@ -292,7 +291,7 @@ private:
         bool operator()(EntryStream* a, EntryStream* b) const {
             if (a->entry().hash != b->entry().hash)
                 return a->entry().hash > b->entry().hash;
-            return a->entry().log_entry.version() > b->entry().log_entry.version();
+            return a->entry().version > b->entry().version;
         }
     };
 
@@ -330,7 +329,7 @@ std::unique_ptr<EntryStream> scanVisible(
         [vs = std::move(visible_set)](const EntryStream::Entry& e) -> bool {
             auto it = vs.find(e.hash);
             if (it == vs.end()) return false;
-            uint32_t v = static_cast<uint32_t>(e.log_entry.version());
+            uint32_t v = static_cast<uint32_t>(e.version);
             return it->second.count(v) > 0;
         });
 }
@@ -343,13 +342,14 @@ std::unique_ptr<EntryStream> scanLatest(
     return filter(
         scan(lf, data_size),
         [&gi, segment_id, snapshot_version](const EntryStream::Entry& e) -> bool {
-            if (e.log_entry.version() > snapshot_version) {
+            if (e.version > snapshot_version) {
                 return false;
             }
+            std::string key_str(e.key);
             uint64_t gi_version;
             uint32_t gi_segment_id;
-            if (gi.get(e.log_entry.key, snapshot_version, gi_version, gi_segment_id)) {
-                return gi_segment_id == segment_id && gi_version == e.log_entry.version();
+            if (gi.get(key_str, snapshot_version, gi_version, gi_segment_id)) {
+                return gi_segment_id == segment_id && gi_version == e.version;
             }
             return false;
         });
@@ -367,8 +367,13 @@ std::unique_ptr<EntryStream> scanLatestConsistent(
         [ls = std::move(latest_set)](const EntryStream::Entry& e) -> bool {
             auto it = ls.find(e.hash);
             if (it == ls.end()) return false;
-            return it->second == static_cast<uint32_t>(e.log_entry.version());
+            return it->second == static_cast<uint32_t>(e.version);
         });
+}
+
+std::unique_ptr<EntryStream> scanWriteBuffer(
+    const WriteBuffer& wb, uint64_t snapshot_version) {
+    return wb.createStream(snapshot_version);
 }
 
 }  // namespace stream

@@ -78,6 +78,8 @@ add_executable(kvlite_segment_index_test
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/entry_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_storage_manager.cpp
@@ -235,8 +237,36 @@ target_link_libraries(kvlite_sm_test
         pthread
 )
 
+# EntryStream tests
+add_executable(kvlite_entry_stream_test
+    test_entry_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/entry_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_lslot_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_delta_hash_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
+    ${CMAKE_SOURCE_DIR}/src/status.cpp
+)
+
+target_include_directories(kvlite_entry_stream_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_entry_stream_test
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
 # Register tests with CTest
 include(GoogleTest)
+gtest_discover_tests(kvlite_entry_stream_test)
 gtest_discover_tests(kvlite_sm_test)
 gtest_discover_tests(kvlite_test)
 gtest_discover_tests(kvlite_bitstream_test)

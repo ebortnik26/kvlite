@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "kvlite/status.h"
@@ -33,7 +34,7 @@ public:
     SegmentIndex& operator=(SegmentIndex&&) noexcept;
 
     // Append (offset, version) to key's list.
-    void put(const std::string& key, uint32_t offset, uint32_t version);
+    void put(std::string_view key, uint32_t offset, uint32_t version);
 
     // Get all (offset, version) pairs for a key. Returns false if key doesn't exist.
     // Pairs are ordered latest-first (highest offset first).

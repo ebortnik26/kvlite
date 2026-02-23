@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "internal/delta_hash_table_base.h"
@@ -39,29 +40,29 @@ public:
     SegmentDeltaHashTable& operator=(SegmentDeltaHashTable&&) noexcept;
 
     // Add an (offset, version) pair for a key's fingerprint.
-    void addEntry(const std::string& key, uint32_t offset, uint32_t version);
+    void addEntry(std::string_view key, uint32_t offset, uint32_t version);
 
     // Add by pre-computed hash (for snapshot loading).
     void addEntryByHash(uint64_t hash, uint32_t offset, uint32_t version);
 
     // Find all (offset, version) pairs for a key. Returns true if key exists.
     // Pairs are ordered by offset desc (highest/latest first).
-    bool findAll(const std::string& key,
+    bool findAll(std::string_view key,
                  std::vector<uint32_t>& offsets,
                  std::vector<uint32_t>& versions) const;
 
     // Find the first (highest offset) entry. Returns true if found.
-    bool findFirst(const std::string& key,
+    bool findFirst(std::string_view key,
                    uint32_t& offset, uint32_t& version) const;
 
-    bool contains(const std::string& key) const;
+    bool contains(std::string_view key) const;
 
     // Remove all entries for a key. Returns number of entries removed.
-    size_t removeAll(const std::string& key);
+    size_t removeAll(std::string_view key);
 
     // Remove entries where the second field (version) matches value.
     // Returns number of entries removed.
-    size_t removeBySecond(const std::string& key, uint32_t value);
+    size_t removeBySecond(std::string_view key, uint32_t value);
 
     // Iterate over all entries.
     void forEach(const std::function<void(uint64_t hash,

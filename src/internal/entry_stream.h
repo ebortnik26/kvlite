@@ -6,10 +6,10 @@
 #include <memory>
 #include <queue>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
-#include "internal/log_entry.h"
 #include "kvlite/status.h"
 
 namespace kvlite {
@@ -18,6 +18,7 @@ namespace internal {
 class GlobalIndex;
 class LogFile;
 class SegmentIndex;
+class WriteBuffer;
 
 // Abstract base for composable entry streams.
 //
@@ -27,7 +28,10 @@ class EntryStream {
 public:
     struct Entry {
         uint64_t hash;
-        LogEntry log_entry;
+        std::string_view key;
+        std::string_view value;
+        uint64_t version;
+        bool tombstone;
     };
 
     virtual ~EntryStream() = default;
@@ -83,6 +87,12 @@ std::unique_ptr<EntryStream> scanLatestConsistent(
     const GlobalIndex& gi, uint32_t segment_id,
     uint64_t snapshot_version,
     const LogFile& lf, uint64_t data_size);
+
+// Stream entries from an in-memory WriteBuffer, filtered to snapshot_version.
+// Thread-safe: locks each bucket during collection. Returns entries sorted
+// by (hash asc, version asc), deduplicated per key (latest version <= snapshot).
+std::unique_ptr<EntryStream> scanWriteBuffer(
+    const WriteBuffer& wb, uint64_t snapshot_version);
 
 }  // namespace stream
 

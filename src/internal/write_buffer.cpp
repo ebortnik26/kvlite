@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <unordered_map>
 
+#include "internal/entry_stream.h"
 #include "internal/global_index.h"
 #include "internal/segment.h"
 
@@ -286,6 +287,146 @@ void WriteBuffer::clear() {
     freeOverflow();
     size_.store(0, std::memory_order_relaxed);
     key_count_.store(0, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// WriteBufferStream — EntryStream backed by compact offset records
+// into WriteBuffer::data_
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class WriteBufferStream : public EntryStream {
+public:
+    struct Record {
+        uint64_t hash;
+        uint32_t offset;   // into WriteBuffer::data_
+        uint16_t key_len;
+        uint32_t val_len;
+        uint64_t version;
+        bool tombstone;
+    };
+
+    WriteBufferStream(const uint8_t* data, std::vector<Record> records)
+        : data_(data), records_(std::move(records)) {
+        if (!records_.empty()) {
+            materialize();
+        }
+    }
+
+    bool valid() const override { return idx_ < records_.size(); }
+    const Entry& entry() const override { return current_; }
+
+    Status next() override {
+        if (idx_ < records_.size()) {
+            ++idx_;
+            if (idx_ < records_.size()) {
+                materialize();
+            }
+        }
+        return Status::OK();
+    }
+
+private:
+    void materialize() {
+        const auto& r = records_[idx_];
+        const char* key_ptr = reinterpret_cast<const char*>(
+            data_ + r.offset + 14);  // kRecordHeaderSize = 14
+        const char* val_ptr = key_ptr + r.key_len;
+
+        current_.hash = r.hash;
+        current_.key = std::string_view(key_ptr, r.key_len);
+        current_.value = std::string_view(val_ptr, r.val_len);
+        current_.version = r.version;
+        current_.tombstone = r.tombstone;
+    }
+
+    const uint8_t* data_;
+    std::vector<Record> records_;
+    size_t idx_ = 0;
+    Entry current_;
+};
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// WriteBuffer::createStream
+// ---------------------------------------------------------------------------
+
+std::unique_ptr<EntryStream> WriteBuffer::createStream(uint64_t snapshot_version) const {
+    std::vector<WriteBufferStream::Record> all;
+
+    for (uint32_t bi = 0; bi < kNumBuckets; ++bi) {
+        locks_[bi].lock();
+
+        const Bucket* b = &buckets_[bi];
+        while (b) {
+            for (uint32_t i = 0; i < b->count; ++i) {
+                uint32_t off = b->slots[i].offset;
+                PackedVersion pv = readPackedVersion(off);
+                if (pv.version() > snapshot_version) continue;
+
+                const uint8_t* p = data_.get() + off;
+                uint16_t kl;
+                uint32_t vl;
+                std::memcpy(&kl, p, 2);
+                std::memcpy(&vl, p + 2, 4);
+
+                uint64_t h = dhtHashBytes(p + kRecordHeaderSize, kl);
+
+                all.push_back({h, off, kl, vl,
+                               pv.version(), pv.tombstone()});
+            }
+            b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
+        }
+
+        locks_[bi].unlock();
+    }
+
+    const uint8_t* data_ptr = data_.get();
+
+    // Deduplicate: keep only the latest version per key (by hash+key bytes).
+    // Sort by (hash, key bytes, version desc) to group duplicates together.
+    std::sort(all.begin(), all.end(),
+              [data_ptr](const WriteBufferStream::Record& a,
+                         const WriteBufferStream::Record& b) {
+                  if (a.hash != b.hash) return a.hash < b.hash;
+                  // Compare key bytes directly in data_
+                  const uint8_t* ka = data_ptr + a.offset + 14;
+                  const uint8_t* kb = data_ptr + b.offset + 14;
+                  uint16_t min_len = a.key_len < b.key_len ? a.key_len : b.key_len;
+                  int cmp = std::memcmp(ka, kb, min_len);
+                  if (cmp != 0) return cmp < 0;
+                  if (a.key_len != b.key_len) return a.key_len < b.key_len;
+                  return a.version > b.version;  // desc for dedup
+              });
+
+    // Build output: one record per key (first in each group = latest).
+    std::vector<WriteBufferStream::Record> deduped;
+    for (size_t i = 0; i < all.size(); ) {
+        deduped.push_back(all[i]);
+
+        // Skip remaining entries with same hash+key.
+        uint64_t h = all[i].hash;
+        const uint8_t* key_i = data_ptr + all[i].offset + 14;
+        uint16_t kl_i = all[i].key_len;
+        ++i;
+        while (i < all.size() && all[i].hash == h &&
+               all[i].key_len == kl_i &&
+               std::memcmp(data_ptr + all[i].offset + 14, key_i, kl_i) == 0) {
+            ++i;
+        }
+    }
+
+    // Re-sort into merge order: (hash asc, version asc).
+    std::sort(deduped.begin(), deduped.end(),
+              [](const WriteBufferStream::Record& a,
+                 const WriteBufferStream::Record& b) {
+                  if (a.hash != b.hash) return a.hash < b.hash;
+                  return a.version < b.version;
+              });
+
+    return std::make_unique<WriteBufferStream>(data_ptr, std::move(deduped));
 }
 
 Status WriteBuffer::flush(Segment& out, uint32_t segment_id,

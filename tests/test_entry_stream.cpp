@@ -14,6 +14,7 @@
 #include "internal/entry_stream.h"
 #include "internal/segment.h"
 #include "internal/segment_index.h"
+#include "internal/write_buffer.h"
 
 using namespace kvlite::internal;
 using kvlite::Status;
@@ -91,9 +92,9 @@ TEST_F(EntryStreamTest, ScanVisible_SingleEntry) {
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().log_entry.key, "key1");
-    EXPECT_EQ(s->entry().log_entry.value, "val1");
-    EXPECT_EQ(s->entry().log_entry.version(), 10u);
+    EXPECT_EQ(s->entry().key, "key1");
+    EXPECT_EQ(s->entry().value, "val1");
+    EXPECT_EQ(s->entry().version, 10u);
 
     ASSERT_TRUE(s->next().ok());
     EXPECT_FALSE(s->valid());
@@ -139,11 +140,11 @@ TEST_F(EntryStreamTest, ScanVisible_MultipleKeys) {
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().log_entry.key, keyA);
+    EXPECT_EQ(s->entry().key, keyA);
 
     ASSERT_TRUE(s->next().ok());
     ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().log_entry.key, keyB);
+    EXPECT_EQ(s->entry().key, keyB);
 
     ASSERT_TRUE(s->next().ok());
     EXPECT_FALSE(s->valid());
@@ -161,8 +162,8 @@ TEST_F(EntryStreamTest, ScanVisible_TombstonePassThrough) {
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().log_entry.key, "key1");
-    EXPECT_TRUE(s->entry().log_entry.tombstone());
+    EXPECT_EQ(s->entry().key, "key1");
+    EXPECT_TRUE(s->entry().tombstone);
 
     ASSERT_TRUE(s->next().ok());
     EXPECT_FALSE(s->valid());
@@ -184,7 +185,7 @@ TEST_F(EntryStreamTest, ScanLatest_SingleSegment) {
     ASSERT_TRUE(s->valid());
     std::vector<std::string> keys;
     while (s->valid()) {
-        keys.push_back(s->entry().log_entry.key);
+        keys.push_back(std::string(s->entry().key));
         ASSERT_TRUE(s->next().ok());
     }
     EXPECT_EQ(keys.size(), 2u);
@@ -214,9 +215,9 @@ TEST_F(EntryStreamTest, ScanLatest_MultiSegmentDedup) {
         seg2.logFile(), seg2.dataSize());
 
     ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().log_entry.key, "key1");
-    EXPECT_EQ(s->entry().log_entry.value, "new");
-    EXPECT_EQ(s->entry().log_entry.version(), 2u);
+    EXPECT_EQ(s->entry().key, "key1");
+    EXPECT_EQ(s->entry().value, "new");
+    EXPECT_EQ(s->entry().version, 2u);
 
     ASSERT_TRUE(s->next().ok());
     EXPECT_FALSE(s->valid());
@@ -234,8 +235,8 @@ TEST_F(EntryStreamTest, ScanLatest_SnapshotBound) {
         seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().log_entry.key, "key1");
-    EXPECT_EQ(s->entry().log_entry.version(), 1u);
+    EXPECT_EQ(s->entry().key, "key1");
+    EXPECT_EQ(s->entry().version, 1u);
 
     ASSERT_TRUE(s->next().ok());
     EXPECT_FALSE(s->valid());
@@ -257,7 +258,7 @@ TEST_F(EntryStreamTest, ScanLatestConsistent_SingleSegment) {
     ASSERT_TRUE(s->valid());
     std::vector<std::string> keys;
     while (s->valid()) {
-        keys.push_back(s->entry().log_entry.key);
+        keys.push_back(std::string(s->entry().key));
         ASSERT_TRUE(s->next().ok());
     }
     EXPECT_EQ(keys.size(), 2u);
@@ -289,8 +290,8 @@ TEST_F(EntryStreamTest, ScanLatestConsistent_SnapshotBound) {
         seg.logFile(), seg.dataSize());
 
     ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().log_entry.key, "key1");
-    EXPECT_EQ(s->entry().log_entry.version(), 1u);
+    EXPECT_EQ(s->entry().key, "key1");
+    EXPECT_EQ(s->entry().version, 1u);
 
     ASSERT_TRUE(s->next().ok());
     EXPECT_FALSE(s->valid());
@@ -441,7 +442,7 @@ TEST_F(EntryStreamTest, Merge_TwoStreamsDisjointKeys) {
 
     std::vector<std::string> keys;
     while (merged->valid()) {
-        keys.push_back(merged->entry().log_entry.key);
+        keys.push_back(std::string(merged->entry().key));
         ASSERT_TRUE(merged->next().ok());
     }
     EXPECT_EQ(keys.size(), 2u);
@@ -461,7 +462,7 @@ TEST_F(EntryStreamTest, Merge_TwoStreamsSameKey) {
 
     std::vector<std::string> keys;
     while (merged->valid()) {
-        keys.push_back(merged->entry().log_entry.key);
+        keys.push_back(std::string(merged->entry().key));
         ASSERT_TRUE(merged->next().ok());
     }
     EXPECT_EQ(keys.size(), 1u);
@@ -496,12 +497,12 @@ TEST_F(EntryStreamTest, Merge_OrderVerification) {
     auto merged = stream::merge(std::move(streams));
 
     ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->entry().log_entry.key, keyA);
+    EXPECT_EQ(merged->entry().key, keyA);
     uint64_t first_hash = merged->entry().hash;
 
     ASSERT_TRUE(merged->next().ok());
     ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->entry().log_entry.key, keyB);
+    EXPECT_EQ(merged->entry().key, keyB);
     uint64_t second_hash = merged->entry().hash;
 
     EXPECT_LT(first_hash, second_hash);
@@ -524,12 +525,12 @@ TEST_F(EntryStreamTest, Filter_Custom) {
     auto s = stream::filter(
         stream::scan(seg.logFile(), seg.dataSize()),
         [](const EntryStream::Entry& e) {
-            return e.log_entry.version() > 1;
+            return e.version > 1;
         });
 
     size_t count = 0;
     while (s->valid()) {
-        EXPECT_GT(s->entry().log_entry.version(), 1u);
+        EXPECT_GT(s->entry().version, 1u);
         count++;
         ASSERT_TRUE(s->next().ok());
     }
@@ -700,4 +701,134 @@ TEST_F(EntryStreamTest, ConcurrentIterate_ScanVisibleWithPuts) {
 
     // scanVisible captured the visible set at construction — all 3 entries visible.
     EXPECT_EQ(count, 3u);
+}
+
+// --- ScanWriteBuffer Tests ---
+
+TEST(ScanWriteBufferTest, Basic) {
+    WriteBuffer wb;
+    wb.put("key1", 1, "val1", false);
+    wb.put("key2", 2, "val2", false);
+
+    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/2);
+
+    std::vector<std::string> keys;
+    while (s->valid()) {
+        keys.push_back(std::string(s->entry().key));
+        EXPECT_FALSE(s->entry().tombstone);
+        ASSERT_TRUE(s->next().ok());
+    }
+    EXPECT_EQ(keys.size(), 2u);
+}
+
+TEST(ScanWriteBufferTest, SnapshotBound) {
+    WriteBuffer wb;
+    wb.put("key1", 1, "val1", false);
+    wb.put("key2", 5, "val2", false);
+    wb.put("key3", 10, "val3", false);
+
+    // Only entries with version <= 5 should be included.
+    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/5);
+
+    std::vector<std::string> keys;
+    while (s->valid()) {
+        EXPECT_LE(s->entry().version, 5u);
+        keys.push_back(std::string(s->entry().key));
+        ASSERT_TRUE(s->next().ok());
+    }
+    EXPECT_EQ(keys.size(), 2u);
+}
+
+TEST(ScanWriteBufferTest, LatestPerKey) {
+    WriteBuffer wb;
+    wb.put("key1", 1, "v1", false);
+    wb.put("key1", 3, "v3", false);
+    wb.put("key1", 5, "v5", false);
+
+    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/5);
+
+    ASSERT_TRUE(s->valid());
+    EXPECT_EQ(s->entry().key, "key1");
+    EXPECT_EQ(s->entry().value, "v5");
+    EXPECT_EQ(s->entry().version, 5u);
+
+    ASSERT_TRUE(s->next().ok());
+    EXPECT_FALSE(s->valid());
+}
+
+TEST(ScanWriteBufferTest, LatestPerKeyWithSnapshotBound) {
+    WriteBuffer wb;
+    wb.put("key1", 1, "v1", false);
+    wb.put("key1", 3, "v3", false);
+    wb.put("key1", 5, "v5", false);
+
+    // Only versions <= 3 visible.
+    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/3);
+
+    ASSERT_TRUE(s->valid());
+    EXPECT_EQ(s->entry().key, "key1");
+    EXPECT_EQ(s->entry().value, "v3");
+    EXPECT_EQ(s->entry().version, 3u);
+
+    ASSERT_TRUE(s->next().ok());
+    EXPECT_FALSE(s->valid());
+}
+
+TEST(ScanWriteBufferTest, Empty) {
+    WriteBuffer wb;
+
+    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/100);
+    EXPECT_FALSE(s->valid());
+}
+
+TEST(ScanWriteBufferTest, Tombstone) {
+    WriteBuffer wb;
+    wb.put("key1", 1, "val1", false);
+    wb.put("key1", 2, "", true);  // tombstone
+
+    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/2);
+
+    ASSERT_TRUE(s->valid());
+    EXPECT_EQ(s->entry().key, "key1");
+    EXPECT_TRUE(s->entry().tombstone);
+
+    ASSERT_TRUE(s->next().ok());
+    EXPECT_FALSE(s->valid());
+}
+
+TEST(ScanWriteBufferTest, SortedByHash) {
+    WriteBuffer wb;
+    // Insert multiple keys; stream should yield them in hash order.
+    wb.put("alpha", 1, "A", false);
+    wb.put("beta", 2, "B", false);
+    wb.put("gamma", 3, "G", false);
+
+    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/3);
+
+    uint64_t prev_hash = 0;
+    size_t count = 0;
+    while (s->valid()) {
+        EXPECT_GE(s->entry().hash, prev_hash);
+        prev_hash = s->entry().hash;
+        count++;
+        ASSERT_TRUE(s->next().ok());
+    }
+    EXPECT_EQ(count, 3u);
+}
+
+// --- WriteBuffer Pin/Unpin Tests ---
+
+TEST(WriteBufferPinTest, PinUnpin) {
+    WriteBuffer wb;
+    wb.put("key1", 1, "val1", false);
+
+    EXPECT_EQ(wb.pinCount(), 0u);
+    wb.pin();
+    EXPECT_EQ(wb.pinCount(), 1u);
+    wb.pin();
+    EXPECT_EQ(wb.pinCount(), 2u);
+    wb.unpin();
+    EXPECT_EQ(wb.pinCount(), 1u);
+    wb.unpin();
+    EXPECT_EQ(wb.pinCount(), 0u);
 }

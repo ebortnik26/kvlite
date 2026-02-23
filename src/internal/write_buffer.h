@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "internal/delta_hash_table_base.h"
+#include "internal/entry_stream.h"
 #include "log_entry.h"
 #include "kvlite/status.h"
 
@@ -69,6 +70,18 @@ public:
     // flushed key in the GlobalIndex under segment_id.
     Status flush(Segment& out, uint32_t segment_id,
                  GlobalIndex& global_index);
+
+    // Create a stream of entries visible at snapshot_version.
+    // Thread-safe: locks each bucket during collection.
+    // Returns entries sorted by (hash asc, version asc), deduplicated
+    // per key (only the latest version <= snapshot_version).
+    std::unique_ptr<EntryStream> createStream(uint64_t snapshot_version) const;
+
+    void pin() { pin_count_.fetch_add(1, std::memory_order_relaxed); }
+    void unpin() { pin_count_.fetch_sub(1, std::memory_order_release); }
+    uint32_t pinCount() const { return pin_count_.load(std::memory_order_acquire); }
+
+    const uint8_t* dataPtr() const { return data_.get(); }
 
     size_t keyCount() const { return key_count_.load(std::memory_order_relaxed); }
     size_t entryCount() const { return size_.load(std::memory_order_relaxed); }
@@ -133,6 +146,7 @@ private:
     // --- Stats ---
     std::atomic<size_t> size_{0};
     std::atomic<size_t> key_count_{0};
+    std::atomic<uint32_t> pin_count_{0};
 
     // --- Helpers ---
 

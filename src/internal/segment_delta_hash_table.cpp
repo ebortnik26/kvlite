@@ -17,7 +17,7 @@ SegmentDeltaHashTable& SegmentDeltaHashTable::operator=(SegmentDeltaHashTable&&)
 
 // --- Find ---
 
-bool SegmentDeltaHashTable::findAll(const std::string& key,
+bool SegmentDeltaHashTable::findAll(std::string_view key,
                                 std::vector<uint32_t>& offsets,
                                 std::vector<uint32_t>& versions) const {
     uint64_t h = hashKey(key);
@@ -35,7 +35,7 @@ bool SegmentDeltaHashTable::findAll(const std::string& key,
     return !offsets.empty();
 }
 
-bool SegmentDeltaHashTable::findFirst(const std::string& key,
+bool SegmentDeltaHashTable::findFirst(std::string_view key,
                                   uint32_t& offset, uint32_t& version) const {
     uint64_t h = hashKey(key);
     uint32_t bi = bucketIndex(h);
@@ -63,14 +63,14 @@ bool SegmentDeltaHashTable::findFirst(const std::string& key,
     return false;
 }
 
-bool SegmentDeltaHashTable::contains(const std::string& key) const {
+bool SegmentDeltaHashTable::contains(std::string_view key) const {
     uint32_t off, ver;
     return findFirst(key, off, ver);
 }
 
 // --- Remove ---
 
-size_t SegmentDeltaHashTable::removeAll(const std::string& key) {
+size_t SegmentDeltaHashTable::removeAll(std::string_view key) {
     uint64_t h = hashKey(key);
     uint32_t bi = bucketIndex(h);
     uint32_t li = lslotIndex(h);
@@ -104,7 +104,7 @@ size_t SegmentDeltaHashTable::removeAll(const std::string& key) {
     return total_removed;
 }
 
-size_t SegmentDeltaHashTable::removeBySecond(const std::string& key, uint32_t value) {
+size_t SegmentDeltaHashTable::removeBySecond(std::string_view key, uint32_t value) {
     uint64_t h = hashKey(key);
     uint32_t bi = bucketIndex(h);
     uint32_t li = lslotIndex(h);
@@ -151,7 +151,7 @@ size_t SegmentDeltaHashTable::removeBySecond(const std::string& key, uint32_t va
 
 // --- Add ---
 
-void SegmentDeltaHashTable::addEntry(const std::string& key,
+void SegmentDeltaHashTable::addEntry(std::string_view key,
                                  uint32_t offset, uint32_t version) {
     uint64_t h = hashKey(key);
     uint32_t bi = bucketIndex(h);

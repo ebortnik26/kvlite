@@ -12,6 +12,7 @@
 #include "internal/segment_index.h"
 #include "internal/global_index.h"
 #include "internal/gc.h"
+#include "internal/entry_stream.h"
 #include "internal/log_file.h"
 #include "internal/segment.h"
 #include "internal/delta_hash_table_base.h"
@@ -563,9 +564,9 @@ TEST_F(SegmentIndexSerializationTest, BadMagic) {
     EXPECT_TRUE(s.isCorruption());
 }
 
-// --- VisibleVersionIterator Tests ---
+// --- EntryStream scanVisible Tests ---
 
-class VisibleVersionIteratorTest : public ::testing::Test {
+class SnapshotVisibilityFilterTest : public ::testing::Test {
 protected:
     void SetUp() override {
         base_ = "/tmp/vvi_test_" + std::to_string(getpid()) + "_";
@@ -606,7 +607,7 @@ protected:
 };
 
 // 1 key, 1 version, snapshot covers it → yields 1 entry with correct key/value.
-TEST_F(VisibleVersionIteratorTest, IteratorAllVisible) {
+TEST_F(SnapshotVisibilityFilterTest, IteratorAllVisible) {
     size_t idx = createSegment(1, {{"key1", 10, "val1", false}});
     auto& seg = segments_[idx];
 
@@ -614,21 +615,21 @@ TEST_F(VisibleVersionIteratorTest, IteratorAllVisible) {
     si.put("key1", 0, 10);
 
     std::vector<uint64_t> snapshots = {10};
-    auto iter = GC::getVisibleVersions(
+    auto iter = stream::scanVisible(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
-    ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.key, "key1");
-    EXPECT_EQ(iter.entry().log_entry.value, "val1");
-    EXPECT_EQ(iter.entry().log_entry.version(), 10u);
-    EXPECT_FALSE(iter.entry().log_entry.tombstone());
+    ASSERT_TRUE(iter->valid());
+    EXPECT_EQ(iter->entry().key, "key1");
+    EXPECT_EQ(iter->entry().value, "val1");
+    EXPECT_EQ(iter->entry().version, 10u);
+    EXPECT_FALSE(iter->entry().tombstone);
 
-    ASSERT_TRUE(iter.next().ok());
-    EXPECT_FALSE(iter.valid());
+    ASSERT_TRUE(iter->next().ok());
+    EXPECT_FALSE(iter->valid());
 }
 
 // key v1(seg1), v2(seg2). Only current snapshot at v2 → seg1 yields 0.
-TEST_F(VisibleVersionIteratorTest, IteratorSuperseded) {
+TEST_F(SnapshotVisibilityFilterTest, IteratorSuperseded) {
     size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
     createSegment(2, {{"key1", 2, "val2", false}});
     auto& seg = segments_[idx];
@@ -637,14 +638,14 @@ TEST_F(VisibleVersionIteratorTest, IteratorSuperseded) {
     si.put("key1", 0, 1);
 
     std::vector<uint64_t> snapshots = {2};
-    auto iter = GC::getVisibleVersions(
+    auto iter = stream::scanVisible(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
-    EXPECT_FALSE(iter.valid());
+    EXPECT_FALSE(iter->valid());
 }
 
 // key v1(seg1), v2(seg2). Snapshot at v1 → seg1 yields v1.
-TEST_F(VisibleVersionIteratorTest, IteratorSnapshotPins) {
+TEST_F(SnapshotVisibilityFilterTest, IteratorSnapshotPins) {
     size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
     createSegment(2, {{"key1", 2, "val2", false}});
     auto& seg = segments_[idx];
@@ -653,20 +654,20 @@ TEST_F(VisibleVersionIteratorTest, IteratorSnapshotPins) {
     si.put("key1", 0, 1);
 
     std::vector<uint64_t> snapshots = {1, 2};
-    auto iter = GC::getVisibleVersions(
+    auto iter = stream::scanVisible(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
-    ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.key, "key1");
-    EXPECT_EQ(iter.entry().log_entry.version(), 1u);
+    ASSERT_TRUE(iter->valid());
+    EXPECT_EQ(iter->entry().key, "key1");
+    EXPECT_EQ(iter->entry().version, 1u);
 
-    ASSERT_TRUE(iter.next().ok());
-    EXPECT_FALSE(iter.valid());
+    ASSERT_TRUE(iter->next().ok());
+    EXPECT_FALSE(iter->valid());
 }
 
 // key v1,v3 in seg1, v5 in seg2. Snapshots pin both v1 and v3.
 // File order is (hash asc, version asc), so yields v1 then v3.
-TEST_F(VisibleVersionIteratorTest, IteratorMultipleVersionsDesc) {
+TEST_F(SnapshotVisibilityFilterTest, IteratorMultipleVersionsDesc) {
     // Segment::put writes entries in call order; we write v1, v3
     // so file order = v1, v3 (version asc for same hash).
     size_t idx = createSegment(1, {
@@ -684,24 +685,24 @@ TEST_F(VisibleVersionIteratorTest, IteratorMultipleVersionsDesc) {
     // snap=4 → latest <= 4 is v3(seg1) → pinned
     // snap=5 → latest <= 5 is v5(seg2) → not in seg1
     std::vector<uint64_t> snapshots = {2, 4, 5};
-    auto iter = GC::getVisibleVersions(
+    auto iter = stream::scanVisible(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
-    ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.version(), 1u);
-    EXPECT_EQ(iter.entry().log_entry.value, "val1");
+    ASSERT_TRUE(iter->valid());
+    EXPECT_EQ(iter->entry().version, 1u);
+    EXPECT_EQ(iter->entry().value, "val1");
 
-    ASSERT_TRUE(iter.next().ok());
-    ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.version(), 3u);
-    EXPECT_EQ(iter.entry().log_entry.value, "val3");
+    ASSERT_TRUE(iter->next().ok());
+    ASSERT_TRUE(iter->valid());
+    EXPECT_EQ(iter->entry().version, 3u);
+    EXPECT_EQ(iter->entry().value, "val3");
 
-    ASSERT_TRUE(iter.next().ok());
-    EXPECT_FALSE(iter.valid());
+    ASSERT_TRUE(iter->next().ok());
+    EXPECT_FALSE(iter->valid());
 }
 
 // Multiple keys: verifies hash-asc then version-asc order.
-TEST_F(VisibleVersionIteratorTest, IteratorMultipleKeys) {
+TEST_F(SnapshotVisibilityFilterTest, IteratorMultipleKeys) {
     // We need two keys with known hash ordering. Write them
     // in hash-ascending order to the segment.
     std::string keyA = "key1";
@@ -733,35 +734,35 @@ TEST_F(VisibleVersionIteratorTest, IteratorMultipleKeys) {
 
     // Snapshots pin all versions.
     std::vector<uint64_t> snapshots = {1, 2, 3, 4};
-    auto iter = GC::getVisibleVersions(
+    auto iter = stream::scanVisible(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
     // Expect: keyA v1, keyA v2, keyB v3, keyB v4
-    ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.key, keyA);
-    EXPECT_EQ(iter.entry().log_entry.version(), 1u);
+    ASSERT_TRUE(iter->valid());
+    EXPECT_EQ(iter->entry().key, keyA);
+    EXPECT_EQ(iter->entry().version, 1u);
 
-    ASSERT_TRUE(iter.next().ok());
-    ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.key, keyA);
-    EXPECT_EQ(iter.entry().log_entry.version(), 2u);
+    ASSERT_TRUE(iter->next().ok());
+    ASSERT_TRUE(iter->valid());
+    EXPECT_EQ(iter->entry().key, keyA);
+    EXPECT_EQ(iter->entry().version, 2u);
 
-    ASSERT_TRUE(iter.next().ok());
-    ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.key, keyB);
-    EXPECT_EQ(iter.entry().log_entry.version(), 3u);
+    ASSERT_TRUE(iter->next().ok());
+    ASSERT_TRUE(iter->valid());
+    EXPECT_EQ(iter->entry().key, keyB);
+    EXPECT_EQ(iter->entry().version, 3u);
 
-    ASSERT_TRUE(iter.next().ok());
-    ASSERT_TRUE(iter.valid());
-    EXPECT_EQ(iter.entry().log_entry.key, keyB);
-    EXPECT_EQ(iter.entry().log_entry.version(), 4u);
+    ASSERT_TRUE(iter->next().ok());
+    ASSERT_TRUE(iter->valid());
+    EXPECT_EQ(iter->entry().key, keyB);
+    EXPECT_EQ(iter->entry().version, 4u);
 
-    ASSERT_TRUE(iter.next().ok());
-    EXPECT_FALSE(iter.valid());
+    ASSERT_TRUE(iter->next().ok());
+    EXPECT_FALSE(iter->valid());
 }
 
 // No visible entries → valid() false immediately.
-TEST_F(VisibleVersionIteratorTest, IteratorEmpty) {
+TEST_F(SnapshotVisibilityFilterTest, IteratorEmpty) {
     size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
     createSegment(2, {{"key1", 2, "val2", false}});
     auto& seg = segments_[idx];
@@ -769,12 +770,12 @@ TEST_F(VisibleVersionIteratorTest, IteratorEmpty) {
     SegmentIndex si;
     si.put("key1", 0, 1);
 
-    // Only snapshot at v2 → latest is v2(seg2), nothing visible in seg1.
+    // Only snapshot at v2 -> latest is v2(seg2), nothing visible in seg1.
     std::vector<uint64_t> snapshots = {2};
-    auto iter = GC::getVisibleVersions(
+    auto iter = stream::scanVisible(
         gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
 
-    EXPECT_FALSE(iter.valid());
+    EXPECT_FALSE(iter->valid());
 }
 
 // --- GC Merge Tests ---
