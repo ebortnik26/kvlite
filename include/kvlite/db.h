@@ -152,10 +152,6 @@ public:
     Status createIterator(std::unique_ptr<Iterator>& iterator);
     Status createIterator(const Snapshot& snapshot, std::unique_ptr<Iterator>& iterator);
 
-    // --- Maintenance ---
-
-    Status flush();
-
     // --- Statistics ---
 
     Status getStats(DBStats& stats) const;
@@ -167,6 +163,7 @@ public:
     uint64_t getOldestVersion() const;
 
 private:
+    Status flush();
     void cleanupRetiredBuffers();
 
     std::string db_path_;
@@ -179,6 +176,7 @@ private:
     std::vector<std::unique_ptr<internal::WriteBuffer>> retired_buffers_;
     uint32_t current_segment_id_ = 0;
     bool is_open_ = false;
+    bool clean_close_persisted_ = true;
     std::mutex batch_mutex_;  // serializes batch write vs batch read snapshot
 };
 

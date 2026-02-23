@@ -1,7 +1,8 @@
-// DB tests: buffer-first reads, auto-flush, explicit flush, stats, getByVersion,
+// DB tests: buffer-first reads, auto-flush, sync writes, stats, getByVersion,
 //           remove with buffer, batch operations, snapshots, iterators.
 #include <gtest/gtest.h>
 #include <kvlite/kvlite.h>
+#include "internal/manifest.h"
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -28,6 +29,13 @@ protected:
     kvlite::Status openDB(kvlite::Options opts = {}) {
         opts.create_if_missing = true;
         return db_.open(test_dir_.string(), opts);
+    }
+
+    // Helper: sync write option forces flush after the write.
+    static kvlite::WriteOptions syncOpts() {
+        kvlite::WriteOptions w;
+        w.sync = true;
+        return w;
     }
 
     fs::path test_dir_;
@@ -81,13 +89,12 @@ TEST_F(DBTest, GetWithVersionFromBuffer) {
     EXPECT_GT(ver, 0u);
 }
 
-// ── Explicit flush ──────────────────────────────────────────────────────────
+// ── Sync write forces flush ─────────────────────────────────────────────────
 
-TEST_F(DBTest, ExplicitFlushMovesDataToSegment) {
+TEST_F(DBTest, SyncWriteMovesDataToSegment) {
     ASSERT_TRUE(openDB().ok());
 
-    ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
 
     // Data should still be readable after flush (now from segment)
     std::string val;
@@ -95,17 +102,22 @@ TEST_F(DBTest, ExplicitFlushMovesDataToSegment) {
     EXPECT_EQ(val, "v1");
 }
 
-TEST_F(DBTest, FlushEmptyBufferIsNoOp) {
+TEST_F(DBTest, SyncWriteForcesFlush) {
     ASSERT_TRUE(openDB().ok());
-    ASSERT_TRUE(db_.flush().ok());  // should succeed with no data
+
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
+
+    // After sync write, data should be in a segment
+    kvlite::DBStats stats;
+    ASSERT_TRUE(db_.getStats(stats).ok());
+    EXPECT_GE(stats.num_log_files, 1u);
 }
 
 TEST_F(DBTest, FlushThenPutThenGet) {
     ASSERT_TRUE(openDB().ok());
 
     // First batch -> segment
-    ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
 
     // Second batch -> buffer
     ASSERT_TRUE(db_.put("k2", "v2").ok());
@@ -122,8 +134,7 @@ TEST_F(DBTest, FlushThenPutThenGet) {
 TEST_F(DBTest, OverwriteAcrossFlush) {
     ASSERT_TRUE(openDB().ok());
 
-    ASSERT_TRUE(db_.put("k1", "old").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k1", "old", syncOpts()).ok());
 
     // Overwrite in new buffer
     ASSERT_TRUE(db_.put("k1", "new").ok());
@@ -161,22 +172,6 @@ TEST_F(DBTest, AutoFlushTriggersOnLargeWrite) {
     }
 }
 
-// ── Sync write ──────────────────────────────────────────────────────────────
-
-TEST_F(DBTest, SyncWriteForcesFlush) {
-    ASSERT_TRUE(openDB().ok());
-
-    kvlite::WriteOptions wopts;
-    wopts.sync = true;
-
-    ASSERT_TRUE(db_.put("k1", "v1", wopts).ok());
-
-    // After sync write, data should be in a segment
-    kvlite::DBStats stats;
-    ASSERT_TRUE(db_.getStats(stats).ok());
-    EXPECT_GE(stats.num_log_files, 1u);
-}
-
 // ── getByVersion ────────────────────────────────────────────────────────────
 
 TEST_F(DBTest, GetByVersionFromBuffer) {
@@ -200,10 +195,9 @@ TEST_F(DBTest, GetByVersionFromSegment) {
 
     ASSERT_TRUE(db_.put("k1", "v1").ok());
     uint64_t ver1 = db_.getLatestVersion();
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k1", "v1_flush", syncOpts()).ok());
 
-    ASSERT_TRUE(db_.put("k1", "v2").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k1", "v2", syncOpts()).ok());
 
     // upper_bound is inclusive (version <= upper_bound)
     std::string val;
@@ -218,8 +212,7 @@ TEST_F(DBTest, RemoveInBufferThenFlush) {
     ASSERT_TRUE(openDB().ok());
 
     ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.remove("k1").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.remove("k1", syncOpts()).ok());
 
     std::string val;
     EXPECT_TRUE(db_.get("k1", val).isNotFound());
@@ -228,8 +221,7 @@ TEST_F(DBTest, RemoveInBufferThenFlush) {
 TEST_F(DBTest, RemoveAfterFlush) {
     ASSERT_TRUE(openDB().ok());
 
-    ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
 
     ASSERT_TRUE(db_.remove("k1").ok());
 
@@ -263,8 +255,7 @@ TEST_F(DBTest, WriteBatchThenFlush) {
     kvlite::WriteBatch batch;
     batch.put("k1", "v1");
     batch.put("k2", "v2");
-    ASSERT_TRUE(db_.write(batch).ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.write(batch, syncOpts()).ok());
 
     std::string val;
     ASSERT_TRUE(db_.get("k1", val).ok());
@@ -277,8 +268,7 @@ TEST_F(DBTest, ReadBatch) {
     ASSERT_TRUE(openDB().ok());
 
     ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.put("k2", "v2").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k2", "v2", syncOpts()).ok());
     ASSERT_TRUE(db_.put("k3", "v3").ok());  // in buffer
 
     kvlite::ReadBatch rbatch;
@@ -304,8 +294,7 @@ TEST_F(DBTest, ReadBatch) {
 TEST_F(DBTest, StatsAfterFlush) {
     ASSERT_TRUE(openDB().ok());
 
-    ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
 
     kvlite::DBStats stats;
     ASSERT_TRUE(db_.getStats(stats).ok());
@@ -317,10 +306,8 @@ TEST_F(DBTest, StatsAfterFlush) {
 TEST_F(DBTest, StatsMultipleSegments) {
     ASSERT_TRUE(openDB().ok());
 
-    ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.flush().ok());
-    ASSERT_TRUE(db_.put("k2", "v2").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
+    ASSERT_TRUE(db_.put("k2", "v2", syncOpts()).ok());
 
     kvlite::DBStats stats;
     ASSERT_TRUE(db_.getStats(stats).ok());
@@ -374,8 +361,7 @@ TEST_F(DBTest, CloseFlushesBuffer) {
 TEST_F(DBTest, SnapshotReadsExistingData) {
     ASSERT_TRUE(openDB().ok());
 
-    ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
 
     std::unique_ptr<kvlite::DB::Snapshot> snap;
     ASSERT_TRUE(db_.createSnapshot(snap).ok());
@@ -393,8 +379,7 @@ TEST_F(DBTest, SnapshotReadsMultipleKeys) {
     ASSERT_TRUE(openDB().ok());
 
     ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.put("k2", "v2").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k2", "v2", syncOpts()).ok());
 
     std::unique_ptr<kvlite::DB::Snapshot> snap;
     ASSERT_TRUE(db_.createSnapshot(snap).ok());
@@ -419,8 +404,7 @@ TEST_F(DBTest, IteratorOverFlushedData) {
 
     ASSERT_TRUE(db_.put("a", "1").ok());
     ASSERT_TRUE(db_.put("b", "2").ok());
-    ASSERT_TRUE(db_.put("c", "3").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("c", "3", syncOpts()).ok());
 
     std::unique_ptr<kvlite::DB::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
@@ -441,16 +425,13 @@ TEST_F(DBTest, MultiSegmentGetWorks) {
     ASSERT_TRUE(openDB().ok());
 
     // Put to segment 1
-    ASSERT_TRUE(db_.put("a", "1").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("a", "1", syncOpts()).ok());
 
     // Put to segment 2
-    ASSERT_TRUE(db_.put("b", "2").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("b", "2", syncOpts()).ok());
 
     // Put to segment 3
-    ASSERT_TRUE(db_.put("c", "3").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("c", "3", syncOpts()).ok());
 
     kvlite::DBStats stats;
     ASSERT_TRUE(db_.getStats(stats).ok());
@@ -470,8 +451,7 @@ TEST_F(DBTest, IteratorSnapshotVersion) {
     ASSERT_TRUE(openDB().ok());
 
     ASSERT_TRUE(db_.put("a", "1").ok());
-    ASSERT_TRUE(db_.put("b", "2").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("b", "2", syncOpts()).ok());
 
     std::unique_ptr<kvlite::DB::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
@@ -491,7 +471,6 @@ TEST_F(DBTest, OperationsOnClosedDBFail) {
     EXPECT_FALSE(db_.put("k", "v").ok());
     EXPECT_FALSE(db_.get("k", val).ok());
     EXPECT_FALSE(db_.remove("k").ok());
-    EXPECT_FALSE(db_.flush().ok());
 }
 
 TEST_F(DBTest, DoubleOpenFails) {
@@ -504,11 +483,10 @@ TEST_F(DBTest, DoubleOpenFails) {
 // ── Recovery ────────────────────────────────────────────────────────────────
 
 TEST_F(DBTest, RecoverAfterFlush) {
-    // Open, put, flush, close.
+    // Open, put with sync (flush), close.
     ASSERT_TRUE(openDB().ok());
     ASSERT_TRUE(db_.put("k1", "v1").ok());
-    ASSERT_TRUE(db_.put("k2", "v2").ok());
-    ASSERT_TRUE(db_.flush().ok());
+    ASSERT_TRUE(db_.put("k2", "v2", syncOpts()).ok());
     ASSERT_TRUE(db_.put("k3", "v3").ok());
     // close() flushes the write buffer, so k3 will be in a segment too.
     ASSERT_TRUE(db_.close().ok());
@@ -528,8 +506,7 @@ TEST_F(DBTest, RecoverMultipleFlushes) {
     ASSERT_TRUE(openDB().ok());
     for (int i = 0; i < 5; ++i) {
         ASSERT_TRUE(db_.put("key" + std::to_string(i),
-                            "val" + std::to_string(i)).ok());
-        ASSERT_TRUE(db_.flush().ok());
+                            "val" + std::to_string(i), syncOpts()).ok());
     }
     ASSERT_TRUE(db_.close().ok());
 
@@ -539,5 +516,47 @@ TEST_F(DBTest, RecoverMultipleFlushes) {
         std::string val;
         ASSERT_TRUE(db_.get("key" + std::to_string(i), val).ok());
         EXPECT_EQ(val, "val" + std::to_string(i));
+    }
+}
+
+// ── Clean close flag ────────────────────────────────────────────────────────
+
+TEST_F(DBTest, CleanCloseFlag) {
+    ASSERT_TRUE(openDB().ok());
+
+    // Before any mutation, clean_close should be absent or "1" (from prior close).
+    {
+        kvlite::internal::Manifest m;
+        ASSERT_TRUE(m.open(test_dir_.string()).ok());
+        std::string val;
+        // Fresh DB: flag absent is fine; if present it should be "1".
+        if (m.get("clean_close", val)) {
+            EXPECT_EQ(val, "1");
+        }
+        m.close();
+    }
+
+    // First mutation should set clean_close=0.
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
+
+    {
+        kvlite::internal::Manifest m;
+        ASSERT_TRUE(m.open(test_dir_.string()).ok());
+        std::string val;
+        ASSERT_TRUE(m.get("clean_close", val));
+        EXPECT_EQ(val, "0");
+        m.close();
+    }
+
+    // Close should set clean_close=1.
+    ASSERT_TRUE(db_.close().ok());
+
+    {
+        kvlite::internal::Manifest m;
+        ASSERT_TRUE(m.open(test_dir_.string()).ok());
+        std::string val;
+        ASSERT_TRUE(m.get("clean_close", val));
+        EXPECT_EQ(val, "1");
+        m.close();
     }
 }
