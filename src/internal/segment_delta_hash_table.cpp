@@ -47,9 +47,13 @@ bool SegmentDeltaHashTable::findFirst(const std::string& key,
         LSlotContents contents = decodeLSlot(*bucket, li);
 
         for (const auto& entry : contents.entries) {
-            if (entry.fingerprint == fp && !entry.offsets.empty()) {
-                offset = entry.offsets[0];
-                version = entry.versions[0];
+            if (entry.fingerprint == fp && !entry.versions.empty()) {
+                // Return the entry with the highest version.
+                auto max_it = std::max_element(entry.versions.begin(),
+                                               entry.versions.end());
+                size_t idx = max_it - entry.versions.begin();
+                offset = entry.offsets[idx];
+                version = entry.versions[idx];
                 return true;
             }
         }

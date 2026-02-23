@@ -46,7 +46,7 @@ public:
     bool get(const std::string& key, uint64_t upper_bound,
              uint64_t& offset, uint64_t& version) const;
 
-    // Get the latest (highest offset) entry for a key.
+    // Get the latest (highest version) entry for a key.
     // Returns false if key doesn't exist.
     bool getLatest(const std::string& key,
                    uint32_t& offset, uint32_t& version) const;
