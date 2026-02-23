@@ -1,0 +1,92 @@
+#ifndef KVLITE_INTERNAL_ENTRY_STREAM_H
+#define KVLITE_INTERNAL_ENTRY_STREAM_H
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <queue>
+#include <set>
+#include <unordered_map>
+#include <vector>
+
+#include "internal/log_entry.h"
+#include "kvlite/status.h"
+
+namespace kvlite {
+namespace internal {
+
+class GlobalIndex;
+class LogFile;
+class SegmentIndex;
+
+// Abstract base for composable entry streams.
+//
+// All operators (Scan, Filter, Merge) implement this interface.
+// Streams yield entries in (hash asc, version asc) order.
+class EntryStream {
+public:
+    struct Entry {
+        uint64_t hash;
+        LogEntry log_entry;
+    };
+
+    virtual ~EntryStream() = default;
+    virtual bool valid() const = 0;
+    virtual const Entry& entry() const = 0;
+    virtual Status next() = 0;
+};
+
+// Compute the set of (hash -> {versions}) visible in a segment, given the
+// GlobalIndex state and active snapshot versions.
+std::unordered_map<uint64_t, std::set<uint32_t>> computeVisibleSet(
+    const GlobalIndex& global_index,
+    const SegmentIndex& segment_index,
+    uint32_t segment_id,
+    const std::vector<uint64_t>& snapshot_versions);
+
+// Compute the set of (hash -> version) that are the latest at snapshot_version
+// and live in segment_id. Only one version per hash (the latest <= snapshot).
+std::unordered_map<uint64_t, uint32_t> computeLatestSet(
+    const GlobalIndex& global_index,
+    uint32_t segment_id,
+    uint64_t snapshot_version);
+
+using Predicate = std::function<bool(const EntryStream::Entry&)>;
+
+namespace stream {
+
+// Scan ALL entries from a LogFile's data region. No filtering.
+std::unique_ptr<EntryStream> scan(const LogFile& lf, uint64_t data_size);
+
+// Wrap any EntryStream, yielding only entries matching the predicate.
+std::unique_ptr<EntryStream> filter(std::unique_ptr<EntryStream> input, Predicate pred);
+
+// K-way merge over N EntryStreams in (hash asc, version asc) order.
+std::unique_ptr<EntryStream> merge(std::vector<std::unique_ptr<EntryStream>> inputs);
+
+// Convenience: scan + visibility filter for GC.
+std::unique_ptr<EntryStream> scanVisible(
+    const GlobalIndex& gi, const SegmentIndex& si,
+    uint32_t segment_id, const std::vector<uint64_t>& snapshot_versions,
+    const LogFile& lf, uint64_t data_size);
+
+// Convenience: scan + latest-version filter for DB iteration (non-atomic).
+// Checks GlobalIndex per entry during iteration — concurrent mutations visible.
+std::unique_ptr<EntryStream> scanLatest(
+    const GlobalIndex& gi, uint32_t segment_id,
+    uint64_t snapshot_version,
+    const LogFile& lf, uint64_t data_size);
+
+// Convenience: scan + snapshot-consistent latest-version filter.
+// Precomputes visibility set at construction — immune to concurrent mutations.
+std::unique_ptr<EntryStream> scanLatestConsistent(
+    const GlobalIndex& gi, uint32_t segment_id,
+    uint64_t snapshot_version,
+    const LogFile& lf, uint64_t data_size);
+
+}  // namespace stream
+
+}  // namespace internal
+}  // namespace kvlite
+
+#endif  // KVLITE_INTERNAL_ENTRY_STREAM_H

@@ -1,6 +1,7 @@
 #include "kvlite/db.h"
 
-#include <algorithm>
+#include <memory>
+#include <vector>
 
 #include "internal/manifest.h"
 #include "internal/version_manager.h"
@@ -10,6 +11,7 @@
 #include "internal/log_entry.h"
 #include "internal/segment.h"
 #include "internal/segment_index.h"
+#include "internal/entry_stream.h"
 
 namespace kvlite {
 
@@ -107,7 +109,7 @@ public:
         value = current_value_;
         version = current_version_;
 
-        advanceAndFindNext();
+        findNextValid();
         return Status::OK();
     }
 
@@ -115,136 +117,51 @@ public:
 
 private:
     void init() {
-        // Get segment IDs sorted ascending (oldest to newest)
-        file_ids_ = db_->storage_->getSegmentIds();
-        // Reverse to iterate newest to oldest
-        std::reverse(file_ids_.begin(), file_ids_.end());
-
-        if (!file_ids_.empty()) {
-            current_file_idx_ = 0;
-            loadCurrentFile();
-            findNextValid();
-        }
-    }
-
-    void loadCurrentFile() {
-        if (current_file_idx_ >= file_ids_.size()) {
-            current_seg_index_ = nullptr;
-            seg_index_entries_.clear();
-            seg_index_entry_idx_ = 0;
-            return;
-        }
-
-        current_file_id_ = file_ids_[current_file_idx_];
-        auto* seg = db_->storage_->getSegment(current_file_id_);
-        current_seg_index_ = seg ? &seg->index() : nullptr;
-
+        auto segment_ids = db_->storage_->getSegmentIds();
         uint64_t snap_ver = snapshot_->version();
 
-        // Collect all entries from this SegmentIndex
-        seg_index_entries_.clear();
-        if (current_seg_index_) {
-            current_seg_index_->forEach([this, snap_ver](uint32_t offset, uint32_t version) {
-                // Only consider entries within our snapshot
-                if (version <= snap_ver) {
-                    SegIndexEntry e;
-                    e.version = version;
-                    e.offset = offset;
-                    seg_index_entries_.push_back(std::move(e));
-                }
-            });
+        // Create a scanLatestConsistent stream per segment.
+        // Pre-computes visibility at construction — immune to concurrent mutations.
+        std::vector<std::unique_ptr<internal::EntryStream>> streams;
+        streams.reserve(segment_ids.size());
+        for (uint32_t id : segment_ids) {
+            auto* seg = db_->storage_->getSegment(id);
+            if (!seg) continue;
+            streams.push_back(internal::stream::scanLatestConsistent(
+                db_->global_index_->index(), id, snap_ver,
+                seg->logFile(), seg->dataSize()));
         }
-        seg_index_entry_idx_ = 0;
-    }
 
-    void advanceAndFindNext() {
-        seg_index_entry_idx_++;
+        merged_ = internal::stream::merge(std::move(streams));
         findNextValid();
     }
 
     void findNextValid() {
-        while (true) {
-            // Move to next file if needed
-            while (seg_index_entry_idx_ >= seg_index_entries_.size()) {
-                current_file_idx_++;
-                if (current_file_idx_ >= file_ids_.size()) {
-                    valid_ = false;
-                    return;
-                }
-                loadCurrentFile();
+        while (merged_->valid()) {
+            const auto& le = merged_->entry().log_entry;
+
+            // Skip tombstones.
+            if (!le.tombstone()) {
+                current_key_ = le.key;
+                current_value_ = le.value;
+                current_version_ = le.version();
+                valid_ = true;
+
+                // Advance past this entry for the next call.
+                merged_->next();
+                return;
             }
 
-            const auto& entry = seg_index_entries_[seg_index_entry_idx_];
-
-            // Read the log entry to get key and value
-            auto* seg = db_->storage_->getSegment(current_file_id_);
-            if (!seg) {
-                seg_index_entry_idx_++;
-                continue;
-            }
-
-            internal::LogEntry log_entry;
-            Status s = seg->readEntry(entry.offset, log_entry);
-            if (!s.ok()) {
-                seg_index_entry_idx_++;
-                continue;
-            }
-
-            // Skip if we've already returned this key
-            if (seen_keys_.count(log_entry.key)) {
-                seg_index_entry_idx_++;
-                continue;
-            }
-
-            // Check GlobalIndex: is this file the latest for this key?
-            uint64_t latest_ver;
-            uint32_t latest_fid;
-            if (!db_->global_index_->getLatest(log_entry.key, latest_ver, latest_fid).ok()) {
-                seg_index_entry_idx_++;
-                continue;
-            }
-
-            if (latest_fid != current_file_id_) {
-                // This file is not the latest for this key, skip
-                seg_index_entry_idx_++;
-                continue;
-            }
-
-            // Skip tombstones
-            if (log_entry.tombstone()) {
-                seen_keys_.insert(log_entry.key);
-                seg_index_entry_idx_++;
-                continue;
-            }
-
-            // Found a valid entry
-            seen_keys_.insert(log_entry.key);
-            current_key_ = std::move(log_entry.key);
-            current_value_ = std::move(log_entry.value);
-            current_version_ = log_entry.version();
-            valid_ = true;
-            return;
+            merged_->next();
         }
+        valid_ = false;
     }
-
-    struct SegIndexEntry {
-        uint32_t version;
-        uint32_t offset;
-    };
 
     DB* db_;
     std::unique_ptr<Snapshot> owned_snapshot_;  // non-null when iterator owns its snapshot
     const Snapshot* snapshot_;                  // always valid — points to owned or borrowed
 
-    std::vector<uint32_t> file_ids_;
-    size_t current_file_idx_ = 0;
-    uint32_t current_file_id_ = 0;
-    const internal::SegmentIndex* current_seg_index_ = nullptr;
-
-    std::vector<SegIndexEntry> seg_index_entries_;
-    size_t seg_index_entry_idx_ = 0;
-
-    std::set<std::string> seen_keys_;
+    std::unique_ptr<internal::EntryStream> merged_;
 
     bool valid_ = false;
     std::string current_key_;
@@ -663,8 +580,12 @@ Status DB::createIterator(std::unique_ptr<Iterator>& iterator) {
         return Status::InvalidArgument("Database not open");
     }
 
+    // Flush write buffer so the iterator can see all entries.
+    Status s = flush();
+    if (!s.ok()) return s;
+
     std::unique_ptr<Snapshot> snap;
-    Status s = createSnapshot(snap);
+    s = createSnapshot(snap);
     if (!s.ok()) {
         return s;
     }
@@ -678,6 +599,10 @@ Status DB::createIterator(const Snapshot& snapshot, std::unique_ptr<Iterator>& i
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
+
+    // Flush write buffer so the iterator can see all entries.
+    Status s = flush();
+    if (!s.ok()) return s;
 
     if (!snapshot.isValid()) {
         return Status::InvalidArgument("Snapshot is invalid");
