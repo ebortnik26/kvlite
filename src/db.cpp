@@ -52,7 +52,7 @@ Status DB::Snapshot::get(const std::string& key, std::string& value,
     if (!db_) {
         return Status::InvalidArgument("Snapshot is invalid");
     }
-    return db_->getByVersion(key, version_ + 1, value, entry_version, options);
+    return db_->getByVersion(key, version_, value, entry_version, options);
 }
 
 Status DB::Snapshot::exists(const std::string& key, bool& exists,
@@ -637,7 +637,9 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
         ReadResult result;
         result.key = key;
 
-        Status s = getByVersion(key, snapshot_version + 1, result.value, result.version);
+        uint64_t entry_version;
+        Status s = getByVersion(key, snapshot_version, result.value, entry_version);
+        result.version = snapshot_version;
         result.status = s;
         batch.addResult(std::move(result));
     }

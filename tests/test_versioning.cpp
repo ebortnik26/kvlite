@@ -79,19 +79,23 @@ TEST_F(VersioningTest, GetByVersionBasic) {
     uint64_t ver3;
     ASSERT_TRUE(db_.get("key", tmp, ver3).ok());
 
-    // Get value at different versions
+    // getByVersion(key, V) returns biggest version <= V.
     std::string value;
 
-    // Version < ver2 should return v1
-    ASSERT_TRUE(db_.getByVersion("key", ver2, value).ok());
+    // Version <= ver1 returns v1
+    ASSERT_TRUE(db_.getByVersion("key", ver1, value).ok());
     EXPECT_EQ(value, "v1");
 
-    // Version < ver3 should return v2
-    ASSERT_TRUE(db_.getByVersion("key", ver3, value).ok());
+    // Version <= ver2 returns v2
+    ASSERT_TRUE(db_.getByVersion("key", ver2, value).ok());
     EXPECT_EQ(value, "v2");
 
-    // Version < ver1 should return NotFound
-    EXPECT_TRUE(db_.getByVersion("key", ver1, value).isNotFound());
+    // Version <= ver3 returns v3
+    ASSERT_TRUE(db_.getByVersion("key", ver3, value).ok());
+    EXPECT_EQ(value, "v3");
+
+    // Version 0 (before any write) returns NotFound
+    EXPECT_TRUE(db_.getByVersion("key", 0, value).isNotFound());
 }
 
 TEST_F(VersioningTest, GetByVersionWithVersionOutput) {
@@ -106,9 +110,16 @@ TEST_F(VersioningTest, GetByVersionWithVersionOutput) {
 
     std::string value;
     uint64_t entry_version;
-    ASSERT_TRUE(db_.getByVersion("key", ver2, value, entry_version).ok());
+
+    // Version <= ver1 returns v1
+    ASSERT_TRUE(db_.getByVersion("key", ver1, value, entry_version).ok());
     EXPECT_EQ(value, "v1");
     EXPECT_EQ(entry_version, ver1);
+
+    // Version <= ver2 returns v2
+    ASSERT_TRUE(db_.getByVersion("key", ver2, value, entry_version).ok());
+    EXPECT_EQ(value, "v2");
+    EXPECT_EQ(entry_version, ver2);
 }
 
 TEST_F(VersioningTest, GetByVersionAfterDelete) {
@@ -117,17 +128,25 @@ TEST_F(VersioningTest, GetByVersionAfterDelete) {
     uint64_t ver1;
     ASSERT_TRUE(db_.get("key", tmp, ver1).ok());
 
+    // Delete the key. The delete gets a version between ver1 and ver2.
     ASSERT_TRUE(db_.remove("key").ok());
-    bool exists;
-    db_.exists("key", exists);  // Get current version somehow
 
     ASSERT_TRUE(db_.put("key", "v2").ok());
     uint64_t ver2;
     ASSERT_TRUE(db_.get("key", tmp, ver2).ok());
 
-    // After the delete, before v2, key should not exist
+    // Version <= ver1 returns v1 (before delete)
     std::string value;
-    EXPECT_TRUE(db_.getByVersion("key", ver2, value).isNotFound());
+    ASSERT_TRUE(db_.getByVersion("key", ver1, value).ok());
+    EXPECT_EQ(value, "v1");
+
+    // Version <= (ver2 - 1) sees the tombstone → NotFound
+    // The delete version is between ver1 and ver2.
+    EXPECT_TRUE(db_.getByVersion("key", ver2 - 1, value).isNotFound());
+
+    // Version <= ver2 returns v2 (after re-put)
+    ASSERT_TRUE(db_.getByVersion("key", ver2, value).ok());
+    EXPECT_EQ(value, "v2");
 }
 
 // --- Snapshot Tests ---
@@ -290,4 +309,77 @@ TEST_F(VersioningTest, SnapshotAfterManyWrites) {
     EXPECT_EQ(value, "value199");
 
     db_.releaseSnapshot(std::move(snapshot));
+}
+
+// --- Version Retention Tests ---
+
+TEST_F(VersioningTest, OldestVersionPinnedBySnapshot) {
+    ASSERT_TRUE(db_.put("key", "v1").ok());
+
+    // Take a snapshot — pins the oldest version.
+    std::unique_ptr<kvlite::DB::Snapshot> snap;
+    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+    uint64_t pinned = snap->version();
+
+    // Write more — versions advance, but oldest stays pinned.
+    ASSERT_TRUE(db_.put("key", "v2").ok());
+    ASSERT_TRUE(db_.put("key", "v3").ok());
+
+    EXPECT_EQ(db_.getOldestVersion(), pinned);
+
+    db_.releaseSnapshot(std::move(snap));
+
+    // After release, oldest advances to latest.
+    EXPECT_GT(db_.getOldestVersion(), pinned);
+}
+
+TEST_F(VersioningTest, OldestVersionPinnedByEarliestSnapshot) {
+    ASSERT_TRUE(db_.put("key", "v1").ok());
+
+    std::unique_ptr<kvlite::DB::Snapshot> snap1;
+    ASSERT_TRUE(db_.createSnapshot(snap1).ok());
+    uint64_t pinned1 = snap1->version();
+
+    ASSERT_TRUE(db_.put("key", "v2").ok());
+
+    std::unique_ptr<kvlite::DB::Snapshot> snap2;
+    ASSERT_TRUE(db_.createSnapshot(snap2).ok());
+    uint64_t pinned2 = snap2->version();
+    EXPECT_GT(pinned2, pinned1);
+
+    ASSERT_TRUE(db_.put("key", "v3").ok());
+
+    // Oldest is pinned by the earliest snapshot.
+    EXPECT_EQ(db_.getOldestVersion(), pinned1);
+
+    // Release the earlier snapshot — oldest advances to snap2.
+    db_.releaseSnapshot(std::move(snap1));
+    EXPECT_EQ(db_.getOldestVersion(), pinned2);
+
+    // Release the last snapshot — oldest advances past snap2.
+    db_.releaseSnapshot(std::move(snap2));
+    EXPECT_GT(db_.getOldestVersion(), pinned2);
+}
+
+TEST_F(VersioningTest, SnapshotRetainsVersionsForReads) {
+    // Verify that data at the snapshot version remains readable even
+    // after newer writes overwrite the same key.
+    ASSERT_TRUE(db_.put("key", "original").ok());
+
+    std::unique_ptr<kvlite::DB::Snapshot> snap;
+    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+
+    // Overwrite the key a few times.
+    ASSERT_TRUE(db_.put("key", "overwrite1").ok());
+    ASSERT_TRUE(db_.put("key", "overwrite2").ok());
+
+    // The snapshot must still see the original value.
+    std::string value;
+    ASSERT_TRUE(snap->get("key", value).ok());
+    EXPECT_EQ(value, "original");
+
+    // And the oldest version must be <= the snapshot version.
+    EXPECT_LE(db_.getOldestVersion(), snap->version());
+
+    db_.releaseSnapshot(std::move(snap));
 }
