@@ -1089,3 +1089,99 @@ TEST_F(GCMergeTest, MergeSnapshotPins) {
     EXPECT_EQ(values.count("v1"), 1u);
     EXPECT_EQ(values.count("v2"), 1u);
 }
+
+// GC drops versions below the oldest live snapshot while retaining versions at or above it.
+TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
+    // key1: v1(seg1), v2(seg2), v3(seg3)
+    size_t idx1 = createSegment(1, {{"key1", 1, "v1", false}});
+    size_t idx2 = createSegment(2, {{"key1", 2, "v2", false}});
+    size_t idx3 = createSegment(3, {{"key1", 3, "v3", false}});
+    auto& seg1 = segments_[idx1];
+    auto& seg2 = segments_[idx2];
+    auto& seg3 = segments_[idx3];
+
+    SegmentIndex si1;
+    si1.put("key1", 0, 1);
+    SegmentIndex si2;
+    si2.put("key1", 0, 2);
+    SegmentIndex si3;
+    si3.put("key1", 0, 3);
+
+    // Snapshots at v2 and v3: oldest is v2.
+    // v1 < v2 (oldest snapshot) → dropped
+    // v2 = oldest snapshot → kept
+    // v3 = latest → kept
+    std::vector<uint64_t> snapshots = {2, 3};
+    std::vector<GC::InputSegment> inputs = {
+        {1, si1, seg1.logFile(), seg1.dataSize()},
+        {2, si2, seg2.logFile(), seg2.dataSize()},
+        {3, si3, seg3.logFile(), seg3.dataSize()},
+    };
+
+    Status s = GC::merge(
+        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(last_result_.entries_written, 2u);
+    ASSERT_EQ(last_result_.outputs.size(), 1u);
+
+    // Output should contain v2 and v3, but not v1.
+    auto& out = last_result_.outputs[0].segment;
+    std::vector<LogEntry> entries;
+    ASSERT_TRUE(out.get("key1", entries).ok());
+    ASSERT_EQ(entries.size(), 2u);
+
+    std::set<uint64_t> versions;
+    for (const auto& e : entries) {
+        versions.insert(e.version());
+    }
+    EXPECT_EQ(versions.count(1u), 0u);  // v1 dropped
+    EXPECT_EQ(versions.count(2u), 1u);  // v2 kept (oldest snapshot)
+    EXPECT_EQ(versions.count(3u), 1u);  // v3 kept (latest)
+}
+
+// Without active snapshots, only the latest version survives GC.
+TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
+    // key1: v1(seg1), v2(seg2)
+    size_t idx1 = createSegment(1, {{"key1", 1, "v1", false}});
+    size_t idx2 = createSegment(2, {{"key1", 2, "v2", false}});
+    auto& seg1 = segments_[idx1];
+    auto& seg2 = segments_[idx2];
+
+    SegmentIndex si1;
+    si1.put("key1", 0, 1);
+    SegmentIndex si2;
+    si2.put("key1", 0, 2);
+
+    // Only latest version (v2), no active snapshots pinning v1.
+    std::vector<uint64_t> snapshots = {2};
+    std::vector<GC::InputSegment> inputs = {
+        {1, si1, seg1.logFile(), seg1.dataSize()},
+        {2, si2, seg2.logFile(), seg2.dataSize()},
+    };
+
+    Status s = GC::merge(
+        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(last_result_.entries_written, 1u);
+    ASSERT_EQ(last_result_.outputs.size(), 1u);
+
+    // Output should contain only v2.
+    auto& out = last_result_.outputs[0].segment;
+    LogEntry entry;
+    ASSERT_TRUE(out.getLatest("key1", entry).ok());
+    EXPECT_EQ(entry.value, "v2");
+    EXPECT_EQ(entry.version(), 2u);
+
+    // v1 should not be present.
+    std::vector<LogEntry> entries;
+    ASSERT_TRUE(out.get("key1", entries).ok());
+    ASSERT_EQ(entries.size(), 1u);
+}
