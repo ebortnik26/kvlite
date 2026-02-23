@@ -705,20 +705,20 @@ TEST_F(EntryStreamTest, ConcurrentIterate_ScanVisibleWithPuts) {
 
 // --- TagSource Tests ---
 
-TEST_F(EntryStreamTest, TagSource_SetsExtSlot) {
+TEST_F(EntryStreamTest, TagSource_SetsExtField) {
     size_t idx = createSegment(1, {
         {"key1", 1, "val1", false},
         {"key2", 2, "val2", false},
     });
     auto& seg = segments_[idx];
 
-    constexpr size_t kSlot = 0;
+    constexpr size_t kBase = 0;
     auto s = stream::tagSource(
-        stream::scan(seg.logFile(), seg.dataSize()), 42, kSlot);
+        stream::scan(seg.logFile(), seg.dataSize()), 42, kBase);
 
     size_t count = 0;
     while (s->valid()) {
-        EXPECT_EQ(s->entry().ext[kSlot], 42u);
+        EXPECT_EQ(s->entry().ext[kBase + TagSourceExt::kSegmentId], 42u);
         count++;
         ASSERT_TRUE(s->next().ok());
     }
@@ -729,16 +729,16 @@ TEST_F(EntryStreamTest, TagSource_PreservesEntryFields) {
     size_t idx = createSegment(1, {{"key1", 5, "val5", true}});
     auto& seg = segments_[idx];
 
-    constexpr size_t kSlot = 2;
+    constexpr size_t kBase = 2;
     auto s = stream::tagSource(
-        stream::scan(seg.logFile(), seg.dataSize()), 99, kSlot);
+        stream::scan(seg.logFile(), seg.dataSize()), 99, kBase);
 
     ASSERT_TRUE(s->valid());
     EXPECT_EQ(s->entry().key, "key1");
     EXPECT_EQ(s->entry().value, "val5");
     EXPECT_EQ(s->entry().version, 5u);
     EXPECT_TRUE(s->entry().tombstone);
-    EXPECT_EQ(s->entry().ext[kSlot], 99u);
+    EXPECT_EQ(s->entry().ext[kBase + TagSourceExt::kSegmentId], 99u);
 }
 
 TEST_F(EntryStreamTest, TagSource_PropagatesThroughMerge) {
@@ -747,19 +747,19 @@ TEST_F(EntryStreamTest, TagSource_PropagatesThroughMerge) {
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    constexpr size_t kSlot = 0;
+    constexpr size_t kBase = 0;
     std::vector<std::unique_ptr<EntryStream>> streams;
     streams.push_back(stream::tagSource(
-        stream::scan(seg1.logFile(), seg1.dataSize()), 1, kSlot));
+        stream::scan(seg1.logFile(), seg1.dataSize()), 1, kBase));
     streams.push_back(stream::tagSource(
-        stream::scan(seg2.logFile(), seg2.dataSize()), 2, kSlot));
+        stream::scan(seg2.logFile(), seg2.dataSize()), 2, kBase));
 
     auto merged = stream::merge(std::move(streams));
 
     // Both entries should retain their tagged segment_id through merge.
     std::set<uint64_t> seen_ids;
     while (merged->valid()) {
-        seen_ids.insert(merged->entry().ext[kSlot]);
+        seen_ids.insert(merged->entry().ext[kBase + TagSourceExt::kSegmentId]);
         ASSERT_TRUE(merged->next().ok());
     }
     EXPECT_EQ(seen_ids.count(1u), 1u);
@@ -775,14 +775,15 @@ TEST_F(EntryStreamTest, Classify_KeepAndEliminate) {
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    constexpr size_t kSlotSeg = 0;
-    constexpr size_t kSlotAction = 1;
+    // Ext layout: [TagSourceExt | ClassifyExt]
+    constexpr size_t kTagBase      = 0;
+    constexpr size_t kClassifyBase = kTagBase + TagSourceExt::kSize;
 
     std::vector<std::unique_ptr<EntryStream>> streams;
     streams.push_back(stream::tagSource(
-        stream::scan(seg1.logFile(), seg1.dataSize()), 1, kSlotSeg));
+        stream::scan(seg1.logFile(), seg1.dataSize()), 1, kTagBase));
     streams.push_back(stream::tagSource(
-        stream::scan(seg2.logFile(), seg2.dataSize()), 2, kSlotSeg));
+        stream::scan(seg2.logFile(), seg2.dataSize()), 2, kTagBase));
 
     auto merged = stream::merge(std::move(streams));
 
@@ -791,22 +792,22 @@ TEST_F(EntryStreamTest, Classify_KeepAndEliminate) {
     visible[hash] = {2};
 
     auto classified = stream::classify(
-        std::move(merged), std::move(visible), kSlotAction);
+        std::move(merged), std::move(visible), kClassifyBase);
 
     // First entry: key1 v1 → kEliminate, segment_id=1 preserved
     ASSERT_TRUE(classified->valid());
     EXPECT_EQ(classified->entry().version, 1u);
-    EXPECT_EQ(classified->entry().ext[kSlotAction],
+    EXPECT_EQ(classified->entry().ext[kClassifyBase + ClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kEliminate));
-    EXPECT_EQ(classified->entry().ext[kSlotSeg], 1u);
+    EXPECT_EQ(classified->entry().ext[kTagBase + TagSourceExt::kSegmentId], 1u);
 
     ASSERT_TRUE(classified->next().ok());
     // Second entry: key1 v2 → kKeep, segment_id=2 preserved
     ASSERT_TRUE(classified->valid());
     EXPECT_EQ(classified->entry().version, 2u);
-    EXPECT_EQ(classified->entry().ext[kSlotAction],
+    EXPECT_EQ(classified->entry().ext[kClassifyBase + ClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kKeep));
-    EXPECT_EQ(classified->entry().ext[kSlotSeg], 2u);
+    EXPECT_EQ(classified->entry().ext[kTagBase + TagSourceExt::kSegmentId], 2u);
 
     ASSERT_TRUE(classified->next().ok());
     EXPECT_FALSE(classified->valid());
@@ -819,7 +820,7 @@ TEST_F(EntryStreamTest, Classify_AllKeep) {
     });
     auto& seg = segments_[idx];
 
-    constexpr size_t kSlotAction = 0;
+    constexpr size_t kBase = 0;
     auto tagged = stream::scan(seg.logFile(), seg.dataSize());
 
     uint64_t h1 = dhtHashBytes("key1", 4);
@@ -829,11 +830,11 @@ TEST_F(EntryStreamTest, Classify_AllKeep) {
     visible[h2] = {2};
 
     auto classified = stream::classify(
-        std::move(tagged), std::move(visible), kSlotAction);
+        std::move(tagged), std::move(visible), kBase);
 
     size_t keep_count = 0;
     while (classified->valid()) {
-        EXPECT_EQ(classified->entry().ext[kSlotAction],
+        EXPECT_EQ(classified->entry().ext[kBase + ClassifyExt::kAction],
                   static_cast<uint64_t>(EntryAction::kKeep));
         keep_count++;
         ASSERT_TRUE(classified->next().ok());
@@ -847,16 +848,16 @@ TEST_F(EntryStreamTest, Classify_AllEliminate) {
     });
     auto& seg = segments_[idx];
 
-    constexpr size_t kSlotAction = 0;
+    constexpr size_t kBase = 0;
 
     // Empty visible set → everything eliminated.
     std::unordered_map<uint64_t, std::set<uint32_t>> visible;
     auto classified = stream::classify(
         stream::scan(seg.logFile(), seg.dataSize()),
-        std::move(visible), kSlotAction);
+        std::move(visible), kBase);
 
     ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().ext[kSlotAction],
+    EXPECT_EQ(classified->entry().ext[kBase + ClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kEliminate));
 
     ASSERT_TRUE(classified->next().ok());

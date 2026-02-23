@@ -27,9 +27,9 @@ Status GC::merge(
     result.entries_written = 0;
     result.entries_eliminated = 0;
 
-    // ext slot assignments for the GC pipeline.
-    constexpr size_t kSlotSegmentId = 0;
-    constexpr size_t kSlotAction    = 1;
+    // Ext layout: [TagSourceExt | ClassifyExt]
+    constexpr size_t kTagBase      = 0;
+    constexpr size_t kClassifyBase = kTagBase + TagSourceExt::kSize;
 
     // 1. Build unfiltered tagSource streams and compute the union visible set.
     std::vector<std::unique_ptr<EntryStream>> streams;
@@ -39,7 +39,7 @@ Status GC::merge(
     for (const auto& input : inputs) {
         streams.push_back(stream::tagSource(
             stream::scan(input.log_file, input.data_size),
-            input.segment_id, kSlotSegmentId));
+            input.segment_id, kTagBase));
 
         auto vs = computeVisibleSet(
             global_index, input.index, input.segment_id, snapshot_versions);
@@ -52,7 +52,7 @@ Status GC::merge(
     // 2. Merge all streams, then classify.
     auto pipeline = stream::classify(
         stream::merge(std::move(streams)),
-        std::move(union_visible), kSlotAction);
+        std::move(union_visible), kClassifyBase);
 
     // 3. If empty, return OK.
     if (!pipeline->valid()) {
@@ -68,8 +68,10 @@ Status GC::merge(
     // 5. Drain pipeline — read action and segment_id from ext slots.
     while (pipeline->valid()) {
         const auto& entry = pipeline->entry();
-        auto action = static_cast<EntryAction>(entry.ext[kSlotAction]);
-        auto old_seg_id = static_cast<uint32_t>(entry.ext[kSlotSegmentId]);
+        auto action = static_cast<EntryAction>(
+            entry.ext[kClassifyBase + ClassifyExt::kAction]);
+        auto old_seg_id = static_cast<uint32_t>(
+            entry.ext[kTagBase + TagSourceExt::kSegmentId]);
 
         if (action == EntryAction::kEliminate) {
             result.eliminations.push_back({

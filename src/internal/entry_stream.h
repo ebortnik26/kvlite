@@ -34,8 +34,9 @@ public:
         bool tombstone;
 
         // Extension fields: flat buffer for operator-defined attributes.
-        // Each operator claims a slot index and stores its value there.
-        // Pass-through operators (merge, filter) preserve ext transparently.
+        // Each operator declares a schema (XxxExt with Field enum + kSize)
+        // and writes at ext[base + Field]. Pass-through operators (merge,
+        // filter) preserve ext transparently.
         static constexpr size_t kMaxExt = 4;
         uint64_t ext[kMaxExt] = {};
     };
@@ -61,7 +62,23 @@ std::unordered_map<uint64_t, uint32_t> computeLatestSet(
     uint32_t segment_id,
     uint64_t snapshot_version);
 
-// Extension field values for the classify operator.
+// ---------------------------------------------------------------------------
+// Operator extension schemas.
+// Each operator declares its ext fields and size. The pipeline builder
+// stacks them by assigning base offsets: operator N starts at
+// base = sum of kSize for operators 0..N-1.
+// ---------------------------------------------------------------------------
+
+struct TagSourceExt {
+    enum Field : size_t { kSegmentId = 0 };
+    static constexpr size_t kSize = 1;
+};
+
+struct ClassifyExt {
+    enum Field : size_t { kAction = 0 };
+    static constexpr size_t kSize = 1;
+};
+
 enum class EntryAction : uint64_t { kKeep = 0, kEliminate = 1 };
 
 using Predicate = std::function<bool(const EntryStream::Entry&)>;
@@ -77,15 +94,17 @@ std::unique_ptr<EntryStream> filter(std::unique_ptr<EntryStream> input, Predicat
 // K-way merge over N EntryStreams in (hash asc, version asc) order.
 std::unique_ptr<EntryStream> merge(std::vector<std::unique_ptr<EntryStream>> inputs);
 
-// Tag each entry with a source segment_id. Writes to ext[slot].
+// Tag each entry with a source segment_id.
+// Writes to ext[base + TagSourceExt::kSegmentId].
 std::unique_ptr<EntryStream> tagSource(
-    std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t slot);
+    std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t base);
 
-// Classify each entry as kKeep or kEliminate. Writes EntryAction to ext[slot].
+// Classify each entry as kKeep or kEliminate.
+// Writes EntryAction to ext[base + ClassifyExt::kAction].
 std::unique_ptr<EntryStream> classify(
     std::unique_ptr<EntryStream> input,
     std::unordered_map<uint64_t, std::set<uint32_t>> visible_set,
-    size_t slot);
+    size_t base);
 
 // Convenience: scan + visibility filter for GC.
 std::unique_ptr<EntryStream> scanVisible(
