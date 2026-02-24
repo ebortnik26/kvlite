@@ -85,24 +85,26 @@ private:
                 continue;
             }
 
-            // Copy fields before advancing — next() invalidates the entry ref.
+            // Copy scalars + key before advancing — next() invalidates the
+            // entry's string_views. Key and value use reusable member strings
+            // so the allocator keeps the buffer across iterations.
             const auto& e = seg_stream_->entry();
             uint64_t version = e.version;
             bool tombstone = e.tombstone;
-            std::string key_str(e.key.data(), e.key.size());
-            std::string val_str(e.value.data(), e.value.size());
+            scan_key_.assign(e.key.data(), e.key.size());
+            scan_value_.assign(e.value.data(), e.value.size());
             seg_stream_->next();
 
+            // Cheap scalar check first.
             if (version > snap_ver) continue;
 
             // WB precedence: if WB has a version for this key at snapshot,
             // skip — it will be emitted in Phase 2.
             {
-                std::string wval;
                 uint64_t wver;
                 bool wtomb;
-                if (pinned_wb_->getByVersion(key_str, snap_ver,
-                                             wval, wver, wtomb)) {
+                if (pinned_wb_->getByVersion(scan_key_, snap_ver,
+                                             wb_probe_, wver, wtomb)) {
                     continue;
                 }
             }
@@ -111,7 +113,7 @@ private:
             // pertinent entry for the key in the GlobalIndex.
             uint64_t gi_version;
             uint32_t gi_segment_id;
-            if (!db_->global_index_->get(key_str, snap_ver,
+            if (!db_->global_index_->get(scan_key_, snap_ver,
                                          gi_version, gi_segment_id)) {
                 continue;
             }
@@ -122,8 +124,9 @@ private:
 
             if (tombstone) continue;
 
-            current_key_ = std::move(key_str);
-            current_value_ = std::move(val_str);
+            // Pertinent non-tombstone — publish to current_*.
+            current_key_.swap(scan_key_);
+            current_value_.swap(scan_value_);
             current_version_ = version;
             valid_ = true;
             return;
@@ -179,6 +182,11 @@ private:
 
     // Phase 2: write buffer
     std::unique_ptr<internal::EntryStream> wb_stream_;
+
+    // Reusable buffers — avoid per-entry allocations in the scan loop.
+    std::string scan_key_;
+    std::string scan_value_;
+    std::string wb_probe_;  // sink for WB getByVersion value output
 
     bool valid_ = false;
     std::string current_key_;
