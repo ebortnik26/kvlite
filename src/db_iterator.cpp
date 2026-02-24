@@ -120,13 +120,13 @@ private:
             // GI pertinence: only emit if this segment+version is the
             // pertinent entry for the key in the GlobalIndex.
             // GI stores packed versions; compare packed forms.
-            uint64_t gi_packed;
+            uint64_t gi_packed_version;
             uint32_t gi_segment_id;
             if (!db_->global_index_->get(scan_key_, packed_bound,
-                                         gi_packed, gi_segment_id)) {
+                                         gi_packed_version, gi_segment_id)) {
                 continue;
             }
-            internal::PackedVersion gi_pv(gi_packed);
+            internal::PackedVersion gi_pv(gi_packed_version);
             if (gi_segment_id != current_segment_id_ ||
                 gi_pv.version() != version) {
                 continue;

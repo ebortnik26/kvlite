@@ -57,13 +57,6 @@ public:
 
     bool contains(std::string_view key) const;
 
-    // Remove all entries for a key. Returns number of entries removed.
-    size_t removeAll(std::string_view key);
-
-    // Remove entries where the second field (version) matches value.
-    // Returns number of entries removed.
-    size_t removeBySecond(std::string_view key, uint32_t value);
-
     // Iterate over all entries.
     void forEach(const std::function<void(uint64_t hash,
                                           uint32_t offset,

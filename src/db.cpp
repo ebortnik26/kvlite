@@ -250,14 +250,14 @@ Status DB::resolve(const std::string& key, uint64_t upper_bound,
     }
 
     // 2. Fall through to GlobalIndex -> Segment.
-    uint64_t gi_version;  // packed: (logical_version << 1) | tombstone
+    uint64_t gi_packed_version;
     uint32_t gi_segment_id;
-    if (!global_index_->get(key, upper_bound, gi_version, gi_segment_id)) {
+    if (!global_index_->get(key, upper_bound, gi_packed_version, gi_segment_id)) {
         return Status::NotFound(key);
     }
 
     result.wb_hit = false;
-    result.gi_version = gi_version;
+    result.gi_packed_version = gi_packed_version;
     result.segment = storage_->getSegment(gi_segment_id);
     assert(result.segment && "GlobalIndex references non-existent segment");
     return Status::OK();
@@ -278,7 +278,7 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
     }
 
     // Check tombstone from the packed version in GI — no segment I/O needed.
-    internal::PackedVersion gi_pv(r.gi_version);
+    internal::PackedVersion gi_pv(r.gi_packed_version);
     if (gi_pv.tombstone()) return Status::NotFound(key);
 
     // Read the value from segment.
@@ -332,7 +332,7 @@ Status DB::exists(const std::string& key, bool& exists,
     }
 
     // GI stores packed version — check tombstone from LSB, no segment I/O.
-    exists = !(r.gi_version & internal::PackedVersion::kTombstoneMask);
+    exists = !(r.gi_packed_version & internal::PackedVersion::kTombstoneMask);
     return Status::OK();
 }
 

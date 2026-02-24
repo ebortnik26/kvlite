@@ -210,8 +210,8 @@ Status Segment::getLatest(const std::string& key, LogEntry& entry) const {
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: getLatest requires Readable state");
     }
-    uint32_t offset, version;
-    if (!index_.getLatest(key, offset, version)) {
+    uint32_t offset, packed_version;
+    if (!index_.getLatest(key, offset, packed_version)) {
         return Status::NotFound("key not found");
     }
     return readEntry(offset, entry);
@@ -222,8 +222,8 @@ Status Segment::get(const std::string& key,
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: get requires Readable state");
     }
-    std::vector<uint32_t> offsets, versions;
-    if (!index_.get(key, offsets, versions)) {
+    std::vector<uint32_t> offsets, packed_versions;
+    if (!index_.get(key, offsets, packed_versions)) {
         return Status::NotFound("key not found");
     }
     entries.clear();
@@ -242,8 +242,8 @@ Status Segment::get(const std::string& key, uint64_t upper_bound,
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: get requires Readable state");
     }
-    uint64_t offset, version;
-    if (!index_.get(key, upper_bound, offset, version)) {
+    uint64_t offset, packed_version;
+    if (!index_.get(key, upper_bound, offset, packed_version)) {
         return Status::NotFound("key not found");
     }
     return readEntry(offset, entry);

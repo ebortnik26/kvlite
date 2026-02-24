@@ -551,95 +551,6 @@ TEST(GlobalIndexDHT, Contains) {
     EXPECT_TRUE(index.contains("key1"));
 }
 
-TEST(GlobalIndexDHT, Remove) {
-    GlobalIndex index;
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-    EXPECT_EQ(index.entryCount(), 2u);
-
-    index.remove("key1");
-    EXPECT_FALSE(index.contains("key1"));
-    EXPECT_EQ(index.keyCount(), 0u);
-    EXPECT_EQ(index.entryCount(), 0u);
-}
-
-TEST(GlobalIndexDHT, RemoveSegment) {
-    GlobalIndex index;
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-    index.put("key1", 300, 3);
-
-    index.removeSegment("key1", 2);
-
-    std::vector<uint32_t> seg_ids;
-    std::vector<uint64_t> vers;
-    ASSERT_TRUE(index.get("key1", seg_ids, vers));
-    ASSERT_EQ(seg_ids.size(), 2u);
-    EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
-    EXPECT_EQ(vers[1], 100u);  EXPECT_EQ(seg_ids[1], 1u);
-    EXPECT_EQ(index.entryCount(), 2u);
-}
-
-TEST(GlobalIndexDHT, RemoveSegmentRemovesKey) {
-    GlobalIndex index;
-    index.put("key1", 100, 1);
-    index.removeSegment("key1", 1);
-    EXPECT_FALSE(index.contains("key1"));
-    EXPECT_EQ(index.keyCount(), 0u);
-    EXPECT_EQ(index.entryCount(), 0u);
-}
-
-TEST(GlobalIndexDHT, RemoveSegmentFromMultiple) {
-    GlobalIndex index;
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-
-    // Remove older segment
-    index.removeSegment("key1", 1);
-
-    std::vector<uint32_t> seg_ids;
-    std::vector<uint64_t> vers;
-    ASSERT_TRUE(index.get("key1", seg_ids, vers));
-    ASSERT_EQ(seg_ids.size(), 1u);
-    EXPECT_EQ(seg_ids[0], 2u);
-    EXPECT_EQ(index.entryCount(), 1u);
-
-    // Remove latest segment
-    index.removeSegment("key1", 2);
-    EXPECT_FALSE(index.contains("key1"));
-    EXPECT_EQ(index.entryCount(), 0u);
-}
-
-TEST(GlobalIndexDHT, RemoveSegmentFromThree) {
-    GlobalIndex index;
-
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-    index.put("key1", 300, 3);
-    EXPECT_EQ(index.entryCount(), 3u);
-
-    index.removeSegment("key1", 2);
-    EXPECT_EQ(index.entryCount(), 2u);
-
-    std::vector<uint32_t> seg_ids;
-    std::vector<uint64_t> vers;
-    ASSERT_TRUE(index.get("key1", seg_ids, vers));
-    ASSERT_EQ(seg_ids.size(), 2u);
-    EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
-    EXPECT_EQ(vers[1], 100u);  EXPECT_EQ(seg_ids[1], 1u);
-
-    index.removeSegment("key1", 1);
-    EXPECT_EQ(index.entryCount(), 1u);
-
-    ASSERT_TRUE(index.get("key1", seg_ids, vers));
-    ASSERT_EQ(seg_ids.size(), 1u);
-    EXPECT_EQ(seg_ids[0], 3u);
-
-    index.removeSegment("key1", 3);
-    EXPECT_EQ(index.entryCount(), 0u);
-    EXPECT_FALSE(index.contains("key1"));
-}
-
 TEST(GlobalIndexDHT, GetNonExistent) {
     GlobalIndex index;
     std::vector<uint32_t> seg_ids;
@@ -1150,43 +1061,6 @@ TEST(SegmentDHTOverflow, MultipleKeysOverflowSameBucket) {
         ASSERT_TRUE(dht.findAll(key, offsets, versions))
             << "key not found: " << key;
         EXPECT_EQ(offsets.size(), 10u);
-    }
-}
-
-// removeAll after overflow should remove entries across the chain.
-TEST(SegmentDHTOverflow, RemoveAfterOverflow) {
-    SegmentDeltaHashTable dht(smallBucketConfig());
-    for (int i = 1; i <= 100; ++i) {
-        dht.addEntry("key", static_cast<uint32_t>(i), 1);
-    }
-    EXPECT_EQ(dht.size(), 100u);
-
-    size_t removed = dht.removeAll("key");
-    EXPECT_EQ(removed, 100u);
-    EXPECT_EQ(dht.size(), 0u);
-    EXPECT_FALSE(dht.contains("key"));
-}
-
-// removeBySecond after overflow: remove entries for a specific version.
-TEST(SegmentDHTOverflow, RemoveBySecondAfterOverflow) {
-    SegmentDeltaHashTable dht(smallBucketConfig());
-    // 50 entries with version=1, 50 with version=2
-    for (int i = 1; i <= 50; ++i) {
-        dht.addEntry("key", static_cast<uint32_t>(i), 1);
-    }
-    for (int i = 51; i <= 100; ++i) {
-        dht.addEntry("key", static_cast<uint32_t>(i), 2);
-    }
-    EXPECT_EQ(dht.size(), 100u);
-
-    size_t removed = dht.removeBySecond("key", 1);
-    EXPECT_EQ(removed, 50u);
-    EXPECT_EQ(dht.size(), 50u);
-
-    std::vector<uint32_t> offsets, versions;
-    ASSERT_TRUE(dht.findAll("key", offsets, versions));
-    for (size_t i = 0; i < versions.size(); ++i) {
-        EXPECT_EQ(versions[i], 2u);
     }
 }
 

@@ -116,42 +116,42 @@ bool GlobalIndex::isOpen() const {
 
 // --- Index Operations ---
 
-Status GlobalIndex::put(const std::string& key, uint64_t version, uint32_t segment_id) {
+Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_t segment_id) {
     if (!dht_.contains(key)) {
         ++key_count_;
     }
-    // DHT "offsets" field = version, "versions" field = segment_id
-    dht_.addEntry(key, static_cast<uint32_t>(version), segment_id);
+    // DHT "offsets" field = packed_version, "versions" field = segment_id
+    dht_.addEntry(key, static_cast<uint32_t>(packed_version), segment_id);
     updates_since_snapshot_++;
     return Status::OK();
 }
 
 bool GlobalIndex::get(const std::string& key,
                   std::vector<uint32_t>& segment_ids,
-                  std::vector<uint64_t>& versions) const {
-    std::vector<uint32_t> raw_vers;   // DHT "offsets" = versions
+                  std::vector<uint64_t>& packed_versions) const {
+    std::vector<uint32_t> raw_vers;   // DHT "offsets" = packed_versions
     std::vector<uint32_t> raw_segs;   // DHT "versions" = segment_ids
     if (!dht_.findAll(key, raw_vers, raw_segs)) return false;
     segment_ids.clear();
-    versions.clear();
+    packed_versions.clear();
     segment_ids.reserve(raw_segs.size());
-    versions.reserve(raw_vers.size());
+    packed_versions.reserve(raw_vers.size());
     for (size_t i = 0; i < raw_vers.size(); ++i) {
-        versions.push_back(static_cast<uint64_t>(raw_vers[i]));
+        packed_versions.push_back(static_cast<uint64_t>(raw_vers[i]));
         segment_ids.push_back(raw_segs[i]);
     }
     return true;
 }
 
 bool GlobalIndex::get(const std::string& key, uint64_t upper_bound,
-                  uint64_t& version, uint32_t& segment_id) const {
+                  uint64_t& packed_version, uint32_t& segment_id) const {
     std::vector<uint32_t> raw_vers;
     std::vector<uint32_t> raw_segs;
     if (!dht_.findAll(key, raw_vers, raw_segs)) return false;
-    // Entries are sorted by version descending; find the first <= upper_bound.
+    // Entries are sorted by packed_version descending; find the first <= upper_bound.
     for (size_t i = 0; i < raw_vers.size(); ++i) {
         if (static_cast<uint64_t>(raw_vers[i]) <= upper_bound) {
-            version = static_cast<uint64_t>(raw_vers[i]);
+            packed_version = static_cast<uint64_t>(raw_vers[i]);
             segment_id = raw_segs[i];
             return true;
         }
@@ -160,12 +160,12 @@ bool GlobalIndex::get(const std::string& key, uint64_t upper_bound,
 }
 
 Status GlobalIndex::getLatest(const std::string& key,
-                        uint64_t& version, uint32_t& segment_id) const {
+                        uint64_t& packed_version, uint32_t& segment_id) const {
     uint32_t raw_ver, raw_seg;
     if (!dht_.findFirst(key, raw_ver, raw_seg)) {
         return Status::NotFound(key);
     }
-    version = static_cast<uint64_t>(raw_ver);
+    packed_version = static_cast<uint64_t>(raw_ver);
     segment_id = raw_seg;
     return Status::OK();
 }
@@ -174,34 +174,17 @@ bool GlobalIndex::contains(const std::string& key) const {
     return dht_.contains(key);
 }
 
-Status GlobalIndex::remove(const std::string& key) {
-    size_t removed = dht_.removeAll(key);
-    if (removed > 0) {
-        --key_count_;
-    }
-    updates_since_snapshot_++;
-    return Status::OK();
-}
-
-void GlobalIndex::removeSegment(const std::string& key, uint32_t segment_id) {
-    // removeBySecond removes entries where DHT "versions" field = segment_id
-    size_t removed = dht_.removeBySecond(key, segment_id);
-    if (removed > 0 && !dht_.contains(key)) {
-        --key_count_;
-    }
-}
-
 // --- Iteration ---
 
 void GlobalIndex::forEachGroup(
     const std::function<void(uint64_t hash,
                              const std::vector<uint32_t>& versions,
                              const std::vector<uint32_t>& segment_ids)>& fn) const {
-    // DHT "offsets" = versions, DHT "versions" = segment_ids
+    // DHT "offsets" = packed_versions, DHT "versions" = segment_ids
     dht_.forEachGroup([&fn](uint64_t hash,
                             const std::vector<uint32_t>& offsets,
                             const std::vector<uint32_t>& versions) {
-        fn(hash, offsets, versions);
+        fn(hash, offsets, versions);  // offsets=packed_versions, versions=segment_ids
     });
 }
 
@@ -264,10 +247,10 @@ Status GlobalIndex::saveSnapshot(const std::string& path) const {
     uint64_t key_count = key_count_;
     writer.writeVal(key_count);
 
-    // Per entry: [hash:8][version:4][segment_id:4]
-    dht_.forEach([&writer](uint64_t hash, uint32_t version, uint32_t segment_id) {
+    // Per entry: [hash:8][packed_version:4][segment_id:4]
+    dht_.forEach([&writer](uint64_t hash, uint32_t packed_version, uint32_t segment_id) {
         writer.writeVal(hash);
-        writer.writeVal(version);
+        writer.writeVal(packed_version);
         writer.writeVal(segment_id);
     });
 
@@ -296,9 +279,9 @@ Status GlobalIndex::loadSnapshot(const std::string& path) {
         return Status::Corruption("Invalid snapshot magic");
     }
 
-    // Version
-    uint32_t version;
-    if (!reader.readVal(version) || version != kVersion) {
+    // Format version
+    uint32_t format_version;
+    if (!reader.readVal(format_version) || format_version != kVersion) {
         return Status::Corruption("Unsupported snapshot version");
     }
 
@@ -319,11 +302,11 @@ Status GlobalIndex::loadSnapshot(const std::string& path) {
 
     for (uint64_t i = 0; i < num_entries; ++i) {
         uint64_t hash;
-        uint32_t ver, seg;
-        if (!reader.readVal(hash) || !reader.readVal(ver) || !reader.readVal(seg)) {
+        uint32_t packed_ver, seg;
+        if (!reader.readVal(hash) || !reader.readVal(packed_ver) || !reader.readVal(seg)) {
             return Status::Corruption("Failed to read entry");
         }
-        dht_.addEntryByHash(hash, ver, seg);
+        dht_.addEntryByHash(hash, packed_ver, seg);
     }
 
     key_count_ = static_cast<size_t>(key_count);

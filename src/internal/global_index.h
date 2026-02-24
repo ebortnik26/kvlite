@@ -15,14 +15,16 @@ namespace internal {
 
 class GlobalIndexWAL;
 
-// GlobalIndex: In-memory index mapping keys to (segment_id, version) lists,
+// GlobalIndex: In-memory index mapping keys to (segment_id, packed_version) lists,
 // with built-in concurrency control and persistence.
 //
-// Structure: key → [(segment_id₁, version₁), (segment_id₂, version₂), ...]
-//            sorted by version desc (latest/highest first)
+// Structure: key → [(segment_id₁, packed_version₁), (segment_id₂, packed_version₂), ...]
+//            sorted by packed_version desc (latest/highest first)
+//
+// Packed versions encode (logical_version << 1) | tombstone_bit.
 //
 // Backed by SegmentDeltaHashTable with swapped field mapping:
-//   DHT "offsets" → versions (sorted desc, so findFirst returns latest)
+//   DHT "offsets" → packed_versions (sorted desc, so findFirst returns latest)
 //   DHT "versions" → segment_ids (parallel)
 //
 // The GlobalIndex is always fully loaded in memory. It is persisted via:
@@ -69,47 +71,39 @@ public:
 
     // --- Index Operations ---
 
-    // Append (segment_id, version) to key's list.
+    // Append (segment_id, packed_version) to key's list.
     // Logs to WAL, then updates in-memory index.
     // May trigger auto-snapshot if snapshot_interval is reached.
-    Status put(const std::string& key, uint64_t version, uint32_t segment_id);
+    Status put(const std::string& key, uint64_t packed_version, uint32_t segment_id);
 
-    // Get all (segment_id, version) pairs for a key. Returns false if key
-    // doesn't exist. Pairs are ordered latest-first (highest version first).
+    // Get all (segment_id, packed_version) pairs for a key. Returns false if key
+    // doesn't exist. Pairs are ordered latest-first (highest packed_version first).
     bool get(const std::string& key,
              std::vector<uint32_t>& segment_ids,
-             std::vector<uint64_t>& versions) const;
+             std::vector<uint64_t>& packed_versions) const;
 
-    // Get the latest entry for a key with version <= upper_bound.
+    // Get the latest entry for a key with packed_version <= upper_bound.
     // Returns false if no matching entry exists.
     bool get(const std::string& key, uint64_t upper_bound,
-             uint64_t& version, uint32_t& segment_id) const;
+             uint64_t& packed_version, uint32_t& segment_id) const;
 
-    // Get the latest (highest version) entry for a key.
+    // Get the latest (highest packed_version) entry for a key.
     // Returns NotFound if key doesn't exist.
     Status getLatest(const std::string& key,
-                     uint64_t& version, uint32_t& segment_id) const;
+                     uint64_t& packed_version, uint32_t& segment_id) const;
 
     // Check if a key exists (has any version).
     bool contains(const std::string& key) const;
-
-    // Remove all entries for a key (used during GC).
-    // Logs to WAL, then updates in-memory index.
-    Status remove(const std::string& key);
-
-    // Remove all entries pointing to a specific segment_id from a key's list.
-    // Note: This is an in-memory-only operation, not logged to WAL.
-    void removeSegment(const std::string& key, uint32_t segment_id);
 
     // --- Iteration ---
 
     // Iterate over all groups (hash-sorted). Callback receives:
     //   hash: the FNV-1a hash
-    //   versions: sorted desc (latest first, mapped from DHT "offsets")
+    //   packed_versions: sorted desc (latest first, mapped from DHT "offsets")
     //   segment_ids: parallel array (mapped from DHT "versions")
     void forEachGroup(
         const std::function<void(uint64_t hash,
-                                 const std::vector<uint32_t>& versions,
+                                 const std::vector<uint32_t>& packed_versions,
                                  const std::vector<uint32_t>& segment_ids)>& fn) const;
 
     // Clear all entries.
@@ -141,12 +135,12 @@ public:
 
     // Snapshot file format (v6, hash-based):
     // [magic: 4 bytes]["L1IX" (legacy)]
-    // [version: 4 bytes][6]
+    // [format_version: 4 bytes][6]
     // [num_entries: 8 bytes]
     // [key_count: 8 bytes]
     // Per entry (via forEach):
     //   [hash: 8 bytes]
-    //   [version: 4 bytes]
+    //   [packed_version: 4 bytes]
     //   [segment_id: 4 bytes]
     // [checksum: 4 bytes]
 
