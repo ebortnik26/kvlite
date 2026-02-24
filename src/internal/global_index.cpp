@@ -4,6 +4,8 @@
 #include <cstring>
 #include <fstream>
 
+#include "internal/global_index_wal.h"
+
 namespace kvlite {
 namespace internal {
 
@@ -63,14 +65,65 @@ struct CRC32Reader {
 
 GlobalIndex::GlobalIndex() = default;
 
-GlobalIndex::~GlobalIndex() = default;
+GlobalIndex::~GlobalIndex() {
+    if (is_open_) {
+        close();
+    }
+}
 
-void GlobalIndex::put(const std::string& key, uint64_t version, uint32_t segment_id) {
+// --- Lifecycle ---
+
+Status GlobalIndex::open(const std::string& db_path, const Options& options) {
+    if (is_open_) {
+        return Status::InvalidArgument("Already open");
+    }
+    db_path_ = db_path;
+    options_ = options;
+    is_open_ = true;
+    return Status::OK();
+}
+
+Status GlobalIndex::recover() {
+    std::string path = snapshotPath();
+    Status s = loadSnapshot(path);
+    if (s.ok()) {
+        return Status::OK();
+    }
+    // No snapshot or corrupted — start with empty index.
+    // Caller (DB::open) will rebuild from segments if needed.
+    return Status::OK();
+}
+
+Status GlobalIndex::close() {
+    if (!is_open_) {
+        return Status::OK();
+    }
+    // Persist index to snapshot before closing.
+    Status s = saveSnapshot(snapshotPath());
+    if (!s.ok()) {
+        wal_.reset();
+        is_open_ = false;
+        return s;
+    }
+    wal_.reset();
+    is_open_ = false;
+    return Status::OK();
+}
+
+bool GlobalIndex::isOpen() const {
+    return is_open_;
+}
+
+// --- Index Operations ---
+
+Status GlobalIndex::put(const std::string& key, uint64_t version, uint32_t segment_id) {
     if (!dht_.contains(key)) {
         ++key_count_;
     }
     // DHT "offsets" field = version, "versions" field = segment_id
     dht_.addEntry(key, static_cast<uint32_t>(version), segment_id);
+    updates_since_snapshot_++;
+    return Status::OK();
 }
 
 bool GlobalIndex::get(const std::string& key,
@@ -106,24 +159,28 @@ bool GlobalIndex::get(const std::string& key, uint64_t upper_bound,
     return false;
 }
 
-bool GlobalIndex::getLatest(const std::string& key,
+Status GlobalIndex::getLatest(const std::string& key,
                         uint64_t& version, uint32_t& segment_id) const {
     uint32_t raw_ver, raw_seg;
-    if (!dht_.findFirst(key, raw_ver, raw_seg)) return false;
+    if (!dht_.findFirst(key, raw_ver, raw_seg)) {
+        return Status::NotFound(key);
+    }
     version = static_cast<uint64_t>(raw_ver);
     segment_id = raw_seg;
-    return true;
+    return Status::OK();
 }
 
 bool GlobalIndex::contains(const std::string& key) const {
     return dht_.contains(key);
 }
 
-void GlobalIndex::remove(const std::string& key) {
+Status GlobalIndex::remove(const std::string& key) {
     size_t removed = dht_.removeAll(key);
     if (removed > 0) {
         --key_count_;
     }
+    updates_since_snapshot_++;
+    return Status::OK();
 }
 
 void GlobalIndex::removeSegment(const std::string& key, uint32_t segment_id) {
@@ -134,17 +191,7 @@ void GlobalIndex::removeSegment(const std::string& key, uint32_t segment_id) {
     }
 }
 
-size_t GlobalIndex::keyCount() const {
-    return key_count_;
-}
-
-size_t GlobalIndex::entryCount() const {
-    return dht_.size();
-}
-
-size_t GlobalIndex::memoryUsage() const {
-    return dht_.memoryUsage();
-}
+// --- Iteration ---
 
 void GlobalIndex::forEachGroup(
     const std::function<void(uint64_t hash,
@@ -161,6 +208,37 @@ void GlobalIndex::forEachGroup(
 void GlobalIndex::clear() {
     dht_.clear();
     key_count_ = 0;
+}
+
+// --- Maintenance ---
+
+Status GlobalIndex::snapshot() {
+    // Stub: no auto-snapshot yet.
+    updates_since_snapshot_ = 0;
+    return Status::OK();
+}
+
+Status GlobalIndex::sync() {
+    // Stub: no WAL yet.
+    return Status::OK();
+}
+
+// --- Statistics ---
+
+size_t GlobalIndex::keyCount() const {
+    return key_count_;
+}
+
+size_t GlobalIndex::entryCount() const {
+    return dht_.size();
+}
+
+size_t GlobalIndex::memoryUsage() const {
+    return dht_.memoryUsage();
+}
+
+uint64_t GlobalIndex::updatesSinceSnapshot() const {
+    return updates_since_snapshot_;
 }
 
 // --- Persistence ---
@@ -262,6 +340,21 @@ Status GlobalIndex::loadSnapshot(const std::string& path) {
     }
 
     return Status::OK();
+}
+
+// --- Private ---
+
+Status GlobalIndex::maybeSnapshot() {
+    // Stub: no auto-snapshot yet.
+    return Status::OK();
+}
+
+std::string GlobalIndex::snapshotPath() const {
+    return db_path_ + "/global_index.snapshot";
+}
+
+std::string GlobalIndex::walPath() const {
+    return db_path_ + "/global_index.wal";
 }
 
 }  // namespace internal

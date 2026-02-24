@@ -48,15 +48,13 @@ TEST_F(BatchTest, WriteBatchBasic) {
     EXPECT_EQ(value, "value3");
 }
 
-TEST_F(BatchTest, WriteBatchWithRemove) {
+TEST_F(BatchTest, WriteBatchOverwrite) {
     // Pre-populate
     ASSERT_TRUE(db_.put("key1", "old1").ok());
-    ASSERT_TRUE(db_.put("key2", "old2").ok());
 
     kvlite::WriteBatch batch;
     batch.put("key1", "new1");
-    batch.remove("key2");
-    batch.put("key3", "value3");
+    batch.put("key2", "value2");
 
     ASSERT_TRUE(db_.write(batch).ok());
 
@@ -64,10 +62,8 @@ TEST_F(BatchTest, WriteBatchWithRemove) {
     ASSERT_TRUE(db_.get("key1", value).ok());
     EXPECT_EQ(value, "new1");
 
-    EXPECT_TRUE(db_.get("key2", value).isNotFound());
-
-    ASSERT_TRUE(db_.get("key3", value).ok());
-    EXPECT_EQ(value, "value3");
+    ASSERT_TRUE(db_.get("key2", value).ok());
+    EXPECT_EQ(value, "value2");
 }
 
 TEST_F(BatchTest, WriteBatchEmpty) {
@@ -93,20 +89,6 @@ TEST_F(BatchTest, WriteBatchSameVersion) {
 
     EXPECT_EQ(ver1, ver2);
     EXPECT_EQ(ver2, ver3);
-}
-
-TEST_F(BatchTest, WriteBatchClear) {
-    kvlite::WriteBatch batch;
-    batch.put("key1", "value1");
-    batch.clear();
-    batch.put("key2", "value2");
-
-    ASSERT_TRUE(db_.write(batch).ok());
-
-    std::string value;
-    EXPECT_TRUE(db_.get("key1", value).isNotFound());
-    ASSERT_TRUE(db_.get("key2", value).ok());
-    EXPECT_EQ(value, "value2");
 }
 
 TEST_F(BatchTest, WriteBatchLarge) {
@@ -141,15 +123,15 @@ TEST_F(BatchTest, ReadBatchBasic) {
     const auto& results = batch.results();
     ASSERT_EQ(results.size(), 3u);
 
-    EXPECT_TRUE(results[0].ok());
+    EXPECT_TRUE(results[0].status.ok());
     EXPECT_EQ(results[0].key, "key1");
     EXPECT_EQ(results[0].value, "value1");
 
-    EXPECT_TRUE(results[1].ok());
+    EXPECT_TRUE(results[1].status.ok());
     EXPECT_EQ(results[1].key, "key2");
     EXPECT_EQ(results[1].value, "value2");
 
-    EXPECT_TRUE(results[2].ok());
+    EXPECT_TRUE(results[2].status.ok());
     EXPECT_EQ(results[2].key, "key3");
     EXPECT_EQ(results[2].value, "value3");
 }
@@ -166,10 +148,10 @@ TEST_F(BatchTest, ReadBatchWithMissing) {
     const auto& results = batch.results();
     ASSERT_EQ(results.size(), 2u);
 
-    EXPECT_TRUE(results[0].ok());
+    EXPECT_TRUE(results[0].status.ok());
     EXPECT_EQ(results[0].value, "value1");
 
-    EXPECT_TRUE(results[1].notFound());
+    EXPECT_TRUE(results[1].status.isNotFound());
 }
 
 TEST_F(BatchTest, ReadBatchConsistentSnapshot) {
@@ -193,31 +175,6 @@ TEST_F(BatchTest, ReadBatchEmpty) {
     EXPECT_TRUE(batch.results().empty());
 }
 
-TEST_F(BatchTest, ReadBatchVectorKeys) {
-    ASSERT_TRUE(db_.put("a", "1").ok());
-    ASSERT_TRUE(db_.put("b", "2").ok());
-    ASSERT_TRUE(db_.put("c", "3").ok());
-
-    std::vector<std::string> keys = {"a", "b", "c"};
-    kvlite::ReadBatch batch;
-    batch.get(keys);
-
-    ASSERT_TRUE(db_.read(batch).ok());
-    EXPECT_EQ(batch.results().size(), 3u);
-}
-
-TEST_F(BatchTest, ReadBatchClear) {
-    ASSERT_TRUE(db_.put("key1", "value1").ok());
-
-    kvlite::ReadBatch batch;
-    batch.get("key1");
-    batch.clear();
-    batch.get("key1");
-
-    ASSERT_TRUE(db_.read(batch).ok());
-    EXPECT_EQ(batch.count(), 1u);
-}
-
 TEST_F(BatchTest, ReadBatchSnapshotVersion) {
     ASSERT_TRUE(db_.put("key", "value").ok());
 
@@ -226,27 +183,4 @@ TEST_F(BatchTest, ReadBatchSnapshotVersion) {
 
     ASSERT_TRUE(db_.read(batch).ok());
     EXPECT_GT(batch.snapshotVersion(), 0u);
-}
-
-TEST_F(BatchTest, ReadBatchResultAccess) {
-    ASSERT_TRUE(db_.put("key1", "value1").ok());
-    ASSERT_TRUE(db_.put("key2", "value2").ok());
-
-    kvlite::ReadBatch batch;
-    batch.get("key1");
-    batch.get("key2");
-
-    ASSERT_TRUE(db_.read(batch).ok());
-
-    // Access by index
-    const auto* r0 = batch.result(0);
-    const auto* r1 = batch.result(1);
-    const auto* r2 = batch.result(2);  // Out of bounds
-
-    ASSERT_NE(r0, nullptr);
-    ASSERT_NE(r1, nullptr);
-    EXPECT_EQ(r2, nullptr);
-
-    EXPECT_EQ(r0->value, "value1");
-    EXPECT_EQ(r1->value, "value2");
 }

@@ -484,7 +484,7 @@ TEST(GlobalIndexDHT, PutAndGetLatest) {
 
     uint64_t ver;
     uint32_t seg;
-    EXPECT_TRUE(index.getLatest("key1", ver, seg));
+    EXPECT_TRUE(index.getLatest("key1", ver, seg).ok());
     EXPECT_EQ(ver, 300u);
     EXPECT_EQ(seg, 3u);
 
@@ -515,11 +515,11 @@ TEST(GlobalIndexDHT, GetLatest) {
 
     uint64_t ver;
     uint32_t seg;
-    EXPECT_TRUE(index.getLatest("key1", ver, seg));
+    EXPECT_TRUE(index.getLatest("key1", ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 2u);
 
-    EXPECT_FALSE(index.getLatest("missing", ver, seg));
+    EXPECT_TRUE(index.getLatest("missing", ver, seg).isNotFound());
 }
 
 TEST(GlobalIndexDHT, GetWithUpperBound) {
@@ -672,11 +672,11 @@ TEST(GlobalIndexDHT, Snapshot) {
 
         uint64_t ver;
         uint32_t seg;
-        EXPECT_TRUE(index.getLatest("key1", ver, seg));
+        EXPECT_TRUE(index.getLatest("key1", ver, seg).ok());
         EXPECT_EQ(ver, 200u);
         EXPECT_EQ(seg, 2u);
 
-        EXPECT_TRUE(index.getLatest("key2", ver, seg));
+        EXPECT_TRUE(index.getLatest("key2", ver, seg).ok());
         EXPECT_EQ(ver, 300u);
         EXPECT_EQ(seg, 3u);
     }
@@ -716,7 +716,7 @@ TEST(GlobalIndexDHT, SnapshotWithManyEntries) {
 
         uint64_t ver;
         uint32_t seg;
-        EXPECT_TRUE(index.getLatest("key2", ver, seg));
+        EXPECT_TRUE(index.getLatest("key2", ver, seg).ok());
         EXPECT_EQ(ver, 400u);
         EXPECT_EQ(seg, 4u);
     }
@@ -1237,7 +1237,7 @@ TEST(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
 
     uint64_t ver;
     uint32_t seg;
-    ASSERT_TRUE(index.getLatest("key", ver, seg));
+    ASSERT_TRUE(index.getLatest("key", ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 1u);
 
@@ -1259,7 +1259,7 @@ TEST(GlobalIndexDHT, ManyVersionsDifferentSegments) {
 
     uint64_t ver;
     uint32_t seg;
-    ASSERT_TRUE(index.getLatest("key", ver, seg));
+    ASSERT_TRUE(index.getLatest("key", ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 200u);
 
@@ -1284,7 +1284,7 @@ TEST(GlobalIndexDHT, LargeScale) {
         std::string key = "key_" + std::to_string(i);
         uint64_t ver;
         uint32_t seg;
-        ASSERT_TRUE(index.getLatest(key, ver, seg));
+        ASSERT_TRUE(index.getLatest(key, ver, seg).ok());
         EXPECT_EQ(ver, static_cast<uint64_t>(i * 10));
         EXPECT_EQ(seg, static_cast<uint32_t>(i));
     }

@@ -731,19 +731,19 @@ TEST_F(FlushTest, GlobalIndexPopulated) {
     // Every entry should be registered in GlobalIndex with segment_id and version.
     uint64_t version;
     uint32_t segment_id;
-    ASSERT_TRUE(global_index_.getLatest("key1", version, segment_id));
+    ASSERT_TRUE(global_index_.getLatest("key1", version, segment_id).ok());
     EXPECT_EQ(version, 2u);  // latest version for key1
     EXPECT_EQ(segment_id, 77u);
 
-    ASSERT_TRUE(global_index_.getLatest("key2", version, segment_id));
+    ASSERT_TRUE(global_index_.getLatest("key2", version, segment_id).ok());
     EXPECT_EQ(version, 3u);
     EXPECT_EQ(segment_id, 77u);
 
-    ASSERT_TRUE(global_index_.getLatest("key3", version, segment_id));
+    ASSERT_TRUE(global_index_.getLatest("key3", version, segment_id).ok());
     EXPECT_EQ(version, 4u);
     EXPECT_EQ(segment_id, 77u);
 
-    EXPECT_FALSE(global_index_.getLatest("missing", version, segment_id));
+    EXPECT_TRUE(global_index_.getLatest("missing", version, segment_id).isNotFound());
 
     EXPECT_EQ(global_index_.keyCount(), 3u);
     EXPECT_EQ(global_index_.entryCount(), 4u);  // 4 total entries (key1 has 2 versions)

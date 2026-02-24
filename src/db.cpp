@@ -7,7 +7,6 @@
 #include "internal/manifest.h"
 #include "internal/version_manager.h"
 #include "internal/global_index.h"
-#include "internal/global_index_manager.h"
 #include "internal/segment_storage_manager.h"
 #include "internal/write_buffer.h"
 #include "internal/log_entry.h"
@@ -149,7 +148,7 @@ private:
             db_->storage_->pinSegment(id);
             pinned_segment_ids_.push_back(id);
             streams.push_back(internal::stream::scanLatestConsistent(
-                db_->global_index_->index(), id, snap_ver,
+                *db_->global_index_, id, snap_ver,
                 seg->logFile(), seg->dataSize()));
         }
 
@@ -279,9 +278,9 @@ Status DB::open(const std::string& path, const Options& options) {
         return s;
     }
 
-    // Initialize GlobalIndex manager
-    global_index_ = std::make_unique<internal::GlobalIndexManager>();
-    internal::GlobalIndexManager::Options global_index_opts;
+    // Initialize GlobalIndex
+    global_index_ = std::make_unique<internal::GlobalIndex>();
+    internal::GlobalIndex::Options global_index_opts;
     global_index_opts.snapshot_interval = options.global_index_snapshot_interval;
     global_index_opts.sync_writes = options.sync_writes;
 
@@ -333,7 +332,7 @@ Status DB::open(const std::string& path, const Options& options) {
                 internal::LogEntry entry;
                 Status rs = seg->readEntry(offset, entry);
                 if (rs.ok()) {
-                    global_index_->index().put(entry.key, entry.version(), id);
+                    global_index_->put(entry.key, entry.version(), id);
                 }
             });
         }
@@ -623,7 +622,7 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
 
     uint64_t snapshot_version = snap->version();
     batch.setSnapshotVersion(snapshot_version);
-    batch.reserveResults(batch.count());
+    batch.reserveResults(batch.keys().size());
 
     for (const auto& key : batch.keys()) {
         ReadResult result;
@@ -706,7 +705,7 @@ Status DB::flush() {
     if (!s.ok()) return s;
 
     auto* seg = storage_->getSegment(current_segment_id_);
-    s = write_buffer_->flush(*seg, current_segment_id_, global_index_->index());
+    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_);
     if (!s.ok()) {
         return s;
     }

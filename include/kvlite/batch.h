@@ -1,7 +1,6 @@
 #ifndef KVLITE_BATCH_H
 #define KVLITE_BATCH_H
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -10,26 +9,10 @@
 
 namespace kvlite {
 
-// WriteBatch holds a collection of updates to apply atomically.
+// WriteBatch: append-only list of operations to apply atomically.
 // All operations in a batch get the same version.
 class WriteBatch {
 public:
-    WriteBatch() = default;
-    ~WriteBatch() = default;
-
-    WriteBatch(const WriteBatch&) = default;
-    WriteBatch& operator=(const WriteBatch&) = default;
-    WriteBatch(WriteBatch&&) = default;
-    WriteBatch& operator=(WriteBatch&&) = default;
-
-    void put(const std::string& key, const std::string& value);
-    void remove(const std::string& key);
-    void clear();
-
-    size_t count() const { return operations_.size(); }
-    bool empty() const { return operations_.empty(); }
-    size_t approximateSize() const { return approximate_size_; }
-
     enum class OpType : uint8_t {
         kPut = 0x01,
         kDelete = 0x02
@@ -41,11 +24,15 @@ public:
         std::string value;
     };
 
+    void put(const std::string& key, const std::string& value) {
+        operations_.push_back({OpType::kPut, key, value});
+    }
+
     const std::vector<Operation>& operations() const { return operations_; }
+    bool empty() const { return operations_.empty(); }
 
 private:
     std::vector<Operation> operations_;
-    size_t approximate_size_ = 0;
 };
 
 // Result of a single read operation in a ReadBatch.
@@ -54,34 +41,15 @@ struct ReadResult {
     std::string value;
     uint64_t version = 0;
     Status status;
-
-    bool ok() const { return status.ok(); }
-    bool notFound() const { return status.isNotFound(); }
 };
 
-// ReadBatch performs multiple gets at a consistent snapshot.
+// ReadBatch: append-only list of keys to read at a consistent snapshot.
 class ReadBatch {
 public:
-    ReadBatch() = default;
-    ~ReadBatch() = default;
-
-    ReadBatch(const ReadBatch&) = default;
-    ReadBatch& operator=(const ReadBatch&) = default;
-    ReadBatch(ReadBatch&&) = default;
-    ReadBatch& operator=(ReadBatch&&) = default;
-
-    void get(const std::string& key);
-    void get(const std::vector<std::string>& keys);
-    void clear();
+    void get(const std::string& key) { keys_.push_back(key); }
 
     const std::vector<std::string>& keys() const { return keys_; }
     const std::vector<ReadResult>& results() const { return results_; }
-
-    const ReadResult* result(size_t index) const {
-        return index < results_.size() ? &results_[index] : nullptr;
-    }
-
-    size_t count() const { return keys_.size(); }
     bool empty() const { return keys_.empty(); }
     uint64_t snapshotVersion() const { return snapshot_version_; }
 

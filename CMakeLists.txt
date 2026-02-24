@@ -40,10 +40,8 @@ set(KVLITE_SOURCES
     src/internal/segment.cpp
     src/internal/segment_storage_manager.cpp
     src/internal/manifest.cpp
-    src/internal/global_index_manager.cpp
     src/internal/global_index_wal.cpp
     src/internal/entry_stream.cpp
-    src/batch.cpp
 )
 
 # Create library

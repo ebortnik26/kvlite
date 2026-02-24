@@ -2,9 +2,10 @@
 #define KVLITE_INTERNAL_L1_INDEX_H
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
-#include <functional>
 
 #include "internal/segment_delta_hash_table.h"
 #include "kvlite/status.h"
@@ -12,7 +13,10 @@
 namespace kvlite {
 namespace internal {
 
-// GlobalIndex: In-memory index mapping keys to (segment_id, version) lists.
+class GlobalIndexWAL;
+
+// GlobalIndex: In-memory index mapping keys to (segment_id, version) lists,
+// with built-in concurrency control and persistence.
 //
 // Structure: key → [(segment_id₁, version₁), (segment_id₂, version₂), ...]
 //            sorted by version desc (latest/highest first)
@@ -25,14 +29,50 @@ namespace internal {
 // 1. WAL (append-only delta log for crash recovery)
 // 2. Periodic snapshots (full dump every N updates + on shutdown)
 //
-// Thread-safety: external synchronization required (GlobalIndexManager provides it).
+// Thread-safety: Index operations are thread-safe via per-bucket spinlocks
+// in the underlying DeltaHashTable. Lifecycle methods (open/recover/close)
+// must be called from a single thread.
 class GlobalIndex {
 public:
+    struct Options {
+        // Number of updates before auto-snapshot (0 = disabled)
+        uint64_t snapshot_interval = 10'000'000;
+
+        // Sync WAL to disk on every write (slower but more durable)
+        bool sync_writes = false;
+    };
+
     GlobalIndex();
     ~GlobalIndex();
 
+    // Non-copyable
+    GlobalIndex(const GlobalIndex&) = delete;
+    GlobalIndex& operator=(const GlobalIndex&) = delete;
+
+    // --- Lifecycle ---
+
+    // Open the index for a database path.
+    // Does NOT recover — call recover() separately after open().
+    Status open(const std::string& db_path, const Options& options);
+
+    // Recover index state from snapshot + WAL.
+    // Must be called after open() and before any read/write operations.
+    // Returns OK even if no snapshot exists (starts with empty index).
+    Status recover();
+
+    // Close the index.
+    // Takes a final snapshot if there are pending updates.
+    Status close();
+
+    // Check if open.
+    bool isOpen() const;
+
+    // --- Index Operations ---
+
     // Append (segment_id, version) to key's list.
-    void put(const std::string& key, uint64_t version, uint32_t segment_id);
+    // Logs to WAL, then updates in-memory index.
+    // May trigger auto-snapshot if snapshot_interval is reached.
+    Status put(const std::string& key, uint64_t version, uint32_t segment_id);
 
     // Get all (segment_id, version) pairs for a key. Returns false if key
     // doesn't exist. Pairs are ordered latest-first (highest version first).
@@ -46,23 +86,22 @@ public:
              uint64_t& version, uint32_t& segment_id) const;
 
     // Get the latest (highest version) entry for a key.
-    // Returns false if key doesn't exist.
-    bool getLatest(const std::string& key,
-                   uint64_t& version, uint32_t& segment_id) const;
+    // Returns NotFound if key doesn't exist.
+    Status getLatest(const std::string& key,
+                     uint64_t& version, uint32_t& segment_id) const;
 
-    // Check if a key exists.
+    // Check if a key exists (has any version).
     bool contains(const std::string& key) const;
 
-    // Remove all entries for a key (used during GC compaction).
-    void remove(const std::string& key);
+    // Remove all entries for a key (used during GC).
+    // Logs to WAL, then updates in-memory index.
+    Status remove(const std::string& key);
 
     // Remove all entries pointing to a specific segment_id from a key's list.
+    // Note: This is an in-memory-only operation, not logged to WAL.
     void removeSegment(const std::string& key, uint32_t segment_id);
 
-    // Get statistics.
-    size_t keyCount() const;
-    size_t entryCount() const;  // total (segment_id, version) refs across all keys
-    size_t memoryUsage() const;
+    // --- Iteration ---
 
     // Iterate over all groups (hash-sorted). Callback receives:
     //   hash: the FNV-1a hash
@@ -76,7 +115,23 @@ public:
     // Clear all entries.
     void clear();
 
-    // --- Persistence ---
+    // --- Maintenance ---
+
+    // Force a snapshot now.
+    // Saves full index to snapshot file, then truncates WAL.
+    Status snapshot();
+
+    // Sync WAL to disk (if not using sync_writes option).
+    Status sync();
+
+    // --- Statistics ---
+
+    size_t keyCount() const;
+    size_t entryCount() const;  // total (segment_id, version) refs across all keys
+    size_t memoryUsage() const;
+    uint64_t updatesSinceSnapshot() const;
+
+    // --- Persistence (low-level) ---
 
     // Save full snapshot to file.
     Status saveSnapshot(const std::string& path) const;
@@ -96,8 +151,20 @@ public:
     // [checksum: 4 bytes]
 
 private:
+    Status maybeSnapshot();
+    std::string snapshotPath() const;
+    std::string walPath() const;
+
+    // --- Data ---
     SegmentDeltaHashTable dht_;
     size_t key_count_ = 0;
+
+    // --- Lifecycle / persistence ---
+    std::string db_path_;
+    Options options_;
+    bool is_open_ = false;
+    std::unique_ptr<GlobalIndexWAL> wal_;
+    uint64_t updates_since_snapshot_ = 0;
 };
 
 } // namespace internal

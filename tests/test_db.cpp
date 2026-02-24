@@ -237,7 +237,6 @@ TEST_F(DBTest, WriteBatchInBuffer) {
     kvlite::WriteBatch batch;
     batch.put("k1", "v1");
     batch.put("k2", "v2");
-    batch.remove("k3");
 
     ASSERT_TRUE(db_.write(batch).ok());
 
@@ -246,7 +245,6 @@ TEST_F(DBTest, WriteBatchInBuffer) {
     EXPECT_EQ(val, "v1");
     ASSERT_TRUE(db_.get("k2", val).ok());
     EXPECT_EQ(val, "v2");
-    EXPECT_TRUE(db_.get("k3", val).isNotFound());
 }
 
 TEST_F(DBTest, WriteBatchThenFlush) {

@@ -15,7 +15,7 @@ namespace kvlite {
 
 // Forward declarations for internal components
 namespace internal {
-class GlobalIndexManager;
+class GlobalIndex;
 class Manifest;
 class SegmentStorageManager;
 class VersionManager;
@@ -170,7 +170,7 @@ private:
     Options options_;
     std::unique_ptr<internal::Manifest> manifest_;
     std::unique_ptr<internal::VersionManager> versions_;
-    std::unique_ptr<internal::GlobalIndexManager> global_index_;
+    std::unique_ptr<internal::GlobalIndex> global_index_;
     std::unique_ptr<internal::SegmentStorageManager> storage_;
     std::unique_ptr<internal::WriteBuffer> write_buffer_;
     std::vector<std::unique_ptr<internal::WriteBuffer>> retired_buffers_;

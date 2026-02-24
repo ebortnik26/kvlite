@@ -475,10 +475,10 @@ TEST_F(ConcurrencyTest, ReadBatchAtomicity) {
             balance += 10;
             pending -= 10;
 
-            batch.clear();
-            batch.put("account_balance", std::to_string(balance));
-            batch.put("account_pending", std::to_string(pending));
-            db_.write(batch);
+            kvlite::WriteBatch batch2;
+            batch2.put("account_balance", std::to_string(balance));
+            batch2.put("account_pending", std::to_string(pending));
+            db_.write(batch2);
         }
     });
 
@@ -491,7 +491,7 @@ TEST_F(ConcurrencyTest, ReadBatchAtomicity) {
             db_.read(batch);
 
             const auto& results = batch.results();
-            if (results.size() == 2 && results[0].ok() && results[1].ok()) {
+            if (results.size() == 2 && results[0].status.ok() && results[1].status.ok()) {
                 int balance = std::stoi(results[0].value);
                 int pending = std::stoi(results[1].value);
                 // Total should always be 1000
@@ -544,12 +544,12 @@ TEST_F(ConcurrencyTest, WriteBatchAllOrNothingViaReadBatch) {
             if (results.size() != 3) continue;
 
             // Before the first batch lands, all may be NotFound.
-            if (results[0].notFound() && results[1].notFound() &&
-                results[2].notFound()) continue;
+            if (results[0].status.isNotFound() && results[1].status.isNotFound() &&
+                results[2].status.isNotFound()) continue;
 
             // All-or-nothing: if any key is found, all must be found.
-            if (results[0].notFound() || results[1].notFound() ||
-                results[2].notFound()) {
+            if (results[0].status.isNotFound() || results[1].status.isNotFound() ||
+                results[2].status.isNotFound()) {
                 violation = true;
                 break;
             }

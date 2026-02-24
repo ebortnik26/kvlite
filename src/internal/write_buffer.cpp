@@ -584,7 +584,8 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
 
     // Register every flushed entry in GlobalIndex.
     for (const auto& e : global_index_entries) {
-        global_index.put(e.key, e.version, segment_id);
+        s = global_index.put(e.key, e.version, segment_id);
+        if (!s.ok()) return s;
     }
 
     return Status::OK();
