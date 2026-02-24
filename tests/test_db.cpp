@@ -88,7 +88,7 @@ TEST_F(DBTest, VersionFromBuffer) {
 
     ASSERT_TRUE(db_.put("k1", "v1").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::string key, val;
@@ -199,7 +199,7 @@ TEST_F(DBTest, SnapshotReadFromBuffer) {
     EXPECT_EQ(val, "v1");
 
     // Verify version via snapshot iterator
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap1)).ok());
     std::string key;
     uint64_t entry_ver;
@@ -422,7 +422,7 @@ TEST_F(DBTest, IteratorOverFlushedData) {
     ASSERT_TRUE(db_.put("b", "2").ok());
     ASSERT_TRUE(db_.put("c", "3", syncOpts()).ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::set<std::string> keys;
@@ -469,7 +469,7 @@ TEST_F(DBTest, IteratorSnapshotVersion) {
     ASSERT_TRUE(db_.put("a", "1").ok());
     ASSERT_TRUE(db_.put("b", "2", syncOpts()).ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     // Iterator should have a valid snapshot

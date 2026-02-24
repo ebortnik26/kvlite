@@ -10,6 +10,7 @@
 #include "kvlite/status.h"
 #include "kvlite/options.h"
 #include "kvlite/batch.h"
+#include "kvlite/iterator.h"
 
 namespace kvlite {
 
@@ -48,29 +49,6 @@ private:
 
 class DB {
 public:
-    class Iterator {
-    public:
-        ~Iterator();
-
-        Iterator(const Iterator&) = delete;
-        Iterator& operator=(const Iterator&) = delete;
-
-        Iterator(Iterator&& other) noexcept;
-        Iterator& operator=(Iterator&& other) noexcept;
-
-        Status next(std::string& key, std::string& value);
-        Status next(std::string& key, std::string& value, uint64_t& version);
-
-        const Snapshot& snapshot() const;
-
-    private:
-        friend class DB;
-        class Impl;
-        explicit Iterator(std::unique_ptr<Impl> impl);
-        std::unique_ptr<Impl> impl_;
-    };
-
-    // --- DB Methods ---
 
     DB();
     ~DB();
@@ -133,6 +111,8 @@ public:
     uint64_t getOldestVersion() const;
 
 private:
+    friend class Iterator;
+
     Status getByVersion(const std::string& key, uint64_t upper_bound,
                         std::string& value,
                         const ReadOptions& options = ReadOptions());

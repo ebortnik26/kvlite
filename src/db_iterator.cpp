@@ -12,7 +12,7 @@
 
 namespace kvlite {
 
-// --- DB::Iterator::Impl ---
+// --- Iterator::Impl ---
 //
 // Two-phase sequential scan with inline pertinence check.
 //
@@ -26,7 +26,7 @@ namespace kvlite {
 // stream is already deduplicated (one entry per key, latest version <=
 // snapshot). Skip tombstones.
 
-class DB::Iterator::Impl {
+class Iterator::Impl {
 public:
     Impl(DB* db, Snapshot snapshot, bool owns_snapshot)
         : db_(db), snapshot_(snapshot), owns_snapshot_(owns_snapshot) {
@@ -194,24 +194,24 @@ private:
     uint64_t current_version_ = 0;
 };
 
-// --- DB::Iterator forwarding methods ---
+// --- Iterator methods ---
 
-DB::Iterator::Iterator(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
-DB::Iterator::~Iterator() = default;
+Iterator::Iterator(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Iterator::~Iterator() = default;
 
-DB::Iterator::Iterator(Iterator&& other) noexcept = default;
-DB::Iterator& DB::Iterator::operator=(Iterator&& other) noexcept = default;
+Iterator::Iterator(Iterator&& other) noexcept = default;
+Iterator& Iterator::operator=(Iterator&& other) noexcept = default;
 
-Status DB::Iterator::next(std::string& key, std::string& value) {
+Status Iterator::next(std::string& key, std::string& value) {
     uint64_t version;
     return next(key, value, version);
 }
 
-Status DB::Iterator::next(std::string& key, std::string& value, uint64_t& version) {
+Status Iterator::next(std::string& key, std::string& value, uint64_t& version) {
     return impl_->next(key, value, version);
 }
 
-const Snapshot& DB::Iterator::snapshot() const {
+const Snapshot& Iterator::snapshot() const {
     return impl_->snapshot();
 }
 

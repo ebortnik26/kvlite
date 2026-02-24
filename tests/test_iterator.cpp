@@ -38,7 +38,7 @@ protected:
 };
 
 TEST_F(IteratorTest, EmptyDatabase) {
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::string key, value;
@@ -49,7 +49,7 @@ TEST_F(IteratorTest, EmptyDatabase) {
 TEST_F(IteratorTest, SingleKey) {
     ASSERT_TRUE(db_.put("key", "value").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::string key, value;
@@ -70,7 +70,7 @@ TEST_F(IteratorTest, MultipleKeys) {
         expected[k] = v;
     }
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::map<std::string, std::string> found;
@@ -86,7 +86,7 @@ TEST_F(IteratorTest, IteratorWithVersion) {
     ASSERT_TRUE(db_.put("key1", "value1").ok());
     ASSERT_TRUE(db_.put("key2", "value2").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::string key, value;
@@ -107,7 +107,7 @@ TEST_F(IteratorTest, OnlyLatestVersionPerKey) {
     ASSERT_TRUE(db_.put("key", "v2").ok());
     ASSERT_TRUE(db_.put("key", "v3").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::string key, value;
@@ -126,7 +126,7 @@ TEST_F(IteratorTest, SkipsDeletedKeys) {
     ASSERT_TRUE(db_.put("key3", "value3").ok());
     ASSERT_TRUE(db_.remove("key2").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::set<std::string> found_keys;
@@ -143,7 +143,7 @@ TEST_F(IteratorTest, SkipsDeletedKeys) {
 TEST_F(IteratorTest, Snapshot) {
     ASSERT_TRUE(db_.put("key", "value").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     EXPECT_GT(iter->snapshot().version(), 0u);
@@ -153,7 +153,7 @@ TEST_F(IteratorTest, ConsistentSnapshot) {
     ASSERT_TRUE(db_.put("key1", "initial1").ok());
     ASSERT_TRUE(db_.put("key2", "initial2").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     // Modify database after iterator creation
@@ -183,7 +183,7 @@ TEST_F(IteratorTest, LargeDataset) {
         expected_keys.insert(k);
     }
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::set<std::string> found_keys;
@@ -205,7 +205,7 @@ TEST_F(IteratorTest, IteratorAfterReopen) {
     opts.create_if_missing = false;
     ASSERT_TRUE(db_.open(test_dir_.string(), opts).ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::set<std::string> found_keys;
@@ -222,8 +222,8 @@ TEST_F(IteratorTest, IteratorAfterReopen) {
 TEST_F(IteratorTest, MultipleIterators) {
     ASSERT_TRUE(db_.put("key", "value").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter1;
-    std::unique_ptr<kvlite::DB::Iterator> iter2;
+    std::unique_ptr<kvlite::Iterator> iter1;
+    std::unique_ptr<kvlite::Iterator> iter2;
 
     ASSERT_TRUE(db_.createIterator(iter1).ok());
     ASSERT_TRUE(db_.createIterator(iter2).ok());
@@ -240,11 +240,11 @@ TEST_F(IteratorTest, MultipleIterators) {
 TEST_F(IteratorTest, IteratorMoveSemantics) {
     ASSERT_TRUE(db_.put("key", "value").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     // Move iterator
-    std::unique_ptr<kvlite::DB::Iterator> iter2 = std::move(iter);
+    std::unique_ptr<kvlite::Iterator> iter2 = std::move(iter);
 
     std::string key, value;
     ASSERT_TRUE(iter2->next(key, value).ok());
@@ -264,7 +264,7 @@ TEST_F(IteratorTest, SnapshotBasedIteratorSeesSnapshotState) {
     ASSERT_TRUE(db_.put("key1", "after_snap").ok());
     ASSERT_TRUE(db_.put("key3", "after_snap").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap)).ok());
 
     std::map<std::string, std::string> found;
@@ -285,7 +285,7 @@ TEST_F(IteratorTest, SnapshotBasedIteratorSnapshot) {
 
     kvlite::Snapshot snap = db_.createSnapshot();
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap)).ok());
 
     EXPECT_EQ(iter->snapshot().version(), snap.version());
@@ -299,7 +299,7 @@ TEST_F(IteratorTest, SnapshotBasedIteratorDoesNotReleaseSnapshot) {
     kvlite::Snapshot snap = db_.createSnapshot();
 
     {
-        std::unique_ptr<kvlite::DB::Iterator> iter;
+        std::unique_ptr<kvlite::Iterator> iter;
         ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap)).ok());
 
         std::string key, value;
@@ -324,7 +324,7 @@ TEST_F(IteratorTest, SnapshotBasedIteratorDeduplicates) {
 
     ASSERT_TRUE(db_.put("key", "v3").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap)).ok());
 
     std::string key, value;
@@ -348,11 +348,11 @@ TEST_F(IteratorTest, DefaultAndSnapshotIteratorsCoexist) {
     ASSERT_TRUE(db_.put("key2", "v2").ok());
 
     // Snapshot-based iterator sees pre-snapshot state
-    std::unique_ptr<kvlite::DB::Iterator> snap_iter;
+    std::unique_ptr<kvlite::Iterator> snap_iter;
     ASSERT_TRUE(db_.createIterator(snap_iter, snapOpts(snap)).ok());
 
     // Default iterator sees current state
-    std::unique_ptr<kvlite::DB::Iterator> default_iter;
+    std::unique_ptr<kvlite::Iterator> default_iter;
     ASSERT_TRUE(db_.createIterator(default_iter).ok());
 
     // Collect snapshot iterator results

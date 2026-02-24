@@ -81,7 +81,7 @@ TEST_F(BatchTest, WriteBatchSameVersion) {
     ASSERT_TRUE(db_.write(batch).ok());
 
     // All keys should have the same version — verify via iterator
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::map<std::string, uint64_t> key_versions;

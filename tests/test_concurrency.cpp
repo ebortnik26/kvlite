@@ -231,7 +231,7 @@ TEST_F(ConcurrencyTest, WriteBatchAtomicity) {
 
     // Verify atomicity: all keys in a batch should have same version.
     // Collect all key→version pairs via iterator.
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::map<std::string, uint64_t> key_versions;
@@ -346,7 +346,7 @@ TEST_F(ConcurrencyTest, IteratorConsistencyDuringWrites) {
         initial_keys.insert(key);
     }
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     // Start concurrent writes
@@ -397,7 +397,7 @@ TEST_F(ConcurrencyTest, VersionOrderingUnderConcurrency) {
     }
 
     // Collect all versions via iterator.
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::string key, value;
@@ -619,7 +619,7 @@ TEST_F(ConcurrencyTest, WriteBatchSameVersionUnderConcurrency) {
     }
 
     // Collect all key→version pairs via iterator.
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::map<std::string, uint64_t> key_versions;

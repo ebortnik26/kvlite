@@ -99,7 +99,7 @@ TEST_F(BasicTest, VersionIsPositive) {
 
     ASSERT_TRUE(db_.put("key", "value").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::string key, value;

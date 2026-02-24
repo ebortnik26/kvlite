@@ -47,7 +47,7 @@ TEST_F(VersioningTest, VersionIncreases) {
     }
 
     // Collect versions via iterator.
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::map<int, uint64_t> idx_to_ver;
@@ -69,7 +69,7 @@ TEST_F(VersioningTest, DifferentKeysGetDifferentVersions) {
     ASSERT_TRUE(db_.put("key1", "value1").ok());
     ASSERT_TRUE(db_.put("key2", "value2").ok());
 
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     std::map<std::string, uint64_t> key_versions;
@@ -124,7 +124,7 @@ TEST_F(VersioningTest, SnapshotPointInTimeWithVersionOutput) {
 
     // Verify versions via snapshot-based iterators.
     {
-        std::unique_ptr<kvlite::DB::Iterator> iter;
+        std::unique_ptr<kvlite::Iterator> iter;
         ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap1)).ok());
         std::string key, value;
         uint64_t entry_version;
@@ -134,7 +134,7 @@ TEST_F(VersioningTest, SnapshotPointInTimeWithVersionOutput) {
     }
 
     {
-        std::unique_ptr<kvlite::DB::Iterator> iter;
+        std::unique_ptr<kvlite::Iterator> iter;
         ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap2)).ok());
         std::string key, value;
         uint64_t entry_version;
@@ -210,7 +210,7 @@ TEST_F(VersioningTest, SnapshotGetWithVersion) {
     EXPECT_EQ(value, "value");
 
     // Verify version via snapshot iterator
-    std::unique_ptr<kvlite::DB::Iterator> iter;
+    std::unique_ptr<kvlite::Iterator> iter;
     ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap)).ok());
     std::string key;
     uint64_t entry_version;
