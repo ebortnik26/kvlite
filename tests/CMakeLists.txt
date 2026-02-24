@@ -268,16 +268,20 @@ target_link_libraries(kvlite_entry_stream_test
         pthread
 )
 
-# Register tests with CTest
-include(GoogleTest)
-gtest_discover_tests(kvlite_entry_stream_test)
-gtest_discover_tests(kvlite_sm_test)
-gtest_discover_tests(kvlite_test)
-gtest_discover_tests(kvlite_bitstream_test)
-gtest_discover_tests(kvlite_dht_test)
-gtest_discover_tests(kvlite_segment_index_test)
-gtest_discover_tests(kvlite_wb_test)
-gtest_discover_tests(kvlite_seg_test)
-gtest_discover_tests(kvlite_lf_test)
-gtest_discover_tests(kvlite_vm_test)
-gtest_discover_tests(kvlite_manifest_test)
+# Register test executables with CTest (one test per executable).
+# This allows safe parallel execution with ctest -j2 since each executable
+# uses its own temp directories.
+add_test(NAME entry_stream_tests COMMAND kvlite_entry_stream_test)
+add_test(NAME storage_manager_tests COMMAND kvlite_sm_test)
+add_test(NAME integration_tests COMMAND kvlite_test)
+add_test(NAME bitstream_tests COMMAND kvlite_bitstream_test)
+add_test(NAME dht_tests COMMAND kvlite_dht_test)
+add_test(NAME segment_index_tests COMMAND kvlite_segment_index_test)
+add_test(NAME write_buffer_tests COMMAND kvlite_wb_test)
+add_test(NAME segment_tests COMMAND kvlite_seg_test)
+add_test(NAME log_file_tests COMMAND kvlite_lf_test)
+add_test(NAME version_manager_tests COMMAND kvlite_vm_test)
+add_test(NAME manifest_tests COMMAND kvlite_manifest_test)
+
+# Default parallel level for ctest
+set(CTEST_PARALLEL_LEVEL 2 CACHE STRING "Number of tests to run in parallel")
