@@ -4,7 +4,6 @@
 #include <cassert>
 #include <memory>
 #include <queue>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -171,21 +170,19 @@ private:
 
         // Classify: entries arrive in version-asc order.
         // For each snapshot, the latest version <= snapshot is kept.
-        std::set<size_t> keep_indices;
+        // Default all to kEliminate, then mark keepers.
+        for (size_t i = 0; i < group_.size(); ++i) {
+            group_[i].ext[base_ + GCClassifyExt::kAction] =
+                static_cast<uint64_t>(EntryAction::kEliminate);
+        }
         for (uint64_t snap : snapshots_) {
             for (int i = static_cast<int>(group_.size()) - 1; i >= 0; --i) {
                 if (group_[i].version <= snap) {
-                    keep_indices.insert(static_cast<size_t>(i));
+                    group_[i].ext[base_ + GCClassifyExt::kAction] =
+                        static_cast<uint64_t>(EntryAction::kKeep);
                     break;
                 }
             }
-        }
-
-        for (size_t i = 0; i < group_.size(); ++i) {
-            group_[i].ext[base_ + GCClassifyExt::kAction] =
-                keep_indices.count(i)
-                    ? static_cast<uint64_t>(EntryAction::kKeep)
-                    : static_cast<uint64_t>(EntryAction::kEliminate);
         }
     }
 

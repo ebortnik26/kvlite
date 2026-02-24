@@ -85,18 +85,22 @@ private:
                 continue;
             }
 
-            // Copy scalars + key before advancing — next() invalidates the
-            // entry's string_views. Key and value use reusable member strings
-            // so the allocator keeps the buffer across iterations.
+            // Read scalars from the entry ref before next() invalidates it.
+            // Defer string copies: version check is free, key is needed for
+            // WB/GI lookups, value is only needed on the emit path.
             const auto& e = seg_stream_->entry();
             uint64_t version = e.version;
+
+            // Cheap scalar check — skip without any string copies.
+            if (version > snap_ver) {
+                seg_stream_->next();
+                continue;
+            }
+
             bool tombstone = e.tombstone;
             scan_key_.assign(e.key.data(), e.key.size());
             scan_value_.assign(e.value.data(), e.value.size());
             seg_stream_->next();
-
-            // Cheap scalar check first.
-            if (version > snap_ver) continue;
 
             // WB precedence: if WB has a version for this key at snapshot,
             // skip — it will be emitted in Phase 2.
@@ -135,18 +139,19 @@ private:
         // Phase 2 — emit WriteBuffer entries pertinent at the snapshot.
         while (wb_stream_ && wb_stream_->valid()) {
             const auto& e = wb_stream_->entry();
-            bool tombstone = e.tombstone;
+
+            if (e.tombstone) {
+                wb_stream_->next();
+                continue;
+            }
 
             current_key_.assign(e.key.data(), e.key.size());
             current_value_.assign(e.value.data(), e.value.size());
             current_version_ = e.version;
-
             wb_stream_->next();
 
-            if (!tombstone) {
-                valid_ = true;
-                return;
-            }
+            valid_ = true;
+            return;
         }
 
         valid_ = false;
