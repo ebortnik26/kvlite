@@ -1,17 +1,15 @@
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <memory>
+#include <set>
 #include <string>
-#include <thread>
-#include <tuple>
-#include <unistd.h>
 #include <vector>
 
 #include "internal/delta_hash_table_base.h"
+#include "internal/entry_stream.h"
+#include "internal/gc_stream.h"
 #include "internal/global_index.h"
 #include "internal/log_file.h"
-#include "internal/entry_stream.h"
 #include "internal/segment.h"
 #include "internal/write_buffer.h"
 
@@ -77,120 +75,9 @@ TEST_F(EntryStreamTest, Scan_AllEntries) {
     EXPECT_EQ(count, 2u);
 }
 
-// --- ScanLatest Tests ---
+// --- GCMergeStream Tests ---
 
-TEST_F(EntryStreamTest, ScanLatest_SingleSegment) {
-    size_t idx = createSegment(1, {
-        {"key1", 1, "val1", false},
-        {"key2", 2, "val2", false},
-    });
-    auto& seg = segments_[idx];
-
-    auto s = stream::scanLatest(
-        gi_, 1, /*snapshot_version=*/2,
-        seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(s->valid());
-    std::vector<std::string> keys;
-    while (s->valid()) {
-        keys.push_back(std::string(s->entry().key));
-        ASSERT_TRUE(s->next().ok());
-    }
-    EXPECT_EQ(keys.size(), 2u);
-    EXPECT_TRUE(std::find(keys.begin(), keys.end(), "key1") != keys.end());
-    EXPECT_TRUE(std::find(keys.begin(), keys.end(), "key2") != keys.end());
-}
-
-TEST_F(EntryStreamTest, ScanLatest_SupersededEntry) {
-    size_t idx = createSegment(1, {{"key1", 1, "old", false}});
-    createSegment(2, {{"key1", 2, "new", false}});
-    auto& seg = segments_[idx];
-
-    auto s = stream::scanLatest(
-        gi_, 1, /*snapshot_version=*/2,
-        seg.logFile(), seg.dataSize());
-
-    EXPECT_FALSE(s->valid());
-}
-
-TEST_F(EntryStreamTest, ScanLatest_MultiSegmentDedup) {
-    createSegment(1, {{"key1", 1, "old", false}});
-    size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
-    auto& seg2 = segments_[idx2];
-
-    auto s = stream::scanLatest(
-        gi_, 2, /*snapshot_version=*/2,
-        seg2.logFile(), seg2.dataSize());
-
-    ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().key, "key1");
-    EXPECT_EQ(s->entry().value, "new");
-    EXPECT_EQ(s->entry().version, 2u);
-
-    ASSERT_TRUE(s->next().ok());
-    EXPECT_FALSE(s->valid());
-}
-
-TEST_F(EntryStreamTest, ScanLatest_SnapshotBound) {
-    size_t idx = createSegment(1, {
-        {"key1", 1, "v1", false},
-        {"key1", 3, "v3", false},
-    });
-    auto& seg = segments_[idx];
-
-    auto s = stream::scanLatest(
-        gi_, 1, /*snapshot_version=*/2,
-        seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().key, "key1");
-    EXPECT_EQ(s->entry().version, 1u);
-
-    ASSERT_TRUE(s->next().ok());
-    EXPECT_FALSE(s->valid());
-}
-
-TEST_F(EntryStreamTest, ScanLatest_NonAtomic_SeesMutation) {
-    // Populate seg1 with 50 keys at versions 1..50.
-    std::vector<std::tuple<std::string, uint64_t, std::string, bool>> entries;
-    for (int i = 0; i < 50; ++i) {
-        entries.push_back({"key" + std::to_string(i),
-                           static_cast<uint64_t>(i + 1),
-                           "val" + std::to_string(i), false});
-    }
-    size_t idx = createSegment(1, entries);
-    auto& seg = segments_[idx];
-
-    // Use snapshot_version=200 so new versions in seg2 are within the bound.
-    // Note: the FilterStream constructor eagerly advances to the first matching
-    // entry, so at most 1 entry can pass before we mutate the GlobalIndex.
-    auto s = stream::scanLatest(
-        gi_, 1, /*snapshot_version=*/200,
-        seg.logFile(), seg.dataSize());
-
-    // Supersede ALL keys with versions within the snapshot bound but in seg2.
-    for (int i = 0; i < 50; ++i) {
-        gi_.put("key" + std::to_string(i),
-                static_cast<uint64_t>(51 + i), 2);
-    }
-
-    // Drain — scanLatest re-checks GlobalIndex per entry, so most entries
-    // should be filtered out. The first entry was already loaded at
-    // construction time, so count may be 1 (not 0).
-    size_t count = 0;
-    while (s->valid()) {
-        count++;
-        ASSERT_TRUE(s->next().ok());
-    }
-
-    // Non-atomic: most entries filtered out by mutation. At most 1 entry
-    // survived (the one preloaded by FilterStream's constructor).
-    EXPECT_LE(count, 1u);
-}
-
-// --- MergeStream Tests ---
-
-TEST_F(EntryStreamTest, Merge_SingleStream) {
+TEST_F(EntryStreamTest, GCMerge_SingleStream) {
     size_t idx = createSegment(1, {
         {"key1", 1, "val1", false},
         {"key2", 2, "val2", false},
@@ -198,11 +85,9 @@ TEST_F(EntryStreamTest, Merge_SingleStream) {
     auto& seg = segments_[idx];
 
     std::vector<std::unique_ptr<EntryStream>> streams;
-    streams.push_back(stream::scanLatest(
-        gi_, 1, /*snapshot_version=*/2,
-        seg.logFile(), seg.dataSize()));
+    streams.push_back(stream::scan(seg.logFile(), seg.dataSize()));
 
-    auto merged = stream::merge(std::move(streams));
+    auto merged = stream::gcMerge(std::move(streams));
 
     size_t count = 0;
     while (merged->valid()) {
@@ -212,17 +97,17 @@ TEST_F(EntryStreamTest, Merge_SingleStream) {
     EXPECT_EQ(count, 2u);
 }
 
-TEST_F(EntryStreamTest, Merge_TwoStreamsDisjointKeys) {
+TEST_F(EntryStreamTest, GCMerge_TwoStreamsDisjointKeys) {
     size_t idx1 = createSegment(1, {{"key1", 1, "val1", false}});
     size_t idx2 = createSegment(2, {{"key2", 2, "val2", false}});
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
     std::vector<std::unique_ptr<EntryStream>> streams;
-    streams.push_back(stream::scanLatest(gi_, 1, 2, seg1.logFile(), seg1.dataSize()));
-    streams.push_back(stream::scanLatest(gi_, 2, 2, seg2.logFile(), seg2.dataSize()));
+    streams.push_back(stream::scan(seg1.logFile(), seg1.dataSize()));
+    streams.push_back(stream::scan(seg2.logFile(), seg2.dataSize()));
 
-    auto merged = stream::merge(std::move(streams));
+    auto merged = stream::gcMerge(std::move(streams));
 
     std::vector<std::string> keys;
     while (merged->valid()) {
@@ -232,34 +117,34 @@ TEST_F(EntryStreamTest, Merge_TwoStreamsDisjointKeys) {
     EXPECT_EQ(keys.size(), 2u);
 }
 
-TEST_F(EntryStreamTest, Merge_TwoStreamsSameKey) {
+TEST_F(EntryStreamTest, GCMerge_TwoStreamsSameKey) {
     createSegment(1, {{"key1", 1, "old", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
     auto& seg1 = segments_[0];
     auto& seg2 = segments_[idx2];
 
     std::vector<std::unique_ptr<EntryStream>> streams;
-    streams.push_back(stream::scanLatest(gi_, 1, 2, seg1.logFile(), seg1.dataSize()));
-    streams.push_back(stream::scanLatest(gi_, 2, 2, seg2.logFile(), seg2.dataSize()));
+    streams.push_back(stream::scan(seg1.logFile(), seg1.dataSize()));
+    streams.push_back(stream::scan(seg2.logFile(), seg2.dataSize()));
 
-    auto merged = stream::merge(std::move(streams));
+    auto merged = stream::gcMerge(std::move(streams));
 
+    // Both versions should be emitted (merge doesn't dedup — classify does).
     std::vector<std::string> keys;
     while (merged->valid()) {
         keys.push_back(std::string(merged->entry().key));
         ASSERT_TRUE(merged->next().ok());
     }
-    EXPECT_EQ(keys.size(), 1u);
-    EXPECT_EQ(keys[0], "key1");
+    EXPECT_EQ(keys.size(), 2u);
 }
 
-TEST_F(EntryStreamTest, Merge_Empty) {
+TEST_F(EntryStreamTest, GCMerge_Empty) {
     std::vector<std::unique_ptr<EntryStream>> streams;
-    auto merged = stream::merge(std::move(streams));
+    auto merged = stream::gcMerge(std::move(streams));
     EXPECT_FALSE(merged->valid());
 }
 
-TEST_F(EntryStreamTest, Merge_OrderVerification) {
+TEST_F(EntryStreamTest, GCMerge_OrderVerification) {
     std::string keyA = "alpha";
     std::string keyB = "beta";
     uint64_t hashA = dhtHashBytes(keyA.data(), keyA.size());
@@ -275,10 +160,10 @@ TEST_F(EntryStreamTest, Merge_OrderVerification) {
     auto& seg2 = segments_[idx2];
 
     std::vector<std::unique_ptr<EntryStream>> streams;
-    streams.push_back(stream::scanLatest(gi_, 1, 2, seg1.logFile(), seg1.dataSize()));
-    streams.push_back(stream::scanLatest(gi_, 2, 2, seg2.logFile(), seg2.dataSize()));
+    streams.push_back(stream::scan(seg1.logFile(), seg1.dataSize()));
+    streams.push_back(stream::scan(seg2.logFile(), seg2.dataSize()));
 
-    auto merged = stream::merge(std::move(streams));
+    auto merged = stream::gcMerge(std::move(streams));
 
     ASSERT_TRUE(merged->valid());
     EXPECT_EQ(merged->entry().key, keyA);
@@ -319,132 +204,6 @@ TEST_F(EntryStreamTest, Filter_Custom) {
         ASSERT_TRUE(s->next().ok());
     }
     EXPECT_EQ(count, 2u);
-}
-
-// --- Concurrent iteration + mutation tests ---
-//
-// These tests verify that draining an EntryStream while another thread
-// mutates the GlobalIndex does not crash or corrupt.
-
-TEST_F(EntryStreamTest, ConcurrentIterate_PutsDuringDrain) {
-    // Populate initial data: seg1 with 100 keys.
-    std::vector<std::tuple<std::string, uint64_t, std::string, bool>> entries;
-    for (int i = 0; i < 100; ++i) {
-        entries.push_back({"key" + std::to_string(i),
-                           static_cast<uint64_t>(i + 1),
-                           "val" + std::to_string(i), false});
-    }
-    size_t idx = createSegment(1, entries);
-    auto& seg = segments_[idx];
-
-    // Create scanLatest stream at snapshot = 100.
-    auto s = stream::scanLatest(
-        gi_, 1, /*snapshot_version=*/100,
-        seg.logFile(), seg.dataSize());
-
-    // Writer thread: put new keys into GlobalIndex concurrently.
-    std::atomic<bool> done{false};
-    std::thread writer([&] {
-        for (int i = 0; i < 500; ++i) {
-            gi_.put("new_key" + std::to_string(i),
-                    static_cast<uint64_t>(200 + i), 2);
-        }
-        done = true;
-    });
-
-    // Drain the stream — should not crash or hang.
-    size_t count = 0;
-    while (s->valid()) {
-        count++;
-        ASSERT_TRUE(s->next().ok());
-    }
-
-    writer.join();
-
-    // All 100 original keys should have been yielded (scanLatest checks
-    // GlobalIndex per entry, but segment_id=1 entries are still there).
-    EXPECT_EQ(count, 100u);
-}
-
-TEST_F(EntryStreamTest, ConcurrentIterate_DeletesDuringDrain) {
-    // Populate: seg1 with 50 keys.
-    std::vector<std::tuple<std::string, uint64_t, std::string, bool>> entries1;
-    for (int i = 0; i < 50; ++i) {
-        entries1.push_back({"key" + std::to_string(i),
-                            static_cast<uint64_t>(i + 1),
-                            "old" + std::to_string(i), false});
-    }
-    size_t idx1 = createSegment(1, entries1);
-    auto& seg1 = segments_[idx1];
-
-    // Create scanLatest on seg1 at snapshot = 50.
-    auto s = stream::scanLatest(
-        gi_, 1, /*snapshot_version=*/50,
-        seg1.logFile(), seg1.dataSize());
-
-    // Writer thread: add superseding versions to GlobalIndex in seg2.
-    std::atomic<bool> done{false};
-    std::thread writer([&] {
-        for (int i = 0; i < 50; ++i) {
-            gi_.put("key" + std::to_string(i),
-                    static_cast<uint64_t>(100 + i), 2);
-        }
-        done = true;
-    });
-
-    // Drain the stream. Some entries may or may not be yielded depending
-    // on race with the writer — the important thing is no crash.
-    size_t count = 0;
-    while (s->valid()) {
-        count++;
-        ASSERT_TRUE(s->next().ok());
-    }
-
-    writer.join();
-
-    // Count may be 0..50 depending on timing — just verify no crash.
-    EXPECT_LE(count, 50u);
-}
-
-TEST_F(EntryStreamTest, ConcurrentIterate_MergeWithPuts) {
-    // Two segments, merge them while another thread adds to GlobalIndex.
-    size_t idx1 = createSegment(1, {
-        {"alpha", 1, "A1", false},
-        {"gamma", 3, "G3", false},
-    });
-    size_t idx2 = createSegment(2, {
-        {"beta", 2, "B2", false},
-        {"delta", 4, "D4", false},
-    });
-    auto& seg1 = segments_[idx1];
-    auto& seg2 = segments_[idx2];
-
-    std::vector<std::unique_ptr<EntryStream>> streams;
-    streams.push_back(stream::scanLatest(gi_, 1, 4, seg1.logFile(), seg1.dataSize()));
-    streams.push_back(stream::scanLatest(gi_, 2, 4, seg2.logFile(), seg2.dataSize()));
-    auto merged = stream::merge(std::move(streams));
-
-    // Writer thread: concurrently update GlobalIndex.
-    std::thread writer([&] {
-        for (int i = 0; i < 200; ++i) {
-            gi_.put("extra" + std::to_string(i),
-                    static_cast<uint64_t>(100 + i), 3);
-        }
-    });
-
-    // Drain merged stream — should not crash or hang.
-    size_t count = 0;
-    while (merged->valid()) {
-        count++;
-        ASSERT_TRUE(merged->next().ok());
-    }
-
-    writer.join();
-
-    // Some entries may be filtered out due to concurrent GlobalIndex mutation
-    // changing which segment holds the "latest" version. The important thing
-    // is no crash or hang.
-    EXPECT_LE(count, 4u);
 }
 
 // --- TagSource Tests ---
@@ -498,7 +257,7 @@ TEST_F(EntryStreamTest, TagSource_PropagatesThroughMerge) {
     streams.push_back(stream::gcTagSource(
         stream::scan(seg2.logFile(), seg2.dataSize()), 2, kBase));
 
-    auto merged = stream::merge(std::move(streams));
+    auto merged = stream::gcMerge(std::move(streams));
 
     // Both entries should retain their tagged segment_id through merge.
     std::set<uint64_t> seen_ids;
@@ -529,7 +288,7 @@ TEST_F(EntryStreamTest, Classify_KeepAndEliminate) {
     streams.push_back(stream::gcTagSource(
         stream::scan(seg2.logFile(), seg2.dataSize()), 2, kTagBase));
 
-    auto merged = stream::merge(std::move(streams));
+    auto merged = stream::gcMerge(std::move(streams));
 
     std::vector<uint64_t> snapshots = {2};
     auto classified = stream::gcClassify(

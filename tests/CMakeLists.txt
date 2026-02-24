@@ -244,6 +244,7 @@ target_link_libraries(kvlite_sm_test
 add_executable(kvlite_entry_stream_test
     test_entry_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/entry_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_lslot_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_delta_hash_table.cpp
