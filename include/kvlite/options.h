@@ -6,6 +6,8 @@
 
 namespace kvlite {
 
+class Snapshot;
+
 // Garbage collection policy for selecting files to compact
 enum class GCPolicy {
     // Select files with the highest ratio of dead entries (default)
@@ -90,6 +92,10 @@ struct ReadOptions {
 
     // If true, cache the SegmentIndex if not already cached
     bool fill_cache = true;
+
+    // If non-null, read at this snapshot's point-in-time.
+    // The caller must keep the Snapshot alive for the duration of the operation.
+    const Snapshot* snapshot = nullptr;
 };
 
 // Options for write operations

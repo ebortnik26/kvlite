@@ -16,66 +16,6 @@
 
 namespace kvlite {
 
-// --- DB::Snapshot Implementation ---
-
-DB::Snapshot::Snapshot(DB* db, uint64_t version)
-    : db_(db), version_(version) {}
-
-DB::Snapshot::~Snapshot() {
-    if (db_) {
-        db_->versions_->releaseSnapshot(version_);
-    }
-}
-
-DB::Snapshot::Snapshot(Snapshot&& other) noexcept
-    : db_(other.db_), version_(other.version_) {
-    other.db_ = nullptr;
-}
-
-DB::Snapshot& DB::Snapshot::operator=(Snapshot&& other) noexcept {
-    if (this != &other) {
-        if (db_) {
-            db_->versions_->releaseSnapshot(version_);
-        }
-        db_ = other.db_;
-        version_ = other.version_;
-        other.db_ = nullptr;
-    }
-    return *this;
-}
-
-Status DB::Snapshot::get(const std::string& key, std::string& value,
-                         const ReadOptions& options) const {
-    uint64_t entry_version;
-    return get(key, value, entry_version, options);
-}
-
-Status DB::Snapshot::get(const std::string& key, std::string& value,
-                         uint64_t& entry_version, const ReadOptions& options) const {
-    if (!db_) {
-        return Status::InvalidArgument("Snapshot is invalid");
-    }
-    return db_->getByVersion(key, version_, value, entry_version, options);
-}
-
-Status DB::Snapshot::exists(const std::string& key, bool& exists,
-                            const ReadOptions& options) const {
-    std::string value;
-    Status s = get(key, value, options);
-    if (s.ok()) {
-        exists = true;
-        return Status::OK();
-    } else if (s.isNotFound()) {
-        exists = false;
-        return Status::OK();
-    }
-    return s;
-}
-
-uint64_t DB::Snapshot::version() const { return version_; }
-bool DB::Snapshot::isValid() const { return db_ != nullptr; }
-void DB::Snapshot::detach() { db_ = nullptr; }
-
 // --- DB::Iterator Implementation ---
 //
 // Scans segment files from newest to oldest. For each entry, consults GlobalIndex
@@ -84,20 +24,8 @@ void DB::Snapshot::detach() { db_ = nullptr; }
 
 class DB::Iterator::Impl {
 public:
-    // Owned snapshot: iterator manages its own snapshot lifetime
-    Impl(DB* db, std::unique_ptr<Snapshot> owned_snapshot)
-        : db_(db),
-          owned_snapshot_(std::move(owned_snapshot)),
-          snapshot_(owned_snapshot_.get()) {
-        pinned_wb_ = db_->write_buffer_.get();
-        pinned_wb_->pin();
-        init();
-    }
-
-    // Borrowed snapshot: caller manages snapshot lifetime
-    Impl(DB* db, const Snapshot* borrowed_snapshot)
-        : db_(db),
-          snapshot_(borrowed_snapshot) {
+    Impl(DB* db, Snapshot snapshot, bool owns_snapshot)
+        : db_(db), snapshot_(snapshot), owns_snapshot_(owns_snapshot) {
         pinned_wb_ = db_->write_buffer_.get();
         pinned_wb_->pin();
         init();
@@ -110,6 +38,9 @@ public:
         }
         pinned_wb_->unpin();
         db_->cleanupRetiredBuffers();
+        if (owns_snapshot_) {
+            db_->releaseSnapshot(snapshot_);
+        }
     }
 
     Status next(std::string& key, std::string& value, uint64_t& version) {
@@ -125,12 +56,12 @@ public:
         return Status::OK();
     }
 
-    const Snapshot& snapshot() const { return *snapshot_; }
+    const Snapshot& snapshot() const { return snapshot_; }
 
 private:
     void init() {
         auto segment_ids = db_->storage_->getSegmentIds();
-        uint64_t snap_ver = snapshot_->version();
+        uint64_t snap_ver = snapshot_.version();
 
         std::vector<std::unique_ptr<internal::EntryStream>> streams;
 
@@ -193,8 +124,8 @@ private:
     }
 
     DB* db_;
-    std::unique_ptr<Snapshot> owned_snapshot_;  // non-null when iterator owns its snapshot
-    const Snapshot* snapshot_;                  // always valid — points to owned or borrowed
+    Snapshot snapshot_;
+    bool owns_snapshot_;
 
     internal::WriteBuffer* pinned_wb_ = nullptr;
     std::vector<uint32_t> pinned_segment_ids_;
@@ -222,7 +153,7 @@ Status DB::Iterator::next(std::string& key, std::string& value, uint64_t& versio
     return impl_->next(key, value, version);
 }
 
-const DB::Snapshot& DB::Iterator::snapshot() const {
+const Snapshot& DB::Iterator::snapshot() const {
     return impl_->snapshot();
 }
 
@@ -328,7 +259,7 @@ Status DB::open(const std::string& path, const Options& options) {
         for (uint32_t id : segment_ids) {
             auto* seg = storage_->getSegment(id);
             if (!seg) continue;
-            seg->index().forEach([&](uint32_t offset, uint32_t version) {
+            seg->index().forEach([&](uint32_t offset, uint32_t /*version*/) {
                 internal::LogEntry entry;
                 Status rs = seg->readEntry(offset, entry);
                 if (rs.ok()) {
@@ -429,10 +360,15 @@ Status DB::get(const std::string& key, std::string& value,
     return get(key, value, version, options);
 }
 
-Status DB::get(const std::string& key, std::string& value, uint64_t& version,
-               const ReadOptions& options) {
+Status DB::get(const std::string& key, std::string& value,
+               uint64_t& version, const ReadOptions& options) {
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
+    }
+
+    // If a snapshot is set, delegate to getByVersion.
+    if (options.snapshot) {
+        return getByVersion(key, options.snapshot->version(), value, version, options);
     }
 
     // 1. Check WriteBuffer first (covers unflushed entries).
@@ -482,7 +418,7 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
 
 Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
                         std::string& value, uint64_t& entry_version,
-                        const ReadOptions& options) {
+                        const ReadOptions& /*options*/) {
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
@@ -612,81 +548,63 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
         return Status::OK();
     }
 
-    // Create a snapshot for consistent reads.
-    std::unique_ptr<Snapshot> snap;
-    {
+    // Use caller's snapshot if provided, otherwise create one.
+    Snapshot owned_snap(0);
+    bool owns_snapshot = false;
+    if (!options.snapshot) {
         std::lock_guard<std::mutex> lock(batch_mutex_);
-        Status s = createSnapshot(snap);
-        if (!s.ok()) return s;
+        owned_snap = createSnapshot();
+        owns_snapshot = true;
     }
+    const Snapshot& snap = owns_snapshot ? owned_snap : *options.snapshot;
 
-    uint64_t snapshot_version = snap->version();
-    batch.setSnapshotVersion(snapshot_version);
+    batch.setSnapshotVersion(snap.version());
     batch.reserveResults(batch.keys().size());
+
+    ReadOptions snap_options = options;
+    snap_options.snapshot = &snap;
 
     for (const auto& key : batch.keys()) {
         ReadResult result;
         result.key = key;
-
-        uint64_t entry_version;
-        result.status = snap->get(key, result.value, entry_version, options);
-        result.version = snapshot_version;
+        result.status = get(key, result.value, snap_options);
+        result.version = snap.version();
         batch.addResult(std::move(result));
     }
 
-    releaseSnapshot(std::move(snap));
+    if (owns_snapshot) {
+        releaseSnapshot(owned_snap);
+    }
     return Status::OK();
 }
 
 // --- Snapshots ---
 
-Status DB::createSnapshot(std::unique_ptr<Snapshot>& snapshot) {
-    if (!isOpen()) {
-        return Status::InvalidArgument("Database not open");
-    }
-
-    uint64_t version = versions_->createSnapshot();
-    snapshot = std::unique_ptr<Snapshot>(new Snapshot(this, version));
-    return Status::OK();
+Snapshot DB::createSnapshot() {
+    return Snapshot(versions_->createSnapshot());
 }
 
-Status DB::releaseSnapshot(std::unique_ptr<Snapshot> snapshot) {
-    if (snapshot) {
-        snapshot->detach();  // Prevent double-release in destructor
-        versions_->releaseSnapshot(snapshot->version());
-    }
-    return Status::OK();
+void DB::releaseSnapshot(const Snapshot& snapshot) {
+    versions_->releaseSnapshot(snapshot.version());
 }
 
 // --- Iteration ---
 
-Status DB::createIterator(std::unique_ptr<Iterator>& iterator) {
+Status DB::createIterator(std::unique_ptr<Iterator>& iterator,
+                          const ReadOptions& options) {
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
 
-    std::unique_ptr<Snapshot> snap;
-    Status s = createSnapshot(snap);
-    if (!s.ok()) {
-        return s;
+    if (options.snapshot) {
+        auto impl = std::make_unique<Iterator::Impl>(
+            this, *options.snapshot, /*owns_snapshot=*/false);
+        iterator = std::unique_ptr<Iterator>(new Iterator(std::move(impl)));
+    } else {
+        auto impl = std::make_unique<Iterator::Impl>(
+            this, createSnapshot(), /*owns_snapshot=*/true);
+        iterator = std::unique_ptr<Iterator>(new Iterator(std::move(impl)));
     }
-
-    auto impl = std::make_unique<Iterator::Impl>(this, std::move(snap));
-    iterator = std::unique_ptr<Iterator>(new Iterator(std::move(impl)));
-    return Status::OK();
-}
-
-Status DB::createIterator(const Snapshot& snapshot, std::unique_ptr<Iterator>& iterator) {
-    if (!isOpen()) {
-        return Status::InvalidArgument("Database not open");
-    }
-
-    if (!snapshot.isValid()) {
-        return Status::InvalidArgument("Snapshot is invalid");
-    }
-
-    auto impl = std::make_unique<Iterator::Impl>(this, &snapshot);
-    iterator = std::unique_ptr<Iterator>(new Iterator(std::move(impl)));
     return Status::OK();
 }
 

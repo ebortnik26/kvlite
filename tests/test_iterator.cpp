@@ -8,6 +8,12 @@
 
 namespace fs = std::filesystem;
 
+static kvlite::ReadOptions snapOpts(const kvlite::Snapshot& snap) {
+    kvlite::ReadOptions opts;
+    opts.snapshot = &snap;
+    return opts;
+}
+
 class IteratorTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -141,7 +147,6 @@ TEST_F(IteratorTest, Snapshot) {
     ASSERT_TRUE(db_.createIterator(iter).ok());
 
     EXPECT_GT(iter->snapshot().version(), 0u);
-    EXPECT_TRUE(iter->snapshot().isValid());
 }
 
 TEST_F(IteratorTest, ConsistentSnapshot) {
@@ -253,15 +258,14 @@ TEST_F(IteratorTest, SnapshotBasedIteratorSeesSnapshotState) {
     ASSERT_TRUE(db_.put("key1", "before_snap").ok());
     ASSERT_TRUE(db_.put("key2", "before_snap").ok());
 
-    std::unique_ptr<kvlite::DB::Snapshot> snap;
-    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+    kvlite::Snapshot snap = db_.createSnapshot();
 
     // Write more data after the snapshot
     ASSERT_TRUE(db_.put("key1", "after_snap").ok());
     ASSERT_TRUE(db_.put("key3", "after_snap").ok());
 
     std::unique_ptr<kvlite::DB::Iterator> iter;
-    ASSERT_TRUE(db_.createIterator(*snap, iter).ok());
+    ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap)).ok());
 
     std::map<std::string, std::string> found;
     std::string key, value;
@@ -272,40 +276,43 @@ TEST_F(IteratorTest, SnapshotBasedIteratorSeesSnapshotState) {
     EXPECT_EQ(found["key1"], "before_snap");  // Not the post-snapshot version
     EXPECT_EQ(found["key2"], "before_snap");
     EXPECT_EQ(found.count("key3"), 0u);       // Written after snapshot
+
+    db_.releaseSnapshot(snap);
 }
 
 TEST_F(IteratorTest, SnapshotBasedIteratorSnapshot) {
     ASSERT_TRUE(db_.put("key", "value").ok());
 
-    std::unique_ptr<kvlite::DB::Snapshot> snap;
-    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+    kvlite::Snapshot snap = db_.createSnapshot();
 
     std::unique_ptr<kvlite::DB::Iterator> iter;
-    ASSERT_TRUE(db_.createIterator(*snap, iter).ok());
+    ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap)).ok());
 
-    EXPECT_EQ(iter->snapshot().version(), snap->version());
+    EXPECT_EQ(iter->snapshot().version(), snap.version());
+
+    db_.releaseSnapshot(snap);
 }
 
 TEST_F(IteratorTest, SnapshotBasedIteratorDoesNotReleaseSnapshot) {
     ASSERT_TRUE(db_.put("key", "value").ok());
 
-    std::unique_ptr<kvlite::DB::Snapshot> snap;
-    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+    kvlite::Snapshot snap = db_.createSnapshot();
 
     {
         std::unique_ptr<kvlite::DB::Iterator> iter;
-        ASSERT_TRUE(db_.createIterator(*snap, iter).ok());
+        ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap)).ok());
 
         std::string key, value;
         ASSERT_TRUE(iter->next(key, value).ok());
         // iter destroyed here
     }
 
-    // Snapshot should still be valid and usable after iterator destruction
-    EXPECT_TRUE(snap->isValid());
+    // Snapshot should still be usable after iterator destruction
     std::string value;
-    ASSERT_TRUE(snap->get("key", value).ok());
+    ASSERT_TRUE(db_.get("key", value, snapOpts(snap)).ok());
     EXPECT_EQ(value, "value");
+
+    db_.releaseSnapshot(snap);
 }
 
 TEST_F(IteratorTest, SnapshotBasedIteratorDeduplicates) {
@@ -313,13 +320,12 @@ TEST_F(IteratorTest, SnapshotBasedIteratorDeduplicates) {
     ASSERT_TRUE(db_.put("key", "v1").ok());
     ASSERT_TRUE(db_.put("key", "v2").ok());
 
-    std::unique_ptr<kvlite::DB::Snapshot> snap;
-    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+    kvlite::Snapshot snap = db_.createSnapshot();
 
     ASSERT_TRUE(db_.put("key", "v3").ok());
 
     std::unique_ptr<kvlite::DB::Iterator> iter;
-    ASSERT_TRUE(db_.createIterator(*snap, iter).ok());
+    ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap)).ok());
 
     std::string key, value;
     int count = 0;
@@ -329,20 +335,21 @@ TEST_F(IteratorTest, SnapshotBasedIteratorDeduplicates) {
         count++;
     }
     EXPECT_EQ(count, 1);
+
+    db_.releaseSnapshot(snap);
 }
 
 TEST_F(IteratorTest, DefaultAndSnapshotIteratorsCoexist) {
     ASSERT_TRUE(db_.put("key1", "v1").ok());
 
-    std::unique_ptr<kvlite::DB::Snapshot> snap;
-    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+    kvlite::Snapshot snap = db_.createSnapshot();
 
     ASSERT_TRUE(db_.put("key1", "v2").ok());
     ASSERT_TRUE(db_.put("key2", "v2").ok());
 
     // Snapshot-based iterator sees pre-snapshot state
     std::unique_ptr<kvlite::DB::Iterator> snap_iter;
-    ASSERT_TRUE(db_.createIterator(*snap, snap_iter).ok());
+    ASSERT_TRUE(db_.createIterator(snap_iter, snapOpts(snap)).ok());
 
     // Default iterator sees current state
     std::unique_ptr<kvlite::DB::Iterator> default_iter;
@@ -369,4 +376,6 @@ TEST_F(IteratorTest, DefaultAndSnapshotIteratorsCoexist) {
     EXPECT_EQ(default_found.size(), 2u);
     EXPECT_EQ(default_found["key1"], "v2");
     EXPECT_EQ(default_found["key2"], "v2");
+
+    db_.releaseSnapshot(snap);
 }

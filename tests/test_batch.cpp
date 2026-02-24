@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <kvlite/kvlite.h>
 #include <filesystem>
+#include <map>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -79,16 +80,20 @@ TEST_F(BatchTest, WriteBatchSameVersion) {
 
     ASSERT_TRUE(db_.write(batch).ok());
 
-    // All keys should have the same version
-    std::string v1, v2, v3;
-    uint64_t ver1, ver2, ver3;
+    // All keys should have the same version — verify via iterator
+    std::unique_ptr<kvlite::DB::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter).ok());
 
-    ASSERT_TRUE(db_.get("key1", v1, ver1).ok());
-    ASSERT_TRUE(db_.get("key2", v2, ver2).ok());
-    ASSERT_TRUE(db_.get("key3", v3, ver3).ok());
+    std::map<std::string, uint64_t> key_versions;
+    std::string key, value;
+    uint64_t version;
+    while (iter->next(key, value, version).ok()) {
+        key_versions[key] = version;
+    }
 
-    EXPECT_EQ(ver1, ver2);
-    EXPECT_EQ(ver2, ver3);
+    ASSERT_EQ(key_versions.size(), 3u);
+    EXPECT_EQ(key_versions["key1"], key_versions["key2"]);
+    EXPECT_EQ(key_versions["key2"], key_versions["key3"]);
 }
 
 TEST_F(BatchTest, WriteBatchLarge) {

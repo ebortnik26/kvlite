@@ -94,14 +94,18 @@ TEST_F(BasicTest, PutOverwrite) {
     EXPECT_EQ(value, "value2");
 }
 
-TEST_F(BasicTest, GetWithVersion) {
+TEST_F(BasicTest, VersionIsPositive) {
     ASSERT_TRUE(openDB().ok());
 
     ASSERT_TRUE(db_.put("key", "value").ok());
 
-    std::string value;
+    std::unique_ptr<kvlite::DB::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter).ok());
+
+    std::string key, value;
     uint64_t version;
-    ASSERT_TRUE(db_.get("key", value, version).ok());
+    ASSERT_TRUE(iter->next(key, value, version).ok());
+    EXPECT_EQ(key, "key");
     EXPECT_EQ(value, "value");
     EXPECT_GT(version, 0u);
 }

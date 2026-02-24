@@ -36,41 +36,18 @@ struct DBStats {
     uint64_t active_snapshots = 0;
 };
 
+class Snapshot {
+public:
+    uint64_t version() const { return version_; }
+
+private:
+    friend class DB;
+    explicit Snapshot(uint64_t version) : version_(version) {}
+    uint64_t version_;
+};
+
 class DB {
 public:
-    // --- Nested Classes ---
-
-    class Snapshot {
-    public:
-        ~Snapshot();
-
-        Snapshot(const Snapshot&) = delete;
-        Snapshot& operator=(const Snapshot&) = delete;
-
-        Snapshot(Snapshot&& other) noexcept;
-        Snapshot& operator=(Snapshot&& other) noexcept;
-
-        Status get(const std::string& key, std::string& value,
-                   const ReadOptions& options = ReadOptions()) const;
-
-        Status get(const std::string& key, std::string& value, uint64_t& entry_version,
-                   const ReadOptions& options = ReadOptions()) const;
-
-        Status exists(const std::string& key, bool& exists,
-                      const ReadOptions& options = ReadOptions()) const;
-
-        uint64_t version() const;
-        bool isValid() const;
-
-    private:
-        friend class DB;
-        Snapshot(DB* db, uint64_t version);
-        void detach();
-
-        DB* db_;
-        uint64_t version_;
-    };
-
     class Iterator {
     public:
         ~Iterator();
@@ -117,16 +94,9 @@ public:
     Status get(const std::string& key, std::string& value,
                const ReadOptions& options = ReadOptions());
 
-    Status get(const std::string& key, std::string& value, uint64_t& version,
+    Status get(const std::string& key, std::string& value,
+               uint64_t& version,
                const ReadOptions& options = ReadOptions());
-
-    Status getByVersion(const std::string& key, uint64_t upper_bound,
-                        std::string& value,
-                        const ReadOptions& options = ReadOptions());
-
-    Status getByVersion(const std::string& key, uint64_t upper_bound,
-                        std::string& value, uint64_t& entry_version,
-                        const ReadOptions& options = ReadOptions());
 
     Status remove(const std::string& key,
                   const WriteOptions& options = WriteOptions());
@@ -144,13 +114,13 @@ public:
 
     // --- Snapshots ---
 
-    Status createSnapshot(std::unique_ptr<Snapshot>& snapshot);
-    Status releaseSnapshot(std::unique_ptr<Snapshot> snapshot);
+    Snapshot createSnapshot();
+    void releaseSnapshot(const Snapshot& snapshot);
 
     // --- Iteration ---
 
-    Status createIterator(std::unique_ptr<Iterator>& iterator);
-    Status createIterator(const Snapshot& snapshot, std::unique_ptr<Iterator>& iterator);
+    Status createIterator(std::unique_ptr<Iterator>& iterator,
+                          const ReadOptions& options = ReadOptions());
 
     // --- Statistics ---
 
@@ -163,6 +133,14 @@ public:
     uint64_t getOldestVersion() const;
 
 private:
+    Status getByVersion(const std::string& key, uint64_t upper_bound,
+                        std::string& value,
+                        const ReadOptions& options = ReadOptions());
+
+    Status getByVersion(const std::string& key, uint64_t upper_bound,
+                        std::string& value, uint64_t& entry_version,
+                        const ReadOptions& options = ReadOptions());
+
     Status flush();
     void cleanupRetiredBuffers();
 

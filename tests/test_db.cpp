@@ -1,4 +1,4 @@
-// DB tests: buffer-first reads, auto-flush, sync writes, stats, getByVersion,
+// DB tests: buffer-first reads, auto-flush, sync writes, stats, snapshot reads,
 //           remove with buffer, batch operations, snapshots, iterators.
 #include <gtest/gtest.h>
 #include <kvlite/kvlite.h>
@@ -10,6 +10,12 @@
 #include <set>
 
 namespace fs = std::filesystem;
+
+static kvlite::ReadOptions snapOpts(const kvlite::Snapshot& snap) {
+    kvlite::ReadOptions opts;
+    opts.snapshot = &snap;
+    return opts;
+}
 
 class DBTest : public ::testing::Test {
 protected:
@@ -77,14 +83,18 @@ TEST_F(DBTest, UnflushedOverwriteReturnsLatest) {
     EXPECT_EQ(val, "v2");
 }
 
-TEST_F(DBTest, GetWithVersionFromBuffer) {
+TEST_F(DBTest, VersionFromBuffer) {
     ASSERT_TRUE(openDB().ok());
 
     ASSERT_TRUE(db_.put("k1", "v1").ok());
 
-    std::string val;
+    std::unique_ptr<kvlite::DB::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter).ok());
+
+    std::string key, val;
     uint64_t ver;
-    ASSERT_TRUE(db_.get("k1", val, ver).ok());
+    ASSERT_TRUE(iter->next(key, val, ver).ok());
+    EXPECT_EQ(key, "k1");
     EXPECT_EQ(val, "v1");
     EXPECT_GT(ver, 0u);
 }
@@ -172,38 +182,48 @@ TEST_F(DBTest, AutoFlushTriggersOnLargeWrite) {
     }
 }
 
-// ── getByVersion ────────────────────────────────────────────────────────────
+// ── Snapshot-based point-in-time reads ───────────────────────────────────────
 
-TEST_F(DBTest, GetByVersionFromBuffer) {
+TEST_F(DBTest, SnapshotReadFromBuffer) {
     ASSERT_TRUE(openDB().ok());
 
     ASSERT_TRUE(db_.put("k1", "v1").ok());
     uint64_t ver1 = db_.getLatestVersion();
+    kvlite::Snapshot snap1 = db_.createSnapshot();
 
     ASSERT_TRUE(db_.put("k1", "v2").ok());
 
-    // upper_bound is inclusive (version <= upper_bound)
+    // Snapshot taken after v1 should see v1
     std::string val;
-    uint64_t entry_ver;
-    ASSERT_TRUE(db_.getByVersion("k1", ver1, val, entry_ver).ok());
+    ASSERT_TRUE(db_.get("k1", val, snapOpts(snap1)).ok());
     EXPECT_EQ(val, "v1");
+
+    // Verify version via snapshot iterator
+    std::unique_ptr<kvlite::DB::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter, snapOpts(snap1)).ok());
+    std::string key;
+    uint64_t entry_ver;
+    ASSERT_TRUE(iter->next(key, val, entry_ver).ok());
     EXPECT_EQ(entry_ver, ver1);
+
+    db_.releaseSnapshot(snap1);
 }
 
-TEST_F(DBTest, GetByVersionFromSegment) {
+TEST_F(DBTest, SnapshotReadFromSegment) {
     ASSERT_TRUE(openDB().ok());
 
     ASSERT_TRUE(db_.put("k1", "v1").ok());
-    uint64_t ver1 = db_.getLatestVersion();
+    kvlite::Snapshot snap1 = db_.createSnapshot();
     ASSERT_TRUE(db_.put("k1", "v1_flush", syncOpts()).ok());
 
     ASSERT_TRUE(db_.put("k1", "v2", syncOpts()).ok());
 
-    // upper_bound is inclusive (version <= upper_bound)
+    // Snapshot taken after v1 should still see v1
     std::string val;
-    uint64_t entry_ver;
-    ASSERT_TRUE(db_.getByVersion("k1", ver1, val, entry_ver).ok());
+    ASSERT_TRUE(db_.get("k1", val, snapOpts(snap1)).ok());
     EXPECT_EQ(val, "v1");
+
+    db_.releaseSnapshot(snap1);
 }
 
 // ── Remove ──────────────────────────────────────────────────────────────────
@@ -361,16 +381,15 @@ TEST_F(DBTest, SnapshotReadsExistingData) {
 
     ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
 
-    std::unique_ptr<kvlite::DB::Snapshot> snap;
-    ASSERT_TRUE(db_.createSnapshot(snap).ok());
-    EXPECT_GT(snap->version(), 0u);
+    kvlite::Snapshot snap = db_.createSnapshot();
+    EXPECT_GT(snap.version(), 0u);
 
     // Snapshot should see existing data
     std::string val;
-    ASSERT_TRUE(snap->get("k1", val).ok());
+    ASSERT_TRUE(db_.get("k1", val, snapOpts(snap)).ok());
     EXPECT_EQ(val, "v1");
 
-    db_.releaseSnapshot(std::move(snap));
+    db_.releaseSnapshot(snap);
 }
 
 TEST_F(DBTest, SnapshotReadsMultipleKeys) {
@@ -379,20 +398,19 @@ TEST_F(DBTest, SnapshotReadsMultipleKeys) {
     ASSERT_TRUE(db_.put("k1", "v1").ok());
     ASSERT_TRUE(db_.put("k2", "v2", syncOpts()).ok());
 
-    std::unique_ptr<kvlite::DB::Snapshot> snap;
-    ASSERT_TRUE(db_.createSnapshot(snap).ok());
+    kvlite::Snapshot snap = db_.createSnapshot();
 
     // Snapshot should see all flushed data
     std::string val;
-    ASSERT_TRUE(snap->get("k1", val).ok());
+    ASSERT_TRUE(db_.get("k1", val, snapOpts(snap)).ok());
     EXPECT_EQ(val, "v1");
-    ASSERT_TRUE(snap->get("k2", val).ok());
+    ASSERT_TRUE(db_.get("k2", val, snapOpts(snap)).ok());
     EXPECT_EQ(val, "v2");
 
     // Non-existent key
-    EXPECT_TRUE(snap->get("missing", val).isNotFound());
+    EXPECT_TRUE(db_.get("missing", val, snapOpts(snap)).isNotFound());
 
-    db_.releaseSnapshot(std::move(snap));
+    db_.releaseSnapshot(snap);
 }
 
 // ── Iterator ────────────────────────────────────────────────────────────────
@@ -456,7 +474,6 @@ TEST_F(DBTest, IteratorSnapshotVersion) {
 
     // Iterator should have a valid snapshot
     EXPECT_GT(iter->snapshot().version(), 0u);
-    EXPECT_TRUE(iter->snapshot().isValid());
 }
 
 // ── Error paths ─────────────────────────────────────────────────────────────

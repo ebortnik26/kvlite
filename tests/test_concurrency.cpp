@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <kvlite/kvlite.h>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -11,6 +12,12 @@
 #include <mutex>
 
 namespace fs = std::filesystem;
+
+static kvlite::ReadOptions snapOpts(const kvlite::Snapshot& snap) {
+    kvlite::ReadOptions opts;
+    opts.snapshot = &snap;
+    return opts;
+}
 
 class ConcurrencyTest : public ::testing::Test {
 protected:
@@ -222,20 +229,33 @@ TEST_F(ConcurrencyTest, WriteBatchAtomicity) {
         t.join();
     }
 
-    // Verify atomicity: all keys in a batch should have same version
+    // Verify atomicity: all keys in a batch should have same version.
+    // Collect all key→version pairs via iterator.
+    std::unique_ptr<kvlite::DB::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter).ok());
+
+    std::map<std::string, uint64_t> key_versions;
+    {
+        std::string key, value;
+        uint64_t version;
+        while (iter->next(key, value, version).ok()) {
+            key_versions[key] = version;
+        }
+    }
+
     for (int t = 0; t < num_threads; ++t) {
         for (int b = 0; b < batches_per_thread; ++b) {
             std::string prefix = "t" + std::to_string(t) + "_b" + std::to_string(b) + "_";
 
-            std::string v1, v2, v3;
-            uint64_t ver1, ver2, ver3;
+            auto it1 = key_versions.find(prefix + "k1");
+            auto it2 = key_versions.find(prefix + "k2");
+            auto it3 = key_versions.find(prefix + "k3");
+            ASSERT_NE(it1, key_versions.end()) << prefix + "k1 missing";
+            ASSERT_NE(it2, key_versions.end()) << prefix + "k2 missing";
+            ASSERT_NE(it3, key_versions.end()) << prefix + "k3 missing";
 
-            ASSERT_TRUE(db_.get(prefix + "k1", v1, ver1).ok());
-            ASSERT_TRUE(db_.get(prefix + "k2", v2, ver2).ok());
-            ASSERT_TRUE(db_.get(prefix + "k3", v3, ver3).ok());
-
-            EXPECT_EQ(ver1, ver2) << "Batch " << prefix << " not atomic";
-            EXPECT_EQ(ver2, ver3) << "Batch " << prefix << " not atomic";
+            EXPECT_EQ(it1->second, it2->second) << "Batch " << prefix << " not atomic";
+            EXPECT_EQ(it2->second, it3->second) << "Batch " << prefix << " not atomic";
         }
     }
 }
@@ -245,8 +265,7 @@ TEST_F(ConcurrencyTest, WriteBatchAtomicity) {
 TEST_F(ConcurrencyTest, SnapshotIsolation) {
     ASSERT_TRUE(db_.put("key", "initial").ok());
 
-    std::unique_ptr<kvlite::DB::Snapshot> snapshot;
-    ASSERT_TRUE(db_.createSnapshot(snapshot).ok());
+    kvlite::Snapshot snapshot = db_.createSnapshot();
 
     const int num_writers = 4;
     const int writes_per_thread = 100;
@@ -268,7 +287,7 @@ TEST_F(ConcurrencyTest, SnapshotIsolation) {
     std::thread reader([&]() {
         for (int i = 0; i < 1000; ++i) {
             std::string value;
-            if (snapshot->get("key", value).ok()) {
+            if (db_.get("key", value, snapOpts(snapshot)).ok()) {
                 if (value != "initial") {
                     snapshot_consistent = false;
                     break;
@@ -284,21 +303,21 @@ TEST_F(ConcurrencyTest, SnapshotIsolation) {
 
     EXPECT_TRUE(snapshot_consistent.load());
 
-    db_.releaseSnapshot(std::move(snapshot));
+    db_.releaseSnapshot(snapshot);
 }
 
 TEST_F(ConcurrencyTest, ConcurrentSnapshots) {
     ASSERT_TRUE(db_.put("counter", "0").ok());
 
     const int num_threads = 4;
-    std::vector<std::unique_ptr<kvlite::DB::Snapshot>> snapshots(num_threads);
+    std::vector<kvlite::Snapshot> snapshots;
     std::vector<std::string> expected_values(num_threads);
 
     // Create snapshots interleaved with writes
     for (int i = 0; i < num_threads; ++i) {
         expected_values[i] = std::to_string(i);
         ASSERT_TRUE(db_.put("counter", expected_values[i]).ok());
-        ASSERT_TRUE(db_.createSnapshot(snapshots[i]).ok());
+        snapshots.push_back(db_.createSnapshot());
     }
 
     // Write more
@@ -307,12 +326,12 @@ TEST_F(ConcurrencyTest, ConcurrentSnapshots) {
     // Each snapshot should see its expected value
     for (int i = 0; i < num_threads; ++i) {
         std::string value;
-        ASSERT_TRUE(snapshots[i]->get("counter", value).ok());
+        ASSERT_TRUE(db_.get("counter", value, snapOpts(snapshots[i])).ok());
         EXPECT_EQ(value, expected_values[i]);
     }
 
     for (auto& snap : snapshots) {
-        db_.releaseSnapshot(std::move(snap));
+        db_.releaseSnapshot(snap);
     }
 }
 
@@ -359,20 +378,12 @@ TEST_F(ConcurrencyTest, VersionOrderingUnderConcurrency) {
     const int num_threads = 4;
     const int ops_per_thread = 100;
 
-    std::mutex versions_mutex;
     std::vector<uint64_t> all_versions;
 
     auto writer = [&](int thread_id) {
         for (int i = 0; i < ops_per_thread; ++i) {
             std::string key = "key_" + std::to_string(thread_id) + "_" + std::to_string(i);
             ASSERT_TRUE(db_.put(key, "value").ok());
-
-            std::string value;
-            uint64_t version;
-            ASSERT_TRUE(db_.get(key, value, version).ok());
-
-            std::lock_guard<std::mutex> lock(versions_mutex);
-            all_versions.push_back(version);
         }
     };
 
@@ -383,6 +394,16 @@ TEST_F(ConcurrencyTest, VersionOrderingUnderConcurrency) {
 
     for (auto& t : threads) {
         t.join();
+    }
+
+    // Collect all versions via iterator.
+    std::unique_ptr<kvlite::DB::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter).ok());
+
+    std::string key, value;
+    uint64_t version;
+    while (iter->next(key, value, version).ok()) {
+        all_versions.push_back(version);
     }
 
     // All versions should be unique
@@ -597,25 +618,37 @@ TEST_F(ConcurrencyTest, WriteBatchSameVersionUnderConcurrency) {
         t.join();
     }
 
+    // Collect all key→version pairs via iterator.
+    std::unique_ptr<kvlite::DB::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter).ok());
+
+    std::map<std::string, uint64_t> key_versions;
+    {
+        std::string key, value;
+        uint64_t version;
+        while (iter->next(key, value, version).ok()) {
+            key_versions[key] = version;
+        }
+    }
+
     // Verify: every batch's keys share one version.
     for (int tid = 0; tid < kThreads; ++tid) {
         for (int b = 0; b < kBatchesPerThread; ++b) {
             std::string prefix = "t" + std::to_string(tid) +
                                  "_b" + std::to_string(b) + "_";
 
-            uint64_t expected_ver = 0;
-            for (int k = 0; k < kKeysPerBatch; ++k) {
+            std::string first_key = prefix + "k0";
+            auto it0 = key_versions.find(first_key);
+            ASSERT_NE(it0, key_versions.end()) << "Missing: " << first_key;
+            uint64_t expected_ver = it0->second;
+
+            for (int k = 1; k < kKeysPerBatch; ++k) {
                 std::string key = prefix + "k" + std::to_string(k);
-                std::string val;
-                uint64_t ver;
-                ASSERT_TRUE(db_.get(key, val, ver).ok()) << "Missing: " << key;
-                if (k == 0) {
-                    expected_ver = ver;
-                } else {
-                    EXPECT_EQ(ver, expected_ver)
-                        << "Version mismatch in batch " << prefix
-                        << " key " << k;
-                }
+                auto it = key_versions.find(key);
+                ASSERT_NE(it, key_versions.end()) << "Missing: " << key;
+                EXPECT_EQ(it->second, expected_ver)
+                    << "Version mismatch in batch " << prefix
+                    << " key " << k;
             }
         }
     }
