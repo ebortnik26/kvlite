@@ -27,6 +27,7 @@ endif()
 # Library sources
 set(KVLITE_SOURCES
     src/db.cpp
+    src/db_iterator.cpp
     src/status.cpp
     src/internal/lslot_codec.cpp
     src/internal/delta_hash_table.cpp
