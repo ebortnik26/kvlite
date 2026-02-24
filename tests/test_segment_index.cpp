@@ -10,9 +10,7 @@
 #include "internal/segment_lslot_codec.h"
 #include "internal/segment_delta_hash_table.h"
 #include "internal/segment_index.h"
-#include "internal/global_index.h"
 #include "internal/gc.h"
-#include "internal/entry_stream.h"
 #include "internal/log_file.h"
 #include "internal/segment.h"
 #include "internal/delta_hash_table_base.h"
@@ -564,219 +562,6 @@ TEST_F(SegmentIndexSerializationTest, BadMagic) {
     EXPECT_TRUE(s.isCorruption());
 }
 
-// --- EntryStream scanVisible Tests ---
-
-class SnapshotVisibilityFilterTest : public ::testing::Test {
-protected:
-    void SetUp() override {
-        base_ = "/tmp/vvi_test_" + std::to_string(getpid()) + "_";
-    }
-    void TearDown() override {
-        for (auto& seg : segments_) {
-            seg.close();
-        }
-        for (auto& path : paths_) {
-            ::unlink(path.c_str());
-        }
-    }
-
-    // Create a segment, write entries, seal it, and register in GlobalIndex.
-    // Returns the segment index in segments_.
-    size_t createSegment(
-        uint32_t segment_id,
-        const std::vector<std::tuple<std::string, uint64_t, std::string, bool>>& entries) {
-        std::string path = base_ + std::to_string(segment_id) + ".data";
-        paths_.push_back(path);
-        segments_.emplace_back();
-        size_t idx = segments_.size() - 1;
-        auto& seg = segments_[idx];
-
-        EXPECT_TRUE(seg.create(path, segment_id).ok());
-        for (const auto& [key, version, value, tombstone] : entries) {
-            EXPECT_TRUE(seg.put(key, version, value, tombstone).ok());
-            gi_.put(key, version, segment_id);
-        }
-        EXPECT_TRUE(seg.seal().ok());
-        return idx;
-    }
-
-    GlobalIndex gi_;
-    std::vector<Segment> segments_;
-    std::string base_;
-    std::vector<std::string> paths_;
-};
-
-// 1 key, 1 version, snapshot covers it → yields 1 entry with correct key/value.
-TEST_F(SnapshotVisibilityFilterTest, IteratorAllVisible) {
-    size_t idx = createSegment(1, {{"key1", 10, "val1", false}});
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put("key1", 0, 10);
-
-    std::vector<uint64_t> snapshots = {10};
-    auto iter = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(iter->valid());
-    EXPECT_EQ(iter->entry().key, "key1");
-    EXPECT_EQ(iter->entry().value, "val1");
-    EXPECT_EQ(iter->entry().version, 10u);
-    EXPECT_FALSE(iter->entry().tombstone);
-
-    ASSERT_TRUE(iter->next().ok());
-    EXPECT_FALSE(iter->valid());
-}
-
-// key v1(seg1), v2(seg2). Only current snapshot at v2 → seg1 yields 0.
-TEST_F(SnapshotVisibilityFilterTest, IteratorSuperseded) {
-    size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
-    createSegment(2, {{"key1", 2, "val2", false}});
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put("key1", 0, 1);
-
-    std::vector<uint64_t> snapshots = {2};
-    auto iter = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    EXPECT_FALSE(iter->valid());
-}
-
-// key v1(seg1), v2(seg2). Snapshot at v1 → seg1 yields v1.
-TEST_F(SnapshotVisibilityFilterTest, IteratorSnapshotPins) {
-    size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
-    createSegment(2, {{"key1", 2, "val2", false}});
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put("key1", 0, 1);
-
-    std::vector<uint64_t> snapshots = {1, 2};
-    auto iter = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(iter->valid());
-    EXPECT_EQ(iter->entry().key, "key1");
-    EXPECT_EQ(iter->entry().version, 1u);
-
-    ASSERT_TRUE(iter->next().ok());
-    EXPECT_FALSE(iter->valid());
-}
-
-// key v1,v3 in seg1, v5 in seg2. Snapshots pin both v1 and v3.
-// File order is (hash asc, version asc), so yields v1 then v3.
-TEST_F(SnapshotVisibilityFilterTest, IteratorMultipleVersionsDesc) {
-    // Segment::put writes entries in call order; we write v1, v3
-    // so file order = v1, v3 (version asc for same hash).
-    size_t idx = createSegment(1, {
-        {"key1", 1, "val1", false},
-        {"key1", 3, "val3", false},
-    });
-    createSegment(2, {{"key1", 5, "val5", false}});
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put("key1", 0, 1);   // offset doesn't matter for visible-set check
-    si.put("key1", 100, 3);
-
-    // snap=2 → latest <= 2 is v1(seg1) → pinned
-    // snap=4 → latest <= 4 is v3(seg1) → pinned
-    // snap=5 → latest <= 5 is v5(seg2) → not in seg1
-    std::vector<uint64_t> snapshots = {2, 4, 5};
-    auto iter = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(iter->valid());
-    EXPECT_EQ(iter->entry().version, 1u);
-    EXPECT_EQ(iter->entry().value, "val1");
-
-    ASSERT_TRUE(iter->next().ok());
-    ASSERT_TRUE(iter->valid());
-    EXPECT_EQ(iter->entry().version, 3u);
-    EXPECT_EQ(iter->entry().value, "val3");
-
-    ASSERT_TRUE(iter->next().ok());
-    EXPECT_FALSE(iter->valid());
-}
-
-// Multiple keys: verifies hash-asc then version-asc order.
-TEST_F(SnapshotVisibilityFilterTest, IteratorMultipleKeys) {
-    // We need two keys with known hash ordering. Write them
-    // in hash-ascending order to the segment.
-    std::string keyA = "key1";
-    std::string keyB = "key2";
-    uint64_t hashA = dhtHashBytes(keyA.data(), keyA.size());
-    uint64_t hashB = dhtHashBytes(keyB.data(), keyB.size());
-
-    // Ensure we know which hash is smaller; swap if needed.
-    if (hashA > hashB) {
-        std::swap(keyA, keyB);
-        std::swap(hashA, hashB);
-    }
-
-    // Write entries: keyA(v1), keyA(v2), keyB(v3), keyB(v4)
-    // File order: hash-asc, version-asc within same hash.
-    size_t idx = createSegment(1, {
-        {keyA, 1, "A_v1", false},
-        {keyA, 2, "A_v2", false},
-        {keyB, 3, "B_v3", false},
-        {keyB, 4, "B_v4", false},
-    });
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put(keyA, 0, 1);
-    si.put(keyA, 100, 2);
-    si.put(keyB, 200, 3);
-    si.put(keyB, 300, 4);
-
-    // Snapshots pin all versions.
-    std::vector<uint64_t> snapshots = {1, 2, 3, 4};
-    auto iter = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    // Expect: keyA v1, keyA v2, keyB v3, keyB v4
-    ASSERT_TRUE(iter->valid());
-    EXPECT_EQ(iter->entry().key, keyA);
-    EXPECT_EQ(iter->entry().version, 1u);
-
-    ASSERT_TRUE(iter->next().ok());
-    ASSERT_TRUE(iter->valid());
-    EXPECT_EQ(iter->entry().key, keyA);
-    EXPECT_EQ(iter->entry().version, 2u);
-
-    ASSERT_TRUE(iter->next().ok());
-    ASSERT_TRUE(iter->valid());
-    EXPECT_EQ(iter->entry().key, keyB);
-    EXPECT_EQ(iter->entry().version, 3u);
-
-    ASSERT_TRUE(iter->next().ok());
-    ASSERT_TRUE(iter->valid());
-    EXPECT_EQ(iter->entry().key, keyB);
-    EXPECT_EQ(iter->entry().version, 4u);
-
-    ASSERT_TRUE(iter->next().ok());
-    EXPECT_FALSE(iter->valid());
-}
-
-// No visible entries → valid() false immediately.
-TEST_F(SnapshotVisibilityFilterTest, IteratorEmpty) {
-    size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
-    createSegment(2, {{"key1", 2, "val2", false}});
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put("key1", 0, 1);
-
-    // Only snapshot at v2 -> latest is v2(seg2), nothing visible in seg1.
-    std::vector<uint64_t> snapshots = {2};
-    auto iter = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    EXPECT_FALSE(iter->valid());
-}
 
 // --- GC Merge Tests ---
 
@@ -794,14 +579,14 @@ protected:
             ::unlink(path.c_str());
         }
         for (auto& out : last_result_.outputs) {
-            out.segment.close();
+            out.close();
         }
         for (auto& path : output_paths_) {
             ::unlink(path.c_str());
         }
     }
 
-    // Create a segment, write entries, seal it, and register in GlobalIndex.
+    // Create a segment, write entries, seal it.
     // Returns the segment index in segments_.
     size_t createSegment(
         uint32_t segment_id,
@@ -815,7 +600,6 @@ protected:
         EXPECT_TRUE(seg.create(path, segment_id).ok());
         for (const auto& [key, version, value, tombstone] : entries) {
             EXPECT_TRUE(seg.put(key, version, value, tombstone).ok());
-            gi_.put(key, version, segment_id);
         }
         EXPECT_TRUE(seg.seal().ok());
         return idx;
@@ -831,7 +615,6 @@ protected:
         return next_id_++;
     }
 
-    GlobalIndex gi_;
     std::vector<Segment> segments_;
     std::string base_;
     std::vector<std::string> paths_;
@@ -849,20 +632,23 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
     });
     auto& seg = segments_[idx];
 
-    SegmentIndex si;
-    si.put("key1", 0, 1);
-    si.put("key2", 100, 2);
-    si.put("key3", 200, 3);
-
     std::vector<uint64_t> snapshots = {3};
-    std::vector<GC::InputSegment> inputs = {
-        {1, si, seg.logFile(), seg.dataSize()},
-    };
+    std::vector<const Segment*> inputs = {&seg};
+
+    std::vector<GC::Relocation> relocations;
+    std::vector<GC::Elimination> eliminations;
 
     Status s = GC::merge(
-        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
+        [&](std::string_view key, uint64_t version,
+            uint32_t old_id, uint32_t new_id) {
+            relocations.push_back({std::string(key), version, old_id, new_id});
+        },
+        [&](std::string_view key, uint64_t version, uint32_t old_id) {
+            eliminations.push_back({std::string(key), version, old_id});
+        },
         last_result_);
 
     ASSERT_TRUE(s.ok());
@@ -870,15 +656,15 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
     // Verify no eliminations and 3 relocations.
-    EXPECT_TRUE(last_result_.eliminations.empty());
-    EXPECT_EQ(last_result_.relocations.size(), 3u);
-    for (const auto& r : last_result_.relocations) {
+    EXPECT_TRUE(eliminations.empty());
+    EXPECT_EQ(relocations.size(), 3u);
+    for (const auto& r : relocations) {
         EXPECT_EQ(r.old_segment_id, 1u);
-        EXPECT_EQ(r.new_segment_id, last_result_.outputs[0].segment_id);
+        EXPECT_EQ(r.new_segment_id, last_result_.outputs[0].getId());
     }
 
     // Verify entries are readable from the output segment.
-    auto& out = last_result_.outputs[0].segment;
+    auto& out = last_result_.outputs[0];
     ASSERT_EQ(out.state(), Segment::State::kReadable);
 
     LogEntry entry;
@@ -902,21 +688,23 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    SegmentIndex si1;
-    si1.put("key1", 0, 1);
-    SegmentIndex si2;
-    si2.put("key1", 0, 2);
-
     std::vector<uint64_t> snapshots = {2};
-    std::vector<GC::InputSegment> inputs = {
-        {1, si1, seg1.logFile(), seg1.dataSize()},
-        {2, si2, seg2.logFile(), seg2.dataSize()},
-    };
+    std::vector<const Segment*> inputs = {&seg1, &seg2};
+
+    std::vector<GC::Relocation> relocations;
+    std::vector<GC::Elimination> eliminations;
 
     Status s = GC::merge(
-        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
+        [&](std::string_view key, uint64_t version,
+            uint32_t old_id, uint32_t new_id) {
+            relocations.push_back({std::string(key), version, old_id, new_id});
+        },
+        [&](std::string_view key, uint64_t version, uint32_t old_id) {
+            eliminations.push_back({std::string(key), version, old_id});
+        },
         last_result_);
 
     ASSERT_TRUE(s.ok());
@@ -924,19 +712,19 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
     // Verify elimination of key1 v1 from seg1.
-    ASSERT_EQ(last_result_.eliminations.size(), 1u);
-    EXPECT_EQ(last_result_.eliminations[0].key, "key1");
-    EXPECT_EQ(last_result_.eliminations[0].version, 1u);
-    EXPECT_EQ(last_result_.eliminations[0].old_segment_id, 1u);
+    ASSERT_EQ(eliminations.size(), 1u);
+    EXPECT_EQ(eliminations[0].key, "key1");
+    EXPECT_EQ(eliminations[0].version, 1u);
+    EXPECT_EQ(eliminations[0].old_segment_id, 1u);
 
     // Verify relocation of key1 v2.
-    ASSERT_EQ(last_result_.relocations.size(), 1u);
-    EXPECT_EQ(last_result_.relocations[0].key, "key1");
-    EXPECT_EQ(last_result_.relocations[0].version, 2u);
-    EXPECT_EQ(last_result_.relocations[0].old_segment_id, 2u);
+    ASSERT_EQ(relocations.size(), 1u);
+    EXPECT_EQ(relocations[0].key, "key1");
+    EXPECT_EQ(relocations[0].version, 2u);
+    EXPECT_EQ(relocations[0].old_segment_id, 2u);
 
     LogEntry entry;
-    ASSERT_TRUE(last_result_.outputs[0].segment.getLatest("key1", entry).ok());
+    ASSERT_TRUE(last_result_.outputs[0].getLatest("key1", entry).ok());
     EXPECT_EQ(entry.value, "new");
     EXPECT_EQ(entry.version(), 2u);
 }
@@ -959,21 +747,17 @@ TEST_F(GCMergeTest, MergePreservesOrder) {
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    SegmentIndex si1;
-    si1.put(keyA, 0, 2);
-    SegmentIndex si2;
-    si2.put(keyB, 0, 1);
-
     std::vector<uint64_t> snapshots = {2};
-    std::vector<GC::InputSegment> inputs = {
-        {1, si1, seg1.logFile(), seg1.dataSize()},
-        {2, si2, seg2.logFile(), seg2.dataSize()},
-    };
+    std::vector<const Segment*> inputs = {&seg1, &seg2};
+
+    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
 
     Status s = GC::merge(
-        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
+        noop_relocate, noop_eliminate,
         last_result_);
 
     ASSERT_TRUE(s.ok());
@@ -981,7 +765,7 @@ TEST_F(GCMergeTest, MergePreservesOrder) {
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
     // Both keys should be present.
-    auto& out = last_result_.outputs[0].segment;
+    auto& out = last_result_.outputs[0];
     LogEntry entry;
     ASSERT_TRUE(out.getLatest(keyA, entry).ok());
     EXPECT_EQ(entry.value, "A_v2");
@@ -1001,24 +785,20 @@ TEST_F(GCMergeTest, MergeSplitsOnSize) {
     });
     auto& seg = segments_[idx];
 
-    SegmentIndex si;
-    si.put("k1", 0, 1);
-    si.put("k2", 100, 2);
-    si.put("k3", 200, 3);
-    si.put("k4", 300, 4);
-
     std::vector<uint64_t> snapshots = {4};
-    std::vector<GC::InputSegment> inputs = {
-        {1, si, seg.logFile(), seg.dataSize()},
-    };
+    std::vector<const Segment*> inputs = {&seg};
+
+    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
 
     // Set max_segment_size small enough that we need multiple outputs.
     // Each entry is ~220 bytes (14 header + 2 key + 200 value + 4 crc).
     // Set limit to ~450 bytes so ~2 entries per output.
     Status s = GC::merge(
-        gi_, snapshots, inputs, /*max_segment_size=*/450,
+        snapshots, inputs, /*max_segment_size=*/450,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
+        noop_relocate, noop_eliminate,
         last_result_);
 
     ASSERT_TRUE(s.ok());
@@ -1028,35 +808,29 @@ TEST_F(GCMergeTest, MergeSplitsOnSize) {
     // Verify all entries are findable across outputs.
     size_t found = 0;
     for (auto& out : last_result_.outputs) {
-        ASSERT_EQ(out.segment.state(), Segment::State::kReadable);
+        ASSERT_EQ(out.state(), Segment::State::kReadable);
         LogEntry entry;
-        if (out.segment.getLatest("k1", entry).ok()) found++;
-        if (out.segment.getLatest("k2", entry).ok()) found++;
-        if (out.segment.getLatest("k3", entry).ok()) found++;
-        if (out.segment.getLatest("k4", entry).ok()) found++;
+        if (out.getLatest("k1", entry).ok()) found++;
+        if (out.getLatest("k2", entry).ok()) found++;
+        if (out.getLatest("k3", entry).ok()) found++;
+        if (out.getLatest("k4", entry).ok()) found++;
     }
     EXPECT_EQ(found, 4u);
 }
 
-// All entries invisible → 0 output segments, entries_written = 0.
+// Empty input → 0 output segments, entries_written = 0.
 TEST_F(GCMergeTest, MergeEmpty) {
-    // seg1 has key1 v1, seg2 has key1 v2. Only snapshot at v2 → seg1 invisible.
-    size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
-    createSegment(2, {{"key1", 2, "new", false}});
-    auto& seg1 = segments_[idx1];
+    std::vector<uint64_t> snapshots = {1};
+    std::vector<const Segment*> inputs;
 
-    SegmentIndex si1;
-    si1.put("key1", 0, 1);
-
-    std::vector<uint64_t> snapshots = {2};
-    std::vector<GC::InputSegment> inputs = {
-        {1, si1, seg1.logFile(), seg1.dataSize()},
-    };
+    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
 
     Status s = GC::merge(
-        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
+        noop_relocate, noop_eliminate,
         last_result_);
 
     ASSERT_TRUE(s.ok());
@@ -1071,22 +845,18 @@ TEST_F(GCMergeTest, MergeSnapshotPins) {
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    SegmentIndex si1;
-    si1.put("key1", 0, 1);
-    SegmentIndex si2;
-    si2.put("key1", 0, 2);
-
     // Snapshot at v1 pins v1 in seg1, current at v2 pins v2 in seg2.
     std::vector<uint64_t> snapshots = {1, 2};
-    std::vector<GC::InputSegment> inputs = {
-        {1, si1, seg1.logFile(), seg1.dataSize()},
-        {2, si2, seg2.logFile(), seg2.dataSize()},
-    };
+    std::vector<const Segment*> inputs = {&seg1, &seg2};
+
+    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
 
     Status s = GC::merge(
-        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
+        noop_relocate, noop_eliminate,
         last_result_);
 
     ASSERT_TRUE(s.ok());
@@ -1094,7 +864,7 @@ TEST_F(GCMergeTest, MergeSnapshotPins) {
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
     // The output should contain both versions.
-    auto& out = last_result_.outputs[0].segment;
+    auto& out = last_result_.outputs[0];
     std::vector<LogEntry> entries;
     ASSERT_TRUE(out.get("key1", entries).ok());
     ASSERT_EQ(entries.size(), 2u);
@@ -1121,28 +891,27 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
     auto& seg2 = segments_[idx2];
     auto& seg3 = segments_[idx3];
 
-    SegmentIndex si1;
-    si1.put("key1", 0, 1);
-    SegmentIndex si2;
-    si2.put("key1", 0, 2);
-    SegmentIndex si3;
-    si3.put("key1", 0, 3);
-
     // Snapshots at v2 and v3: oldest is v2.
     // v1 < v2 (oldest snapshot) → dropped
     // v2 = oldest snapshot → kept
     // v3 = latest → kept
     std::vector<uint64_t> snapshots = {2, 3};
-    std::vector<GC::InputSegment> inputs = {
-        {1, si1, seg1.logFile(), seg1.dataSize()},
-        {2, si2, seg2.logFile(), seg2.dataSize()},
-        {3, si3, seg3.logFile(), seg3.dataSize()},
-    };
+    std::vector<const Segment*> inputs = {&seg1, &seg2, &seg3};
+
+    std::vector<GC::Relocation> relocations;
+    std::vector<GC::Elimination> eliminations;
 
     Status s = GC::merge(
-        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
+        [&](std::string_view key, uint64_t version,
+            uint32_t old_id, uint32_t new_id) {
+            relocations.push_back({std::string(key), version, old_id, new_id});
+        },
+        [&](std::string_view key, uint64_t version, uint32_t old_id) {
+            eliminations.push_back({std::string(key), version, old_id});
+        },
         last_result_);
 
     ASSERT_TRUE(s.ok());
@@ -1150,16 +919,16 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
     // Verify elimination of v1.
-    ASSERT_EQ(last_result_.eliminations.size(), 1u);
-    EXPECT_EQ(last_result_.eliminations[0].key, "key1");
-    EXPECT_EQ(last_result_.eliminations[0].version, 1u);
-    EXPECT_EQ(last_result_.eliminations[0].old_segment_id, 1u);
+    ASSERT_EQ(eliminations.size(), 1u);
+    EXPECT_EQ(eliminations[0].key, "key1");
+    EXPECT_EQ(eliminations[0].version, 1u);
+    EXPECT_EQ(eliminations[0].old_segment_id, 1u);
 
     // Verify 2 relocations (v2 and v3).
-    EXPECT_EQ(last_result_.relocations.size(), 2u);
+    EXPECT_EQ(relocations.size(), 2u);
 
     // Output should contain v2 and v3, but not v1.
-    auto& out = last_result_.outputs[0].segment;
+    auto& out = last_result_.outputs[0];
     std::vector<LogEntry> entries;
     ASSERT_TRUE(out.get("key1", entries).ok());
     ASSERT_EQ(entries.size(), 2u);
@@ -1181,22 +950,18 @@ TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    SegmentIndex si1;
-    si1.put("key1", 0, 1);
-    SegmentIndex si2;
-    si2.put("key1", 0, 2);
-
     // Only latest version (v2), no active snapshots pinning v1.
     std::vector<uint64_t> snapshots = {2};
-    std::vector<GC::InputSegment> inputs = {
-        {1, si1, seg1.logFile(), seg1.dataSize()},
-        {2, si2, seg2.logFile(), seg2.dataSize()},
-    };
+    std::vector<const Segment*> inputs = {&seg1, &seg2};
+
+    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
 
     Status s = GC::merge(
-        gi_, snapshots, inputs, /*max_segment_size=*/1 << 20,
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
+        noop_relocate, noop_eliminate,
         last_result_);
 
     ASSERT_TRUE(s.ok());
@@ -1204,7 +969,7 @@ TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
     // Output should contain only v2.
-    auto& out = last_result_.outputs[0].segment;
+    auto& out = last_result_.outputs[0];
     LogEntry entry;
     ASSERT_TRUE(out.getLatest("key1", entry).ok());
     EXPECT_EQ(entry.value, "v2");

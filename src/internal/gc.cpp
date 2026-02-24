@@ -4,55 +4,43 @@
 #include <vector>
 
 #include "internal/entry_stream.h"
-#include "internal/global_index.h"
 #include "internal/log_entry.h"
-#include "internal/log_file.h"
-#include "internal/segment_index.h"
 
 namespace kvlite {
 namespace internal {
 
 Status GC::merge(
-    const GlobalIndex& global_index,
     const std::vector<uint64_t>& snapshot_versions,
-    const std::vector<InputSegment>& inputs,
+    const std::vector<const Segment*>& inputs,
     uint64_t max_segment_size,
     const std::function<std::string(uint32_t)>& path_fn,
     const std::function<uint32_t()>& id_fn,
+    const RelocateFn& on_relocate,
+    const EliminateFn& on_eliminate,
     Result& result) {
 
     result.outputs.clear();
-    result.relocations.clear();
-    result.eliminations.clear();
     result.entries_written = 0;
     result.entries_eliminated = 0;
 
-    // Ext layout: [TagSourceExt | ClassifyExt]
+    // Ext layout: [GCTagSourceExt | GCClassifyExt]
     constexpr size_t kTagBase      = 0;
-    constexpr size_t kClassifyBase = kTagBase + TagSourceExt::kSize;
+    constexpr size_t kClassifyBase = kTagBase + GCTagSourceExt::kSize;
 
-    // 1. Build unfiltered tagSource streams and compute the union visible set.
+    // 1. Build tagSource streams — one per input segment.
     std::vector<std::unique_ptr<EntryStream>> streams;
     streams.reserve(inputs.size());
-    std::unordered_map<uint64_t, std::set<uint32_t>> union_visible;
 
-    for (const auto& input : inputs) {
-        streams.push_back(stream::tagSource(
-            stream::scan(input.log_file, input.data_size),
-            input.segment_id, kTagBase));
-
-        auto vs = computeVisibleSet(
-            global_index, input.index, input.segment_id, snapshot_versions);
-        for (auto& [hash, versions] : vs) {
-            auto& dst = union_visible[hash];
-            dst.insert(versions.begin(), versions.end());
-        }
+    for (const auto* input : inputs) {
+        streams.push_back(stream::gcTagSource(
+            stream::scan(input->logFile(), input->dataSize()),
+            input->getId(), kTagBase));
     }
 
-    // 2. Merge all streams, then classify.
-    auto pipeline = stream::classify(
+    // 2. Merge all streams, then classify using snapshot versions.
+    auto pipeline = stream::gcClassify(
         stream::merge(std::move(streams)),
-        std::move(union_visible), kClassifyBase);
+        snapshot_versions, kClassifyBase);
 
     // 3. If empty, return OK.
     if (!pipeline->valid()) {
@@ -69,13 +57,12 @@ Status GC::merge(
     while (pipeline->valid()) {
         const auto& entry = pipeline->entry();
         auto action = static_cast<EntryAction>(
-            entry.ext[kClassifyBase + ClassifyExt::kAction]);
+            entry.ext[kClassifyBase + GCClassifyExt::kAction]);
         auto old_seg_id = static_cast<uint32_t>(
-            entry.ext[kTagBase + TagSourceExt::kSegmentId]);
+            entry.ext[kTagBase + GCTagSourceExt::kSegmentId]);
 
         if (action == EntryAction::kEliminate) {
-            result.eliminations.push_back({
-                std::string(entry.key), entry.version, old_seg_id});
+            on_eliminate(entry.key, entry.version, old_seg_id);
             result.entries_eliminated++;
             s = pipeline->next();
             if (!s.ok()) return s;
@@ -89,7 +76,7 @@ Status GC::merge(
             output.dataSize() + serialized_size > max_segment_size) {
             s = output.seal();
             if (!s.ok()) return s;
-            result.outputs.push_back({output_id, std::move(output)});
+            result.outputs.push_back(std::move(output));
 
             output = Segment();
             output_id = id_fn();
@@ -100,8 +87,7 @@ Status GC::merge(
         s = output.put(entry.key, entry.version, entry.value, entry.tombstone);
         if (!s.ok()) return s;
 
-        result.relocations.push_back({
-            std::string(entry.key), entry.version, old_seg_id, output_id});
+        on_relocate(entry.key, entry.version, old_seg_id, output_id);
         result.entries_written++;
 
         s = pipeline->next();
@@ -112,7 +98,7 @@ Status GC::merge(
     if (output.dataSize() > 0) {
         s = output.seal();
         if (!s.ok()) return s;
-        result.outputs.push_back({output_id, std::move(output)});
+        result.outputs.push_back(std::move(output));
     } else {
         output.close();
     }

@@ -147,7 +147,7 @@ private:
             if (!seg) continue;
             db_->storage_->pinSegment(id);
             pinned_segment_ids_.push_back(id);
-            streams.push_back(internal::stream::scanLatestConsistent(
+            streams.push_back(internal::stream::scanLatest(
                 *db_->global_index_, id, snap_ver,
                 seg->logFile(), seg->dataSize()));
         }
@@ -157,7 +157,7 @@ private:
     }
 
     void findNextValid() {
-        // MergeStream yields entries in (hash asc, version asc) order.
+        // GCMergeStream yields entries in (hash asc, version asc) order.
         // For the same hash, advance to the last entry (highest version = latest).
         // If the latest is a tombstone, skip the key.
         //

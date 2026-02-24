@@ -13,7 +13,6 @@
 #include "internal/log_file.h"
 #include "internal/entry_stream.h"
 #include "internal/segment.h"
-#include "internal/segment_index.h"
 #include "internal/write_buffer.h"
 
 using namespace kvlite::internal;
@@ -76,97 +75,6 @@ TEST_F(EntryStreamTest, Scan_AllEntries) {
         ASSERT_TRUE(s->next().ok());
     }
     EXPECT_EQ(count, 2u);
-}
-
-// --- SnapshotVisibility (scanVisible) Tests ---
-
-TEST_F(EntryStreamTest, ScanVisible_SingleEntry) {
-    size_t idx = createSegment(1, {{"key1", 10, "val1", false}});
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put("key1", 0, 10);
-
-    std::vector<uint64_t> snapshots = {10};
-    auto s = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().key, "key1");
-    EXPECT_EQ(s->entry().value, "val1");
-    EXPECT_EQ(s->entry().version, 10u);
-
-    ASSERT_TRUE(s->next().ok());
-    EXPECT_FALSE(s->valid());
-}
-
-TEST_F(EntryStreamTest, ScanVisible_EmptyVisibleSet) {
-    size_t idx = createSegment(1, {{"key1", 1, "val1", false}});
-    createSegment(2, {{"key1", 2, "val2", false}});
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put("key1", 0, 1);
-
-    // Only snapshot at v2 -> latest is v2(seg2), nothing visible in seg1.
-    std::vector<uint64_t> snapshots = {2};
-    auto s = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    EXPECT_FALSE(s->valid());
-}
-
-TEST_F(EntryStreamTest, ScanVisible_MultipleKeys) {
-    std::string keyA = "key1";
-    std::string keyB = "key2";
-    uint64_t hashA = dhtHashBytes(keyA.data(), keyA.size());
-    uint64_t hashB = dhtHashBytes(keyB.data(), keyB.size());
-    if (hashA > hashB) {
-        std::swap(keyA, keyB);
-    }
-
-    size_t idx = createSegment(1, {
-        {keyA, 1, "A_v1", false},
-        {keyB, 2, "B_v2", false},
-    });
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put(keyA, 0, 1);
-    si.put(keyB, 100, 2);
-
-    std::vector<uint64_t> snapshots = {2};
-    auto s = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().key, keyA);
-
-    ASSERT_TRUE(s->next().ok());
-    ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().key, keyB);
-
-    ASSERT_TRUE(s->next().ok());
-    EXPECT_FALSE(s->valid());
-}
-
-TEST_F(EntryStreamTest, ScanVisible_TombstonePassThrough) {
-    size_t idx = createSegment(1, {{"key1", 1, "val1", true}});
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put("key1", 0, 1);
-
-    std::vector<uint64_t> snapshots = {1};
-    auto s = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().key, "key1");
-    EXPECT_TRUE(s->entry().tombstone);
-
-    ASSERT_TRUE(s->next().ok());
-    EXPECT_FALSE(s->valid());
 }
 
 // --- ScanLatest Tests ---
@@ -242,93 +150,6 @@ TEST_F(EntryStreamTest, ScanLatest_SnapshotBound) {
     EXPECT_FALSE(s->valid());
 }
 
-// --- ScanLatestConsistent Tests ---
-
-TEST_F(EntryStreamTest, ScanLatestConsistent_SingleSegment) {
-    size_t idx = createSegment(1, {
-        {"key1", 1, "val1", false},
-        {"key2", 2, "val2", false},
-    });
-    auto& seg = segments_[idx];
-
-    auto s = stream::scanLatestConsistent(
-        gi_, 1, /*snapshot_version=*/2,
-        seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(s->valid());
-    std::vector<std::string> keys;
-    while (s->valid()) {
-        keys.push_back(std::string(s->entry().key));
-        ASSERT_TRUE(s->next().ok());
-    }
-    EXPECT_EQ(keys.size(), 2u);
-    EXPECT_TRUE(std::find(keys.begin(), keys.end(), "key1") != keys.end());
-    EXPECT_TRUE(std::find(keys.begin(), keys.end(), "key2") != keys.end());
-}
-
-TEST_F(EntryStreamTest, ScanLatestConsistent_SupersededEntry) {
-    size_t idx = createSegment(1, {{"key1", 1, "old", false}});
-    createSegment(2, {{"key1", 2, "new", false}});
-    auto& seg = segments_[idx];
-
-    auto s = stream::scanLatestConsistent(
-        gi_, 1, /*snapshot_version=*/2,
-        seg.logFile(), seg.dataSize());
-
-    EXPECT_FALSE(s->valid());
-}
-
-TEST_F(EntryStreamTest, ScanLatestConsistent_SnapshotBound) {
-    size_t idx = createSegment(1, {
-        {"key1", 1, "v1", false},
-        {"key1", 3, "v3", false},
-    });
-    auto& seg = segments_[idx];
-
-    auto s = stream::scanLatestConsistent(
-        gi_, 1, /*snapshot_version=*/2,
-        seg.logFile(), seg.dataSize());
-
-    ASSERT_TRUE(s->valid());
-    EXPECT_EQ(s->entry().key, "key1");
-    EXPECT_EQ(s->entry().version, 1u);
-
-    ASSERT_TRUE(s->next().ok());
-    EXPECT_FALSE(s->valid());
-}
-
-TEST_F(EntryStreamTest, ScanLatestConsistent_ImmuneToMutation) {
-    // Populate seg1 with 50 keys.
-    std::vector<std::tuple<std::string, uint64_t, std::string, bool>> entries;
-    for (int i = 0; i < 50; ++i) {
-        entries.push_back({"key" + std::to_string(i),
-                           static_cast<uint64_t>(i + 1),
-                           "val" + std::to_string(i), false});
-    }
-    size_t idx = createSegment(1, entries);
-    auto& seg = segments_[idx];
-
-    // Create scanLatestConsistent — precomputes visibility set now.
-    auto s = stream::scanLatestConsistent(
-        gi_, 1, /*snapshot_version=*/50,
-        seg.logFile(), seg.dataSize());
-
-    // Mutate GlobalIndex: supersede all keys with newer versions in seg2.
-    for (int i = 0; i < 50; ++i) {
-        gi_.put("key" + std::to_string(i),
-                static_cast<uint64_t>(100 + i), 2);
-    }
-
-    // Drain the stream — should still yield all 50, since visibility was
-    // precomputed before the mutations.
-    size_t count = 0;
-    while (s->valid()) {
-        count++;
-        ASSERT_TRUE(s->next().ok());
-    }
-    EXPECT_EQ(count, 50u);
-}
-
 TEST_F(EntryStreamTest, ScanLatest_NonAtomic_SeesMutation) {
     // Populate seg1 with 50 keys at versions 1..50.
     std::vector<std::tuple<std::string, uint64_t, std::string, bool>> entries;
@@ -364,44 +185,7 @@ TEST_F(EntryStreamTest, ScanLatest_NonAtomic_SeesMutation) {
 
     // Non-atomic: most entries filtered out by mutation. At most 1 entry
     // survived (the one preloaded by FilterStream's constructor).
-    // Contrast with scanLatestConsistent which would return all 50.
     EXPECT_LE(count, 1u);
-}
-
-TEST_F(EntryStreamTest, ScanLatestConsistent_ConcurrentMutation) {
-    // Populate seg1 with 100 keys.
-    std::vector<std::tuple<std::string, uint64_t, std::string, bool>> entries;
-    for (int i = 0; i < 100; ++i) {
-        entries.push_back({"key" + std::to_string(i),
-                           static_cast<uint64_t>(i + 1),
-                           "val" + std::to_string(i), false});
-    }
-    size_t idx = createSegment(1, entries);
-    auto& seg = segments_[idx];
-
-    // Create scanLatestConsistent — precomputes visibility set.
-    auto s = stream::scanLatestConsistent(
-        gi_, 1, /*snapshot_version=*/100,
-        seg.logFile(), seg.dataSize());
-
-    // Writer thread: supersede keys concurrently.
-    std::thread writer([&] {
-        for (int i = 0; i < 100; ++i) {
-            gi_.put("key" + std::to_string(i),
-                    static_cast<uint64_t>(200 + i), 2);
-        }
-    });
-
-    // Drain — should still see all 100, since set was precomputed.
-    size_t count = 0;
-    while (s->valid()) {
-        count++;
-        ASSERT_TRUE(s->next().ok());
-    }
-
-    writer.join();
-
-    EXPECT_EQ(count, 100u);
 }
 
 // --- MergeStream Tests ---
@@ -663,46 +447,6 @@ TEST_F(EntryStreamTest, ConcurrentIterate_MergeWithPuts) {
     EXPECT_LE(count, 4u);
 }
 
-TEST_F(EntryStreamTest, ConcurrentIterate_ScanVisibleWithPuts) {
-    // Create a segment and set up a scanVisible stream, then mutate GlobalIndex.
-    size_t idx = createSegment(1, {
-        {"key1", 1, "v1", false},
-        {"key2", 2, "v2", false},
-        {"key3", 3, "v3", false},
-    });
-    auto& seg = segments_[idx];
-
-    SegmentIndex si;
-    si.put("key1", 0, 1);
-    si.put("key2", 100, 2);
-    si.put("key3", 200, 3);
-
-    std::vector<uint64_t> snapshots = {3};
-    // scanVisible pre-computes visible set at creation time, so concurrent
-    // mutations to GlobalIndex should not affect it.
-    auto s = stream::scanVisible(
-        gi_, si, 1, snapshots, seg.logFile(), seg.dataSize());
-
-    // Writer thread: add newer versions to GlobalIndex.
-    std::thread writer([&] {
-        for (int i = 0; i < 100; ++i) {
-            gi_.put("key" + std::to_string(i % 3 + 1),
-                    static_cast<uint64_t>(100 + i), 2);
-        }
-    });
-
-    size_t count = 0;
-    while (s->valid()) {
-        count++;
-        ASSERT_TRUE(s->next().ok());
-    }
-
-    writer.join();
-
-    // scanVisible captured the visible set at construction — all 3 entries visible.
-    EXPECT_EQ(count, 3u);
-}
-
 // --- TagSource Tests ---
 
 TEST_F(EntryStreamTest, TagSource_SetsExtField) {
@@ -713,12 +457,12 @@ TEST_F(EntryStreamTest, TagSource_SetsExtField) {
     auto& seg = segments_[idx];
 
     constexpr size_t kBase = 0;
-    auto s = stream::tagSource(
+    auto s = stream::gcTagSource(
         stream::scan(seg.logFile(), seg.dataSize()), 42, kBase);
 
     size_t count = 0;
     while (s->valid()) {
-        EXPECT_EQ(s->entry().ext[kBase + TagSourceExt::kSegmentId], 42u);
+        EXPECT_EQ(s->entry().ext[kBase + GCTagSourceExt::kSegmentId], 42u);
         count++;
         ASSERT_TRUE(s->next().ok());
     }
@@ -730,7 +474,7 @@ TEST_F(EntryStreamTest, TagSource_PreservesEntryFields) {
     auto& seg = segments_[idx];
 
     constexpr size_t kBase = 2;
-    auto s = stream::tagSource(
+    auto s = stream::gcTagSource(
         stream::scan(seg.logFile(), seg.dataSize()), 99, kBase);
 
     ASSERT_TRUE(s->valid());
@@ -738,7 +482,7 @@ TEST_F(EntryStreamTest, TagSource_PreservesEntryFields) {
     EXPECT_EQ(s->entry().value, "val5");
     EXPECT_EQ(s->entry().version, 5u);
     EXPECT_TRUE(s->entry().tombstone);
-    EXPECT_EQ(s->entry().ext[kBase + TagSourceExt::kSegmentId], 99u);
+    EXPECT_EQ(s->entry().ext[kBase + GCTagSourceExt::kSegmentId], 99u);
 }
 
 TEST_F(EntryStreamTest, TagSource_PropagatesThroughMerge) {
@@ -749,9 +493,9 @@ TEST_F(EntryStreamTest, TagSource_PropagatesThroughMerge) {
 
     constexpr size_t kBase = 0;
     std::vector<std::unique_ptr<EntryStream>> streams;
-    streams.push_back(stream::tagSource(
+    streams.push_back(stream::gcTagSource(
         stream::scan(seg1.logFile(), seg1.dataSize()), 1, kBase));
-    streams.push_back(stream::tagSource(
+    streams.push_back(stream::gcTagSource(
         stream::scan(seg2.logFile(), seg2.dataSize()), 2, kBase));
 
     auto merged = stream::merge(std::move(streams));
@@ -759,7 +503,7 @@ TEST_F(EntryStreamTest, TagSource_PropagatesThroughMerge) {
     // Both entries should retain their tagged segment_id through merge.
     std::set<uint64_t> seen_ids;
     while (merged->valid()) {
-        seen_ids.insert(merged->entry().ext[kBase + TagSourceExt::kSegmentId]);
+        seen_ids.insert(merged->entry().ext[kBase + GCTagSourceExt::kSegmentId]);
         ASSERT_TRUE(merged->next().ok());
     }
     EXPECT_EQ(seen_ids.count(1u), 1u);
@@ -769,45 +513,42 @@ TEST_F(EntryStreamTest, TagSource_PropagatesThroughMerge) {
 // --- Classify Tests ---
 
 TEST_F(EntryStreamTest, Classify_KeepAndEliminate) {
-    // key1 v1 (seg1) + key1 v2 (seg2). Only v2 visible.
+    // key1 v1 (seg1) + key1 v2 (seg2). Only snapshot at v2 → v1 eliminated.
     size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    // Ext layout: [TagSourceExt | ClassifyExt]
+    // Ext layout: [GCTagSourceExt | GCClassifyExt]
     constexpr size_t kTagBase      = 0;
-    constexpr size_t kClassifyBase = kTagBase + TagSourceExt::kSize;
+    constexpr size_t kClassifyBase = kTagBase + GCTagSourceExt::kSize;
 
     std::vector<std::unique_ptr<EntryStream>> streams;
-    streams.push_back(stream::tagSource(
+    streams.push_back(stream::gcTagSource(
         stream::scan(seg1.logFile(), seg1.dataSize()), 1, kTagBase));
-    streams.push_back(stream::tagSource(
+    streams.push_back(stream::gcTagSource(
         stream::scan(seg2.logFile(), seg2.dataSize()), 2, kTagBase));
 
     auto merged = stream::merge(std::move(streams));
 
-    uint64_t hash = dhtHashBytes("key1", 4);
-    std::unordered_map<uint64_t, std::set<uint32_t>> visible;
-    visible[hash] = {2};
-
-    auto classified = stream::classify(
-        std::move(merged), std::move(visible), kClassifyBase);
+    std::vector<uint64_t> snapshots = {2};
+    auto classified = stream::gcClassify(
+        std::move(merged), snapshots, kClassifyBase);
 
     // First entry: key1 v1 → kEliminate, segment_id=1 preserved
     ASSERT_TRUE(classified->valid());
     EXPECT_EQ(classified->entry().version, 1u);
-    EXPECT_EQ(classified->entry().ext[kClassifyBase + ClassifyExt::kAction],
+    EXPECT_EQ(classified->entry().ext[kClassifyBase + GCClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kEliminate));
-    EXPECT_EQ(classified->entry().ext[kTagBase + TagSourceExt::kSegmentId], 1u);
+    EXPECT_EQ(classified->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 1u);
 
     ASSERT_TRUE(classified->next().ok());
     // Second entry: key1 v2 → kKeep, segment_id=2 preserved
     ASSERT_TRUE(classified->valid());
     EXPECT_EQ(classified->entry().version, 2u);
-    EXPECT_EQ(classified->entry().ext[kClassifyBase + ClassifyExt::kAction],
+    EXPECT_EQ(classified->entry().ext[kClassifyBase + GCClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kKeep));
-    EXPECT_EQ(classified->entry().ext[kTagBase + TagSourceExt::kSegmentId], 2u);
+    EXPECT_EQ(classified->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 2u);
 
     ASSERT_TRUE(classified->next().ok());
     EXPECT_FALSE(classified->valid());
@@ -823,18 +564,14 @@ TEST_F(EntryStreamTest, Classify_AllKeep) {
     constexpr size_t kBase = 0;
     auto tagged = stream::scan(seg.logFile(), seg.dataSize());
 
-    uint64_t h1 = dhtHashBytes("key1", 4);
-    uint64_t h2 = dhtHashBytes("key2", 4);
-    std::unordered_map<uint64_t, std::set<uint32_t>> visible;
-    visible[h1] = {1};
-    visible[h2] = {2};
-
-    auto classified = stream::classify(
-        std::move(tagged), std::move(visible), kBase);
+    // Snapshot covers all versions → all kept.
+    std::vector<uint64_t> snapshots = {2};
+    auto classified = stream::gcClassify(
+        std::move(tagged), snapshots, kBase);
 
     size_t keep_count = 0;
     while (classified->valid()) {
-        EXPECT_EQ(classified->entry().ext[kBase + ClassifyExt::kAction],
+        EXPECT_EQ(classified->entry().ext[kBase + GCClassifyExt::kAction],
                   static_cast<uint64_t>(EntryAction::kKeep));
         keep_count++;
         ASSERT_TRUE(classified->next().ok());
@@ -843,22 +580,33 @@ TEST_F(EntryStreamTest, Classify_AllKeep) {
 }
 
 TEST_F(EntryStreamTest, Classify_AllEliminate) {
+    // key1 v1 + key1 v2 in same segment. Only snapshot at v2.
+    // v2 is latest → kept, v1 eliminated.
     size_t idx = createSegment(1, {
         {"key1", 1, "val1", false},
+        {"key1", 2, "val2", false},
     });
     auto& seg = segments_[idx];
 
     constexpr size_t kBase = 0;
 
-    // Empty visible set → everything eliminated.
-    std::unordered_map<uint64_t, std::set<uint32_t>> visible;
-    auto classified = stream::classify(
+    std::vector<uint64_t> snapshots = {2};
+    auto classified = stream::gcClassify(
         stream::scan(seg.logFile(), seg.dataSize()),
-        std::move(visible), kBase);
+        snapshots, kBase);
 
+    // v1 → kEliminate
     ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().ext[kBase + ClassifyExt::kAction],
+    EXPECT_EQ(classified->entry().version, 1u);
+    EXPECT_EQ(classified->entry().ext[kBase + GCClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kEliminate));
+
+    ASSERT_TRUE(classified->next().ok());
+    // v2 → kKeep
+    ASSERT_TRUE(classified->valid());
+    EXPECT_EQ(classified->entry().version, 2u);
+    EXPECT_EQ(classified->entry().ext[kBase + GCClassifyExt::kAction],
+              static_cast<uint64_t>(EntryAction::kKeep));
 
     ASSERT_TRUE(classified->next().ok());
     EXPECT_FALSE(classified->valid());

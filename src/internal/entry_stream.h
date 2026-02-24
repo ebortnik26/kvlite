@@ -5,9 +5,7 @@
 #include <functional>
 #include <memory>
 #include <queue>
-#include <set>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include "kvlite/status.h"
@@ -17,7 +15,6 @@ namespace internal {
 
 class GlobalIndex;
 class LogFile;
-class SegmentIndex;
 class WriteBuffer;
 
 // Abstract base for composable entry streams.
@@ -47,21 +44,6 @@ public:
     virtual Status next() = 0;
 };
 
-// Compute the set of (hash -> {versions}) visible in a segment, given the
-// GlobalIndex state and active snapshot versions.
-std::unordered_map<uint64_t, std::set<uint32_t>> computeVisibleSet(
-    const GlobalIndex& global_index,
-    const SegmentIndex& segment_index,
-    uint32_t segment_id,
-    const std::vector<uint64_t>& snapshot_versions);
-
-// Compute the set of (hash -> version) that are the latest at snapshot_version
-// and live in segment_id. Only one version per hash (the latest <= snapshot).
-std::unordered_map<uint64_t, uint32_t> computeLatestSet(
-    const GlobalIndex& global_index,
-    uint32_t segment_id,
-    uint64_t snapshot_version);
-
 // ---------------------------------------------------------------------------
 // Operator extension schemas.
 // Each operator declares its ext fields and size. The pipeline builder
@@ -69,12 +51,12 @@ std::unordered_map<uint64_t, uint32_t> computeLatestSet(
 // base = sum of kSize for operators 0..N-1.
 // ---------------------------------------------------------------------------
 
-struct TagSourceExt {
+struct GCTagSourceExt {
     enum Field : size_t { kSegmentId = 0 };
     static constexpr size_t kSize = 1;
 };
 
-struct ClassifyExt {
+struct GCClassifyExt {
     enum Field : size_t { kAction = 0 };
     static constexpr size_t kSize = 1;
 };
@@ -95,33 +77,22 @@ std::unique_ptr<EntryStream> filter(std::unique_ptr<EntryStream> input, Predicat
 std::unique_ptr<EntryStream> merge(std::vector<std::unique_ptr<EntryStream>> inputs);
 
 // Tag each entry with a source segment_id.
-// Writes to ext[base + TagSourceExt::kSegmentId].
-std::unique_ptr<EntryStream> tagSource(
+// Writes to ext[base + GCTagSourceExt::kSegmentId].
+std::unique_ptr<EntryStream> gcTagSource(
     std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t base);
 
-// Classify each entry as kKeep or kEliminate.
-// Writes EntryAction to ext[base + ClassifyExt::kAction].
-std::unique_ptr<EntryStream> classify(
+// Classify each entry as kKeep or kEliminate based on snapshot visibility.
+// Entries must arrive in (hash asc, version asc) order. For each hash group,
+// the latest version <= each snapshot is kept; all others are eliminated.
+// Writes EntryAction to ext[base + GCClassifyExt::kAction].
+std::unique_ptr<EntryStream> gcClassify(
     std::unique_ptr<EntryStream> input,
-    std::unordered_map<uint64_t, std::set<uint32_t>> visible_set,
+    const std::vector<uint64_t>& snapshot_versions,
     size_t base);
 
-// Convenience: scan + visibility filter for GC.
-std::unique_ptr<EntryStream> scanVisible(
-    const GlobalIndex& gi, const SegmentIndex& si,
-    uint32_t segment_id, const std::vector<uint64_t>& snapshot_versions,
-    const LogFile& lf, uint64_t data_size);
-
-// Convenience: scan + latest-version filter for DB iteration (non-atomic).
+// Convenience: scan + latest-version filter for DB iteration.
 // Checks GlobalIndex per entry during iteration — concurrent mutations visible.
 std::unique_ptr<EntryStream> scanLatest(
-    const GlobalIndex& gi, uint32_t segment_id,
-    uint64_t snapshot_version,
-    const LogFile& lf, uint64_t data_size);
-
-// Convenience: scan + snapshot-consistent latest-version filter.
-// Precomputes visibility set at construction — immune to concurrent mutations.
-std::unique_ptr<EntryStream> scanLatestConsistent(
     const GlobalIndex& gi, uint32_t segment_id,
     uint64_t snapshot_version,
     const LogFile& lf, uint64_t data_size);

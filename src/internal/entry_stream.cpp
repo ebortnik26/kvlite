@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 
 #include "internal/crc32.h"
@@ -11,127 +12,10 @@
 #include "internal/global_index.h"
 #include "internal/log_entry.h"
 #include "internal/log_file.h"
-#include "internal/segment_index.h"
 #include "internal/write_buffer.h"
 
 namespace kvlite {
 namespace internal {
-
-// ---------------------------------------------------------------------------
-// computeVisibleSet
-// ---------------------------------------------------------------------------
-
-std::unordered_map<uint64_t, std::set<uint32_t>> computeVisibleSet(
-    const GlobalIndex& global_index,
-    const SegmentIndex& segment_index,
-    uint32_t segment_id,
-    const std::vector<uint64_t>& snapshot_versions) {
-
-    std::unordered_map<uint64_t, std::set<uint32_t>> result;
-
-    if (snapshot_versions.empty()) {
-        return result;
-    }
-
-    // Phase 1: Collect both sides.
-    struct GlobalGroup {
-        uint64_t hash;
-        std::vector<uint32_t> versions;     // sorted desc
-        std::vector<uint32_t> segment_ids;  // parallel array
-    };
-
-    std::vector<GlobalGroup> global_groups;
-    global_index.forEachGroup(
-        [&global_groups](uint64_t hash,
-                         const std::vector<uint32_t>& versions,
-                         const std::vector<uint32_t>& segment_ids) {
-            global_groups.push_back({hash, versions, segment_ids});
-        });
-
-    std::vector<uint64_t> local_hashes;
-    segment_index.forEachGroup(
-        [&local_hashes](uint64_t hash,
-                        const std::vector<uint32_t>&,
-                        const std::vector<uint32_t>&) {
-            local_hashes.push_back(hash);
-        });
-
-    // Sort both sides by hash.
-    std::sort(global_groups.begin(), global_groups.end(),
-              [](const GlobalGroup& a, const GlobalGroup& b) {
-                  return a.hash < b.hash;
-              });
-    std::sort(local_hashes.begin(), local_hashes.end());
-
-    // Phase 2: Merge-join on hash.
-    size_t gi = 0;
-    size_t li = 0;
-
-    while (gi < global_groups.size() && li < local_hashes.size()) {
-        uint64_t gh = global_groups[gi].hash;
-        uint64_t lh = local_hashes[li];
-
-        if (gh < lh) {
-            ++gi;
-        } else if (gh > lh) {
-            ++li;
-        } else {
-            const auto& global_versions = global_groups[gi].versions;
-            const auto& global_seg_ids = global_groups[gi].segment_ids;
-
-            std::set<uint32_t> pinned;
-
-            for (uint64_t snap : snapshot_versions) {
-                for (size_t j = 0; j < global_versions.size(); ++j) {
-                    if (static_cast<uint64_t>(global_versions[j]) <= snap) {
-                        if (global_seg_ids[j] == segment_id) {
-                            pinned.insert(global_versions[j]);
-                        }
-                        break;
-                    }
-                }
-            }
-
-            if (!pinned.empty()) {
-                result[gh] = std::move(pinned);
-            }
-            ++gi;
-            ++li;
-        }
-    }
-
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// computeLatestSet
-// ---------------------------------------------------------------------------
-
-std::unordered_map<uint64_t, uint32_t> computeLatestSet(
-    const GlobalIndex& global_index,
-    uint32_t segment_id,
-    uint64_t snapshot_version) {
-
-    std::unordered_map<uint64_t, uint32_t> result;
-
-    global_index.forEachGroup(
-        [&result, segment_id, snapshot_version](
-            uint64_t hash,
-            const std::vector<uint32_t>& versions,
-            const std::vector<uint32_t>& segment_ids) {
-            // versions are sorted desc. Find first <= snapshot_version.
-            for (size_t i = 0; i < versions.size(); ++i) {
-                if (static_cast<uint64_t>(versions[i]) <= snapshot_version) {
-                    if (segment_ids[i] == segment_id) {
-                        result[hash] = versions[i];
-                    }
-                    break;
-                }
-            }
-        });
-
-    return result;
-}
 
 // ---------------------------------------------------------------------------
 // ScanStream — reads ALL entries from a LogFile
@@ -301,14 +185,14 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// TagSourceStream — writes segment_id to ext[base + TagSourceExt::kSegmentId]
+// GCTagSourceStream — writes segment_id to ext[base + GCTagSourceExt::kSegmentId]
 // ---------------------------------------------------------------------------
 
-class TagSourceStream : public EntryStream {
+class GCTagSourceStream : public EntryStream {
 public:
-    TagSourceStream(std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t base)
+    GCTagSourceStream(std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t base)
         : input_(std::move(input)), segment_id_(segment_id), base_(base) {
-        assert(base_ + TagSourceExt::kSize <= Entry::kMaxExt);
+        assert(base_ + GCTagSourceExt::kSize <= Entry::kMaxExt);
         if (input_->valid()) {
             stamp();
         }
@@ -329,7 +213,7 @@ public:
 private:
     void stamp() {
         current_ = input_->entry();
-        current_.ext[base_ + TagSourceExt::kSegmentId] = segment_id_;
+        current_.ext[base_ + GCTagSourceExt::kSegmentId] = segment_id_;
     }
 
     std::unique_ptr<EntryStream> input_;
@@ -339,55 +223,102 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// ClassifyStream — writes EntryAction to ext[base + ClassifyExt::kAction]
+// GCClassifyStream — writes EntryAction to ext[base + GCClassifyExt::kAction]
+//
+// Input must be in (hash asc, version asc) order. Buffers entries per hash
+// group, classifies the group when the hash changes (or stream exhausts),
+// then replays the classified entries one at a time.
+//
+// Classification: for each snapshot version, the latest entry version <=
+// snapshot is kept. All other entries are eliminated.
 // ---------------------------------------------------------------------------
 
-class ClassifyStream : public EntryStream {
+class GCClassifyStream : public EntryStream {
 public:
-    ClassifyStream(std::unique_ptr<EntryStream> input,
-                   std::unordered_map<uint64_t, std::set<uint32_t>> visible_set,
-                   size_t base)
+    GCClassifyStream(std::unique_ptr<EntryStream> input,
+                     std::vector<uint64_t> snapshot_versions,
+                     size_t base)
         : input_(std::move(input)),
-          visible_set_(std::move(visible_set)),
+          snapshots_(std::move(snapshot_versions)),
           base_(base) {
-        assert(base_ + ClassifyExt::kSize <= Entry::kMaxExt);
+        assert(base_ + GCClassifyExt::kSize <= Entry::kMaxExt);
+        std::sort(snapshots_.begin(), snapshots_.end());
         if (input_->valid()) {
-            classify();
+            fillGroup();
         }
     }
 
-    bool valid() const override { return input_->valid(); }
-    const Entry& entry() const override { return current_; }
+    bool valid() const override { return pos_ < group_.size(); }
+    const Entry& entry() const override { return group_[pos_]; }
 
     Status next() override {
-        Status s = input_->next();
-        if (!s.ok()) return s;
+        ++pos_;
+        if (pos_ < group_.size()) {
+            return Status::OK();
+        }
+        // Current group exhausted — fill next group from input.
         if (input_->valid()) {
-            classify();
+            fillGroup();
         }
         return Status::OK();
     }
 
 private:
-    void classify() {
-        current_ = input_->entry();
-        const auto it = visible_set_.find(current_.hash);
-        if (it != visible_set_.end()) {
-            uint32_t v = static_cast<uint32_t>(current_.version);
-            if (it->second.count(v) > 0) {
-                current_.ext[base_ + ClassifyExt::kAction] =
-                    static_cast<uint64_t>(EntryAction::kKeep);
-                return;
+    // Consume entries from input_ sharing the same hash, classify them,
+    // and store in group_. Leaves input_ positioned at the first entry
+    // of the next hash group (or exhausted).
+    void fillGroup() {
+        group_.clear();
+        strings_.clear();
+        pos_ = 0;
+
+        uint64_t current_hash = input_->entry().hash;
+
+        // Collect all entries with the same hash.
+        // Copy key/value into owned strings since input_->next() invalidates
+        // the string_views from the previous entry.
+        while (input_->valid() && input_->entry().hash == current_hash) {
+            const auto& e = input_->entry();
+            strings_.emplace_back(e.key);
+            strings_.emplace_back(e.value);
+            group_.push_back(e);
+            Status s = input_->next();
+            if (!s.ok()) break;
+        }
+
+        // Fix up string_views to point at owned strings.
+        for (size_t i = 0; i < group_.size(); ++i) {
+            group_[i].key = strings_[i * 2];
+            group_[i].value = strings_[i * 2 + 1];
+        }
+
+        // Classify: entries arrive in version-asc order.
+        // For each snapshot, the latest version <= snapshot is kept.
+        std::set<size_t> keep_indices;
+        for (uint64_t snap : snapshots_) {
+            // Walk backwards to find latest version <= snap.
+            for (int i = static_cast<int>(group_.size()) - 1; i >= 0; --i) {
+                if (group_[i].version <= snap) {
+                    keep_indices.insert(static_cast<size_t>(i));
+                    break;
+                }
             }
         }
-        current_.ext[base_ + ClassifyExt::kAction] =
-            static_cast<uint64_t>(EntryAction::kEliminate);
+
+        for (size_t i = 0; i < group_.size(); ++i) {
+            group_[i].ext[base_ + GCClassifyExt::kAction] =
+                keep_indices.count(i)
+                    ? static_cast<uint64_t>(EntryAction::kKeep)
+                    : static_cast<uint64_t>(EntryAction::kEliminate);
+        }
     }
 
     std::unique_ptr<EntryStream> input_;
-    std::unordered_map<uint64_t, std::set<uint32_t>> visible_set_;
+    std::vector<uint64_t> snapshots_;
     size_t base_;
-    Entry current_;
+    std::vector<Entry> group_;
+    std::vector<std::string> strings_;  // owned key/value storage
+    size_t pos_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -408,33 +339,16 @@ std::unique_ptr<EntryStream> merge(std::vector<std::unique_ptr<EntryStream>> inp
     return std::make_unique<MergeStream>(std::move(inputs));
 }
 
-std::unique_ptr<EntryStream> tagSource(
+std::unique_ptr<EntryStream> gcTagSource(
     std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t base) {
-    return std::make_unique<TagSourceStream>(std::move(input), segment_id, base);
+    return std::make_unique<GCTagSourceStream>(std::move(input), segment_id, base);
 }
 
-std::unique_ptr<EntryStream> classify(
+std::unique_ptr<EntryStream> gcClassify(
     std::unique_ptr<EntryStream> input,
-    std::unordered_map<uint64_t, std::set<uint32_t>> visible_set,
+    const std::vector<uint64_t>& snapshot_versions,
     size_t base) {
-    return std::make_unique<ClassifyStream>(std::move(input), std::move(visible_set), base);
-}
-
-std::unique_ptr<EntryStream> scanVisible(
-    const GlobalIndex& gi, const SegmentIndex& si,
-    uint32_t segment_id, const std::vector<uint64_t>& snapshot_versions,
-    const LogFile& lf, uint64_t data_size) {
-
-    auto visible_set = computeVisibleSet(gi, si, segment_id, snapshot_versions);
-
-    return filter(
-        scan(lf, data_size),
-        [vs = std::move(visible_set)](const EntryStream::Entry& e) -> bool {
-            auto it = vs.find(e.hash);
-            if (it == vs.end()) return false;
-            uint32_t v = static_cast<uint32_t>(e.version);
-            return it->second.count(v) > 0;
-        });
+    return std::make_unique<GCClassifyStream>(std::move(input), snapshot_versions, base);
 }
 
 std::unique_ptr<EntryStream> scanLatest(
@@ -455,22 +369,6 @@ std::unique_ptr<EntryStream> scanLatest(
                 return gi_segment_id == segment_id && gi_version == e.version;
             }
             return false;
-        });
-}
-
-std::unique_ptr<EntryStream> scanLatestConsistent(
-    const GlobalIndex& gi, uint32_t segment_id,
-    uint64_t snapshot_version,
-    const LogFile& lf, uint64_t data_size) {
-
-    auto latest_set = computeLatestSet(gi, segment_id, snapshot_version);
-
-    return filter(
-        scan(lf, data_size),
-        [ls = std::move(latest_set)](const EntryStream::Entry& e) -> bool {
-            auto it = ls.find(e.hash);
-            if (it == ls.end()) return false;
-            return it->second == static_cast<uint32_t>(e.version);
         });
 }
 
