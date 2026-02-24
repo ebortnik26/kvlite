@@ -667,3 +667,100 @@ TEST_F(DBTest, CleanCloseFlag) {
         m.close();
     }
 }
+
+// ── Tombstone lookups avoid segment I/O ─────────────────────────────────────
+//
+// Strategy: after flushing a tombstone and a live key into the same segment,
+// chmod the segment file to 000 (unreadable).  Lookups for the tombstoned key
+// must still succeed (NotFound / exists=false) because the answer comes from
+// the GlobalIndex packed version alone.  Lookups for the live key must fail
+// with IOError, proving the file is genuinely unreadable and that the
+// tombstone path truly skipped I/O.
+
+// Helper: collect segment data-file paths under a DB directory.
+static std::vector<fs::path> segmentFiles(const fs::path& dir) {
+    std::vector<fs::path> result;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        auto name = entry.path().filename().string();
+        if (name.size() > 5 &&
+            name.substr(name.size() - 5) == ".data" &&
+            name.substr(0, 8) == "segment_") {
+            result.push_back(entry.path());
+        }
+    }
+    return result;
+}
+
+TEST_F(DBTest, GetTombstoneNoIO) {
+    ASSERT_TRUE(openDB().ok());
+
+    // Flush a live key and a tombstoned key into the same segment.
+    ASSERT_TRUE(db_.put("live", "value").ok());
+    ASSERT_TRUE(db_.put("dead", "gone").ok());
+    ASSERT_TRUE(db_.remove("dead", syncOpts()).ok());
+
+    // Sanity: both resolved correctly while data is intact.
+    std::string val;
+    ASSERT_TRUE(db_.get("live", val).ok());
+    EXPECT_EQ(val, "value");
+    ASSERT_TRUE(db_.get("dead", val).isNotFound());
+
+    // Corrupt the data region of every segment file by overwriting the first
+    // bytes with garbage.  The index/footer at the end remain intact so the
+    // in-memory SegmentIndex is unaffected, but any pread of the data region
+    // will yield a CRC mismatch.
+    auto files = segmentFiles(test_dir_);
+    ASSERT_FALSE(files.empty());
+    for (const auto& f : files) {
+        // Write 64 bytes of 0xFF at offset 0 (middle of the first log entry).
+        FILE* fp = fopen(f.c_str(), "r+b");
+        ASSERT_NE(fp, nullptr);
+        uint8_t garbage[64];
+        memset(garbage, 0xFF, sizeof(garbage));
+        fwrite(garbage, 1, sizeof(garbage), fp);
+        fclose(fp);
+    }
+
+    // Tombstoned key: resolved from GI packed version alone, no data read.
+    EXPECT_TRUE(db_.get("dead", val).isNotFound());
+
+    // Live key: requires segment data read → CRC mismatch on corrupted data.
+    kvlite::Status s = db_.get("live", val);
+    EXPECT_FALSE(s.ok());
+    EXPECT_FALSE(s.isNotFound());  // Corruption, not NotFound
+}
+
+TEST_F(DBTest, ExistsTombstoneNoIO) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("live", "value").ok());
+    ASSERT_TRUE(db_.put("dead", "gone").ok());
+    ASSERT_TRUE(db_.remove("dead", syncOpts()).ok());
+
+    // Sanity.
+    bool e;
+    ASSERT_TRUE(db_.exists("live", e).ok());
+    EXPECT_TRUE(e);
+    ASSERT_TRUE(db_.exists("dead", e).ok());
+    EXPECT_FALSE(e);
+
+    // Corrupt segment data regions (same technique as GetTombstoneNoIO).
+    auto files = segmentFiles(test_dir_);
+    ASSERT_FALSE(files.empty());
+    for (const auto& f : files) {
+        FILE* fp = fopen(f.c_str(), "r+b");
+        ASSERT_NE(fp, nullptr);
+        uint8_t garbage[64];
+        memset(garbage, 0xFF, sizeof(garbage));
+        fwrite(garbage, 1, sizeof(garbage), fp);
+        fclose(fp);
+    }
+
+    // exists() never reads segment data — answer comes from GI packed version.
+    // Both tombstone and non-tombstone checks succeed despite corrupt data.
+    ASSERT_TRUE(db_.exists("dead", e).ok());
+    EXPECT_FALSE(e);
+
+    ASSERT_TRUE(db_.exists("live", e).ok());
+    EXPECT_TRUE(e);
+}
