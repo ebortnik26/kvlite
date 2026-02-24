@@ -45,15 +45,14 @@ private:
         Status s = log_file_.readAt(file_offset_, hdr, LogEntry::kHeaderSize);
         if (!s.ok()) { valid_ = false; return s; }
 
-        uint64_t version;
-        uint16_t key_len_raw;
+        uint64_t packed_ver;
+        uint16_t kl;
         uint32_t vl;
-        std::memcpy(&version, hdr, 8);
-        std::memcpy(&key_len_raw, hdr + 8, 2);
+        std::memcpy(&packed_ver, hdr, 8);
+        std::memcpy(&kl, hdr + 8, 2);
         std::memcpy(&vl, hdr + 10, 4);
 
-        bool tombstone = (key_len_raw & LogEntry::kTombstoneBit) != 0;
-        uint32_t kl = key_len_raw & ~LogEntry::kTombstoneBit;
+        PackedVersion pv(packed_ver);
 
         // Read full entry for CRC validation into persistent buf_.
         size_t entry_size = LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
@@ -79,8 +78,7 @@ private:
         current_.hash = dhtHashBytes(key_ptr, kl);
         current_.key = std::string_view(key_ptr, kl);
         current_.value = std::string_view(val_ptr, vl);
-        current_.version = version;
-        current_.tombstone = tombstone;
+        current_.pv = pv;
         valid_ = true;
 
         file_offset_ += entry_size;

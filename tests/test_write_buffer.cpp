@@ -74,7 +74,8 @@ TEST(WriteBuffer, GetByVersionExact) {
     uint64_t version;
     bool tombstone;
 
-    ASSERT_TRUE(wb.getByVersion("key1", 3, value, version, tombstone));
+    // Upper bound is packed: (logical_version << 1) | 1
+    ASSERT_TRUE(wb.getByVersion("key1", (3ULL << 1) | 1, value, version, tombstone));
     EXPECT_EQ(value, "v3");
     EXPECT_EQ(version, 3u);
 }
@@ -89,7 +90,7 @@ TEST(WriteBuffer, GetByVersionBetween) {
     uint64_t version;
     bool tombstone;
 
-    ASSERT_TRUE(wb.getByVersion("key1", 4, value, version, tombstone));
+    ASSERT_TRUE(wb.getByVersion("key1", (4ULL << 1) | 1, value, version, tombstone));
     EXPECT_EQ(value, "v3");
     EXPECT_EQ(version, 3u);
 }
@@ -101,7 +102,7 @@ TEST(WriteBuffer, GetByVersionTooLow) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    EXPECT_FALSE(wb.getByVersion("key1", 3, value, version, tombstone));
+    EXPECT_FALSE(wb.getByVersion("key1", (3ULL << 1) | 1, value, version, tombstone));
 }
 
 TEST(WriteBuffer, GetByVersionMissingKey) {
@@ -109,7 +110,7 @@ TEST(WriteBuffer, GetByVersionMissingKey) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    EXPECT_FALSE(wb.getByVersion("missing", 100, value, version, tombstone));
+    EXPECT_FALSE(wb.getByVersion("missing", (100ULL << 1) | 1, value, version, tombstone));
 }
 
 TEST(WriteBuffer, ForEach) {
@@ -483,17 +484,14 @@ protected:
         uint8_t hdr[LogEntry::kHeaderSize];
         rawRead(offset, hdr, LogEntry::kHeaderSize);
 
-        uint64_t version;
-        uint16_t key_len_raw;
+        uint64_t packed_ver;
+        uint16_t kl;
         uint32_t vl;
-        std::memcpy(&version, hdr, 8);
-        std::memcpy(&key_len_raw, hdr + 8, 2);
+        std::memcpy(&packed_ver, hdr, 8);
+        std::memcpy(&kl, hdr + 8, 2);
         std::memcpy(&vl, hdr + 10, 4);
 
-        bool tombstone = (key_len_raw & LogEntry::kTombstoneBit) != 0;
-        uint32_t kl = key_len_raw & ~LogEntry::kTombstoneBit;
-
-        out.pv = PackedVersion(version, tombstone);
+        out.pv = PackedVersion(packed_ver);
         out.key.resize(kl);
         out.value.resize(vl);
 
@@ -728,19 +726,20 @@ TEST_F(FlushTest, GlobalIndexPopulated) {
     ASSERT_TRUE(seg_.create(path_, 77).ok());
     ASSERT_TRUE(wb.flush(seg_, 77, global_index_).ok());
 
-    // Every entry should be registered in GlobalIndex with segment_id and version.
+    // Every entry should be registered in GlobalIndex with packed version.
+    // Packed version = (logical_version << 1) | tombstone_bit.
     uint64_t version;
     uint32_t segment_id;
     ASSERT_TRUE(global_index_.getLatest("key1", version, segment_id).ok());
-    EXPECT_EQ(version, 2u);  // latest version for key1
+    EXPECT_EQ(version, 2u << 1);  // latest version for key1 (packed, non-tombstone)
     EXPECT_EQ(segment_id, 77u);
 
     ASSERT_TRUE(global_index_.getLatest("key2", version, segment_id).ok());
-    EXPECT_EQ(version, 3u);
+    EXPECT_EQ(version, (3u << 1) | 1);  // packed, tombstone
     EXPECT_EQ(segment_id, 77u);
 
     ASSERT_TRUE(global_index_.getLatest("key3", version, segment_id).ok());
-    EXPECT_EQ(version, 4u);
+    EXPECT_EQ(version, 4u << 1);  // packed, non-tombstone
     EXPECT_EQ(segment_id, 77u);
 
     EXPECT_TRUE(global_index_.getLatest("missing", version, segment_id).isNotFound());
@@ -748,22 +747,22 @@ TEST_F(FlushTest, GlobalIndexPopulated) {
     EXPECT_EQ(global_index_.keyCount(), 3u);
     EXPECT_EQ(global_index_.entryCount(), 4u);  // 4 total entries (key1 has 2 versions)
 
-    // Verify all versions for key1.
+    // Verify all versions for key1 (packed).
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> versions;
     ASSERT_TRUE(global_index_.get("key1", seg_ids, versions));
     ASSERT_EQ(seg_ids.size(), 2u);
     // Latest first.
-    EXPECT_EQ(versions[0], 2u);
-    EXPECT_EQ(versions[1], 1u);
+    EXPECT_EQ(versions[0], 2u << 1);
+    EXPECT_EQ(versions[1], 1u << 1);
     EXPECT_EQ(seg_ids[0], 77u);
     EXPECT_EQ(seg_ids[1], 77u);
 
-    // Verify version-bounded get.
+    // Verify version-bounded get (upper_bound is packed).
     uint64_t ver64;
-    ASSERT_TRUE(global_index_.get("key1", 1u, ver64, segment_id));
-    EXPECT_EQ(ver64, 1u);
+    ASSERT_TRUE(global_index_.get("key1", (1ULL << 1) | 1, ver64, segment_id));
+    EXPECT_EQ(ver64, 1u << 1);
     EXPECT_EQ(segment_id, 77u);
 
-    ASSERT_FALSE(global_index_.get("key1", 0u, ver64, segment_id));
+    ASSERT_FALSE(global_index_.get("key1", (0ULL << 1) | 1, ver64, segment_id));
 }

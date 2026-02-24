@@ -55,7 +55,7 @@ private:
         bool operator()(EntryStream* a, EntryStream* b) const {
             if (a->entry().hash != b->entry().hash)
                 return a->entry().hash > b->entry().hash;
-            return a->entry().version > b->entry().version;
+            return a->entry().version() > b->entry().version();
         }
     };
 
@@ -177,7 +177,7 @@ private:
         }
         for (uint64_t snap : snapshots_) {
             for (int i = static_cast<int>(group_.size()) - 1; i >= 0; --i) {
-                if (group_[i].version <= snap) {
+                if (group_[i].version() <= snap) {
                     group_[i].ext[base_ + GCClassifyExt::kAction] =
                         static_cast<uint64_t>(EntryAction::kKeep);
                     break;
@@ -275,7 +275,7 @@ Status GC::merge(
             entry.ext[kTagBase + GCTagSourceExt::kSegmentId]);
 
         if (action == EntryAction::kEliminate) {
-            on_eliminate(entry.key, entry.version, old_seg_id);
+            on_eliminate(entry.key, entry.version(), old_seg_id);
             result.entries_eliminated++;
             s = pipeline->next();
             if (!s.ok()) return s;
@@ -297,10 +297,10 @@ Status GC::merge(
             if (!s.ok()) return s;
         }
 
-        s = output.put(entry.key, entry.version, entry.value, entry.tombstone);
+        s = output.put(entry.key, entry.version(), entry.value, entry.tombstone());
         if (!s.ok()) return s;
 
-        on_relocate(entry.key, entry.version, old_seg_id, output_id);
+        on_relocate(entry.key, entry.version(), old_seg_id, output_id);
         result.entries_written++;
 
         s = pipeline->next();

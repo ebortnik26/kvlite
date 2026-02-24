@@ -194,12 +194,12 @@ TEST_F(EntryStreamTest, Filter_Custom) {
     auto s = stream::filter(
         stream::scan(seg.logFile(), seg.dataSize()),
         [](const EntryStream::Entry& e) {
-            return e.version > 1;
+            return e.version() > 1;
         });
 
     size_t count = 0;
     while (s->valid()) {
-        EXPECT_GT(s->entry().version, 1u);
+        EXPECT_GT(s->entry().version(), 1u);
         count++;
         ASSERT_TRUE(s->next().ok());
     }
@@ -239,8 +239,8 @@ TEST_F(EntryStreamTest, TagSource_PreservesEntryFields) {
     ASSERT_TRUE(s->valid());
     EXPECT_EQ(s->entry().key, "key1");
     EXPECT_EQ(s->entry().value, "val5");
-    EXPECT_EQ(s->entry().version, 5u);
-    EXPECT_TRUE(s->entry().tombstone);
+    EXPECT_EQ(s->entry().version(), 5u);
+    EXPECT_TRUE(s->entry().tombstone());
     EXPECT_EQ(s->entry().ext[kBase + GCTagSourceExt::kSegmentId], 99u);
 }
 
@@ -296,7 +296,7 @@ TEST_F(EntryStreamTest, Classify_KeepAndEliminate) {
 
     // First entry: key1 v1 → kEliminate, segment_id=1 preserved
     ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().version, 1u);
+    EXPECT_EQ(classified->entry().version(), 1u);
     EXPECT_EQ(classified->entry().ext[kClassifyBase + GCClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kEliminate));
     EXPECT_EQ(classified->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 1u);
@@ -304,7 +304,7 @@ TEST_F(EntryStreamTest, Classify_KeepAndEliminate) {
     ASSERT_TRUE(classified->next().ok());
     // Second entry: key1 v2 → kKeep, segment_id=2 preserved
     ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().version, 2u);
+    EXPECT_EQ(classified->entry().version(), 2u);
     EXPECT_EQ(classified->entry().ext[kClassifyBase + GCClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kKeep));
     EXPECT_EQ(classified->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 2u);
@@ -356,14 +356,14 @@ TEST_F(EntryStreamTest, Classify_AllEliminate) {
 
     // v1 → kEliminate
     ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().version, 1u);
+    EXPECT_EQ(classified->entry().version(), 1u);
     EXPECT_EQ(classified->entry().ext[kBase + GCClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kEliminate));
 
     ASSERT_TRUE(classified->next().ok());
     // v2 → kKeep
     ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().version, 2u);
+    EXPECT_EQ(classified->entry().version(), 2u);
     EXPECT_EQ(classified->entry().ext[kBase + GCClassifyExt::kAction],
               static_cast<uint64_t>(EntryAction::kKeep));
 
@@ -378,12 +378,13 @@ TEST(ScanWriteBufferTest, Basic) {
     wb.put("key1", 1, "val1", false);
     wb.put("key2", 2, "val2", false);
 
-    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/2);
+    // Packed snapshot bound: (logical_version << 1) | 1
+    auto s = stream::scanWriteBuffer(wb, (2ULL << 1) | 1);
 
     std::vector<std::string> keys;
     while (s->valid()) {
         keys.push_back(std::string(s->entry().key));
-        EXPECT_FALSE(s->entry().tombstone);
+        EXPECT_FALSE(s->entry().tombstone());
         ASSERT_TRUE(s->next().ok());
     }
     EXPECT_EQ(keys.size(), 2u);
@@ -396,11 +397,11 @@ TEST(ScanWriteBufferTest, SnapshotBound) {
     wb.put("key3", 10, "val3", false);
 
     // Only entries with version <= 5 should be included.
-    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/5);
+    auto s = stream::scanWriteBuffer(wb, (5ULL << 1) | 1);
 
     std::vector<std::string> keys;
     while (s->valid()) {
-        EXPECT_LE(s->entry().version, 5u);
+        EXPECT_LE(s->entry().version(), 5u);
         keys.push_back(std::string(s->entry().key));
         ASSERT_TRUE(s->next().ok());
     }
@@ -413,12 +414,12 @@ TEST(ScanWriteBufferTest, LatestPerKey) {
     wb.put("key1", 3, "v3", false);
     wb.put("key1", 5, "v5", false);
 
-    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/5);
+    auto s = stream::scanWriteBuffer(wb, (5ULL << 1) | 1);
 
     ASSERT_TRUE(s->valid());
     EXPECT_EQ(s->entry().key, "key1");
     EXPECT_EQ(s->entry().value, "v5");
-    EXPECT_EQ(s->entry().version, 5u);
+    EXPECT_EQ(s->entry().version(), 5u);
 
     ASSERT_TRUE(s->next().ok());
     EXPECT_FALSE(s->valid());
@@ -431,12 +432,12 @@ TEST(ScanWriteBufferTest, LatestPerKeyWithSnapshotBound) {
     wb.put("key1", 5, "v5", false);
 
     // Only versions <= 3 visible.
-    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/3);
+    auto s = stream::scanWriteBuffer(wb, (3ULL << 1) | 1);
 
     ASSERT_TRUE(s->valid());
     EXPECT_EQ(s->entry().key, "key1");
     EXPECT_EQ(s->entry().value, "v3");
-    EXPECT_EQ(s->entry().version, 3u);
+    EXPECT_EQ(s->entry().version(), 3u);
 
     ASSERT_TRUE(s->next().ok());
     EXPECT_FALSE(s->valid());
@@ -445,7 +446,7 @@ TEST(ScanWriteBufferTest, LatestPerKeyWithSnapshotBound) {
 TEST(ScanWriteBufferTest, Empty) {
     WriteBuffer wb;
 
-    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/100);
+    auto s = stream::scanWriteBuffer(wb, (100ULL << 1) | 1);
     EXPECT_FALSE(s->valid());
 }
 
@@ -454,11 +455,11 @@ TEST(ScanWriteBufferTest, Tombstone) {
     wb.put("key1", 1, "val1", false);
     wb.put("key1", 2, "", true);  // tombstone
 
-    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/2);
+    auto s = stream::scanWriteBuffer(wb, (2ULL << 1) | 1);
 
     ASSERT_TRUE(s->valid());
     EXPECT_EQ(s->entry().key, "key1");
-    EXPECT_TRUE(s->entry().tombstone);
+    EXPECT_TRUE(s->entry().tombstone());
 
     ASSERT_TRUE(s->next().ok());
     EXPECT_FALSE(s->valid());
@@ -471,7 +472,7 @@ TEST(ScanWriteBufferTest, SortedByHash) {
     wb.put("beta", 2, "B", false);
     wb.put("gamma", 3, "G", false);
 
-    auto s = stream::scanWriteBuffer(wb, /*snapshot_version=*/3);
+    auto s = stream::scanWriteBuffer(wb, (3ULL << 1) | 1);
 
     uint64_t prev_hash = 0;
     size_t count = 0;

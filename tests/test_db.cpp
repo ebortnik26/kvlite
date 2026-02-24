@@ -358,6 +358,57 @@ TEST_F(DBTest, ExistsAfterRemove) {
     EXPECT_FALSE(e);
 }
 
+TEST_F(DBTest, ExistsAfterFlushedRemove) {
+    ASSERT_TRUE(openDB().ok());
+
+    // Put + flush → entry is in segment and GI.
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
+
+    bool e;
+    ASSERT_TRUE(db_.exists("k1", e).ok());
+    EXPECT_TRUE(e);
+
+    // Remove + flush → tombstone is in segment and GI, WB is cleared.
+    ASSERT_TRUE(db_.remove("k1", syncOpts()).ok());
+
+    ASSERT_TRUE(db_.exists("k1", e).ok());
+    EXPECT_FALSE(e);
+}
+
+TEST_F(DBTest, ExistsAfterFlushedRemoveThenReput) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
+    ASSERT_TRUE(db_.remove("k1", syncOpts()).ok());
+
+    // Re-put (in WB) should make exists return true again.
+    ASSERT_TRUE(db_.put("k1", "v2").ok());
+
+    bool e;
+    ASSERT_TRUE(db_.exists("k1", e).ok());
+    EXPECT_TRUE(e);
+}
+
+TEST_F(DBTest, ExistsWithSnapshot) {
+    ASSERT_TRUE(openDB().ok());
+
+    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
+    kvlite::Snapshot snap = db_.createSnapshot();
+
+    ASSERT_TRUE(db_.remove("k1", syncOpts()).ok());
+
+    // Snapshot before remove should see the key.
+    bool e;
+    ASSERT_TRUE(db_.exists("k1", e, snapOpts(snap)).ok());
+    EXPECT_TRUE(e);
+
+    // Current should not see it.
+    ASSERT_TRUE(db_.exists("k1", e).ok());
+    EXPECT_FALSE(e);
+
+    db_.releaseSnapshot(snap);
+}
+
 // ── Close flushes buffer ────────────────────────────────────────────────────
 
 TEST_F(DBTest, CloseFlushesBuffer) {
@@ -474,6 +525,47 @@ TEST_F(DBTest, IteratorSnapshotVersion) {
 
     // Iterator should have a valid snapshot
     EXPECT_GT(iter->snapshot().version(), 0u);
+}
+
+// ── Snapshot get resolves to correct segment ────────────────────────────────
+
+TEST_F(DBTest, SnapshotGetAcrossMultipleSegments) {
+    ASSERT_TRUE(openDB().ok());
+
+    // v1 in segment 1
+    ASSERT_TRUE(db_.put("key", "seg1", syncOpts()).ok());
+    kvlite::Snapshot snap1 = db_.createSnapshot();
+
+    // v2 in segment 2
+    ASSERT_TRUE(db_.put("key", "seg2", syncOpts()).ok());
+    kvlite::Snapshot snap2 = db_.createSnapshot();
+
+    // v3 in segment 3
+    ASSERT_TRUE(db_.put("key", "seg3", syncOpts()).ok());
+    kvlite::Snapshot snap3 = db_.createSnapshot();
+
+    kvlite::DBStats stats;
+    ASSERT_TRUE(db_.getStats(stats).ok());
+    EXPECT_GE(stats.num_log_files, 3u);
+
+    // Each snapshot resolves to exactly the right segment.
+    std::string val;
+    ASSERT_TRUE(db_.get("key", val, snapOpts(snap1)).ok());
+    EXPECT_EQ(val, "seg1");
+
+    ASSERT_TRUE(db_.get("key", val, snapOpts(snap2)).ok());
+    EXPECT_EQ(val, "seg2");
+
+    ASSERT_TRUE(db_.get("key", val, snapOpts(snap3)).ok());
+    EXPECT_EQ(val, "seg3");
+
+    // Latest (no snapshot) also works.
+    ASSERT_TRUE(db_.get("key", val).ok());
+    EXPECT_EQ(val, "seg3");
+
+    db_.releaseSnapshot(snap1);
+    db_.releaseSnapshot(snap2);
+    db_.releaseSnapshot(snap3);
 }
 
 // ── Error paths ─────────────────────────────────────────────────────────────

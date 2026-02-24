@@ -7,36 +7,44 @@
 namespace kvlite {
 namespace internal {
 
-// Packed version: stores version (63 bits) + tombstone flag (MSB) in 64 bits.
+// Packed version: stores version (63 bits) + tombstone flag (LSB) in 64 bits.
 // Used by LogEntry, WriteBuffer::Entry, and anywhere version+tombstone are stored together.
+//
+// Layout: [63-bit logical version | 1-bit tombstone]
+//   packed = (logical_version << 1) | tombstone
+//
+// LSB encoding preserves ordering: packed values for different logical
+// versions compare correctly with plain < and <=. Snapshot upper bounds
+// use (snapshot_version << 1) | 1 to include tombstones at that version.
 struct PackedVersion {
     uint64_t data = 0;
 
-    static constexpr uint64_t kTombstoneMask = 1ULL << 63;
-    static constexpr uint64_t kVersionMask = ~kTombstoneMask;
+    static constexpr uint64_t kTombstoneMask = 1;
+    static constexpr uint64_t kVersionShift = 1;
 
     PackedVersion() = default;
     PackedVersion(uint64_t version, bool tombstone)
-        : data(tombstone ? (version | kTombstoneMask) : version) {}
+        : data((version << kVersionShift) | (tombstone ? 1 : 0)) {}
     explicit PackedVersion(uint64_t packed) : data(packed) {}
 
-    uint64_t version() const { return data & kVersionMask; }
+    uint64_t version() const { return data >> kVersionShift; }
     bool tombstone() const { return (data & kTombstoneMask) != 0; }
 
     bool operator<(const PackedVersion& other) const {
-        return version() < other.version();
+        return data < other.data;
     }
 };
 
 // Log entry stored in data files.
 //
 // On-disk format:
-// ┌─────────┬─────────────────┬───────────┬─────┬───────┬──────────┐
-// │ version │ key_len|tombst. │ value_len │ key │ value │ checksum │
-// │ 8 bytes │     2 bytes     │  4 bytes  │ var │  var  │ 4 bytes  │
-// └─────────┴─────────────────┴───────────┴─────┴───────┴──────────┘
+// ┌──────────────┬─────────┬───────────┬─────┬───────┬──────────┐
+// │ packed_ver   │ key_len │ value_len │ key │ value │ checksum │
+// │   8 bytes    │ 2 bytes │  4 bytes  │ var │  var  │ 4 bytes  │
+// └──────────────┴─────────┴───────────┴─────┴───────┴──────────┘
 //
-// key_len field: 15 bits for length (max 32767), 1 bit (MSB) for tombstone.
+// packed_ver: (logical_version << 1) | tombstone_bit
+// key_len: full 16 bits for length (max 65535).
 // Total header size: 14 bytes (before key/value)
 // Checksum: CRC32 of all preceding bytes
 struct LogEntry {
@@ -51,10 +59,9 @@ struct LogEntry {
         return kHeaderSize + key.size() + value.size() + kChecksumSize;
     }
 
-    static constexpr size_t kHeaderSize = 8 + 2 + 4;  // version + key_len|tombstone + value_len
+    static constexpr size_t kHeaderSize = 8 + 2 + 4;  // packed_ver + key_len + value_len
     static constexpr size_t kChecksumSize = 4;
-    static constexpr size_t kMaxKeyLen = 0x7FFF;      // 15 bits = 32767
-    static constexpr uint16_t kTombstoneBit = 0x8000; // MSB of key_len field
+    static constexpr size_t kMaxKeyLen = 0xFFFF;      // 16 bits = 65535
 };
 
 // Index entry stored in the SegmentIndex.

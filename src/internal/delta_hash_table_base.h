@@ -58,20 +58,27 @@ public:
 protected:
     static constexpr uint32_t kBucketPadding = 8;
 
+    // Lightweight view into bucket data. Primary buckets point into the
+    // contiguous arena_; overflow buckets own their storage.
     struct Bucket {
-        std::vector<uint8_t> data;
-        explicit Bucket(uint32_t size) : data(size + kBucketPadding, 0) {}
-        Bucket() = default;
+        uint8_t* data = nullptr;
     };
+
+    uint32_t bucketStride() const { return config_.bucket_bytes + kBucketPadding; }
 
     explicit DeltaHashTableBase(const Config& config)
         : config_(config),
           fingerprint_bits_(64 - config.bucket_bits - config.lslot_bits),
           lslot_codec_(fingerprint_bits_) {
         uint32_t num_buckets = 1u << config_.bucket_bits;
-        buckets_.reserve(num_buckets);
+        uint32_t stride = bucketStride();
+        arena_ = std::make_unique<uint8_t[]>(
+            static_cast<size_t>(num_buckets) * stride);
+        std::memset(arena_.get(), 0,
+                    static_cast<size_t>(num_buckets) * stride);
+        buckets_.resize(num_buckets);
         for (uint32_t i = 0; i < num_buckets; ++i) {
-            buckets_.emplace_back(config_.bucket_bytes);
+            buckets_[i].data = arena_.get() + static_cast<size_t>(i) * stride;
         }
         clearBuckets();
     }
@@ -107,12 +114,12 @@ protected:
 
     uint64_t getExtensionPtr(const Bucket& bucket) const {
         uint64_t ptr = 0;
-        std::memcpy(&ptr, bucket.data.data() + config_.bucket_bytes - 8, 8);
+        std::memcpy(&ptr, bucket.data + config_.bucket_bytes - 8, 8);
         return ptr;
     }
 
     void setExtensionPtr(Bucket& bucket, uint64_t ptr) const {
-        std::memcpy(bucket.data.data() + config_.bucket_bytes - 8, &ptr, 8);
+        std::memcpy(bucket.data + config_.bucket_bytes - 8, &ptr, 8);
     }
 
     size_t bucketDataBits() const {
@@ -127,8 +134,8 @@ protected:
 
     // Decode a single lslot from a bucket by index.
     LSlotContents decodeLSlot(const Bucket& bucket, uint32_t lslot_idx) const {
-        size_t bit_off = lslot_codec_.bitOffset(bucket.data.data(), lslot_idx);
-        return lslot_codec_.decode(bucket.data.data(), bit_off);
+        size_t bit_off = lslot_codec_.bitOffset(bucket.data, lslot_idx);
+        return lslot_codec_.decode(bucket.data, bit_off);
     }
 
     std::vector<LSlotContents> decodeAllLSlots(const Bucket& bucket) const {
@@ -136,7 +143,7 @@ protected:
         std::vector<LSlotContents> slots(n);
         size_t offset = 0;
         for (uint32_t s = 0; s < n; ++s) {
-            slots[s] = lslot_codec_.decode(bucket.data.data(), offset, &offset);
+            slots[s] = lslot_codec_.decode(bucket.data, offset, &offset);
         }
         return slots;
     }
@@ -145,12 +152,12 @@ protected:
                            const std::vector<LSlotContents>& all_slots) {
         size_t data_bytes = config_.bucket_bytes - 8;
         uint64_t ext_ptr = getExtensionPtr(bucket);
-        std::memset(bucket.data.data(), 0, data_bytes);
+        std::memset(bucket.data, 0, data_bytes);
         setExtensionPtr(bucket, ext_ptr);
 
         size_t write_offset = 0;
         for (uint32_t s = 0; s < all_slots.size(); ++s) {
-            write_offset = lslot_codec_.encode(bucket.data.data(), write_offset,
+            write_offset = lslot_codec_.encode(bucket.data, write_offset,
                                                all_slots[s]);
         }
     }
@@ -176,7 +183,12 @@ protected:
     }
 
     Bucket* createExtension(Bucket& bucket) {
-        auto ext = std::make_unique<Bucket>(config_.bucket_bytes);
+        uint32_t stride = bucketStride();
+        auto storage = std::make_unique<uint8_t[]>(stride);
+        std::memset(storage.get(), 0, stride);
+        auto ext = std::make_unique<Bucket>();
+        ext->data = storage.get();
+        ext_storage_.push_back(std::move(storage));
         extensions_.push_back(std::move(ext));
         uint64_t ext_ptr = extensions_.size();  // 1-based
         setExtensionPtr(bucket, ext_ptr);
@@ -258,7 +270,7 @@ protected:
                 size_t offset = 0;
                 for (uint32_t s = 0; s < n_lslots; ++s) {
                     LSlotContents contents =
-                        lslot_codec_.decode(b->data.data(), offset, &offset);
+                        lslot_codec_.decode(b->data, offset, &offset);
                     for (const auto& entry : contents.entries) {
                         uint64_t hash =
                             (static_cast<uint64_t>(bi) << (64 - config_.bucket_bits)) |
@@ -275,8 +287,8 @@ protected:
     // --- Stats ---
 
     size_t bucketMemoryUsage() const {
-        return buckets_.size() * (config_.bucket_bytes + kBucketPadding)
-             + extensions_.size() * (config_.bucket_bytes + kBucketPadding);
+        size_t stride = config_.bucket_bytes + kBucketPadding;
+        return buckets_.size() * stride + extensions_.size() * stride;
     }
 
     void clearBuckets() {
@@ -284,6 +296,7 @@ protected:
             initBucket(bucket);
         }
         extensions_.clear();
+        ext_storage_.clear();
     }
 
     // --- Members ---
@@ -291,17 +304,19 @@ protected:
     Config config_;
     uint8_t fingerprint_bits_;
     Codec lslot_codec_;
-    std::vector<Bucket> buckets_;
+    std::unique_ptr<uint8_t[]> arena_;              // contiguous primary bucket data
+    std::vector<Bucket> buckets_;                   // views into arena_
     std::vector<std::unique_ptr<Bucket>> extensions_;
+    std::vector<std::unique_ptr<uint8_t[]>> ext_storage_;  // overflow bucket data
 
 private:
     void initBucket(Bucket& bucket) {
         size_t data_bytes = config_.bucket_bytes - 8;
         uint64_t ext_ptr = getExtensionPtr(bucket);
-        std::memset(bucket.data.data(), 0, data_bytes);
+        std::memset(bucket.data, 0, data_bytes);
         setExtensionPtr(bucket, ext_ptr);
 
-        BitWriter writer(bucket.data.data(), 0);
+        BitWriter writer(bucket.data, 0);
         for (uint32_t s = 0; s < numLSlots(); ++s) {
             writer.writeUnary(0);
         }

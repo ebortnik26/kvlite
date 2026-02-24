@@ -1,6 +1,7 @@
 #include "kvlite/db.h"
 
 #include <algorithm>
+#include <cassert>
 #include <memory>
 #include <vector>
 
@@ -111,16 +112,17 @@ Status DB::open(const std::string& path, const Options& options) {
     }
 
     // Rebuild GlobalIndex from recovered segments.
+    // SegmentIndex stores packed versions — pass them through to GI directly.
     {
         auto segment_ids = storage_->getSegmentIds();
         for (uint32_t id : segment_ids) {
             auto* seg = storage_->getSegment(id);
             if (!seg) continue;
-            seg->index().forEach([&](uint32_t offset, uint32_t /*version*/) {
+            seg->index().forEach([&](uint32_t offset, uint32_t packed_ver) {
                 internal::LogEntry entry;
                 Status rs = seg->readEntry(offset, entry);
                 if (rs.ok()) {
-                    global_index_->put(entry.key, entry.version(), id);
+                    global_index_->put(entry.key, packed_ver, id);
                 }
             });
         }
@@ -219,12 +221,10 @@ Status DB::get(const std::string& key, std::string& value,
 
 Status DB::get(const std::string& key, std::string& value,
                uint64_t& version, const ReadOptions& options) {
-    if (!isOpen()) {
-        return Status::InvalidArgument("Database not open");
-    }
-
+    // Pack the snapshot version as an upper bound: include tombstones at that version.
     uint64_t upper_bound = options.snapshot
-        ? options.snapshot->version()
+        ? (options.snapshot->version() << internal::PackedVersion::kVersionShift)
+          | internal::PackedVersion::kTombstoneMask
         : UINT64_MAX;
     return getByVersion(key, upper_bound, value, version, options);
 }
@@ -235,50 +235,60 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
     return getByVersion(key, upper_bound, value, entry_version, options);
 }
 
-Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
-                        std::string& value, uint64_t& entry_version,
-                        const ReadOptions& /*options*/) {
+Status DB::resolve(const std::string& key, uint64_t upper_bound,
+                   ResolveResult& result) {
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
 
     // 1. Check WriteBuffer first.
-    {
-        std::string wval;
-        uint64_t wver;
-        bool tombstone;
-        if (write_buffer_->getByVersion(key, upper_bound, wval, wver, tombstone)) {
-            if (tombstone) return Status::NotFound(key);
-            value = std::move(wval);
-            entry_version = wver;
-            return Status::OK();
-        }
+    if (write_buffer_->getByVersion(key, upper_bound,
+                                    result.wb_value, result.wb_version,
+                                    result.wb_tombstone)) {
+        result.wb_hit = true;
+        return Status::OK();
     }
 
     // 2. Fall through to GlobalIndex -> Segment.
-    std::vector<uint32_t> segment_ids;
-    std::vector<uint64_t> versions;
-    if (!global_index_->get(key, segment_ids, versions)) {
+    uint64_t gi_version;  // packed: (logical_version << 1) | tombstone
+    uint32_t gi_segment_id;
+    if (!global_index_->get(key, upper_bound, gi_version, gi_segment_id)) {
         return Status::NotFound(key);
     }
 
-    for (uint32_t sid : segment_ids) {
-        auto* seg = storage_->getSegment(sid);
-        if (!seg) continue;
+    result.wb_hit = false;
+    result.gi_version = gi_version;
+    result.segment = storage_->getSegment(gi_segment_id);
+    assert(result.segment && "GlobalIndex references non-existent segment");
+    return Status::OK();
+}
 
-        internal::LogEntry entry;
-        Status s = seg->get(key, upper_bound, entry);
-        if (s.ok()) {
-            if (entry.tombstone()) return Status::NotFound(key);
-            value = std::move(entry.value);
-            entry_version = entry.version();
-            return Status::OK();
-        }
-        if (!s.isNotFound()) {
-            return s;
-        }
+Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
+                        std::string& value, uint64_t& entry_version,
+                        const ReadOptions& /*options*/) {
+    ResolveResult r;
+    Status s = resolve(key, upper_bound, r);
+    if (!s.ok()) return s;
+
+    if (r.wb_hit) {
+        if (r.wb_tombstone) return Status::NotFound(key);
+        value = std::move(r.wb_value);
+        entry_version = r.wb_version;
+        return Status::OK();
     }
-    return Status::NotFound(key);
+
+    // Check tombstone from the packed version in GI — no segment I/O needed.
+    internal::PackedVersion gi_pv(r.gi_version);
+    if (gi_pv.tombstone()) return Status::NotFound(key);
+
+    // Read the value from segment.
+    internal::LogEntry entry;
+    s = r.segment->get(key, upper_bound, entry);
+    if (!s.ok()) return s;
+
+    value = std::move(entry.value);
+    entry_version = gi_pv.version();
+    return Status::OK();
 }
 
 Status DB::remove(const std::string& key, const WriteOptions& options) {
@@ -303,16 +313,27 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
 
 Status DB::exists(const std::string& key, bool& exists,
                   const ReadOptions& options) {
-    std::string value;
-    Status s = get(key, value, options);
-    if (s.ok()) {
-        exists = true;
-        return Status::OK();
-    } else if (s.isNotFound()) {
+    uint64_t upper_bound = options.snapshot
+        ? (options.snapshot->version() << internal::PackedVersion::kVersionShift)
+          | internal::PackedVersion::kTombstoneMask
+        : UINT64_MAX;
+
+    ResolveResult r;
+    Status s = resolve(key, upper_bound, r);
+    if (s.isNotFound()) {
         exists = false;
         return Status::OK();
     }
-    return s;
+    if (!s.ok()) return s;
+
+    if (r.wb_hit) {
+        exists = !r.wb_tombstone;
+        return Status::OK();
+    }
+
+    // GI stores packed version — check tombstone from LSB, no segment I/O.
+    exists = !(r.gi_version & internal::PackedVersion::kTombstoneMask);
+    return Status::OK();
 }
 
 // --- Batch Operations ---

@@ -286,9 +286,9 @@ bool WriteBuffer::getByVersion(const std::string& key, uint64_t upper_bound,
             if (!keyMatches(off, key)) continue;
 
             PackedVersion pv = readPackedVersion(off);
-            if (pv.version() <= upper_bound &&
-                (!found || pv.version() > best_version)) {
-                best_version = pv.version();
+            if (pv.data <= upper_bound &&
+                (!found || pv.data > best_version)) {
+                best_version = pv.data;
                 best_pv = pv;
                 best_offset = off;
                 found = true;
@@ -360,8 +360,7 @@ public:
         uint32_t offset;   // into WriteBuffer::data_
         uint16_t key_len;
         uint32_t val_len;
-        uint64_t version;
-        bool tombstone;
+        PackedVersion pv;
     };
 
     WriteBufferStream(const uint8_t* data, std::vector<Record> records)
@@ -394,8 +393,7 @@ private:
         current_.hash = r.hash;
         current_.key = std::string_view(key_ptr, r.key_len);
         current_.value = std::string_view(val_ptr, r.val_len);
-        current_.version = r.version;
-        current_.tombstone = r.tombstone;
+        current_.pv = r.pv;
     }
 
     const uint8_t* data_;
@@ -421,7 +419,7 @@ std::unique_ptr<EntryStream> WriteBuffer::createStream(uint64_t snapshot_version
             for (uint32_t i = 0; i < b->count; ++i) {
                 uint32_t off = b->slots[i].offset;
                 PackedVersion pv = readPackedVersion(off);
-                if (pv.version() > snapshot_version) continue;
+                if (pv.data > snapshot_version) continue;
 
                 const uint8_t* p = data_.get() + off;
                 uint16_t kl;
@@ -431,8 +429,7 @@ std::unique_ptr<EntryStream> WriteBuffer::createStream(uint64_t snapshot_version
 
                 uint64_t h = dhtHashBytes(p + kRecordHeaderSize, kl);
 
-                all.push_back({h, off, kl, vl,
-                               pv.version(), pv.tombstone()});
+                all.push_back({h, off, kl, vl, pv});
             }
             b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
         }
@@ -455,7 +452,7 @@ std::unique_ptr<EntryStream> WriteBuffer::createStream(uint64_t snapshot_version
                   int cmp = std::memcmp(ka, kb, min_len);
                   if (cmp != 0) return cmp < 0;
                   if (a.key_len != b.key_len) return a.key_len < b.key_len;
-                  return a.version > b.version;  // desc for dedup
+                  return a.pv.version() > b.pv.version();  // desc for dedup
               });
 
     // Build output: one record per key (first in each group = latest).
@@ -480,7 +477,7 @@ std::unique_ptr<EntryStream> WriteBuffer::createStream(uint64_t snapshot_version
               [](const WriteBufferStream::Record& a,
                  const WriteBufferStream::Record& b) {
                   if (a.hash != b.hash) return a.hash < b.hash;
-                  return a.version < b.version;
+                  return a.pv.version() < b.pv.version();
               });
 
     return std::make_unique<WriteBufferStream>(data_ptr, std::move(deduped));
@@ -492,16 +489,16 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
 
     struct FlatEntry {
         uint64_t hash;
-        uint64_t version;
+        uint64_t packed_ver;  // (logical_version << 1) | tombstone
         std::string key;
         PackedVersion pv;
         std::string value;
     };
 
-    // Collect every (key, version) to register in GlobalIndex after seal.
+    // Collect every (key, packed_version) to register in GlobalIndex after seal.
     struct GlobalIndexEntry {
         std::string key;
-        uint64_t version;
+        uint64_t packed_ver;
     };
     std::vector<GlobalIndexEntry> global_index_entries;
     global_index_entries.reserve(size_.load(std::memory_order_relaxed));
@@ -524,7 +521,7 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
                 PackedVersion pv = readPackedVersion(off);
                 std::string val;
                 readValue(off, val);
-                bucket_entries.push_back({h, pv.version(), std::move(key),
+                bucket_entries.push_back({h, pv.data, std::move(key),
                                           pv, std::move(val)});
             }
             b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
@@ -533,22 +530,22 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
         std::sort(bucket_entries.begin(), bucket_entries.end(),
                   [](const FlatEntry& a, const FlatEntry& b) {
                       if (a.hash != b.hash) return a.hash < b.hash;
-                      return a.version < b.version;
+                      return a.packed_ver < b.packed_ver;
                   });
 
         for (const auto& e : bucket_entries) {
-            s = out.put(e.key, e.version, e.value, e.pv.tombstone());
+            s = out.put(e.key, e.pv.version(), e.value, e.pv.tombstone());
             if (!s.ok()) return s;
-            global_index_entries.push_back({e.key, e.version});
+            global_index_entries.push_back({e.key, e.packed_ver});
         }
     }
 
     s = out.seal();
     if (!s.ok()) return s;
 
-    // Register every flushed entry in GlobalIndex.
+    // Register every flushed entry in GlobalIndex (packed version preserves tombstone).
     for (const auto& e : global_index_entries) {
-        s = global_index.put(e.key, e.version, segment_id);
+        s = global_index.put(e.key, e.packed_ver, segment_id);
         if (!s.ok()) return s;
     }
 

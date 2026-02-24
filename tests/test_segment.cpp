@@ -152,7 +152,7 @@ TEST_F(SegmentTest, QueriesWhileWritingFail) {
     std::vector<LogEntry> entries;
     EXPECT_FALSE(seg_.get("k", entries).ok());
 
-    EXPECT_FALSE(seg_.get("k", 100u, entry).ok());
+    EXPECT_FALSE(seg_.get("k", (100ULL << 1) | 1, entry).ok());
 }
 
 // --- Create error ---
@@ -244,15 +244,16 @@ TEST_F(SegmentTest, GetByUpperBoundAfterSeal) {
     writeEntry("k", 30, "c", false);
     ASSERT_TRUE(seg_.seal().ok());
 
+    // Upper bound is packed: (logical_version << 1) | 1
     LogEntry entry;
-    ASSERT_TRUE(seg_.get("k", 25u, entry).ok());
+    ASSERT_TRUE(seg_.get("k", (25ULL << 1) | 1, entry).ok());
     EXPECT_EQ(entry.version(), 20u);
     EXPECT_EQ(entry.value, "b");
 
-    ASSERT_TRUE(seg_.get("k", 10u, entry).ok());
+    ASSERT_TRUE(seg_.get("k", (10ULL << 1) | 1, entry).ok());
     EXPECT_EQ(entry.version(), 10u);
 
-    EXPECT_FALSE(seg_.get("k", 5u, entry).ok());
+    EXPECT_FALSE(seg_.get("k", (5ULL << 1) | 1, entry).ok());
 }
 
 // --- Seal + open round-trip ---

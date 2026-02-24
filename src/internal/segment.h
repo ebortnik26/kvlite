@@ -81,7 +81,11 @@ public:
     Status get(const std::string& key, uint64_t upper_bound,
                LogEntry& entry) const;
 
-    // Check if a key exists.
+    // Read the tombstone flag from the entry header at the given file offset.
+    // Header-only read (14 bytes), no value extraction, no CRC.
+    Status readTombstone(uint64_t offset, bool& tombstone) const;
+
+    // Check if a key exists (any version).
     bool contains(const std::string& key) const;
 
     // --- Stats (any state) ---

@@ -18,6 +18,7 @@ namespace kvlite {
 namespace internal {
 class GlobalIndex;
 class Manifest;
+class Segment;
 class SegmentStorageManager;
 class VersionManager;
 class WriteBuffer;
@@ -120,6 +121,21 @@ private:
     Status getByVersion(const std::string& key, uint64_t upper_bound,
                         std::string& value, uint64_t& entry_version,
                         const ReadOptions& options = ReadOptions());
+
+    // Shared WB + GI resolution for get/exists.
+    // On WB hit: sets wb_hit=true, wb_tombstone, wb_value, wb_version.
+    // On GI hit: sets wb_hit=false, returns segment pointer.
+    // Returns NotFound if neither WB nor GI has the key.
+    struct ResolveResult {
+        bool wb_hit = false;
+        bool wb_tombstone = false;
+        std::string wb_value;
+        uint64_t wb_version = 0;
+        internal::Segment* segment = nullptr;
+        uint64_t gi_version = 0;  // packed version from GI (has tombstone in LSB)
+    };
+    Status resolve(const std::string& key, uint64_t upper_bound,
+                   ResolveResult& result);
 
     Status flush();
     void cleanupRetiredBuffers();

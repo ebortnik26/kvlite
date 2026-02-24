@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "log_entry.h"
 #include "kvlite/status.h"
 
 namespace kvlite {
@@ -25,8 +26,10 @@ public:
         uint64_t hash;
         std::string_view key;
         std::string_view value;
-        uint64_t version;
-        bool tombstone;
+        PackedVersion pv;    // packed: (logical_version << 1) | tombstone
+
+        uint64_t version() const { return pv.version(); }
+        bool tombstone() const { return pv.tombstone(); }
 
         // Extension fields: flat buffer for operator-defined attributes.
         // Each operator declares a schema (XxxExt with Field enum + kSize)

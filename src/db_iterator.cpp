@@ -6,6 +6,7 @@
 
 #include "internal/entry_stream.h"
 #include "internal/global_index.h"
+#include "internal/log_entry.h"
 #include "internal/segment.h"
 #include "internal/segment_storage_manager.h"
 #include "internal/write_buffer.h"
@@ -72,6 +73,9 @@ public:
 private:
     void findNextValid() {
         uint64_t snap_ver = snapshot_.version();
+        // Packed upper bound: includes tombstones at snapshot version.
+        uint64_t packed_bound = (snap_ver << internal::PackedVersion::kVersionShift)
+                               | internal::PackedVersion::kTombstoneMask;
 
         // Phase 1 — scan segments sequentially with inline pertinence check.
         while (phase_ == 0) {
@@ -79,7 +83,7 @@ private:
                 if (!openNextSegment()) {
                     phase_ = 1;
                     wb_stream_ = internal::stream::scanWriteBuffer(
-                        *pinned_wb_, snap_ver);
+                        *pinned_wb_, packed_bound);
                     break;
                 }
                 continue;
@@ -89,7 +93,7 @@ private:
             // Defer string copies: version check is free, key is needed for
             // WB/GI lookups, value is only needed on the emit path.
             const auto& e = seg_stream_->entry();
-            uint64_t version = e.version;
+            uint64_t version = e.version();  // logical version
 
             // Cheap scalar check — skip without any string copies.
             if (version > snap_ver) {
@@ -97,7 +101,7 @@ private:
                 continue;
             }
 
-            bool tombstone = e.tombstone;
+            bool tombstone = e.tombstone();
             scan_key_.assign(e.key.data(), e.key.size());
             scan_value_.assign(e.value.data(), e.value.size());
             seg_stream_->next();
@@ -107,7 +111,7 @@ private:
             {
                 uint64_t wver;
                 bool wtomb;
-                if (pinned_wb_->getByVersion(scan_key_, snap_ver,
+                if (pinned_wb_->getByVersion(scan_key_, packed_bound,
                                              wb_probe_, wver, wtomb)) {
                     continue;
                 }
@@ -115,14 +119,16 @@ private:
 
             // GI pertinence: only emit if this segment+version is the
             // pertinent entry for the key in the GlobalIndex.
-            uint64_t gi_version;
+            // GI stores packed versions; compare packed forms.
+            uint64_t gi_packed;
             uint32_t gi_segment_id;
-            if (!db_->global_index_->get(scan_key_, snap_ver,
-                                         gi_version, gi_segment_id)) {
+            if (!db_->global_index_->get(scan_key_, packed_bound,
+                                         gi_packed, gi_segment_id)) {
                 continue;
             }
+            internal::PackedVersion gi_pv(gi_packed);
             if (gi_segment_id != current_segment_id_ ||
-                gi_version != version) {
+                gi_pv.version() != version) {
                 continue;
             }
 
@@ -140,14 +146,14 @@ private:
         while (wb_stream_ && wb_stream_->valid()) {
             const auto& e = wb_stream_->entry();
 
-            if (e.tombstone) {
+            if (e.tombstone()) {
                 wb_stream_->next();
                 continue;
             }
 
             current_key_.assign(e.key.data(), e.key.size());
             current_value_.assign(e.value.data(), e.value.size());
-            current_version_ = e.version;
+            current_version_ = e.version();
             wb_stream_->next();
 
             valid_ = true;

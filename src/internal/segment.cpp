@@ -123,8 +123,10 @@ Status Segment::put(std::string_view key, uint64_t version,
         return Status::InvalidArgument("Segment: key too long");
     }
 
+    // On-disk version is the packed form: (logical_version << 1) | tombstone.
+    PackedVersion pv(version, tombstone);
+    uint64_t packed_ver = pv.data;
     uint16_t key_len = static_cast<uint16_t>(key.size());
-    if (tombstone) key_len |= LogEntry::kTombstoneBit;
     uint32_t val_len = static_cast<uint32_t>(value.size());
     size_t raw_key_len = key.size();
     size_t entry_size = LogEntry::kHeaderSize + raw_key_len + val_len +
@@ -139,9 +141,9 @@ Status Segment::put(std::string_view key, uint64_t version,
     }
 
     uint8_t* p = buf;
-    std::memcpy(p, &version, 8);   p += 8;
-    std::memcpy(p, &key_len, 2);   p += 2;
-    std::memcpy(p, &val_len, 4);   p += 4;
+    std::memcpy(p, &packed_ver, 8); p += 8;
+    std::memcpy(p, &key_len, 2);    p += 2;
+    std::memcpy(p, &val_len, 4);    p += 4;
     std::memcpy(p, key.data(), raw_key_len);   p += raw_key_len;
     std::memcpy(p, value.data(), val_len);  p += val_len;
 
@@ -154,8 +156,9 @@ Status Segment::put(std::string_view key, uint64_t version,
     if (!s.ok()) return s;
 
     data_size_ = offset + entry_size;
+    // Store packed version in index so tombstone info is preserved.
     index_.put(key, static_cast<uint32_t>(offset),
-               static_cast<uint32_t>(version));
+               static_cast<uint32_t>(packed_ver));
     return Status::OK();
 }
 
@@ -167,15 +170,12 @@ Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {
     Status s = log_file_.readAt(offset, hdr, LogEntry::kHeaderSize);
     if (!s.ok()) return s;
 
-    uint64_t version;
-    uint16_t key_len_raw;
+    uint64_t packed_ver;
+    uint16_t kl;
     uint32_t vl;
-    std::memcpy(&version, hdr, 8);
-    std::memcpy(&key_len_raw, hdr + 8, 2);
+    std::memcpy(&packed_ver, hdr, 8);
+    std::memcpy(&kl, hdr + 8, 2);
     std::memcpy(&vl, hdr + 10, 4);
-
-    bool tombstone = (key_len_raw & LogEntry::kTombstoneBit) != 0;
-    uint32_t kl = key_len_raw & ~LogEntry::kTombstoneBit;
 
     // Read full entry for CRC validation.
     size_t entry_size = LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
@@ -200,7 +200,7 @@ Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {
                                   std::to_string(offset));
     }
 
-    entry.pv = PackedVersion(version, tombstone);
+    entry.pv = PackedVersion(packed_ver);
     entry.key.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize), kl);
     entry.value.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize + kl), vl);
     return Status::OK();
@@ -247,6 +247,16 @@ Status Segment::get(const std::string& key, uint64_t upper_bound,
         return Status::NotFound("key not found");
     }
     return readEntry(offset, entry);
+}
+
+Status Segment::readTombstone(uint64_t offset, bool& tombstone) const {
+    // Tombstone is the LSB of the packed version (first 8 bytes).
+    // Only need 1 byte, but read 8 for alignment safety.
+    uint64_t packed_ver;
+    Status s = log_file_.readAt(offset, &packed_ver, 8);
+    if (!s.ok()) return s;
+    tombstone = (packed_ver & PackedVersion::kTombstoneMask) != 0;
+    return Status::OK();
 }
 
 bool Segment::contains(const std::string& key) const {

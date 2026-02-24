@@ -241,7 +241,7 @@ void DeltaHashTable::forEachGroup(
             size_t offset = 0;
             for (uint32_t s = 0; s < n_lslots; ++s) {
                 LSlotContents contents = lslot_codec_.decode(
-                    b->data.data(), offset, &offset);
+                    b->data, offset, &offset);
                 for (const auto& entry : contents.entries) {
                     bool merged = false;
                     for (auto& g : groups) {
