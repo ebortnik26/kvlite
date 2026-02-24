@@ -223,48 +223,10 @@ Status DB::get(const std::string& key, std::string& value,
         return Status::InvalidArgument("Database not open");
     }
 
-    // If a snapshot is set, delegate to getByVersion.
-    if (options.snapshot) {
-        return getByVersion(key, options.snapshot->version(), value, version, options);
-    }
-
-    // 1. Check WriteBuffer first (covers unflushed entries).
-    {
-        std::string wval;
-        uint64_t wver;
-        bool tombstone;
-        if (write_buffer_->get(key, wval, wver, tombstone)) {
-            if (tombstone) return Status::NotFound(key);
-            value = std::move(wval);
-            version = wver;
-            return Status::OK();
-        }
-    }
-
-    // 2. Fall through to GlobalIndex -> Segment (flushed entries).
-    std::vector<uint32_t> segment_ids;
-    std::vector<uint64_t> versions;
-    if (!global_index_->get(key, segment_ids, versions)) {
-        return Status::NotFound(key);
-    }
-
-    for (uint32_t sid : segment_ids) {
-        auto* seg = storage_->getSegment(sid);
-        if (!seg) continue;
-
-        internal::LogEntry entry;
-        Status s = seg->getLatest(key, entry);
-        if (s.ok()) {
-            if (entry.tombstone()) return Status::NotFound(key);
-            value = std::move(entry.value);
-            version = entry.version();
-            return Status::OK();
-        }
-        if (!s.isNotFound()) {
-            return s;  // propagate non-NotFound errors
-        }
-    }
-    return Status::NotFound(key);
+    uint64_t upper_bound = options.snapshot
+        ? options.snapshot->version()
+        : UINT64_MAX;
+    return getByVersion(key, upper_bound, value, version, options);
 }
 
 Status DB::getByVersion(const std::string& key, uint64_t upper_bound,

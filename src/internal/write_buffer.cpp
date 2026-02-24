@@ -261,43 +261,7 @@ void WriteBuffer::putBatch(const std::vector<BatchOp>& ops, uint64_t version) {
 
 bool WriteBuffer::get(const std::string& key,
                       std::string& value, uint64_t& version, bool& tombstone) const {
-    uint64_t hash = dhtHashBytes(key.data(), key.size());
-    uint32_t bi = bucketIndex(hash);
-    uint32_t fp = fingerprint(hash);
-
-    locks_[bi].lock();
-
-    bool found = false;
-    uint64_t best_version = 0;
-    PackedVersion best_pv;
-    uint32_t best_offset = 0;
-
-    const Bucket* b = &buckets_[bi];
-    while (b) {
-        for (uint32_t i = 0; i < b->count; ++i) {
-            if (b->slots[i].fingerprint != fp) continue;
-            uint32_t off = b->slots[i].offset;
-            if (!keyMatches(off, key)) continue;
-
-            PackedVersion pv = readPackedVersion(off);
-            if (!found || pv.version() > best_version) {
-                best_version = pv.version();
-                best_pv = pv;
-                best_offset = off;
-                found = true;
-            }
-        }
-        b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
-    }
-
-    if (found) {
-        readValue(best_offset, value);
-        version = best_pv.version();
-        tombstone = best_pv.tombstone();
-    }
-
-    locks_[bi].unlock();
-    return found;
+    return getByVersion(key, UINT64_MAX, value, version, tombstone);
 }
 
 bool WriteBuffer::getByVersion(const std::string& key, uint64_t upper_bound,
