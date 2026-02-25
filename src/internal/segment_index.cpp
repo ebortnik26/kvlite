@@ -92,15 +92,11 @@ Status SegmentIndex::writeTo(LogFile& file) {
     // Seal the DHT — no more writes after serialization.
     dht_.seal();
 
-    // Collect all entries via DHT-level forEach (has hash).
-    std::vector<SegmentIndexEntry> entries;
-    dht_.forEach([&entries](uint64_t hash, uint64_t packed_version, uint32_t id) {
-        entries.push_back({hash, id, packed_version});
-    });
-
-    // Build the serialized buffer: header + entries + crc32.
+    // Single-buffer serialization: header + entries + crc32.
+    // No intermediate vector — forEach writes directly into the output buffer.
+    const size_t num_entries = dht_.size();
     const size_t header_size = sizeof(SegmentIndexHeader);
-    const size_t entries_size = entries.size() * sizeof(SegmentIndexEntry);
+    const size_t entries_size = num_entries * sizeof(SegmentIndexEntry);
     const size_t payload_size = header_size + entries_size;
     const size_t total_size = payload_size + sizeof(uint32_t);
 
@@ -109,15 +105,18 @@ Status SegmentIndex::writeTo(LogFile& file) {
     // Write header.
     SegmentIndexHeader header;
     header.magic = kSegmentIndexMagic;
-    header.entry_count = static_cast<uint32_t>(entries.size());
+    header.entry_count = static_cast<uint32_t>(num_entries);
     header.key_count = static_cast<uint32_t>(key_count_);
     header.reserved = 0;
     std::memcpy(buf.data(), &header, header_size);
 
-    // Write entries.
-    if (!entries.empty()) {
-        std::memcpy(buf.data() + header_size, entries.data(), entries_size);
-    }
+    // Write entries directly into buffer.
+    size_t entry_offset = header_size;
+    dht_.forEach([&buf, &entry_offset](uint64_t hash, uint64_t packed_version, uint32_t id) {
+        SegmentIndexEntry entry{hash, id, packed_version};
+        std::memcpy(buf.data() + entry_offset, &entry, sizeof(entry));
+        entry_offset += sizeof(entry);
+    });
 
     // Compute and write CRC32 over header + entries.
     uint32_t checksum = crc32(buf.data(), payload_size);
