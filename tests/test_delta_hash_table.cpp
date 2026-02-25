@@ -1135,6 +1135,165 @@ TEST(ReadOnlyDHT, TwoEntriesSameFingerprint) {
     EXPECT_EQ(id, 2u);
 }
 
+// ============================================================
+// ReadWriteDeltaHashTable removeEntry / updateEntryId tests
+// ============================================================
+
+TEST(ReadWriteDHT, RemoveEntryBasic) {
+    ReadWriteDeltaHashTable dht;
+    dht.addEntry("key", 100, 1);
+    dht.addEntry("key", 200, 2);
+    dht.addEntry("key", 300, 3);
+    EXPECT_EQ(dht.size(), 3u);
+
+    bool group_empty = dht.removeEntry("key", 200, 2);
+    EXPECT_FALSE(group_empty);
+    EXPECT_EQ(dht.size(), 2u);
+
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll("key", pvs, ids));
+    EXPECT_EQ(pvs.size(), 2u);
+    std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
+    EXPECT_EQ(pv_set.count(100u), 1u);
+    EXPECT_EQ(pv_set.count(300u), 1u);
+    EXPECT_EQ(pv_set.count(200u), 0u);
+}
+
+TEST(ReadWriteDHT, RemoveEntryLastInGroup) {
+    ReadWriteDeltaHashTable dht;
+    dht.addEntry("key", 100, 1);
+    EXPECT_EQ(dht.size(), 1u);
+
+    bool group_empty = dht.removeEntry("key", 100, 1);
+    EXPECT_TRUE(group_empty);
+    EXPECT_EQ(dht.size(), 0u);
+
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    EXPECT_FALSE(dht.findAll("key", pvs, ids));
+}
+
+TEST(ReadWriteDHT, RemoveEntryFromOverflowChain) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.lslot_bits = 2;
+    cfg.bucket_bytes = 128;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    // Add enough entries to force overflow.
+    const int N = 100;
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    EXPECT_EQ(dht.size(), static_cast<size_t>(N));
+
+    // Remove one entry.
+    bool group_empty = dht.removeEntry("key", 50, 50);
+    EXPECT_FALSE(group_empty);
+    EXPECT_EQ(dht.size(), static_cast<size_t>(N - 1));
+
+    // Verify remaining entries.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll("key", pvs, ids));
+    EXPECT_EQ(pvs.size(), static_cast<size_t>(N - 1));
+    std::set<uint32_t> id_set(ids.begin(), ids.end());
+    EXPECT_EQ(id_set.count(50u), 0u);
+    for (int i = 1; i <= N; ++i) {
+        if (i == 50) continue;
+        EXPECT_EQ(id_set.count(static_cast<uint32_t>(i)), 1u) << "missing id " << i;
+    }
+}
+
+TEST(ReadWriteDHT, UpdateEntryIdBasic) {
+    ReadWriteDeltaHashTable dht;
+    dht.addEntry("key", 100, 100);
+    EXPECT_EQ(dht.size(), 1u);
+
+    bool found = dht.updateEntryId("key", 100, 100, 200);
+    EXPECT_TRUE(found);
+    EXPECT_EQ(dht.size(), 1u);
+
+    uint64_t pv;
+    uint32_t id;
+    ASSERT_TRUE(dht.findFirst("key", pv, id));
+    EXPECT_EQ(pv, 100u);
+    EXPECT_EQ(id, 200u);
+}
+
+TEST(ReadWriteDHT, UpdateEntryIdOverflow) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.lslot_bits = 2;
+    cfg.bucket_bytes = 128;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    const int N = 100;
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    // Update id=50 to a large value (may cause different delta encoding).
+    bool found = dht.updateEntryId("key", 50, 50, 999999);
+    EXPECT_TRUE(found);
+    EXPECT_EQ(dht.size(), static_cast<size_t>(N));
+
+    // Verify the updated entry.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll("key", pvs, ids));
+    EXPECT_EQ(pvs.size(), static_cast<size_t>(N));
+    bool found_updated = false;
+    for (size_t i = 0; i < pvs.size(); ++i) {
+        if (pvs[i] == 50) {
+            EXPECT_EQ(ids[i], 999999u);
+            found_updated = true;
+        }
+    }
+    EXPECT_TRUE(found_updated);
+}
+
+TEST(ReadWriteDHT, ConcurrentRemoveAndFind) {
+    ReadWriteDeltaHashTable dht;
+    const int N = 2000;
+
+    // Pre-populate.
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    std::atomic<bool> done{false};
+
+    // 2 writer threads removing entries.
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 2; ++t) {
+        writers.emplace_back([&dht, &done, t, N]() {
+            for (int i = t + 1; i <= N; i += 2) {
+                dht.removeEntry("key", static_cast<uint64_t>(i),
+                                static_cast<uint32_t>(i));
+            }
+        });
+    }
+
+    // 2 reader threads.
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 2; ++t) {
+        readers.emplace_back([&dht, &done]() {
+            for (int i = 0; i < 1000; ++i) {
+                uint64_t pv;
+                uint32_t id;
+                dht.findFirst("key", pv, id);
+            }
+        });
+    }
+
+    for (auto& w : writers) w.join();
+    for (auto& r : readers) r.join();
+    // If we get here without crash/ASAN error, the test passes.
+    EXPECT_EQ(dht.size(), 0u);
+}
+
 TEST(ReadOnlyDHT, MaxPackedVersion) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
     uint64_t max_pv = UINT64_MAX - 1;  // near max (UINT64_MAX itself may cause issues with delta encoding)

@@ -72,6 +72,14 @@ public:
 
     bool contains(const std::string& key) const;
 
+    // Update segment_id for an existing entry.
+    Status relocate(const std::string& key, uint64_t packed_version,
+                    uint32_t old_segment_id, uint32_t new_segment_id);
+
+    // Remove an entry. If the key's fingerprint group becomes empty, decrements key_count_.
+    Status eliminate(const std::string& key, uint64_t packed_version,
+                     uint32_t segment_id);
+
     // --- Iteration ---
 
     void forEachGroup(

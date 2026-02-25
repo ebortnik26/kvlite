@@ -39,6 +39,13 @@ public:
     // Like addEntry, but returns true if the key's fingerprint group is new.
     bool addEntryIsNew(std::string_view key, uint64_t packed_version, uint32_t id);
 
+    // Remove entry (packed_version, id) for key. Returns true if fp group is now empty.
+    bool removeEntry(std::string_view key, uint64_t packed_version, uint32_t id);
+
+    // Update id for entry (packed_version, old_id) for key. Returns true if found.
+    bool updateEntryId(std::string_view key, uint64_t packed_version,
+                       uint32_t old_id, uint32_t new_id);
+
     // Locked read methods (hide base class unlocked versions)
     bool findAll(std::string_view key,
                  std::vector<uint64_t>& packed_versions,

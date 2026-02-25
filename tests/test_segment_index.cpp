@@ -646,12 +646,12 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t version,
+        [&](std::string_view key, uint64_t packed_version,
             uint32_t old_id, uint32_t new_id) {
-            relocations.push_back({std::string(key), version, old_id, new_id});
+            relocations.push_back({std::string(key), packed_version, old_id, new_id});
         },
-        [&](std::string_view key, uint64_t version, uint32_t old_id) {
-            eliminations.push_back({std::string(key), version, old_id});
+        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+            eliminations.push_back({std::string(key), packed_version, old_id});
         },
         last_result_);
 
@@ -699,12 +699,12 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t version,
+        [&](std::string_view key, uint64_t packed_version,
             uint32_t old_id, uint32_t new_id) {
-            relocations.push_back({std::string(key), version, old_id, new_id});
+            relocations.push_back({std::string(key), packed_version, old_id, new_id});
         },
-        [&](std::string_view key, uint64_t version, uint32_t old_id) {
-            eliminations.push_back({std::string(key), version, old_id});
+        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+            eliminations.push_back({std::string(key), packed_version, old_id});
         },
         last_result_);
 
@@ -714,12 +714,12 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
 
     ASSERT_EQ(eliminations.size(), 1u);
     EXPECT_EQ(eliminations[0].key, "key1");
-    EXPECT_EQ(eliminations[0].version, 1u);
+    EXPECT_EQ(eliminations[0].packed_version, PackedVersion(1, false).data);
     EXPECT_EQ(eliminations[0].old_segment_id, 1u);
 
     ASSERT_EQ(relocations.size(), 1u);
     EXPECT_EQ(relocations[0].key, "key1");
-    EXPECT_EQ(relocations[0].version, 2u);
+    EXPECT_EQ(relocations[0].packed_version, PackedVersion(2, false).data);
     EXPECT_EQ(relocations[0].old_segment_id, 2u);
 
     LogEntry entry;
@@ -883,12 +883,12 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t version,
+        [&](std::string_view key, uint64_t packed_version,
             uint32_t old_id, uint32_t new_id) {
-            relocations.push_back({std::string(key), version, old_id, new_id});
+            relocations.push_back({std::string(key), packed_version, old_id, new_id});
         },
-        [&](std::string_view key, uint64_t version, uint32_t old_id) {
-            eliminations.push_back({std::string(key), version, old_id});
+        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+            eliminations.push_back({std::string(key), packed_version, old_id});
         },
         last_result_);
 
@@ -898,7 +898,7 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
 
     ASSERT_EQ(eliminations.size(), 1u);
     EXPECT_EQ(eliminations[0].key, "key1");
-    EXPECT_EQ(eliminations[0].version, 1u);
+    EXPECT_EQ(eliminations[0].packed_version, PackedVersion(1, false).data);
     EXPECT_EQ(eliminations[0].old_segment_id, 1u);
 
     EXPECT_EQ(relocations.size(), 2u);
@@ -949,4 +949,204 @@ TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
     std::vector<LogEntry> entries;
     ASSERT_TRUE(out.get("key1", entries).ok());
     ASSERT_EQ(entries.size(), 1u);
+}
+
+// --- GC + GlobalIndex integration tests ---
+
+#include "internal/global_index.h"
+
+TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
+    // Put entries into GlobalIndex with specific segment_ids.
+    GlobalIndex gi;
+    gi.put("key1", PackedVersion(1, false).data, 1);
+    gi.put("key2", PackedVersion(2, false).data, 1);
+
+    // Create segment with those entries.
+    size_t idx = createSegment(1, {
+        {"key1", 1, "val1", false},
+        {"key2", 2, "val2", false},
+    });
+    auto& seg = segments_[idx];
+
+    std::vector<uint64_t> snapshots = {2};
+    std::vector<const Segment*> inputs = {&seg};
+
+    Status s = GC::merge(
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        [&gi](std::string_view key, uint64_t packed_version,
+              uint32_t old_id, uint32_t new_id) {
+            gi.relocate(std::string(key), packed_version, old_id, new_id);
+        },
+        [&gi](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+            gi.eliminate(std::string(key), packed_version, old_id);
+        },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    ASSERT_EQ(last_result_.outputs.size(), 1u);
+    uint32_t new_seg_id = last_result_.outputs[0].getId();
+
+    // Verify GlobalIndex entries now point to the new segment.
+    uint64_t pv;
+    uint32_t seg_id;
+    ASSERT_TRUE(gi.getLatest("key1", pv, seg_id).ok());
+    EXPECT_EQ(seg_id, new_seg_id);
+    ASSERT_TRUE(gi.getLatest("key2", pv, seg_id).ok());
+    EXPECT_EQ(seg_id, new_seg_id);
+
+    EXPECT_EQ(gi.keyCount(), 2u);
+    EXPECT_EQ(gi.entryCount(), 2u);
+}
+
+TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
+    GlobalIndex gi;
+    gi.put("key1", PackedVersion(1, false).data, 1);
+    gi.put("key1", PackedVersion(2, false).data, 2);
+
+    size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
+    size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
+    auto& seg1 = segments_[idx1];
+    auto& seg2 = segments_[idx2];
+
+    std::vector<uint64_t> snapshots = {2};
+    std::vector<const Segment*> inputs = {&seg1, &seg2};
+
+    Status s = GC::merge(
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        [&gi](std::string_view key, uint64_t packed_version,
+              uint32_t old_id, uint32_t new_id) {
+            gi.relocate(std::string(key), packed_version, old_id, new_id);
+        },
+        [&gi](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+            gi.eliminate(std::string(key), packed_version, old_id);
+        },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    EXPECT_EQ(last_result_.entries_eliminated, 1u);
+
+    // Only version 2 should remain in GlobalIndex, pointing to new segment.
+    EXPECT_EQ(gi.entryCount(), 1u);
+    EXPECT_EQ(gi.keyCount(), 1u);
+
+    uint64_t pv;
+    uint32_t seg_id;
+    ASSERT_TRUE(gi.getLatest("key1", pv, seg_id).ok());
+    EXPECT_EQ(pv, PackedVersion(2, false).data);
+    EXPECT_EQ(seg_id, last_result_.outputs[0].getId());
+}
+
+TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
+    GlobalIndex gi;
+    // Two versions of "key1" in same segment — both will be compacted,
+    // but only the latest survives the single-snapshot classification.
+    // To eliminate ALL versions, we need a tombstone as latest.
+    gi.put("key1", PackedVersion(1, false).data, 1);
+    gi.put("key1", PackedVersion(2, true).data, 1);  // tombstone
+
+    size_t idx = createSegment(1, {
+        {"key1", 1, "val1", false},
+        {"key1", 2, "", true},  // tombstone
+    });
+    auto& seg = segments_[idx];
+
+    // Single snapshot at version 2 — classification keeps only the latest
+    // entry per snapshot. The latest is the tombstone at version 2.
+    // With only one snapshot, version 1 is eliminated.
+    std::vector<uint64_t> snapshots = {2};
+    std::vector<const Segment*> inputs = {&seg};
+
+    Status s = GC::merge(
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        [&gi](std::string_view key, uint64_t packed_version,
+              uint32_t old_id, uint32_t new_id) {
+            gi.relocate(std::string(key), packed_version, old_id, new_id);
+        },
+        [&gi](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+            gi.eliminate(std::string(key), packed_version, old_id);
+        },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+
+    // Version 1 was eliminated, version 2 (tombstone) was relocated.
+    EXPECT_EQ(last_result_.entries_eliminated, 1u);
+    EXPECT_EQ(last_result_.entries_written, 1u);
+
+    // key1 still exists in GlobalIndex (tombstone entry remains).
+    // This is correct: the tombstone must stay until the output segment
+    // containing it is GC'ed in a future pass.
+    EXPECT_EQ(gi.entryCount(), 1u);
+    EXPECT_EQ(gi.keyCount(), 1u);
+    EXPECT_TRUE(gi.contains("key1"));
+
+    // Verify the remaining entry is the tombstone at version 2.
+    uint64_t pv;
+    uint32_t seg_id;
+    ASSERT_TRUE(gi.getLatest("key1", pv, seg_id).ok());
+    EXPECT_EQ(pv, PackedVersion(2, true).data);
+    EXPECT_EQ(seg_id, last_result_.outputs[0].getId());
+}
+
+TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
+    // Simulate: after a first GC pass, a key has only a tombstone left
+    // in the output segment. A second GC pass eliminates it entirely.
+    GlobalIndex gi;
+    uint32_t first_seg_id = 50;
+    gi.put("key1", PackedVersion(2, true).data, first_seg_id);  // tombstone only
+
+    // Create a segment containing just the tombstone.
+    size_t idx = createSegment(first_seg_id, {
+        {"key1", 2, "", true},  // tombstone
+    });
+    auto& seg = segments_[idx];
+
+    EXPECT_EQ(gi.keyCount(), 1u);
+    EXPECT_EQ(gi.entryCount(), 1u);
+    EXPECT_TRUE(gi.contains("key1"));
+
+    // Second GC pass: single snapshot at version 2.
+    // The tombstone is the only entry — it's the latest for the snapshot,
+    // so it is kept (relocated), not eliminated.
+    std::vector<uint64_t> snapshots = {2};
+    std::vector<const Segment*> inputs = {&seg};
+
+    Status s = GC::merge(
+        snapshots, inputs, /*max_segment_size=*/1 << 20,
+        [this](uint32_t id) { return pathForOutput(id); },
+        [this]() { return allocateId(); },
+        [&gi](std::string_view key, uint64_t packed_version,
+              uint32_t old_id, uint32_t new_id) {
+            gi.relocate(std::string(key), packed_version, old_id, new_id);
+        },
+        [&gi](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+            gi.eliminate(std::string(key), packed_version, old_id);
+        },
+        last_result_);
+
+    ASSERT_TRUE(s.ok());
+    // Tombstone is kept (relocated) — it's the latest visible entry.
+    EXPECT_EQ(last_result_.entries_written, 1u);
+    EXPECT_EQ(last_result_.entries_eliminated, 0u);
+
+    // Key still exists — tombstone persists until no snapshot pins it.
+    EXPECT_EQ(gi.keyCount(), 1u);
+    EXPECT_TRUE(gi.contains("key1"));
+
+    // Now simulate: eliminate the tombstone directly (as would happen
+    // when all snapshots are released and a GC eliminates it).
+    uint64_t tomb_pv = PackedVersion(2, true).data;
+    uint32_t new_seg_id = last_result_.outputs[0].getId();
+    gi.eliminate("key1", tomb_pv, new_seg_id);
+
+    // Now the key is fully gone from GlobalIndex.
+    EXPECT_EQ(gi.keyCount(), 0u);
+    EXPECT_EQ(gi.entryCount(), 0u);
+    EXPECT_FALSE(gi.contains("key1"));
 }

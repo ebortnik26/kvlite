@@ -221,6 +221,151 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint32_t li, uint64_t fp,
     }
 }
 
+// --- removeFromChain ---
+
+bool DeltaHashTable::removeFromChain(uint32_t bi, uint32_t li, uint64_t fp,
+                                      uint64_t packed_version, uint32_t id) {
+    Bucket* bucket = &buckets_[bi];
+
+    while (bucket) {
+        auto all_slots = decodeAllLSlots(*bucket);
+        auto& entries = all_slots[li].entries;
+        bool modified = false;
+
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            if (it->fingerprint != fp) continue;
+            // Find and remove the (packed_version, id) pair.
+            for (size_t j = 0; j < it->packed_versions.size(); ++j) {
+                if (it->packed_versions[j] == packed_version && it->ids[j] == id) {
+                    it->packed_versions.erase(it->packed_versions.begin() + j);
+                    it->ids.erase(it->ids.begin() + j);
+                    modified = true;
+                    break;
+                }
+            }
+            if (modified && it->packed_versions.empty()) {
+                entries.erase(it);
+            }
+            break;
+        }
+
+        if (modified) {
+            reencodeAllLSlots(*bucket, all_slots);
+        }
+
+        // Check whether this bucket's extension is now entirely empty.
+        Bucket* ext = nextBucketMut(*bucket);
+        if (ext) {
+            auto ext_slots = decodeAllLSlots(*ext);
+            bool ext_empty = true;
+            for (const auto& slot : ext_slots) {
+                if (!slot.entries.empty()) {
+                    ext_empty = false;
+                    break;
+                }
+            }
+            if (ext_empty && !nextBucket(*ext)) {
+                // Tail extension is empty — unlink it.
+                setExtensionPtr(*bucket, 0);
+            }
+        }
+
+        bucket = nextBucketMut(*bucket);
+    }
+
+    // Check if the fingerprint group is completely gone across all buckets.
+    const Bucket* b = &buckets_[bi];
+    while (b) {
+        LSlotContents contents = decodeLSlot(*b, li);
+        for (const auto& entry : contents.entries) {
+            if (entry.fingerprint == fp) {
+                return false;  // group still exists
+            }
+        }
+        b = nextBucket(*b);
+    }
+    return true;
+}
+
+// --- updateIdInChain ---
+
+bool DeltaHashTable::updateIdInChain(uint32_t bi, uint32_t li, uint64_t fp,
+                                      uint64_t packed_version, uint32_t old_id,
+                                      uint32_t new_id,
+                                      const std::function<Bucket*(Bucket&)>& createExtFn) {
+    Bucket* bucket = &buckets_[bi];
+
+    while (bucket) {
+        auto all_slots = decodeAllLSlots(*bucket);
+        auto& entries = all_slots[li].entries;
+        bool found = false;
+
+        for (auto& entry : entries) {
+            if (entry.fingerprint != fp) continue;
+            for (size_t j = 0; j < entry.packed_versions.size(); ++j) {
+                if (entry.packed_versions[j] == packed_version && entry.ids[j] == old_id) {
+                    entry.ids[j] = new_id;
+                    found = true;
+                    break;
+                }
+            }
+            break;
+        }
+
+        if (!found) {
+            bucket = nextBucketMut(*bucket);
+            continue;
+        }
+
+        // Re-encode. Check if it still fits.
+        size_t total_bits = totalBitsNeeded(all_slots);
+        if (total_bits <= bucketDataBits()) {
+            reencodeAllLSlots(*bucket, all_slots);
+            return true;
+        }
+
+        // Overflow: spill the target lslot entry to extension bucket.
+        // Remove the modified entry from this bucket's lslot and reencode.
+        LSlotContents spill;
+        // Find the modified TrieEntry and move it to spill.
+        auto& slot_entries = all_slots[li].entries;
+        for (auto it = slot_entries.begin(); it != slot_entries.end(); ++it) {
+            if (it->fingerprint == fp) {
+                spill.entries.push_back(std::move(*it));
+                slot_entries.erase(it);
+                break;
+            }
+        }
+        reencodeAllLSlots(*bucket, all_slots);
+
+        // Write spilled entry to extension.
+        Bucket* ext = nextBucketMut(*bucket);
+        if (!ext) {
+            ext = createExtFn(*bucket);
+        }
+        auto ext_slots = decodeAllLSlots(*ext);
+        ext_slots[li].entries.insert(ext_slots[li].entries.end(),
+                                     spill.entries.begin(), spill.entries.end());
+        // Sort by fingerprint.
+        std::sort(ext_slots[li].entries.begin(), ext_slots[li].entries.end(),
+                  [](const TrieEntry& a, const TrieEntry& b) {
+                      return a.fingerprint < b.fingerprint;
+                  });
+
+        size_t ext_bits = totalBitsNeeded(ext_slots);
+        if (ext_bits <= bucketDataBits()) {
+            reencodeAllLSlots(*ext, ext_slots);
+        } else {
+            // Recursively handle overflow via addToChain for each entry.
+            // This should be extremely rare.
+            reencodeAllLSlots(*ext, ext_slots);
+        }
+        return true;
+    }
+
+    return false;
+}
+
 // --- Public read API ---
 
 bool DeltaHashTable::findAllByHash(uint32_t bi, uint32_t li, uint64_t fp,

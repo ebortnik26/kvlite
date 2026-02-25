@@ -123,7 +123,7 @@ protected:
     bool findFirstByHash(uint32_t bi, uint32_t li, uint64_t fp,
                          uint64_t& packed_version, uint32_t& id) const;
 
-    // --- Protected write helper ---
+    // --- Protected write helpers ---
     // Adds an entry to the chain at (bi, li) for fingerprint fp.
     // createExtFn is called (with bucket lock held by caller if needed)
     // when the current bucket overflows.
@@ -131,6 +131,18 @@ protected:
     bool addToChain(uint32_t bi, uint32_t li, uint64_t fp,
                     uint64_t packed_version, uint32_t id,
                     const std::function<Bucket*(Bucket&)>& createExtFn);
+
+    // Remove entry matching (fp, packed_version, id) from chain at (bi, li).
+    // Returns true if the fingerprint group is now empty (all entries removed).
+    bool removeFromChain(uint32_t bi, uint32_t li, uint64_t fp,
+                         uint64_t packed_version, uint32_t id);
+
+    // Update id for entry matching (fp, packed_version, old_id) to new_id.
+    // createExtFn called if re-encoding overflows the current bucket.
+    // Returns true if the entry was found and updated.
+    bool updateIdInChain(uint32_t bi, uint32_t li, uint64_t fp,
+                         uint64_t packed_version, uint32_t old_id, uint32_t new_id,
+                         const std::function<Bucket*(Bucket&)>& createExtFn);
 
     // --- Bulk helpers ---
 

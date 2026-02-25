@@ -26,22 +26,22 @@ namespace internal {
 class GC {
 public:
     using RelocateFn = std::function<void(
-        std::string_view key, uint64_t version,
+        std::string_view key, uint64_t packed_version,
         uint32_t old_segment_id, uint32_t new_segment_id)>;
     using EliminateFn = std::function<void(
-        std::string_view key, uint64_t version,
+        std::string_view key, uint64_t packed_version,
         uint32_t old_segment_id)>;
 
     struct Relocation {
         std::string key;
-        uint64_t version;
+        uint64_t packed_version;
         uint32_t old_segment_id;
         uint32_t new_segment_id;
     };
 
     struct Elimination {
         std::string key;
-        uint64_t version;
+        uint64_t packed_version;
         uint32_t old_segment_id;
     };
 

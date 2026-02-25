@@ -167,6 +167,23 @@ bool GlobalIndex::contains(const std::string& key) const {
     return dht_.contains(key);
 }
 
+Status GlobalIndex::relocate(const std::string& key, uint64_t packed_version,
+                              uint32_t old_segment_id, uint32_t new_segment_id) {
+    dht_.updateEntryId(key, packed_version, old_segment_id, new_segment_id);
+    updates_since_snapshot_++;
+    return Status::OK();
+}
+
+Status GlobalIndex::eliminate(const std::string& key, uint64_t packed_version,
+                               uint32_t segment_id) {
+    bool group_empty = dht_.removeEntry(key, packed_version, segment_id);
+    if (group_empty) {
+        --key_count_;
+    }
+    updates_since_snapshot_++;
+    return Status::OK();
+}
+
 // --- Iteration ---
 
 void GlobalIndex::forEachGroup(

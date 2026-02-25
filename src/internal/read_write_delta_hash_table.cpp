@@ -72,6 +72,35 @@ void ReadWriteDeltaHashTable::addEntryByHash(uint64_t hash,
             packed_version, id);
 }
 
+bool ReadWriteDeltaHashTable::removeEntry(std::string_view key,
+                                           uint64_t packed_version, uint32_t id) {
+    uint64_t h = hashKey(key);
+    uint32_t bi = bucketIndex(h);
+    uint32_t li = lslotIndex(h);
+    uint64_t fp = fingerprint(h);
+
+    BucketLockGuard guard(bucket_locks_[bi]);
+    bool group_empty = removeFromChain(bi, li, fp, packed_version, id);
+    size_.fetch_sub(1, std::memory_order_relaxed);
+    return group_empty;
+}
+
+bool ReadWriteDeltaHashTable::updateEntryId(std::string_view key,
+                                              uint64_t packed_version,
+                                              uint32_t old_id, uint32_t new_id) {
+    uint64_t h = hashKey(key);
+    uint32_t bi = bucketIndex(h);
+    uint32_t li = lslotIndex(h);
+    uint64_t fp = fingerprint(h);
+
+    BucketLockGuard guard(bucket_locks_[bi]);
+    return updateIdInChain(bi, li, fp, packed_version, old_id, new_id,
+        [this](Bucket& bucket) -> Bucket* {
+            std::lock_guard<std::mutex> g(ext_mutex_);
+            return createExtension(bucket);
+        });
+}
+
 bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint32_t li, uint64_t fp,
                                        uint64_t packed_version, uint32_t id) {
     BucketLockGuard guard(bucket_locks_[bi]);
