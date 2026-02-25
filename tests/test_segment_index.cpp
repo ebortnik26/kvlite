@@ -7,147 +7,147 @@
 #include <vector>
 
 #include "internal/bit_stream.h"
-#include "internal/segment_lslot_codec.h"
-#include "internal/segment_delta_hash_table.h"
+#include "internal/lslot_codec.h"
+#include "internal/read_only_delta_hash_table.h"
 #include "internal/segment_index.h"
 #include "internal/gc.h"
 #include "internal/log_file.h"
 #include "internal/segment.h"
-#include "internal/delta_hash_table_base.h"
+#include "internal/delta_hash_table.h"
 
 using namespace kvlite::internal;
 using kvlite::Status;
 
-// --- SegmentLSlotCodec Tests ---
+// --- LSlotCodec Tests ---
 
-TEST(SegmentLSlotCodec, EncodeDecodeEmpty) {
-    SegmentLSlotCodec codec(39);
-    SegmentLSlotCodec::LSlotContents contents;
+TEST(LSlotCodec, EncodeDecodeEmpty) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
 
     uint8_t buf[128] = {};
     size_t end = codec.encode(buf, 0, contents);
     EXPECT_GT(end, 0u);
 
     size_t decoded_end;
-    SegmentLSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
+    LSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
     EXPECT_EQ(decoded_end, end);
     EXPECT_TRUE(decoded.entries.empty());
 }
 
-TEST(SegmentLSlotCodec, EncodeDecodeSingleEntry) {
-    SegmentLSlotCodec codec(39);
-    SegmentLSlotCodec::LSlotContents contents;
-    SegmentLSlotCodec::TrieEntry entry;
+TEST(LSlotCodec, EncodeDecodeSingleEntry) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
+    LSlotCodec::TrieEntry entry;
     entry.fingerprint = 0x1234;
-    entry.offsets = {1000};
-    entry.versions = {5};
+    entry.packed_versions = {1000};
+    entry.ids = {5};
     contents.entries.push_back(entry);
 
     uint8_t buf[128] = {};
     size_t end = codec.encode(buf, 0, contents);
 
     size_t decoded_end;
-    SegmentLSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
+    LSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
     EXPECT_EQ(decoded_end, end);
     ASSERT_EQ(decoded.entries.size(), 1u);
     EXPECT_EQ(decoded.entries[0].fingerprint, 0x1234u);
-    ASSERT_EQ(decoded.entries[0].offsets.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].offsets[0], 1000u);
-    EXPECT_EQ(decoded.entries[0].versions[0], 5u);
+    ASSERT_EQ(decoded.entries[0].packed_versions.size(), 1u);
+    EXPECT_EQ(decoded.entries[0].packed_versions[0], 1000u);
+    EXPECT_EQ(decoded.entries[0].ids[0], 5u);
 }
 
-TEST(SegmentLSlotCodec, EncodeDecodeMultiplePairs) {
-    SegmentLSlotCodec codec(39);
-    SegmentLSlotCodec::LSlotContents contents;
-    SegmentLSlotCodec::TrieEntry entry;
+TEST(LSlotCodec, EncodeDecodeMultiplePairs) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
+    LSlotCodec::TrieEntry entry;
     entry.fingerprint = 42;
-    entry.offsets = {3000, 2000, 1000};   // desc
-    entry.versions = {30, 20, 10};        // desc
+    entry.packed_versions = {3000, 2000, 1000};   // desc
+    entry.ids = {30, 20, 10};                      // desc
     contents.entries.push_back(entry);
 
     uint8_t buf[256] = {};
     size_t end = codec.encode(buf, 0, contents);
 
     size_t decoded_end;
-    SegmentLSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
+    LSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
     EXPECT_EQ(decoded_end, end);
     ASSERT_EQ(decoded.entries.size(), 1u);
-    ASSERT_EQ(decoded.entries[0].offsets.size(), 3u);
-    EXPECT_EQ(decoded.entries[0].offsets[0], 3000u);
-    EXPECT_EQ(decoded.entries[0].offsets[1], 2000u);
-    EXPECT_EQ(decoded.entries[0].offsets[2], 1000u);
-    EXPECT_EQ(decoded.entries[0].versions[0], 30u);
-    EXPECT_EQ(decoded.entries[0].versions[1], 20u);
-    EXPECT_EQ(decoded.entries[0].versions[2], 10u);
+    ASSERT_EQ(decoded.entries[0].packed_versions.size(), 3u);
+    EXPECT_EQ(decoded.entries[0].packed_versions[0], 3000u);
+    EXPECT_EQ(decoded.entries[0].packed_versions[1], 2000u);
+    EXPECT_EQ(decoded.entries[0].packed_versions[2], 1000u);
+    EXPECT_EQ(decoded.entries[0].ids[0], 30u);
+    EXPECT_EQ(decoded.entries[0].ids[1], 20u);
+    EXPECT_EQ(decoded.entries[0].ids[2], 10u);
 }
 
-TEST(SegmentLSlotCodec, EncodeDecodeMultipleFingerprints) {
-    SegmentLSlotCodec codec(39);
-    SegmentLSlotCodec::LSlotContents contents;
+TEST(LSlotCodec, EncodeDecodeMultipleFingerprints) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
 
-    SegmentLSlotCodec::TrieEntry e1;
+    LSlotCodec::TrieEntry e1;
     e1.fingerprint = 10;
-    e1.offsets = {500, 400};
-    e1.versions = {50, 40};
+    e1.packed_versions = {500, 400};
+    e1.ids = {50, 40};
     contents.entries.push_back(e1);
 
-    SegmentLSlotCodec::TrieEntry e2;
+    LSlotCodec::TrieEntry e2;
     e2.fingerprint = 20;
-    e2.offsets = {900};
-    e2.versions = {90};
+    e2.packed_versions = {900};
+    e2.ids = {90};
     contents.entries.push_back(e2);
 
     uint8_t buf[256] = {};
     size_t end = codec.encode(buf, 0, contents);
 
     size_t decoded_end;
-    SegmentLSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
+    LSlotCodec::LSlotContents decoded = codec.decode(buf, 0, &decoded_end);
     EXPECT_EQ(decoded_end, end);
     ASSERT_EQ(decoded.entries.size(), 2u);
     EXPECT_EQ(decoded.entries[0].fingerprint, 10u);
     EXPECT_EQ(decoded.entries[1].fingerprint, 20u);
-    ASSERT_EQ(decoded.entries[0].offsets.size(), 2u);
-    ASSERT_EQ(decoded.entries[1].offsets.size(), 1u);
+    ASSERT_EQ(decoded.entries[0].packed_versions.size(), 2u);
+    ASSERT_EQ(decoded.entries[1].packed_versions.size(), 1u);
 }
 
-TEST(SegmentLSlotCodec, BitsNeeded) {
-    SegmentLSlotCodec::LSlotContents empty;
-    EXPECT_EQ(SegmentLSlotCodec::bitsNeeded(empty, 39), 1u);
+TEST(LSlotCodec, BitsNeeded) {
+    LSlotCodec::LSlotContents empty;
+    EXPECT_EQ(LSlotCodec::bitsNeeded(empty, 39), 1u);
 
-    SegmentLSlotCodec::LSlotContents contents;
-    SegmentLSlotCodec::TrieEntry entry;
+    LSlotCodec::LSlotContents contents;
+    LSlotCodec::TrieEntry entry;
     entry.fingerprint = 1;
-    entry.offsets = {100};
-    entry.versions = {5};
+    entry.packed_versions = {100};
+    entry.ids = {5};
     contents.entries.push_back(entry);
 
-    size_t bits = SegmentLSlotCodec::bitsNeeded(contents, 39);
-    // unary(1)=2 + fp=39 + unary(1)=2 + offset_raw=32 + version_raw=32 = 107
-    EXPECT_EQ(bits, 107u);
+    size_t bits = LSlotCodec::bitsNeeded(contents, 39);
+    // unary(1)=2 + fp=39 + unary(1)=2 + packed_version_raw=64 + id_raw=32 = 139
+    EXPECT_EQ(bits, 139u);
 }
 
-TEST(SegmentLSlotCodec, BitOffsetAndTotalBits) {
-    SegmentLSlotCodec codec(39);
+TEST(LSlotCodec, BitOffsetAndTotalBits) {
+    LSlotCodec codec(39);
 
     uint8_t buf[512] = {};
     size_t offset = 0;
 
-    SegmentLSlotCodec::LSlotContents s0;
-    SegmentLSlotCodec::TrieEntry e0;
+    LSlotCodec::LSlotContents s0;
+    LSlotCodec::TrieEntry e0;
     e0.fingerprint = 1;
-    e0.offsets = {10};
-    e0.versions = {1};
+    e0.packed_versions = {10};
+    e0.ids = {1};
     s0.entries.push_back(e0);
     offset = codec.encode(buf, offset, s0);
 
-    SegmentLSlotCodec::LSlotContents s1;  // empty
+    LSlotCodec::LSlotContents s1;  // empty
     offset = codec.encode(buf, offset, s1);
 
-    SegmentLSlotCodec::LSlotContents s2;
-    SegmentLSlotCodec::TrieEntry e2;
+    LSlotCodec::LSlotContents s2;
+    LSlotCodec::TrieEntry e2;
     e2.fingerprint = 2;
-    e2.offsets = {20};
-    e2.versions = {2};
+    e2.packed_versions = {20};
+    e2.ids = {2};
     s2.entries.push_back(e2);
     offset = codec.encode(buf, offset, s2);
 
@@ -156,36 +156,38 @@ TEST(SegmentLSlotCodec, BitOffsetAndTotalBits) {
     EXPECT_EQ(codec.totalBits(buf, 3), offset);
 }
 
-// --- SegmentDeltaHashTable Tests ---
+// --- ReadOnlyDeltaHashTable Tests ---
 
-static SegmentDeltaHashTable::Config testConfig() {
-    SegmentDeltaHashTable::Config cfg;
+static ReadOnlyDeltaHashTable::Config testConfig() {
+    ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
     cfg.lslot_bits = 2;
     cfg.bucket_bytes = 512;
     return cfg;
 }
 
-TEST(SegmentDeltaHashTable, AddAndFindFirst) {
-    SegmentDeltaHashTable dht(testConfig());
+TEST(ReadOnlyDeltaHashTable, AddAndFindFirst) {
+    ReadOnlyDeltaHashTable dht(testConfig());
 
     dht.addEntry("hello", 100, 1);
 
-    uint32_t off, ver;
-    EXPECT_TRUE(dht.findFirst("hello", off, ver));
-    EXPECT_EQ(off, 100u);
-    EXPECT_EQ(ver, 1u);
+    uint64_t pv;
+    uint32_t id;
+    EXPECT_TRUE(dht.findFirst("hello", pv, id));
+    EXPECT_EQ(pv, 100u);
+    EXPECT_EQ(id, 1u);
     EXPECT_EQ(dht.size(), 1u);
 }
 
-TEST(SegmentDeltaHashTable, FindNonExistent) {
-    SegmentDeltaHashTable dht(testConfig());
-    uint32_t off, ver;
-    EXPECT_FALSE(dht.findFirst("missing", off, ver));
+TEST(ReadOnlyDeltaHashTable, FindNonExistent) {
+    ReadOnlyDeltaHashTable dht(testConfig());
+    uint64_t pv;
+    uint32_t id;
+    EXPECT_FALSE(dht.findFirst("missing", pv, id));
 }
 
-TEST(SegmentDeltaHashTable, AddMultipleEntries) {
-    SegmentDeltaHashTable dht(testConfig());
+TEST(ReadOnlyDeltaHashTable, AddMultipleEntries) {
+    ReadOnlyDeltaHashTable dht(testConfig());
 
     dht.addEntry("key1", 100, 1);
     dht.addEntry("key1", 200, 2);
@@ -193,44 +195,46 @@ TEST(SegmentDeltaHashTable, AddMultipleEntries) {
 
     EXPECT_EQ(dht.size(), 3u);
 
-    std::vector<uint32_t> offsets, versions;
-    ASSERT_TRUE(dht.findAll("key1", offsets, versions));
-    ASSERT_EQ(offsets.size(), 3u);
-    EXPECT_EQ(offsets[0], 300u);
-    EXPECT_EQ(offsets[1], 200u);
-    EXPECT_EQ(offsets[2], 100u);
-    EXPECT_EQ(versions[0], 3u);
-    EXPECT_EQ(versions[1], 2u);
-    EXPECT_EQ(versions[2], 1u);
+    std::vector<uint64_t> packed_versions;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll("key1", packed_versions, ids));
+    ASSERT_EQ(packed_versions.size(), 3u);
+    EXPECT_EQ(packed_versions[0], 300u);
+    EXPECT_EQ(packed_versions[1], 200u);
+    EXPECT_EQ(packed_versions[2], 100u);
+    EXPECT_EQ(ids[0], 3u);
+    EXPECT_EQ(ids[1], 2u);
+    EXPECT_EQ(ids[2], 1u);
 }
 
-TEST(SegmentDeltaHashTable, FindFirstReturnsHighest) {
-    SegmentDeltaHashTable dht(testConfig());
+TEST(ReadOnlyDeltaHashTable, FindFirstReturnsHighest) {
+    ReadOnlyDeltaHashTable dht(testConfig());
 
     dht.addEntry("key1", 100, 1);
     dht.addEntry("key1", 300, 3);
     dht.addEntry("key1", 200, 2);
 
-    uint32_t off, ver;
-    ASSERT_TRUE(dht.findFirst("key1", off, ver));
-    EXPECT_EQ(off, 300u);
-    EXPECT_EQ(ver, 3u);
+    uint64_t pv;
+    uint32_t id;
+    ASSERT_TRUE(dht.findFirst("key1", pv, id));
+    EXPECT_EQ(pv, 300u);
+    EXPECT_EQ(id, 3u);
 }
 
-TEST(SegmentDeltaHashTable, Contains) {
-    SegmentDeltaHashTable dht(testConfig());
+TEST(ReadOnlyDeltaHashTable, Contains) {
+    ReadOnlyDeltaHashTable dht(testConfig());
 
     EXPECT_FALSE(dht.contains("key1"));
     dht.addEntry("key1", 100, 1);
     EXPECT_TRUE(dht.contains("key1"));
 }
 
-TEST(SegmentDeltaHashTable, Clear) {
-    SegmentDeltaHashTable dht(testConfig());
+TEST(ReadOnlyDeltaHashTable, Clear) {
+    ReadOnlyDeltaHashTable dht(testConfig());
 
     for (int i = 0; i < 10; ++i) {
         dht.addEntry("key" + std::to_string(i),
-                     static_cast<uint32_t>(i * 100 + 1),
+                     static_cast<uint64_t>(i * 100 + 1),
                      static_cast<uint32_t>(i + 1));
     }
     EXPECT_EQ(dht.size(), 10u);
@@ -243,57 +247,57 @@ TEST(SegmentDeltaHashTable, Clear) {
     }
 }
 
-TEST(SegmentDeltaHashTable, ForEach) {
-    SegmentDeltaHashTable dht(testConfig());
+TEST(ReadOnlyDeltaHashTable, ForEach) {
+    ReadOnlyDeltaHashTable dht(testConfig());
 
     dht.addEntry("a", 100, 1);
     dht.addEntry("b", 200, 2);
     dht.addEntry("c", 300, 3);
 
-    std::set<uint32_t> all_offsets;
-    dht.forEach([&](uint64_t, uint32_t offset, uint32_t) {
-        all_offsets.insert(offset);
+    std::set<uint32_t> all_ids;
+    dht.forEach([&](uint64_t, uint64_t, uint32_t id) {
+        all_ids.insert(id);
     });
 
-    EXPECT_EQ(all_offsets.size(), 3u);
-    EXPECT_EQ(all_offsets.count(100u), 1u);
-    EXPECT_EQ(all_offsets.count(200u), 1u);
-    EXPECT_EQ(all_offsets.count(300u), 1u);
+    EXPECT_EQ(all_ids.size(), 3u);
+    EXPECT_EQ(all_ids.count(1u), 1u);
+    EXPECT_EQ(all_ids.count(2u), 1u);
+    EXPECT_EQ(all_ids.count(3u), 1u);
 }
 
-TEST(SegmentDeltaHashTable, ForEachGroup) {
-    SegmentDeltaHashTable dht(testConfig());
+TEST(ReadOnlyDeltaHashTable, ForEachGroup) {
+    ReadOnlyDeltaHashTable dht(testConfig());
 
     dht.addEntry("a", 100, 1);
     dht.addEntry("a", 200, 2);
     dht.addEntry("b", 300, 3);
 
     size_t group_count = 0;
-    dht.forEachGroup([&](uint64_t, const std::vector<uint32_t>& offsets,
-                         const std::vector<uint32_t>& versions) {
+    dht.forEachGroup([&](uint64_t, const std::vector<uint64_t>& pvs,
+                         const std::vector<uint32_t>& ids) {
         ++group_count;
-        if (offsets.size() == 2) {
-            EXPECT_EQ(offsets[0], 200u);
-            EXPECT_EQ(offsets[1], 100u);
-            EXPECT_EQ(versions[0], 2u);
-            EXPECT_EQ(versions[1], 1u);
+        if (pvs.size() == 2) {
+            EXPECT_EQ(pvs[0], 200u);
+            EXPECT_EQ(pvs[1], 100u);
+            EXPECT_EQ(ids[0], 2u);
+            EXPECT_EQ(ids[1], 1u);
         } else {
-            EXPECT_EQ(offsets.size(), 1u);
-            EXPECT_EQ(offsets[0], 300u);
-            EXPECT_EQ(versions[0], 3u);
+            EXPECT_EQ(pvs.size(), 1u);
+            EXPECT_EQ(pvs[0], 300u);
+            EXPECT_EQ(ids[0], 3u);
         }
     });
 
     EXPECT_EQ(group_count, 2u);
 }
 
-TEST(SegmentDeltaHashTable, ManyKeys) {
-    SegmentDeltaHashTable dht(testConfig());
+TEST(ReadOnlyDeltaHashTable, ManyKeys) {
+    ReadOnlyDeltaHashTable dht(testConfig());
 
     const int N = 200;
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        dht.addEntry(key, static_cast<uint32_t>(i * 100 + 1),
+        dht.addEntry(key, static_cast<uint64_t>(i * 100 + 1),
                      static_cast<uint32_t>(i + 1));
     }
 
@@ -301,24 +305,25 @@ TEST(SegmentDeltaHashTable, ManyKeys) {
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        uint32_t off, ver;
-        ASSERT_TRUE(dht.findFirst(key, off, ver)) << "key not found: " << key;
-        EXPECT_EQ(off, static_cast<uint32_t>(i * 100 + 1));
-        EXPECT_EQ(ver, static_cast<uint32_t>(i + 1));
+        uint64_t pv;
+        uint32_t id;
+        ASSERT_TRUE(dht.findFirst(key, pv, id)) << "key not found: " << key;
+        EXPECT_EQ(pv, static_cast<uint64_t>(i * 100 + 1));
+        EXPECT_EQ(id, static_cast<uint32_t>(i + 1));
     }
 }
 
-TEST(SegmentDeltaHashTable, AddEntryByHash) {
-    SegmentDeltaHashTable dht(testConfig());
+TEST(ReadOnlyDeltaHashTable, AddEntryByHash) {
+    ReadOnlyDeltaHashTable dht(testConfig());
 
     uint64_t hash = 0xDEADBEEF12345678ULL;
     dht.addEntryByHash(hash, 100, 1);
 
     size_t count = 0;
-    dht.forEach([&](uint64_t, uint32_t offset, uint32_t version) {
+    dht.forEach([&](uint64_t, uint64_t pv, uint32_t id) {
         ++count;
-        EXPECT_EQ(offset, 100u);
-        EXPECT_EQ(version, 1u);
+        EXPECT_EQ(pv, 100u);
+        EXPECT_EQ(id, 1u);
     });
     EXPECT_EQ(count, 1u);
 }
@@ -332,12 +337,14 @@ TEST(SegmentIndex, PutAndGetLatest) {
     index.put("key1", 200, 2);
     index.put("key1", 300, 3);
 
-    uint32_t off, ver;
+    uint32_t off;
+    uint64_t ver;
     EXPECT_TRUE(index.getLatest("key1", off, ver));
     EXPECT_EQ(off, 300u);
     EXPECT_EQ(ver, 3u);
 
-    std::vector<uint32_t> offsets, versions;
+    std::vector<uint32_t> offsets;
+    std::vector<uint64_t> versions;
     ASSERT_TRUE(index.get("key1", offsets, versions));
     ASSERT_EQ(offsets.size(), 3u);
     EXPECT_EQ(offsets[0], 300u);
@@ -353,7 +360,8 @@ TEST(SegmentIndex, GetLatest) {
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
 
-    uint32_t off, ver;
+    uint32_t off;
+    uint64_t ver;
     EXPECT_TRUE(index.getLatest("key1", off, ver));
     EXPECT_EQ(off, 200u);
     EXPECT_EQ(ver, 2u);
@@ -370,7 +378,8 @@ TEST(SegmentIndex, Contains) {
 
 TEST(SegmentIndex, GetNonExistent) {
     SegmentIndex index;
-    std::vector<uint32_t> offsets, versions;
+    std::vector<uint32_t> offsets;
+    std::vector<uint64_t> versions;
     EXPECT_FALSE(index.get("missing", offsets, versions));
 }
 
@@ -393,17 +402,18 @@ TEST(SegmentIndex, LargeScale) {
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
         index.put(key, static_cast<uint32_t>(i * 100),
-                  static_cast<uint32_t>(i + 1));
+                  static_cast<uint64_t>(i + 1));
     }
 
     EXPECT_EQ(index.keyCount(), static_cast<size_t>(N));
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        uint32_t off, ver;
+        uint32_t off;
+        uint64_t ver;
         ASSERT_TRUE(index.getLatest(key, off, ver));
         EXPECT_EQ(off, static_cast<uint32_t>(i * 100));
-        EXPECT_EQ(ver, static_cast<uint32_t>(i + 1));
+        EXPECT_EQ(ver, static_cast<uint64_t>(i + 1));
     }
 }
 
@@ -456,7 +466,8 @@ TEST_F(SegmentIndexSerializationTest, SingleEntryRoundTrip) {
     EXPECT_EQ(dst.entryCount(), 1u);
     EXPECT_EQ(dst.keyCount(), 1u);
 
-    uint32_t off, ver;
+    uint32_t off;
+    uint64_t ver;
     ASSERT_TRUE(dst.getLatest("hello", off, ver));
     EXPECT_EQ(off, 100u);
     EXPECT_EQ(ver, 1u);
@@ -486,7 +497,8 @@ TEST_F(SegmentIndexSerializationTest, MultiEntryRoundTrip) {
     EXPECT_EQ(dst.keyCount(), 3u);
 
     // Verify all entries preserved via getLatest.
-    uint32_t off, ver;
+    uint32_t off;
+    uint64_t ver;
     ASSERT_TRUE(dst.getLatest("a", off, ver));
     EXPECT_EQ(off, 200u);
     EXPECT_EQ(ver, 2u);
@@ -515,11 +527,9 @@ TEST_F(SegmentIndexSerializationTest, CorruptedChecksum) {
         ASSERT_TRUE(f.open(path_).ok());
         uint8_t byte = 0xFF;
         uint64_t dummy;
-        // Overwrite byte 4 (inside the header entry_count field).
-        f.append(&byte, 1, dummy);  // appends at end, won't help
+        f.append(&byte, 1, dummy);
         f.close();
 
-        // Directly corrupt via POSIX write.
         int fd = ::open(path_.c_str(), O_WRONLY);
         ASSERT_GE(fd, 0);
         ssize_t w = ::pwrite(fd, &byte, 1, 4);
@@ -533,12 +543,10 @@ TEST_F(SegmentIndexSerializationTest, CorruptedChecksum) {
     Status s = dst.readFrom(rf);
     rf.close();
 
-    // Could be checksum mismatch or a read error due to size change.
     EXPECT_FALSE(s.ok());
 }
 
 TEST_F(SegmentIndexSerializationTest, BadMagic) {
-    // Write a file with bad magic.
     {
         LogFile f;
         ASSERT_TRUE(f.create(path_).ok());
@@ -547,7 +555,6 @@ TEST_F(SegmentIndexSerializationTest, BadMagic) {
         uint64_t dummy;
         f.append(&bad_magic, sizeof(bad_magic), dummy);
         f.append(zeros, sizeof(zeros), dummy);
-        // Write a CRC (won't match, but magic check comes first).
         uint32_t crc = 0;
         f.append(&crc, sizeof(crc), dummy);
         f.close();
@@ -586,8 +593,6 @@ protected:
         }
     }
 
-    // Create a segment, write entries, seal it.
-    // Returns the segment index in segments_.
     size_t createSegment(
         uint32_t segment_id,
         const std::vector<std::tuple<std::string, uint64_t, std::string, bool>>& entries) {
@@ -623,7 +628,6 @@ protected:
     GC::Result last_result_;
 };
 
-// 1 segment, 3 keys, all visible → 1 output with all 3 entries.
 TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
     size_t idx = createSegment(1, {
         {"key1", 1, "val1", false},
@@ -655,7 +659,6 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
     EXPECT_EQ(last_result_.entries_written, 3u);
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
-    // Verify no eliminations and 3 relocations.
     EXPECT_TRUE(eliminations.empty());
     EXPECT_EQ(relocations.size(), 3u);
     for (const auto& r : relocations) {
@@ -663,7 +666,6 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
         EXPECT_EQ(r.new_segment_id, last_result_.outputs[0].getId());
     }
 
-    // Verify entries are readable from the output segment.
     auto& out = last_result_.outputs[0];
     ASSERT_EQ(out.state(), Segment::State::kReadable);
 
@@ -681,7 +683,6 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
     EXPECT_EQ(entry.version(), 3u);
 }
 
-// 2 segments, key has v1(seg1) + v2(seg2), only latest snapshot → output has only v2.
 TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
@@ -711,13 +712,11 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     EXPECT_EQ(last_result_.entries_written, 1u);
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
-    // Verify elimination of key1 v1 from seg1.
     ASSERT_EQ(eliminations.size(), 1u);
     EXPECT_EQ(eliminations[0].key, "key1");
     EXPECT_EQ(eliminations[0].version, 1u);
     EXPECT_EQ(eliminations[0].old_segment_id, 1u);
 
-    // Verify relocation of key1 v2.
     ASSERT_EQ(relocations.size(), 1u);
     EXPECT_EQ(relocations[0].key, "key1");
     EXPECT_EQ(relocations[0].version, 2u);
@@ -729,9 +728,7 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     EXPECT_EQ(entry.version(), 2u);
 }
 
-// 2 segments with interleaved keys → output entries in (hash asc, version asc).
 TEST_F(GCMergeTest, MergePreservesOrder) {
-    // Determine hash ordering of keys.
     std::string keyA = "alpha";
     std::string keyB = "beta";
     uint64_t hashA = dhtHashBytes(keyA.data(), keyA.size());
@@ -741,7 +738,6 @@ TEST_F(GCMergeTest, MergePreservesOrder) {
         std::swap(hashA, hashB);
     }
 
-    // seg1 has keyA v2, seg2 has keyB v1.
     size_t idx1 = createSegment(1, {{keyA, 2, "A_v2", false}});
     size_t idx2 = createSegment(2, {{keyB, 1, "B_v1", false}});
     auto& seg1 = segments_[idx1];
@@ -764,7 +760,6 @@ TEST_F(GCMergeTest, MergePreservesOrder) {
     EXPECT_EQ(last_result_.entries_written, 2u);
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
-    // Both keys should be present.
     auto& out = last_result_.outputs[0];
     LogEntry entry;
     ASSERT_TRUE(out.getLatest(keyA, entry).ok());
@@ -773,10 +768,8 @@ TEST_F(GCMergeTest, MergePreservesOrder) {
     EXPECT_EQ(entry.value, "B_v1");
 }
 
-// 1 segment with entries totaling > max_segment_size → 2+ output segments.
 TEST_F(GCMergeTest, MergeSplitsOnSize) {
-    // Create a segment with several entries. Use large values to control size.
-    std::string big_val(200, 'x');  // ~218 bytes per entry serialized
+    std::string big_val(200, 'x');
     size_t idx = createSegment(1, {
         {"k1", 1, big_val, false},
         {"k2", 2, big_val, false},
@@ -791,9 +784,6 @@ TEST_F(GCMergeTest, MergeSplitsOnSize) {
     auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
     auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
 
-    // Set max_segment_size small enough that we need multiple outputs.
-    // Each entry is ~220 bytes (14 header + 2 key + 200 value + 4 crc).
-    // Set limit to ~450 bytes so ~2 entries per output.
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/450,
         [this](uint32_t id) { return pathForOutput(id); },
@@ -805,7 +795,6 @@ TEST_F(GCMergeTest, MergeSplitsOnSize) {
     EXPECT_EQ(last_result_.entries_written, 4u);
     EXPECT_GE(last_result_.outputs.size(), 2u);
 
-    // Verify all entries are findable across outputs.
     size_t found = 0;
     for (auto& out : last_result_.outputs) {
         ASSERT_EQ(out.state(), Segment::State::kReadable);
@@ -818,7 +807,6 @@ TEST_F(GCMergeTest, MergeSplitsOnSize) {
     EXPECT_EQ(found, 4u);
 }
 
-// Empty input → 0 output segments, entries_written = 0.
 TEST_F(GCMergeTest, MergeEmpty) {
     std::vector<uint64_t> snapshots = {1};
     std::vector<const Segment*> inputs;
@@ -838,14 +826,12 @@ TEST_F(GCMergeTest, MergeEmpty) {
     EXPECT_EQ(last_result_.outputs.size(), 0u);
 }
 
-// Snapshot pins old version in seg1 while newer exists in seg2 → both versions in output.
 TEST_F(GCMergeTest, MergeSnapshotPins) {
     size_t idx1 = createSegment(1, {{"key1", 1, "v1", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "v2", false}});
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    // Snapshot at v1 pins v1 in seg1, current at v2 pins v2 in seg2.
     std::vector<uint64_t> snapshots = {1, 2};
     std::vector<const Segment*> inputs = {&seg1, &seg2};
 
@@ -863,12 +849,10 @@ TEST_F(GCMergeTest, MergeSnapshotPins) {
     EXPECT_EQ(last_result_.entries_written, 2u);
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
-    // The output should contain both versions.
     auto& out = last_result_.outputs[0];
     std::vector<LogEntry> entries;
     ASSERT_TRUE(out.get("key1", entries).ok());
     ASSERT_EQ(entries.size(), 2u);
-    // Verify both versions are present (order depends on SegmentIndex internals).
     std::set<uint64_t> versions;
     std::set<std::string> values;
     for (const auto& e : entries) {
@@ -881,9 +865,7 @@ TEST_F(GCMergeTest, MergeSnapshotPins) {
     EXPECT_EQ(values.count("v2"), 1u);
 }
 
-// GC drops versions below the oldest live snapshot while retaining versions at or above it.
 TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
-    // key1: v1(seg1), v2(seg2), v3(seg3)
     size_t idx1 = createSegment(1, {{"key1", 1, "v1", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "v2", false}});
     size_t idx3 = createSegment(3, {{"key1", 3, "v3", false}});
@@ -891,10 +873,6 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
     auto& seg2 = segments_[idx2];
     auto& seg3 = segments_[idx3];
 
-    // Snapshots at v2 and v3: oldest is v2.
-    // v1 < v2 (oldest snapshot) → dropped
-    // v2 = oldest snapshot → kept
-    // v3 = latest → kept
     std::vector<uint64_t> snapshots = {2, 3};
     std::vector<const Segment*> inputs = {&seg1, &seg2, &seg3};
 
@@ -918,16 +896,13 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
     EXPECT_EQ(last_result_.entries_written, 2u);
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
-    // Verify elimination of v1.
     ASSERT_EQ(eliminations.size(), 1u);
     EXPECT_EQ(eliminations[0].key, "key1");
     EXPECT_EQ(eliminations[0].version, 1u);
     EXPECT_EQ(eliminations[0].old_segment_id, 1u);
 
-    // Verify 2 relocations (v2 and v3).
     EXPECT_EQ(relocations.size(), 2u);
 
-    // Output should contain v2 and v3, but not v1.
     auto& out = last_result_.outputs[0];
     std::vector<LogEntry> entries;
     ASSERT_TRUE(out.get("key1", entries).ok());
@@ -937,20 +912,17 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
     for (const auto& e : entries) {
         versions.insert(e.version());
     }
-    EXPECT_EQ(versions.count(1u), 0u);  // v1 dropped
-    EXPECT_EQ(versions.count(2u), 1u);  // v2 kept (oldest snapshot)
-    EXPECT_EQ(versions.count(3u), 1u);  // v3 kept (latest)
+    EXPECT_EQ(versions.count(1u), 0u);
+    EXPECT_EQ(versions.count(2u), 1u);
+    EXPECT_EQ(versions.count(3u), 1u);
 }
 
-// Without active snapshots, only the latest version survives GC.
 TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
-    // key1: v1(seg1), v2(seg2)
     size_t idx1 = createSegment(1, {{"key1", 1, "v1", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "v2", false}});
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    // Only latest version (v2), no active snapshots pinning v1.
     std::vector<uint64_t> snapshots = {2};
     std::vector<const Segment*> inputs = {&seg1, &seg2};
 
@@ -968,14 +940,12 @@ TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
     EXPECT_EQ(last_result_.entries_written, 1u);
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
-    // Output should contain only v2.
     auto& out = last_result_.outputs[0];
     LogEntry entry;
     ASSERT_TRUE(out.getLatest("key1", entry).ok());
     EXPECT_EQ(entry.value, "v2");
     EXPECT_EQ(entry.version(), 2u);
 
-    // v1 should not be present.
     std::vector<LogEntry> entries;
     ASSERT_TRUE(out.get("key1", entries).ok());
     ASSERT_EQ(entries.size(), 1u);

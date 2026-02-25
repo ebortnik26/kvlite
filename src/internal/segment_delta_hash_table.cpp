@@ -15,6 +15,12 @@ SegmentDeltaHashTable::~SegmentDeltaHashTable() = default;
 SegmentDeltaHashTable::SegmentDeltaHashTable(SegmentDeltaHashTable&&) noexcept = default;
 SegmentDeltaHashTable& SegmentDeltaHashTable::operator=(SegmentDeltaHashTable&&) noexcept = default;
 
+// --- Seal ---
+
+void SegmentDeltaHashTable::seal() {
+    sealTable();
+}
+
 // --- Find ---
 
 bool SegmentDeltaHashTable::findAll(std::string_view key,
@@ -72,6 +78,8 @@ bool SegmentDeltaHashTable::contains(std::string_view key) const {
 
 void SegmentDeltaHashTable::addEntry(std::string_view key,
                                  uint32_t offset, uint32_t version) {
+    assertWritable();
+
     uint64_t h = hashKey(key);
     uint32_t bi = bucketIndex(h);
     uint32_t li = lslotIndex(h);
@@ -127,6 +135,8 @@ void SegmentDeltaHashTable::addEntry(std::string_view key,
 
 void SegmentDeltaHashTable::addEntryByHash(uint64_t hash,
                                        uint32_t offset, uint32_t version) {
+    assertWritable();
+
     uint32_t bi = bucketIndex(hash);
     uint32_t li = lslotIndex(hash);
     uint64_t fp = fingerprint(hash);
@@ -259,6 +269,7 @@ size_t SegmentDeltaHashTable::memoryUsage() const {
 void SegmentDeltaHashTable::clear() {
     clearBuckets();
     size_ = 0;
+    sealed_ = false;
 }
 
 }  // namespace internal

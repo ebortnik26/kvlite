@@ -7,23 +7,26 @@
 namespace kvlite {
 namespace internal {
 
-// LSlot codec: encodes and decodes logical slots within DHT buckets.
+// LSlot codec: encodes and decodes logical slots for delta hash tables.
 //
 // Format per lslot:
-//   unary(K)                       — K unique fingerprints
+//   unary(K)                              — K unique fingerprints
 //   for each fingerprint:
-//     [fingerprint_bits]           — fingerprint value
-//     unary(M)                     — M values for this fingerprint
-//     [32 bits]                    — first value (highest, stored raw)
-//     (M-1) x gamma(delta+1)      — deltas between consecutive desc values (zero-safe)
+//     [fingerprint_bits]                  — fingerprint value
+//     unary(M)                            — M entries
+//     [64 bits]                           — first packed_version (highest, raw)
+//     (M-1) x gamma(delta_pv+1)          — packed_version deltas (desc order, zero-safe)
+//     [32 bits]                           — first id (highest, raw)
+//     (M-1) x gamma(delta_id+1)          — id deltas (desc order, zero-safe)
 //
 // The codec operates on raw uint8_t* pointers and owns no memory.
 class LSlotCodec {
 public:
-    // A single fingerprint group: one fingerprint with its associated values.
+    // A single fingerprint group with parallel packed_version and id lists.
     struct TrieEntry {
         uint64_t fingerprint;
-        std::vector<uint32_t> values;  // sorted desc (highest/latest first)
+        std::vector<uint64_t> packed_versions;  // sorted desc, parallel with ids
+        std::vector<uint32_t> ids;              // sorted desc, parallel with packed_versions
     };
 
     // An lslot's decoded contents: list of fingerprint groups.
@@ -41,11 +44,12 @@ public:
 
     static size_t bitsNeeded(const LSlotContents& contents, uint8_t fp_bits);
 
-    // Navigate to the Nth lslot in a bucket's data region.
     size_t bitOffset(const uint8_t* data, uint32_t target_lslot) const;
 
-    // Total bits used by num_lslots consecutive lslots.
     size_t totalBits(const uint8_t* data, uint32_t num_lslots) const;
+
+    // Skip one lslot without allocating, returning the bit position after it.
+    size_t skipLSlot(const uint8_t* data, size_t bit_offset) const;
 
 private:
     uint8_t fingerprint_bits_;

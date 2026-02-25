@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "internal/delta_hash_table_base.h"
+#include "internal/delta_hash_table.h"
 #include "internal/entry_stream.h"
 #include "internal/gc_stream.h"
 #include "internal/global_index.h"

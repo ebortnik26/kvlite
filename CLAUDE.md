@@ -32,7 +32,7 @@ cd build && ctest
 | `kvlite_seg_test` | `test_segment.cpp` | Segment (LogFile + SegmentIndex pair) |
 | `kvlite_wb_test` | `test_write_buffer.cpp` | WriteBuffer + flush to Segment |
 | `kvlite_segment_index_test` | `test_segment_index.cpp` | SegmentIndex serialization/queries |
-| `kvlite_dht_test` | `test_delta_hash_table.cpp` | DeltaHashTable |
+| `kvlite_dht_test` | `test_delta_hash_table.cpp` | LSlotCodec, ReadOnlyDeltaHashTable, GlobalIndex |
 | `kvlite_vm_test` | `test_version_manager.cpp` | VersionManager persistence/snapshots |
 | `kvlite_lf_test` | `test_log_file.cpp` | LogFile POSIX I/O |
 | `kvlite_bitstream_test` | `test_bit_stream.cpp` | BitStream encoding |
@@ -45,10 +45,17 @@ kvlite is an **index-plus-log** key-value store inspired by the Pliops XDP paper
 
 ### Two-Level Indexing
 
-- **GlobalIndex** (`global_index.h`): Always in memory. Maps key → list of file_ids (latest first). Persisted via WAL + periodic snapshots. Managed by `GlobalIndexManager`.
-- **SegmentIndex** (`segment_index.h`): Per-file. Maps key → list of (offset, version) pairs. Stored inside each Segment file. Cached in `SegmentIndexCache` (LRU).
+- **GlobalIndex** (`global_index.h`): Always in memory. Maps key → list of (packed_version, segment_id) pairs (latest first). Persisted via WAL + periodic snapshots.
+- **SegmentIndex** (`segment_index.h`): Per-file. Maps key → list of (offset, packed_version) pairs. Stored inside each Segment file. Cached in `SegmentIndexCache` (LRU).
 
-Both indexes use `DeltaHashTable` — a compact hash table with per-bucket spinlocks, bit-packed slot encoding (`LSlotCodec`/`SegmentLSlotCodec`), and overflow chain buckets.
+Both indexes use the **DeltaHashTable** family — compact hash tables with bit-packed slot encoding and overflow chain buckets:
+
+```
+DeltaHashTable                      (non-template base, .h + .cpp)
+├── ReadOnlyDeltaHashTable          (write-once lifecycle, no locks)
+└── ReadWriteDeltaHashTable         (always-mutable, per-bucket spinlocks)
+LSlotCodec                          (.h + .cpp)
+```
 
 ### Storage Layer
 
@@ -66,12 +73,12 @@ Both indexes use `DeltaHashTable` — a compact hash table with per-bucket spinl
 
 ### Read Path
 
-`DB::get` → `GlobalIndexManager::getLatest` → file_id → `SegmentStorageManager::readValue` → `SegmentIndexCache` → SegmentIndex lookup → `DataCache` hit or LogFile read + CRC verify.
+`DB::get` → `GlobalIndexManager::getLatest` → file_id → `SegmentStorageManager::readValue` → `SegmentIndexCache` → SegmentIndex lookup → LogFile read + CRC verify.
 
 ### Concurrency Model
 
-- Per-bucket spinlocks in DeltaHashTable (no global lock on indexes)
-- `shared_mutex` on SegmentIndexCache and DataCache (reader-writer)
+- Per-bucket spinlocks in ReadWriteDeltaHashTable (GlobalIndex); no locks in ReadOnlyDeltaHashTable (SegmentIndex)
+- `shared_mutex` on SegmentIndexCache (reader-writer)
 - `LogFile::readAt` is thread-safe (pread); `append` is single-threaded (called only from flush)
 - Background GC thread with condition_variable signaling; respects oldest active snapshot version
 

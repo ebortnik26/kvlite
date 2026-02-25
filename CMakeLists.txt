@@ -31,9 +31,9 @@ set(KVLITE_SOURCES
     src/status.cpp
     src/internal/lslot_codec.cpp
     src/internal/delta_hash_table.cpp
+    src/internal/read_only_delta_hash_table.cpp
+    src/internal/read_write_delta_hash_table.cpp
     src/internal/global_index.cpp
-    src/internal/segment_lslot_codec.cpp
-    src/internal/segment_delta_hash_table.cpp
     src/internal/segment_index.cpp
     src/internal/version_manager.cpp
     src/internal/write_buffer.cpp

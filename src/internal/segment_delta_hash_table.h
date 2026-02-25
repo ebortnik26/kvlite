@@ -7,23 +7,20 @@
 #include <string_view>
 #include <vector>
 
-#include "internal/delta_hash_table_base.h"
+#include "internal/read_only_delta_hash_table.h"
 #include "internal/segment_lslot_codec.h"
 
 namespace kvlite {
 namespace internal {
 
-// Segment Delta Hash Table: compact hash table for paired indexes.
+// Segment Delta Hash Table: compact hash table for per-file segment indexes.
 //
 // Stores (offset, version) pairs per fingerprint.
-// No concurrency control — external synchronization required.
-//
-// Bucket format (managed by SegmentLSlotCodec header protocol):
-//   [32 bits: base_offset] [lslot 0] [lslot 1] ... [lslot N-1] [8 bytes: ext_ptr]
-//
-// All offsets within a bucket are encoded as gamma(offset - base_offset + 1).
-class SegmentDeltaHashTable : private DeltaHashTableBase<SegmentLSlotCodec> {
-    using Base = DeltaHashTableBase<SegmentLSlotCodec>;
+// Write-once lifecycle: entries are added during building (single-threaded),
+// then seal() transitions to immutable read-only state.
+// No concurrency control — external synchronization required during building.
+class SegmentDeltaHashTable : private ReadOnlyDeltaHashTable<SegmentLSlotCodec> {
+    using Base = ReadOnlyDeltaHashTable<SegmentLSlotCodec>;
 
 public:
     using Base::Config;
@@ -39,11 +36,18 @@ public:
     SegmentDeltaHashTable(SegmentDeltaHashTable&&) noexcept;
     SegmentDeltaHashTable& operator=(SegmentDeltaHashTable&&) noexcept;
 
+    // --- Building phase (single-threaded, before seal) ---
+
     // Add an (offset, version) pair for a key's fingerprint.
     void addEntry(std::string_view key, uint32_t offset, uint32_t version);
 
-    // Add by pre-computed hash (for snapshot loading).
+    // Add by pre-computed hash (for snapshot/index loading).
     void addEntryByHash(uint64_t hash, uint32_t offset, uint32_t version);
+
+    // Transition to read-only state. After this, writes are forbidden.
+    void seal();
+
+    // --- Read operations (work in both building and sealed states) ---
 
     // Find all (offset, version) pairs for a key. Returns true if key exists.
     // Pairs are ordered by offset desc (highest/latest first).
@@ -70,9 +74,6 @@ public:
     size_t size() const;
     size_t memoryUsage() const;
     void clear();
-
-private:
-    size_t size_ = 0;
 };
 
 }  // namespace internal

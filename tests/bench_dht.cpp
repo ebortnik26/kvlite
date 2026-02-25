@@ -4,7 +4,6 @@
 #include <vector>
 
 #include "internal/bit_stream.h"
-#include "internal/delta_hash_table.h"
 
 using namespace kvlite::internal;
 
@@ -50,63 +49,10 @@ static void bench_bitstream_write() {
     printf("BitStream write: %8.2f ms  (%d iters)\n", elapsed, N);
 }
 
-static DeltaHashTable::Config benchConfig() {
-    DeltaHashTable::Config cfg;
-    cfg.bucket_bits = 14;     // 16K buckets
-    cfg.lslot_bits = 4;       // 16 lslots
-    cfg.bucket_bytes = 512;
-    return cfg;
-}
-
-static void bench_dht_add(int N) {
-    DeltaHashTable dht(benchConfig());
-
-    std::vector<std::string> keys(N);
-    for (int i = 0; i < N; ++i) {
-        keys[i] = "key_" + std::to_string(i);
-    }
-
-    double start = now_ms();
-    for (int i = 0; i < N; ++i) {
-        dht.addEntry(keys[i], static_cast<uint32_t>(i * 10 + 1));
-    }
-    double elapsed = now_ms() - start;
-    printf("DHT add    %6dk: %8.2f ms  (%5.0f ns/op, mem=%zu KB)\n",
-           N/1000, elapsed, elapsed * 1e6 / N, dht.memoryUsage() / 1024);
-}
-
-static void bench_dht_find(int N) {
-    DeltaHashTable dht(benchConfig());
-
-    std::vector<std::string> keys(N);
-    for (int i = 0; i < N; ++i) {
-        keys[i] = "key_" + std::to_string(i);
-        dht.addEntry(keys[i], static_cast<uint32_t>(i + 1));
-    }
-
-    double start = now_ms();
-    int found = 0;
-    for (int iter = 0; iter < 3; ++iter) {
-        for (int i = 0; i < N; ++i) {
-            uint32_t val;
-            if (dht.findFirst(keys[i], val)) ++found;
-        }
-    }
-    double elapsed = now_ms() - start;
-    printf("DHT find   %6dk: %8.2f ms  (%5.0f ns/op, found=%d)\n",
-           N/1000, elapsed, elapsed * 1e6 / (3 * N), found);
-}
-
 int main() {
     printf("=== BitStream ===\n");
     bench_bitstream_read();
     bench_bitstream_write();
-
-    printf("\n=== DeltaHashTable ===\n");
-    bench_dht_add(10'000);
-    bench_dht_add(100'000);
-    bench_dht_find(10'000);
-    bench_dht_find(100'000);
 
     return 0;
 }

@@ -157,8 +157,7 @@ Status Segment::put(std::string_view key, uint64_t version,
 
     data_size_ = offset + entry_size;
     // Store packed version in index so tombstone info is preserved.
-    index_.put(key, static_cast<uint32_t>(offset),
-               static_cast<uint32_t>(packed_ver));
+    index_.put(key, static_cast<uint32_t>(offset), packed_ver);
     return Status::OK();
 }
 
@@ -210,7 +209,8 @@ Status Segment::getLatest(const std::string& key, LogEntry& entry) const {
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: getLatest requires Readable state");
     }
-    uint32_t offset, packed_version;
+    uint32_t offset;
+    uint64_t packed_version;
     if (!index_.getLatest(key, offset, packed_version)) {
         return Status::NotFound("key not found");
     }
@@ -222,7 +222,8 @@ Status Segment::get(const std::string& key,
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: get requires Readable state");
     }
-    std::vector<uint32_t> offsets, packed_versions;
+    std::vector<uint32_t> offsets;
+    std::vector<uint64_t> packed_versions;
     if (!index_.get(key, offsets, packed_versions)) {
         return Status::NotFound("key not found");
     }

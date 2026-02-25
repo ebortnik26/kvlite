@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "internal/crc32.h"
-#include "internal/delta_hash_table_base.h"
+#include "internal/delta_hash_table.h"
 #include "internal/global_index.h"
 #include "internal/segment.h"
 #include "internal/write_buffer.h"

@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "kvlite/status.h"
-#include "segment_delta_hash_table.h"
+#include "read_only_delta_hash_table.h"
 
 namespace kvlite {
 namespace internal {
@@ -18,7 +18,7 @@ class LogFile;
 // SegmentIndex: In-memory per-file index mapping keys to (offset, packed_version) lists.
 //
 // Structure: key → [(offset₁, packed_version₁), (offset₂, packed_version₂), ...]
-//            sorted by offset desc (latest/highest first)
+//            sorted by packed_version desc (latest/highest first)
 //
 // Packed versions encode (logical_version << 1) | tombstone_bit.
 //
@@ -36,13 +36,13 @@ public:
     SegmentIndex& operator=(SegmentIndex&&) noexcept;
 
     // Append (offset, packed_version) to key's list.
-    void put(std::string_view key, uint32_t offset, uint32_t packed_version);
+    void put(std::string_view key, uint32_t offset, uint64_t packed_version);
 
     // Get all (offset, packed_version) pairs for a key. Returns false if key doesn't exist.
-    // Pairs are ordered latest-first (highest offset first).
+    // Pairs are ordered latest-first (highest packed_version first).
     bool get(const std::string& key,
              std::vector<uint32_t>& offsets,
-             std::vector<uint32_t>& packed_versions) const;
+             std::vector<uint64_t>& packed_versions) const;
 
     // Get the latest entry for a key with packed_version <= upper_bound.
     // Returns false if no matching entry exists.
@@ -52,7 +52,7 @@ public:
     // Get the latest (highest packed_version) entry for a key.
     // Returns false if key doesn't exist.
     bool getLatest(const std::string& key,
-                   uint32_t& offset, uint32_t& packed_version) const;
+                   uint32_t& offset, uint64_t& packed_version) const;
 
     // Check if a key exists.
     bool contains(const std::string& key) const;
@@ -64,7 +64,7 @@ public:
     Status readFrom(const LogFile& file, uint64_t offset = 0);
 
     // Iterate over all entries, calling fn(offset, packed_version) for each.
-    void forEach(const std::function<void(uint32_t offset, uint32_t packed_version)>& fn) const;
+    void forEach(const std::function<void(uint32_t offset, uint64_t packed_version)>& fn) const;
 
     // Iterate over all groups (hash-sorted). Callback receives:
     //   hash: the FNV-1a hash
@@ -73,7 +73,7 @@ public:
     void forEachGroup(
         const std::function<void(uint64_t hash,
                                  const std::vector<uint32_t>& offsets,
-                                 const std::vector<uint32_t>& packed_versions)>& fn) const;
+                                 const std::vector<uint64_t>& packed_versions)>& fn) const;
 
     size_t keyCount() const;
     size_t entryCount() const;
@@ -81,7 +81,7 @@ public:
     void clear();
 
 private:
-    SegmentDeltaHashTable dht_;
+    ReadOnlyDeltaHashTable dht_;
     size_t key_count_ = 0;
 };
 

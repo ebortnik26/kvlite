@@ -117,11 +117,9 @@ bool GlobalIndex::isOpen() const {
 // --- Index Operations ---
 
 Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_t segment_id) {
-    if (!dht_.contains(key)) {
+    if (dht_.addEntryIsNew(key, packed_version, segment_id)) {
         ++key_count_;
     }
-    // DHT "offsets" field = packed_version, "versions" field = segment_id
-    dht_.addEntry(key, static_cast<uint32_t>(packed_version), segment_id);
     updates_since_snapshot_++;
     return Status::OK();
 }
@@ -129,30 +127,24 @@ Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_
 bool GlobalIndex::get(const std::string& key,
                   std::vector<uint32_t>& segment_ids,
                   std::vector<uint64_t>& packed_versions) const {
-    std::vector<uint32_t> raw_vers;   // DHT "offsets" = packed_versions
-    std::vector<uint32_t> raw_segs;   // DHT "versions" = segment_ids
-    if (!dht_.findAll(key, raw_vers, raw_segs)) return false;
-    segment_ids.clear();
-    packed_versions.clear();
-    segment_ids.reserve(raw_segs.size());
-    packed_versions.reserve(raw_vers.size());
-    for (size_t i = 0; i < raw_vers.size(); ++i) {
-        packed_versions.push_back(static_cast<uint64_t>(raw_vers[i]));
-        segment_ids.push_back(raw_segs[i]);
-    }
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    if (!dht_.findAll(key, pvs, ids)) return false;
+    packed_versions = std::move(pvs);
+    segment_ids = std::move(ids);
     return true;
 }
 
 bool GlobalIndex::get(const std::string& key, uint64_t upper_bound,
                   uint64_t& packed_version, uint32_t& segment_id) const {
-    std::vector<uint32_t> raw_vers;
-    std::vector<uint32_t> raw_segs;
-    if (!dht_.findAll(key, raw_vers, raw_segs)) return false;
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    if (!dht_.findAll(key, pvs, ids)) return false;
     // Entries are sorted by packed_version descending; find the first <= upper_bound.
-    for (size_t i = 0; i < raw_vers.size(); ++i) {
-        if (static_cast<uint64_t>(raw_vers[i]) <= upper_bound) {
-            packed_version = static_cast<uint64_t>(raw_vers[i]);
-            segment_id = raw_segs[i];
+    for (size_t i = 0; i < pvs.size(); ++i) {
+        if (pvs[i] <= upper_bound) {
+            packed_version = pvs[i];
+            segment_id = ids[i];
             return true;
         }
     }
@@ -161,12 +153,13 @@ bool GlobalIndex::get(const std::string& key, uint64_t upper_bound,
 
 Status GlobalIndex::getLatest(const std::string& key,
                         uint64_t& packed_version, uint32_t& segment_id) const {
-    uint32_t raw_ver, raw_seg;
-    if (!dht_.findFirst(key, raw_ver, raw_seg)) {
+    uint64_t pv;
+    uint32_t id;
+    if (!dht_.findFirst(key, pv, id)) {
         return Status::NotFound(key);
     }
-    packed_version = static_cast<uint64_t>(raw_ver);
-    segment_id = raw_seg;
+    packed_version = pv;
+    segment_id = id;
     return Status::OK();
 }
 
@@ -178,13 +171,13 @@ bool GlobalIndex::contains(const std::string& key) const {
 
 void GlobalIndex::forEachGroup(
     const std::function<void(uint64_t hash,
-                             const std::vector<uint32_t>& versions,
+                             const std::vector<uint64_t>& packed_versions,
                              const std::vector<uint32_t>& segment_ids)>& fn) const {
-    // DHT "offsets" = packed_versions, DHT "versions" = segment_ids
+    // DHT stores (packed_versions, ids=segment_ids) — matches caller's signature
     dht_.forEachGroup([&fn](uint64_t hash,
-                            const std::vector<uint32_t>& offsets,
-                            const std::vector<uint32_t>& versions) {
-        fn(hash, offsets, versions);  // offsets=packed_versions, versions=segment_ids
+                            const std::vector<uint64_t>& pvs,
+                            const std::vector<uint32_t>& ids) {
+        fn(hash, pvs, ids);
     });
 }
 
@@ -227,7 +220,7 @@ uint64_t GlobalIndex::updatesSinceSnapshot() const {
 // --- Persistence ---
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
-static constexpr uint32_t kVersion = 6;
+static constexpr uint32_t kVersion = 7;
 
 Status GlobalIndex::saveSnapshot(const std::string& path) const {
     std::ofstream file(path, std::ios::binary);
@@ -247,11 +240,11 @@ Status GlobalIndex::saveSnapshot(const std::string& path) const {
     uint64_t key_count = key_count_;
     writer.writeVal(key_count);
 
-    // Per entry: [hash:8][packed_version:4][segment_id:4]
-    dht_.forEach([&writer](uint64_t hash, uint32_t packed_version, uint32_t segment_id) {
+    // Per entry: [hash:8][packed_version:8][segment_id:4]
+    dht_.forEach([&writer](uint64_t hash, uint64_t packed_version, uint32_t id) {
         writer.writeVal(hash);
         writer.writeVal(packed_version);
-        writer.writeVal(segment_id);
+        writer.writeVal(id);
     });
 
     // Checksum
@@ -302,7 +295,8 @@ Status GlobalIndex::loadSnapshot(const std::string& path) {
 
     for (uint64_t i = 0; i < num_entries; ++i) {
         uint64_t hash;
-        uint32_t packed_ver, seg;
+        uint64_t packed_ver;
+        uint32_t seg;
         if (!reader.readVal(hash) || !reader.readVal(packed_ver) || !reader.readVal(seg)) {
             return Status::Corruption("Failed to read entry");
         }

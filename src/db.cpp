@@ -118,7 +118,7 @@ Status DB::open(const std::string& path, const Options& options) {
         for (uint32_t id : segment_ids) {
             auto* seg = storage_->getSegment(id);
             if (!seg) continue;
-            seg->index().forEach([&](uint32_t offset, uint32_t packed_ver) {
+            seg->index().forEach([&](uint32_t offset, uint64_t packed_ver) {
                 internal::LogEntry entry;
                 Status rs = seg->readEntry(offset, entry);
                 if (rs.ok()) {

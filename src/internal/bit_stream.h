@@ -124,11 +124,18 @@ public:
         }
     }
 
-    // Read an Elias-gamma-coded value (result ≥ 1).
+    // Read an Elias-gamma-coded value (result ≥ 1, 32-bit).
     uint32_t readEliasGamma() {
         uint8_t k = static_cast<uint8_t>(readUnary());
         if (k == 0) return 1;
         return (1u << k) | static_cast<uint32_t>(read(k));
+    }
+
+    // Read an Elias-gamma-coded value (result ≥ 1, 64-bit).
+    uint64_t readEliasGamma64() {
+        uint8_t k = static_cast<uint8_t>(readUnary());
+        if (k == 0) return 1;
+        return (1ULL << k) | read(k);
     }
 
     size_t position() const { return pos_; }
@@ -207,13 +214,23 @@ public:
         }
     }
 
-    // Write an Elias-gamma-coded value (n ≥ 1).
+    // Write an Elias-gamma-coded value (n ≥ 1, 32-bit).
     void writeEliasGamma(uint32_t n) {
         assert(n >= 1);
         uint8_t k = static_cast<uint8_t>(31 - __builtin_clz(n));
         writeUnary(k);
         if (k > 0) {
             write(n & ((1u << k) - 1), k);
+        }
+    }
+
+    // Write an Elias-gamma-coded value (n ≥ 1, 64-bit).
+    void writeEliasGamma64(uint64_t n) {
+        assert(n >= 1);
+        uint8_t k = static_cast<uint8_t>(63 - __builtin_clzll(n));
+        writeUnary(k);
+        if (k > 0) {
+            write(n & ((1ULL << k) - 1), k);
         }
     }
 

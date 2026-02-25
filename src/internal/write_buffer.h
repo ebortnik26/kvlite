@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "internal/delta_hash_table_base.h"
+#include "internal/delta_hash_table.h"
 #include "internal/entry_stream.h"
 #include "log_entry.h"
 #include "kvlite/status.h"

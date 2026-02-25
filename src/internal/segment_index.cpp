@@ -21,11 +21,11 @@ struct SegmentIndexHeader {
 struct SegmentIndexEntry {
     uint64_t hash;
     uint32_t offset;
-    uint32_t packed_version;
+    uint64_t packed_version;
 };
 
-static SegmentDeltaHashTable::Config defaultDHTConfig() {
-    SegmentDeltaHashTable::Config config;
+static ReadOnlyDeltaHashTable::Config defaultDHTConfig() {
+    ReadOnlyDeltaHashTable::Config config;
     config.bucket_bits = 16;
     config.lslot_bits = 4;
     config.bucket_bytes = 256;
@@ -38,26 +38,31 @@ SegmentIndex::~SegmentIndex() = default;
 SegmentIndex::SegmentIndex(SegmentIndex&&) noexcept = default;
 SegmentIndex& SegmentIndex::operator=(SegmentIndex&&) noexcept = default;
 
-void SegmentIndex::put(std::string_view key, uint32_t offset, uint32_t packed_version) {
-    bool is_new = !dht_.contains(key);
-    dht_.addEntry(key, offset, packed_version);
-    if (is_new) {
+void SegmentIndex::put(std::string_view key, uint32_t offset, uint64_t packed_version) {
+    if (dht_.addEntryIsNew(key, packed_version, offset)) {
         ++key_count_;
     }
 }
 
 bool SegmentIndex::get(const std::string& key,
                   std::vector<uint32_t>& offsets,
-                  std::vector<uint32_t>& packed_versions) const {
-    return dht_.findAll(key, offsets, packed_versions);
+                  std::vector<uint64_t>& packed_versions) const {
+    // DHT stores (packed_version, id=offset)
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    if (!dht_.findAll(key, pvs, ids)) return false;
+    packed_versions = std::move(pvs);
+    offsets = std::move(ids);
+    return true;
 }
 
 bool SegmentIndex::get(const std::string& key, uint64_t upper_bound,
                   uint64_t& offset, uint64_t& packed_version) const {
-    std::vector<uint32_t> offsets, packed_versions;
-    if (!dht_.findAll(key, offsets, packed_versions)) return false;
+    std::vector<uint32_t> offsets;
+    std::vector<uint64_t> packed_versions;
+    if (!get(key, offsets, packed_versions)) return false;
 
-    // Pairs are sorted desc by offset. Find first with packed_version <= upper_bound.
+    // Pairs are sorted desc by packed_version. Find first with packed_version <= upper_bound.
     for (size_t i = 0; i < packed_versions.size(); ++i) {
         if (packed_versions[i] <= upper_bound) {
             offset = offsets[i];
@@ -69,8 +74,14 @@ bool SegmentIndex::get(const std::string& key, uint64_t upper_bound,
 }
 
 bool SegmentIndex::getLatest(const std::string& key,
-                        uint32_t& offset, uint32_t& packed_version) const {
-    return dht_.findFirst(key, offset, packed_version);
+                        uint32_t& offset, uint64_t& packed_version) const {
+    // DHT stores (packed_version, id=offset)
+    uint64_t pv;
+    uint32_t id;
+    if (!dht_.findFirst(key, pv, id)) return false;
+    packed_version = pv;
+    offset = id;
+    return true;
 }
 
 bool SegmentIndex::contains(const std::string& key) const {
@@ -78,10 +89,13 @@ bool SegmentIndex::contains(const std::string& key) const {
 }
 
 Status SegmentIndex::writeTo(LogFile& file) {
+    // Seal the DHT — no more writes after serialization.
+    dht_.seal();
+
     // Collect all entries via DHT-level forEach (has hash).
     std::vector<SegmentIndexEntry> entries;
-    dht_.forEach([&entries](uint64_t hash, uint32_t offset, uint32_t packed_version) {
-        entries.push_back({hash, offset, packed_version});
+    dht_.forEach([&entries](uint64_t hash, uint64_t packed_version, uint32_t id) {
+        entries.push_back({hash, id, packed_version});
     });
 
     // Build the serialized buffer: header + entries + crc32.
@@ -145,24 +159,33 @@ Status SegmentIndex::readFrom(const LogFile& file, uint64_t offset) {
     const SegmentIndexEntry* entries = reinterpret_cast<const SegmentIndexEntry*>(
         buf.data() + sizeof(SegmentIndexHeader));
     for (uint32_t i = 0; i < header.entry_count; ++i) {
-        dht_.addEntryByHash(entries[i].hash, entries[i].offset, entries[i].packed_version);
+        // DHT stores (packed_version, id=offset)
+        dht_.addEntryByHash(entries[i].hash, entries[i].packed_version, entries[i].offset);
     }
     key_count_ = header.key_count;
+
+    // Seal the DHT — deserialized indexes are immutable.
+    dht_.seal();
 
     return Status::OK();
 }
 
-void SegmentIndex::forEach(const std::function<void(uint32_t offset, uint32_t packed_version)>& fn) const {
-    dht_.forEach([&fn](uint64_t /*hash*/, uint32_t offset, uint32_t packed_version) {
-        fn(offset, packed_version);
+void SegmentIndex::forEach(const std::function<void(uint32_t offset, uint64_t packed_version)>& fn) const {
+    dht_.forEach([&fn](uint64_t /*hash*/, uint64_t packed_version, uint32_t id) {
+        fn(id, packed_version);
     });
 }
 
 void SegmentIndex::forEachGroup(
     const std::function<void(uint64_t hash,
                              const std::vector<uint32_t>& offsets,
-                             const std::vector<uint32_t>& versions)>& fn) const {
-    dht_.forEachGroup(fn);
+                             const std::vector<uint64_t>& packed_versions)>& fn) const {
+    // DHT stores (packed_versions, ids=offsets) — swap for caller
+    dht_.forEachGroup([&fn](uint64_t hash,
+                            const std::vector<uint64_t>& pvs,
+                            const std::vector<uint32_t>& ids) {
+        fn(hash, ids, pvs);
+    });
 }
 
 size_t SegmentIndex::keyCount() const {

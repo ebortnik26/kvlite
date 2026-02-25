@@ -18,15 +18,23 @@ LSlotCodec::LSlotContents LSlotCodec::decode(
     contents.entries.resize(num_fps);
 
     for (uint64_t i = 0; i < num_fps; ++i) {
-        contents.entries[i].fingerprint = reader.read(fingerprint_bits_);
-        uint64_t num_values = reader.readUnary();
-        contents.entries[i].values.resize(num_values);
-        if (num_values > 0) {
-            contents.entries[i].values[0] = static_cast<uint32_t>(reader.read(32));
-            for (uint64_t v = 1; v < num_values; ++v) {
+        auto& entry = contents.entries[i];
+        entry.fingerprint = reader.read(fingerprint_bits_);
+        uint64_t num_entries = reader.readUnary();
+        entry.packed_versions.resize(num_entries);
+        entry.ids.resize(num_entries);
+        if (num_entries > 0) {
+            // Packed versions: 64-bit raw first, gamma(delta+1) for rest (desc, zero-delta safe)
+            entry.packed_versions[0] = reader.read(64);
+            for (uint64_t v = 1; v < num_entries; ++v) {
+                uint64_t delta = reader.readEliasGamma64() - 1;
+                entry.packed_versions[v] = entry.packed_versions[v - 1] - delta;
+            }
+            // IDs: 32-bit raw first, gamma(delta+1) for rest (desc, zero-delta safe)
+            entry.ids[0] = static_cast<uint32_t>(reader.read(32));
+            for (uint64_t v = 1; v < num_entries; ++v) {
                 uint32_t delta = reader.readEliasGamma() - 1;
-                contents.entries[i].values[v] =
-                    contents.entries[i].values[v - 1] - delta;
+                entry.ids[v] = entry.ids[v - 1] - delta;
             }
         }
     }
@@ -47,14 +55,21 @@ size_t LSlotCodec::encode(
     writer.writeUnary(num_fps);
 
     for (uint64_t i = 0; i < num_fps; ++i) {
-        writer.write(contents.entries[i].fingerprint, fingerprint_bits_);
-        uint64_t num_values = contents.entries[i].values.size();
-        writer.writeUnary(num_values);
-        if (num_values > 0) {
-            writer.write(contents.entries[i].values[0], 32);
-            for (uint64_t v = 1; v < num_values; ++v) {
-                uint32_t delta =
-                    contents.entries[i].values[v - 1] - contents.entries[i].values[v];
+        const auto& entry = contents.entries[i];
+        writer.write(entry.fingerprint, fingerprint_bits_);
+        uint64_t num_entries = entry.packed_versions.size();
+        writer.writeUnary(num_entries);
+        if (num_entries > 0) {
+            // Packed versions: 64-bit raw first, gamma(delta+1) for rest (desc, zero-delta safe)
+            writer.write(entry.packed_versions[0], 64);
+            for (uint64_t v = 1; v < num_entries; ++v) {
+                uint64_t delta = entry.packed_versions[v - 1] - entry.packed_versions[v];
+                writer.writeEliasGamma64(delta + 1);
+            }
+            // IDs: 32-bit raw first, gamma(delta+1) for rest (desc, zero-delta safe)
+            writer.write(entry.ids[0], 32);
+            for (uint64_t v = 1; v < num_entries; ++v) {
+                uint32_t delta = entry.ids[v - 1] - entry.ids[v];
                 writer.writeEliasGamma(delta + 1);
             }
         }
@@ -69,16 +84,29 @@ static uint8_t eliasGammaBits(uint32_t n) {
     return 2 * k + 1;
 }
 
+// Bits needed to Elias-gamma-encode a 64-bit n (n >= 1).
+static uint8_t eliasGammaBits64(uint64_t n) {
+    uint8_t k = 63 - __builtin_clzll(n);  // floor(log2(n))
+    return 2 * k + 1;
+}
+
 size_t LSlotCodec::bitsNeeded(const LSlotContents& contents,
-                               uint8_t fp_bits) {
+                                 uint8_t fp_bits) {
     size_t bits = contents.entries.size() + 1;  // unary(K)
     for (const auto& entry : contents.entries) {
-        bits += fp_bits;                         // fingerprint
-        bits += entry.values.size() + 1;         // unary(M)
-        if (!entry.values.empty()) {
-            bits += 32;                          // first value raw
-            for (size_t v = 1; v < entry.values.size(); ++v) {
-                uint32_t delta = entry.values[v - 1] - entry.values[v];
+        bits += fp_bits;                               // fingerprint
+        bits += entry.packed_versions.size() + 1;      // unary(M)
+        if (!entry.packed_versions.empty()) {
+            // Packed versions: 64-bit raw first + gamma(delta+1) deltas
+            bits += 64;
+            for (size_t v = 1; v < entry.packed_versions.size(); ++v) {
+                uint64_t delta = entry.packed_versions[v - 1] - entry.packed_versions[v];
+                bits += eliasGammaBits64(delta + 1);
+            }
+            // IDs: 32-bit raw first + gamma(delta+1) deltas
+            bits += 32;
+            for (size_t v = 1; v < entry.ids.size(); ++v) {
+                uint32_t delta = entry.ids[v - 1] - entry.ids[v];
                 bits += eliasGammaBits(delta + 1);
             }
         }
@@ -86,15 +114,33 @@ size_t LSlotCodec::bitsNeeded(const LSlotContents& contents,
     return bits;
 }
 
-size_t LSlotCodec::bitOffset(const uint8_t* data, uint32_t target_lslot) const {
+size_t LSlotCodec::skipLSlot(const uint8_t* data, size_t bit_offset) const {
+    BitReader reader(data, bit_offset);
+    uint64_t num_fps = reader.readUnary();
+    for (uint64_t i = 0; i < num_fps; ++i) {
+        reader.read(fingerprint_bits_);
+        uint64_t M = reader.readUnary();
+        if (M > 0) {
+            reader.read(64);                                // first packed_version
+            for (uint64_t v = 1; v < M; ++v) reader.readEliasGamma64(); // pv deltas
+            reader.read(32);                                // first id
+            for (uint64_t v = 1; v < M; ++v) reader.readEliasGamma();   // id deltas
+        }
+    }
+    return reader.position();
+}
+
+size_t LSlotCodec::bitOffset(const uint8_t* data,
+                                uint32_t target_lslot) const {
     size_t offset = 0;
     for (uint32_t s = 0; s < target_lslot; ++s) {
-        decode(data, offset, &offset);
+        offset = skipLSlot(data, offset);
     }
     return offset;
 }
 
-size_t LSlotCodec::totalBits(const uint8_t* data, uint32_t num_lslots) const {
+size_t LSlotCodec::totalBits(const uint8_t* data,
+                                uint32_t num_lslots) const {
     return bitOffset(data, num_lslots);
 }
 

@@ -10,7 +10,7 @@ namespace kvlite {
 namespace internal {
 
 static constexpr char kNextSegmentIdKey[] = "next_segment_id";
-static constexpr char kSegmentPrefix[] = "segment.";
+static const std::string kSegmentPrefix = "segment.";
 
 SegmentStorageManager::SegmentStorageManager(Manifest& manifest) : manifest_(manifest) {}
 SegmentStorageManager::~SegmentStorageManager() = default;
@@ -46,7 +46,7 @@ Status SegmentStorageManager::recover() {
     auto keys = manifest_.getKeysWithPrefix(kSegmentPrefix);
     for (const auto& key : keys) {
         // Parse segment ID from "segment.<id>".
-        std::string id_str = key.substr(std::strlen(kSegmentPrefix));
+        std::string id_str = key.substr(kSegmentPrefix.size());
         uint32_t id = static_cast<uint32_t>(std::stoul(id_str));
 
         std::string path = segmentPath(id);

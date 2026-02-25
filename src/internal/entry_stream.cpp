@@ -5,7 +5,7 @@
 #include <string>
 
 #include "internal/crc32.h"
-#include "internal/delta_hash_table_base.h"
+#include "internal/delta_hash_table.h"
 #include "internal/log_entry.h"
 #include "internal/log_file.h"
 #include "internal/write_buffer.h"

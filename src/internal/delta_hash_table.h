@@ -1,120 +1,153 @@
 #ifndef KVLITE_INTERNAL_DELTA_HASH_TABLE_H
 #define KVLITE_INTERNAL_DELTA_HASH_TABLE_H
 
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include "internal/delta_hash_table_base.h"
 #include "internal/lslot_codec.h"
 
 namespace kvlite {
 namespace internal {
 
-// Delta Hash Table: a compact hash table inspired by the Pliops XDP paper.
-//
-// Hash key decomposition:
-//   [bucket_bits | lslot_bits | fingerprint_bits]
-//   bucket_bits  → selects bucket
-//   lslot_bits   → selects logical slot within bucket
-//   fingerprint  → stored in delta trie for identity
-//
-// Each bucket is a fixed-size byte array containing up to 2^lslot_bits
-// logical slots (lslots). Lslot encoding format is defined in LSlotCodec.
-//
-// When a bucket overflows, an extension bucket is chained.
-// Thread-safe: per-bucket spinlocks protect concurrent access.
-class DeltaHashTable : private DeltaHashTableBase<LSlotCodec> {
-    using Base = DeltaHashTableBase<LSlotCodec>;
+// 64-bit FNV-1a with avalanche mixing.
+inline uint64_t dhtHashBytes(const void* data, size_t len) {
+    uint64_t hash = 14695981039346656037ULL;
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    hash ^= hash >> 33;
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= hash >> 33;
+    hash *= 0xc4ceb9fe1a85ec53ULL;
+    hash ^= hash >> 33;
+    return hash;
+}
 
+// Base class for Delta Hash Tables.
+//
+// Provides all bucket management, hash decomposition, extension chain
+// handling, and generic chain-traversal helpers. Derived classes add
+// lifecycle-specific public APIs and optional locking.
+//
+// Payload per fingerprint group: parallel arrays of
+//   packed_version (uint64_t) — opaque 64-bit value
+//   id            (uint32_t) — opaque 32-bit value (file-offset or segment-id)
+class DeltaHashTable {
 public:
-    using Base::Config;
     using TrieEntry = LSlotCodec::TrieEntry;
     using LSlotContents = LSlotCodec::LSlotContents;
 
-    DeltaHashTable();
+    struct Config {
+        uint8_t bucket_bits = 20;
+        uint8_t lslot_bits = 5;
+        uint32_t bucket_bytes = 512;
+    };
+
+    // --- Public read API (no locking) ---
+
+    bool findAll(std::string_view key,
+                 std::vector<uint64_t>& packed_versions,
+                 std::vector<uint32_t>& ids) const;
+
+    bool findFirst(std::string_view key,
+                   uint64_t& packed_version, uint32_t& id) const;
+
+    bool contains(std::string_view key) const;
+
+    void forEach(const std::function<void(uint64_t hash,
+                                          uint64_t packed_version,
+                                          uint32_t id)>& fn) const;
+
+    void forEachGroup(const std::function<void(uint64_t hash,
+                                               const std::vector<uint64_t>& packed_versions,
+                                               const std::vector<uint32_t>& ids)>& fn) const;
+
+    size_t memoryUsage() const;
+
+protected:
+    static constexpr uint32_t kBucketPadding = 8;
+
+    struct Bucket {
+        uint8_t* data = nullptr;
+    };
+
     explicit DeltaHashTable(const Config& config);
     ~DeltaHashTable();
 
-    // Non-copyable, non-movable (contains mutex and atomics)
     DeltaHashTable(const DeltaHashTable&) = delete;
     DeltaHashTable& operator=(const DeltaHashTable&) = delete;
-    DeltaHashTable(DeltaHashTable&&) = delete;
-    DeltaHashTable& operator=(DeltaHashTable&&) = delete;
+    DeltaHashTable(DeltaHashTable&&) noexcept;
+    DeltaHashTable& operator=(DeltaHashTable&&) noexcept;
 
-    // Add a value for a key's fingerprint. Duplicate values are not added.
-    void addEntry(const std::string& key, uint32_t value);
+    // --- Hash decomposition ---
 
-    // Add a value by pre-computed hash (for snapshot loading).
-    void addEntryByHash(uint64_t hash, uint32_t value);
+    uint64_t hashKey(std::string_view key) const;
+    uint32_t bucketIndex(uint64_t hash) const;
+    uint32_t lslotIndex(uint64_t hash) const;
+    uint64_t fingerprint(uint64_t hash) const;
 
-    // Find all values for a key. Returns true if key exists.
-    // Values are ordered highest-first (latest id first).
-    bool findAll(const std::string& key, std::vector<uint32_t>& out) const;
+    // --- Bucket data ---
 
-    // Find the first (highest/latest) value for a key. Returns true if found.
-    bool findFirst(const std::string& key, uint32_t& value) const;
+    uint32_t bucketStride() const;
+    uint64_t getExtensionPtr(const Bucket& bucket) const;
+    void setExtensionPtr(Bucket& bucket, uint64_t ptr) const;
+    size_t bucketDataBits() const;
+    uint32_t numLSlots() const;
 
-    // Check if a key exists.
-    bool contains(const std::string& key) const;
+    // --- Decode / Encode ---
 
-    // Remove a specific value from a key. Returns true if found and removed.
-    bool removeEntry(const std::string& key, uint32_t value);
+    LSlotContents decodeLSlot(const Bucket& bucket, uint32_t lslot_idx) const;
+    std::vector<LSlotContents> decodeAllLSlots(const Bucket& bucket) const;
+    void reencodeAllLSlots(Bucket& bucket,
+                           const std::vector<LSlotContents>& all_slots);
+    size_t totalBitsNeeded(const std::vector<LSlotContents>& all_slots) const;
 
-    // Remove all values for a key. Returns number of values removed.
-    size_t removeAll(const std::string& key);
+    // --- Extension chain ---
 
-    // Iterate over all entries, providing the reconstructed hash and each value.
-    void forEach(const std::function<void(uint64_t hash, uint32_t value)>& fn) const;
+    const Bucket* nextBucket(const Bucket& bucket) const;
+    Bucket* nextBucketMut(Bucket& bucket);
+    Bucket* createExtension(Bucket& bucket);
 
-    // Iterate over all groups, providing the reconstructed hash and all values.
-    void forEachGroup(const std::function<void(uint64_t hash,
-                                               const std::vector<uint32_t>&)>& fn) const;
+    // --- Protected read helpers (pre-hashed) ---
 
-    // Total number of id entries across all fingerprints.
-    size_t size() const;
-    size_t memoryUsage() const;
-    void clear();
+    bool findAllByHash(uint32_t bi, uint32_t li, uint64_t fp,
+                       std::vector<uint64_t>& packed_versions,
+                       std::vector<uint32_t>& ids) const;
+
+    bool findFirstByHash(uint32_t bi, uint32_t li, uint64_t fp,
+                         uint64_t& packed_version, uint32_t& id) const;
+
+    // --- Protected write helper ---
+    // Adds an entry to the chain at (bi, li) for fingerprint fp.
+    // createExtFn is called (with bucket lock held by caller if needed)
+    // when the current bucket overflows.
+    // Returns true if the fingerprint group was newly created (key is new).
+    bool addToChain(uint32_t bi, uint32_t li, uint64_t fp,
+                    uint64_t packed_version, uint32_t id,
+                    const std::function<Bucket*(Bucket&)>& createExtFn);
+
+    // --- Bulk helpers ---
+
+    void clearBuckets();
+
+    // --- Members ---
+
+    Config config_;
+    uint8_t fingerprint_bits_;
+    LSlotCodec lslot_codec_;
+    std::unique_ptr<uint8_t[]> arena_;
+    std::vector<Bucket> buckets_;
+    std::vector<std::unique_ptr<Bucket>> extensions_;
+    std::vector<std::unique_ptr<uint8_t[]>> ext_storage_;
 
 private:
-    struct BucketLock {
-        std::atomic<uint8_t> locked{0};
-
-        void lock() {
-            while (locked.exchange(1, std::memory_order_acquire)) {
-                while (locked.load(std::memory_order_relaxed)) {
-#if defined(__x86_64__) || defined(_M_X64)
-                    __builtin_ia32_pause();
-#endif
-                }
-            }
-        }
-
-        void unlock() {
-            locked.store(0, std::memory_order_release);
-        }
-    };
-
-    struct BucketLockGuard {
-        BucketLock& lock_;
-        explicit BucketLockGuard(BucketLock& l) : lock_(l) { lock_.lock(); }
-        ~BucketLockGuard() { lock_.unlock(); }
-        BucketLockGuard(const BucketLockGuard&) = delete;
-        BucketLockGuard& operator=(const BucketLockGuard&) = delete;
-    };
-
-    void addImpl(uint32_t bi, uint32_t li, uint64_t fp, uint32_t value);
-
-    size_t removeAllFromChain(uint32_t bucket_idx, uint32_t lslot_idx,
-                              uint64_t fp);
-
-    std::unique_ptr<BucketLock[]> bucket_locks_;
-    std::mutex ext_mutex_;
-    std::atomic<size_t> size_{0};
+    void initBucket(Bucket& bucket);
 };
 
 }  // namespace internal

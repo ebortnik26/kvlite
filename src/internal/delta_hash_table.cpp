@@ -1,230 +1,334 @@
 #include "internal/delta_hash_table.h"
 
 #include <algorithm>
-#include <functional>
+#include <cstring>
+#include <unordered_map>
+
+#include "internal/bit_stream.h"
 
 namespace kvlite {
 namespace internal {
 
-DeltaHashTable::DeltaHashTable() : DeltaHashTable(Config{}) {}
+// --- Construction / Move ---
 
 DeltaHashTable::DeltaHashTable(const Config& config)
-    : Base(config) {
-    bucket_locks_ = std::make_unique<BucketLock[]>(1u << config.bucket_bits);
+    : config_(config),
+      fingerprint_bits_(64 - config.bucket_bits - config.lslot_bits),
+      lslot_codec_(fingerprint_bits_) {
+    uint32_t num_buckets = 1u << config_.bucket_bits;
+    uint32_t stride = bucketStride();
+    arena_ = std::make_unique<uint8_t[]>(
+        static_cast<size_t>(num_buckets) * stride);
+    std::memset(arena_.get(), 0,
+                static_cast<size_t>(num_buckets) * stride);
+    buckets_.resize(num_buckets);
+    for (uint32_t i = 0; i < num_buckets; ++i) {
+        buckets_[i].data = arena_.get() + static_cast<size_t>(i) * stride;
+    }
+    clearBuckets();
 }
 
 DeltaHashTable::~DeltaHashTable() = default;
+DeltaHashTable::DeltaHashTable(DeltaHashTable&&) noexcept = default;
+DeltaHashTable& DeltaHashTable::operator=(DeltaHashTable&&) noexcept = default;
 
-// --- Find ---
+// --- Hash decomposition ---
 
-bool DeltaHashTable::findAll(const std::string& key,
-                              std::vector<uint32_t>& out) const {
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
-
-    BucketLockGuard guard(const_cast<DeltaHashTable*>(this)->bucket_locks_[bi]);
-    out.clear();
-    findInChainImpl(bi, li, fp, [&out](const TrieEntry& entry) {
-        out.insert(out.end(), entry.values.begin(), entry.values.end());
-    });
-    return !out.empty();
+uint64_t DeltaHashTable::hashKey(std::string_view key) const {
+    return dhtHashBytes(key.data(), key.size());
 }
 
-bool DeltaHashTable::findFirst(const std::string& key, uint32_t& value) const {
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
+uint32_t DeltaHashTable::bucketIndex(uint64_t hash) const {
+    return static_cast<uint32_t>(hash >> (64 - config_.bucket_bits));
+}
 
-    BucketLockGuard guard(const_cast<DeltaHashTable*>(this)->bucket_locks_[bi]);
+uint32_t DeltaHashTable::lslotIndex(uint64_t hash) const {
+    return static_cast<uint32_t>(
+        (hash >> (64 - config_.bucket_bits - config_.lslot_bits))
+        & ((1u << config_.lslot_bits) - 1));
+}
+
+uint64_t DeltaHashTable::fingerprint(uint64_t hash) const {
+    return hash & ((1ULL << fingerprint_bits_) - 1);
+}
+
+// --- Bucket data ---
+
+uint32_t DeltaHashTable::bucketStride() const {
+    return config_.bucket_bytes + kBucketPadding;
+}
+
+uint64_t DeltaHashTable::getExtensionPtr(const Bucket& bucket) const {
+    uint64_t ptr = 0;
+    std::memcpy(&ptr, bucket.data + config_.bucket_bytes - 8, 8);
+    return ptr;
+}
+
+void DeltaHashTable::setExtensionPtr(Bucket& bucket, uint64_t ptr) const {
+    std::memcpy(bucket.data + config_.bucket_bytes - 8, &ptr, 8);
+}
+
+size_t DeltaHashTable::bucketDataBits() const {
+    return (config_.bucket_bytes - 8) * 8;
+}
+
+uint32_t DeltaHashTable::numLSlots() const {
+    return 1u << config_.lslot_bits;
+}
+
+// --- Decode / Encode ---
+
+DeltaHashTable::LSlotContents DeltaHashTable::decodeLSlot(
+    const Bucket& bucket, uint32_t lslot_idx) const {
+    size_t bit_off = lslot_codec_.bitOffset(bucket.data, lslot_idx);
+    return lslot_codec_.decode(bucket.data, bit_off);
+}
+
+std::vector<DeltaHashTable::LSlotContents> DeltaHashTable::decodeAllLSlots(
+    const Bucket& bucket) const {
+    uint32_t n = numLSlots();
+    std::vector<LSlotContents> slots(n);
+    size_t offset = 0;
+    for (uint32_t s = 0; s < n; ++s) {
+        slots[s] = lslot_codec_.decode(bucket.data, offset, &offset);
+    }
+    return slots;
+}
+
+void DeltaHashTable::reencodeAllLSlots(
+    Bucket& bucket, const std::vector<LSlotContents>& all_slots) {
+    size_t data_bytes = config_.bucket_bytes - 8;
+    uint64_t ext_ptr = getExtensionPtr(bucket);
+    std::memset(bucket.data, 0, data_bytes);
+    setExtensionPtr(bucket, ext_ptr);
+
+    size_t write_offset = 0;
+    for (uint32_t s = 0; s < all_slots.size(); ++s) {
+        write_offset = lslot_codec_.encode(bucket.data, write_offset,
+                                           all_slots[s]);
+    }
+}
+
+size_t DeltaHashTable::totalBitsNeeded(
+    const std::vector<LSlotContents>& all_slots) const {
+    size_t bits = 0;
+    for (const auto& slot : all_slots) {
+        bits += LSlotCodec::bitsNeeded(slot, fingerprint_bits_);
+    }
+    return bits;
+}
+
+// --- Extension chain ---
+
+const DeltaHashTable::Bucket* DeltaHashTable::nextBucket(
+    const Bucket& bucket) const {
+    uint64_t ext = getExtensionPtr(bucket);
+    return ext ? extensions_[ext - 1].get() : nullptr;
+}
+
+DeltaHashTable::Bucket* DeltaHashTable::nextBucketMut(Bucket& bucket) {
+    uint64_t ext = getExtensionPtr(bucket);
+    return ext ? extensions_[ext - 1].get() : nullptr;
+}
+
+DeltaHashTable::Bucket* DeltaHashTable::createExtension(Bucket& bucket) {
+    uint32_t stride = bucketStride();
+    auto storage = std::make_unique<uint8_t[]>(stride);
+    std::memset(storage.get(), 0, stride);
+    auto ext = std::make_unique<Bucket>();
+    ext->data = storage.get();
+    ext_storage_.push_back(std::move(storage));
+    extensions_.push_back(std::move(ext));
+    uint64_t ext_ptr = extensions_.size();  // 1-based
+    setExtensionPtr(bucket, ext_ptr);
+
+    Bucket* ext_bucket = extensions_[ext_ptr - 1].get();
+    initBucket(*ext_bucket);
+    return ext_bucket;
+}
+
+// --- addToChain ---
+
+bool DeltaHashTable::addToChain(uint32_t bi, uint32_t li, uint64_t fp,
+                                 uint64_t packed_version, uint32_t id,
+                                 const std::function<Bucket*(Bucket&)>& createExtFn) {
+    Bucket* bucket = &buckets_[bi];
+    bool is_new = true;
+
+    while (true) {
+        auto all_slots = decodeAllLSlots(*bucket);
+
+        // Check if fingerprint already exists in this bucket's lslot.
+        if (is_new) {
+            for (const auto& entry : all_slots[li].entries) {
+                if (entry.fingerprint == fp) {
+                    is_new = false;
+                    break;
+                }
+            }
+        }
+
+        // Compute current bit cost of the target lslot before insertion.
+        size_t old_slot_bits = LSlotCodec::bitsNeeded(all_slots[li],
+                                                       fingerprint_bits_);
+
+        // Build a candidate copy with the new entry inserted.
+        LSlotContents candidate = all_slots[li];
+        auto& entries = candidate.entries;
+        bool found = false;
+        for (auto& entry : entries) {
+            if (entry.fingerprint == fp) {
+                auto it = std::lower_bound(entry.packed_versions.begin(),
+                                           entry.packed_versions.end(),
+                                           packed_version,
+                                           std::greater<uint64_t>());
+                size_t pos = it - entry.packed_versions.begin();
+                entry.packed_versions.insert(it, packed_version);
+                entry.ids.insert(entry.ids.begin() + pos, id);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            TrieEntry new_entry;
+            new_entry.fingerprint = fp;
+            new_entry.packed_versions.push_back(packed_version);
+            new_entry.ids.push_back(id);
+            entries.push_back(std::move(new_entry));
+            std::sort(entries.begin(), entries.end(),
+                      [](const TrieEntry& a, const TrieEntry& b) {
+                          return a.fingerprint < b.fingerprint;
+                      });
+        }
+
+        size_t new_slot_bits = LSlotCodec::bitsNeeded(candidate,
+                                                       fingerprint_bits_);
+        size_t total_bits = totalBitsNeeded(all_slots) - old_slot_bits
+                            + new_slot_bits;
+
+        if (total_bits <= bucketDataBits()) {
+            all_slots[li] = std::move(candidate);
+            reencodeAllLSlots(*bucket, all_slots);
+            return is_new;
+        }
+
+        // Doesn't fit — discard candidate, walk to extension bucket.
+        Bucket* ext = nextBucketMut(*bucket);
+        if (!ext) {
+            ext = createExtFn(*bucket);
+        }
+        bucket = ext;
+    }
+}
+
+// --- Public read API ---
+
+bool DeltaHashTable::findAllByHash(uint32_t bi, uint32_t li, uint64_t fp,
+                                    std::vector<uint64_t>& packed_versions,
+                                    std::vector<uint32_t>& ids) const {
+    packed_versions.clear();
+    ids.clear();
+
+    const Bucket* bucket = &buckets_[bi];
+    while (bucket) {
+        LSlotContents contents = decodeLSlot(*bucket, li);
+        for (const auto& entry : contents.entries) {
+            if (entry.fingerprint == fp) {
+                packed_versions.insert(packed_versions.end(),
+                                       entry.packed_versions.begin(),
+                                       entry.packed_versions.end());
+                ids.insert(ids.end(), entry.ids.begin(), entry.ids.end());
+            }
+        }
+        bucket = nextBucket(*bucket);
+    }
+    return !packed_versions.empty();
+}
+
+bool DeltaHashTable::findFirstByHash(uint32_t bi, uint32_t li, uint64_t fp,
+                                      uint64_t& packed_version, uint32_t& id) const {
+    bool found = false;
+    uint64_t best_pv = 0;
+    uint32_t best_id = 0;
 
     const Bucket* bucket = &buckets_[bi];
     while (bucket) {
         LSlotContents contents = decodeLSlot(*bucket, li);
 
         for (const auto& entry : contents.entries) {
-            if (entry.fingerprint == fp && !entry.values.empty()) {
-                value = entry.values[0];
-                return true;
+            if (entry.fingerprint == fp && !entry.packed_versions.empty()) {
+                uint64_t pv = entry.packed_versions[0];
+                if (!found || pv > best_pv) {
+                    best_pv = pv;
+                    best_id = entry.ids[0];
+                    found = true;
+                }
             }
         }
 
         bucket = nextBucket(*bucket);
     }
-    return false;
-}
 
-bool DeltaHashTable::contains(const std::string& key) const {
-    uint32_t dummy;
-    return findFirst(key, dummy);
-}
-
-// --- Add ---
-
-void DeltaHashTable::addEntry(const std::string& key, uint32_t value) {
-    uint64_t h = hashKey(key);
-    addImpl(bucketIndex(h), lslotIndex(h), fingerprint(h), value);
-}
-
-void DeltaHashTable::addEntryByHash(uint64_t hash, uint32_t value) {
-    addImpl(bucketIndex(hash), lslotIndex(hash), fingerprint(hash), value);
-}
-
-void DeltaHashTable::addImpl(uint32_t bi, uint32_t li, uint64_t fp,
-                              uint32_t value) {
-    BucketLockGuard guard(bucket_locks_[bi]);
-
-    // Check for duplicate across chain.
-    bool dup = false;
-    findInChainImpl(bi, li, fp, [&](const TrieEntry& entry) {
-        for (uint32_t v : entry.values) {
-            if (v == value) dup = true;
-        }
-    });
-    if (dup) return;
-
-    addToChainImpl(bi, li,
-        [fp, value](std::vector<TrieEntry>& entries) {
-            bool found_fp = false;
-            for (auto& entry : entries) {
-                if (entry.fingerprint == fp) {
-                    auto it = std::lower_bound(entry.values.begin(),
-                                               entry.values.end(),
-                                               value, std::greater<uint32_t>());
-                    entry.values.insert(it, value);
-                    found_fp = true;
-                    break;
-                }
-            }
-            if (!found_fp) {
-                TrieEntry new_entry;
-                new_entry.fingerprint = fp;
-                new_entry.values.push_back(value);
-                entries.push_back(std::move(new_entry));
-                std::sort(entries.begin(), entries.end(),
-                          [](const TrieEntry& a, const TrieEntry& b) {
-                              return a.fingerprint < b.fingerprint;
-                          });
-            }
-        },
-        [fp, value](std::vector<TrieEntry>& entries) {
-            for (auto it = entries.begin(); it != entries.end(); ++it) {
-                if (it->fingerprint == fp) {
-                    auto vit = std::find(it->values.begin(), it->values.end(),
-                                         value);
-                    if (vit != it->values.end()) {
-                        it->values.erase(vit);
-                    }
-                    if (it->values.empty()) {
-                        entries.erase(it);
-                    }
-                    break;
-                }
-            }
-        },
-        [this](Bucket& bucket) -> Bucket* {
-            std::lock_guard<std::mutex> ext_guard(ext_mutex_);
-            return createExtension(bucket);
-        }
-    );
-    size_.fetch_add(1, std::memory_order_relaxed);
-}
-
-// --- Remove ---
-
-bool DeltaHashTable::removeEntry(const std::string& key, uint32_t value) {
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
-
-    BucketLockGuard guard(bucket_locks_[bi]);
-
-    bool removed = modifyInChainImpl(bi, li,
-        [fp, value](std::vector<TrieEntry>& entries) -> bool {
-            for (auto it = entries.begin(); it != entries.end(); ++it) {
-                if (it->fingerprint == fp) {
-                    auto vit = std::find(it->values.begin(), it->values.end(),
-                                         value);
-                    if (vit != it->values.end()) {
-                        it->values.erase(vit);
-                        if (it->values.empty()) {
-                            entries.erase(it);
-                        }
-                        return true;
-                    }
-                }
-            }
-            return false;
-        });
-
-    if (removed) {
-        size_.fetch_sub(1, std::memory_order_relaxed);
+    if (found) {
+        packed_version = best_pv;
+        id = best_id;
     }
-    return removed;
+    return found;
 }
 
-size_t DeltaHashTable::removeAll(const std::string& key) {
+bool DeltaHashTable::findAll(std::string_view key,
+                              std::vector<uint64_t>& packed_versions,
+                              std::vector<uint32_t>& ids) const {
     uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
-
-    BucketLockGuard guard(bucket_locks_[bi]);
-
-    size_t removed = removeAllFromChain(bi, li, fp);
-    if (removed > 0) {
-        size_.fetch_sub(removed, std::memory_order_relaxed);
-    }
-    return removed;
+    return findAllByHash(bucketIndex(h), lslotIndex(h), fingerprint(h),
+                         packed_versions, ids);
 }
 
-size_t DeltaHashTable::removeAllFromChain(uint32_t bucket_idx,
-                                           uint32_t lslot_idx,
-                                           uint64_t fp) {
-    Bucket* bucket = &buckets_[bucket_idx];
-    size_t total_removed = 0;
-
-    while (bucket) {
-        auto all_slots = decodeAllLSlots(*bucket);
-        auto& entries = all_slots[lslot_idx].entries;
-        size_t removed = 0;
-
-        for (auto it = entries.begin(); it != entries.end(); ++it) {
-            if (it->fingerprint == fp) {
-                removed = it->values.size();
-                entries.erase(it);
-                break;
-            }
-        }
-
-        if (removed > 0) {
-            total_removed += removed;
-            reencodeAllLSlots(*bucket, all_slots);
-        }
-
-        bucket = nextBucketMut(*bucket);
-    }
-
-    return total_removed;
+bool DeltaHashTable::findFirst(std::string_view key,
+                                uint64_t& packed_version, uint32_t& id) const {
+    uint64_t h = hashKey(key);
+    return findFirstByHash(bucketIndex(h), lslotIndex(h), fingerprint(h),
+                           packed_version, id);
 }
 
-// --- Iteration ---
+bool DeltaHashTable::contains(std::string_view key) const {
+    uint64_t pv;
+    uint32_t id;
+    return findFirst(key, pv, id);
+}
 
 void DeltaHashTable::forEach(
-    const std::function<void(uint64_t hash, uint32_t value)>& fn) const {
-    forEachEntryImpl([&fn](uint64_t hash, const TrieEntry& entry) {
-        for (uint32_t v : entry.values) {
-            fn(hash, v);
+    const std::function<void(uint64_t hash, uint64_t packed_version,
+                             uint32_t id)>& fn) const {
+    uint32_t num_buckets = 1u << config_.bucket_bits;
+    uint32_t n_lslots = numLSlots();
+
+    for (uint32_t bi = 0; bi < num_buckets; ++bi) {
+        const Bucket* b = &buckets_[bi];
+        while (b) {
+            size_t offset = 0;
+            for (uint32_t s = 0; s < n_lslots; ++s) {
+                LSlotContents contents =
+                    lslot_codec_.decode(b->data, offset, &offset);
+                for (const auto& entry : contents.entries) {
+                    uint64_t hash =
+                        (static_cast<uint64_t>(bi) << (64 - config_.bucket_bits)) |
+                        (static_cast<uint64_t>(s) << fingerprint_bits_) |
+                        entry.fingerprint;
+                    for (size_t i = 0; i < entry.packed_versions.size(); ++i) {
+                        fn(hash, entry.packed_versions[i], entry.ids[i]);
+                    }
+                }
+            }
+            b = nextBucket(*b);
         }
-    });
+    }
 }
 
 void DeltaHashTable::forEachGroup(
     const std::function<void(uint64_t hash,
-                             const std::vector<uint32_t>&)>& fn) const {
+                             const std::vector<uint64_t>& packed_versions,
+                             const std::vector<uint32_t>& ids)>& fn) const {
     uint32_t num_buckets = 1u << config_.bucket_bits;
     uint32_t n_lslots = numLSlots();
 
@@ -232,59 +336,77 @@ void DeltaHashTable::forEachGroup(
         struct Group {
             uint32_t lslot;
             uint64_t fp;
-            std::vector<uint32_t> values;
+            std::vector<uint64_t> packed_versions;
+            std::vector<uint32_t> ids;
         };
-        std::vector<Group> groups;
+        // O(1) lookup by (lslot << fp_bits) | fingerprint
+        std::unordered_map<uint64_t, Group> group_map;
 
         const Bucket* b = &buckets_[bi];
         while (b) {
             size_t offset = 0;
             for (uint32_t s = 0; s < n_lslots; ++s) {
-                LSlotContents contents = lslot_codec_.decode(
-                    b->data, offset, &offset);
+                LSlotContents contents =
+                    lslot_codec_.decode(b->data, offset, &offset);
                 for (const auto& entry : contents.entries) {
-                    bool merged = false;
-                    for (auto& g : groups) {
-                        if (g.lslot == s && g.fp == entry.fingerprint) {
-                            g.values.insert(g.values.end(),
-                                            entry.values.begin(),
-                                            entry.values.end());
-                            merged = true;
-                            break;
-                        }
-                    }
-                    if (!merged) {
-                        groups.push_back({s, entry.fingerprint, entry.values});
+                    uint64_t map_key = (static_cast<uint64_t>(s) << fingerprint_bits_)
+                                       | entry.fingerprint;
+                    auto it = group_map.find(map_key);
+                    if (it != group_map.end()) {
+                        it->second.packed_versions.insert(
+                            it->second.packed_versions.end(),
+                            entry.packed_versions.begin(),
+                            entry.packed_versions.end());
+                        it->second.ids.insert(
+                            it->second.ids.end(),
+                            entry.ids.begin(),
+                            entry.ids.end());
+                    } else {
+                        group_map.emplace(map_key,
+                            Group{s, entry.fingerprint,
+                                  entry.packed_versions,
+                                  entry.ids});
                     }
                 }
             }
             b = nextBucket(*b);
         }
 
-        for (const auto& g : groups) {
+        for (const auto& [map_key, g] : group_map) {
             uint64_t hash =
                 (static_cast<uint64_t>(bi) << (64 - config_.bucket_bits)) |
                 (static_cast<uint64_t>(g.lslot) << fingerprint_bits_) |
                 g.fp;
-            fn(hash, g.values);
+            fn(hash, g.packed_versions, g.ids);
         }
     }
 }
 
 // --- Stats ---
 
-size_t DeltaHashTable::size() const {
-    return size_.load(std::memory_order_relaxed);
-}
-
 size_t DeltaHashTable::memoryUsage() const {
-    return bucketMemoryUsage()
-         + (1u << config_.bucket_bits) * sizeof(BucketLock);
+    size_t stride = config_.bucket_bytes + kBucketPadding;
+    return buckets_.size() * stride + extensions_.size() * stride;
 }
 
-void DeltaHashTable::clear() {
-    clearBuckets();
-    size_.store(0, std::memory_order_relaxed);
+void DeltaHashTable::clearBuckets() {
+    for (auto& bucket : buckets_) {
+        initBucket(bucket);
+    }
+    extensions_.clear();
+    ext_storage_.clear();
+}
+
+void DeltaHashTable::initBucket(Bucket& bucket) {
+    size_t data_bytes = config_.bucket_bytes - 8;
+    uint64_t ext_ptr = getExtensionPtr(bucket);
+    std::memset(bucket.data, 0, data_bytes);
+    setExtensionPtr(bucket, ext_ptr);
+
+    BitWriter writer(bucket.data, 0);
+    for (uint32_t s = 0; s < numLSlots(); ++s) {
+        writer.writeUnary(0);
+    }
 }
 
 }  // namespace internal
