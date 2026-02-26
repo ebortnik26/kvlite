@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <queue>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,6 +18,7 @@ namespace internal {
 // index operations (put, relocate, eliminate) with no value data.
 struct WALRecord {
     WalOp op;                // kPut, kRelocate, kEliminate (kCommit is consumed internally)
+    uint8_t producer_id;     // WalProducer::kWB or kGC
     uint64_t packed_version;
     uint32_t segment_id;     // for put/eliminate: the segment; for relocate: old_seg
     uint32_t new_segment_id; // for relocate only (0 otherwise)
@@ -61,6 +61,7 @@ private:
     // Owned records from the current WAL file.
     struct OwnedRecord {
         WalOp op;
+        uint8_t producer_id;
         uint64_t packed_version;
         uint32_t segment_id;
         uint32_t new_segment_id;
@@ -73,39 +74,12 @@ private:
     bool valid_ = false;
 };
 
-// 2-way streaming merge over WALStreams ordered by commit_version.
-// Both inputs are already in commit order within each WAL, so this is a
-// pure streaming interleave via a min-heap on commit_version.
-class WALMergeStream : public WALStream {
-public:
-    explicit WALMergeStream(std::vector<std::unique_ptr<WALStream>> inputs);
-
-    bool valid() const override;
-    const WALRecord& record() const override;
-    Status next() override;
-
-private:
-    void initHeap();
-
-    struct StreamGreater {
-        bool operator()(WALStream* a, WALStream* b) const {
-            return a->record().commit_version > b->record().commit_version;
-        }
-    };
-    std::vector<std::unique_ptr<WALStream>> inputs_;
-    std::priority_queue<WALStream*, std::vector<WALStream*>, StreamGreater> heap_;
-    WALStream* current_stream_ = nullptr;
-};
-
 // Factory functions
 namespace stream {
 
 std::unique_ptr<WALStream> walReplay(
     const std::string& wal_dir,
     const std::vector<uint32_t>& file_ids);
-
-std::unique_ptr<WALStream> walMerge(
-    std::vector<std::unique_ptr<WALStream>> inputs);
 
 } // namespace stream
 

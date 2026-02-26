@@ -25,9 +25,18 @@ enum class WalOp : uint8_t {
     kCommit    = 4,   // batch boundary marker (version payload)
 };
 
+// Producer IDs for the single multiplexed WAL.
+namespace WalProducer {
+    constexpr uint8_t kWB = 0;   // WriteBuffer flush
+    constexpr uint8_t kGC = 1;   // Garbage collection
+}
+
 // Write-Ahead Log for GlobalIndex.
 //
-// Multi-file design: WAL files live in <db_path>/wal/<name>/ with names
+// Single multiplexed WAL shared by all producers (WriteBuffer flush, GC).
+// Each record carries a producer_id byte for demultiplexing during replay.
+//
+// Multi-file design: WAL files live in <db_path>/gi/wal/ with names
 // NNNNNNNN.log (zero-padded 8-digit file ID). When the active file
 // exceeds max_file_size after a commit(), the WAL rolls over to a new
 // file. Each file is tracked in the Manifest.
@@ -35,14 +44,14 @@ enum class WalOp : uint8_t {
 // Built on the generic WAL primitive which provides CRC-protected records
 // with transaction semantics. Domain payloads (no per-record CRC) are:
 //
-// kPut / kEliminate (15 + key_len bytes):
-//   [op:1][packed_version:8][segment_id:4][key_len:2][key:var]
+// kPut / kEliminate (16 + key_len bytes):
+//   [op:1][producer_id:1][packed_version:8][segment_id:4][key_len:2][key:var]
 //
-// kRelocate (19 + key_len bytes):
-//   [op:1][packed_version:8][old_segment_id:4][new_segment_id:4][key_len:2][key:var]
+// kRelocate (20 + key_len bytes):
+//   [op:1][producer_id:1][packed_version:8][old_segment_id:4][new_segment_id:4][key_len:2][key:var]
 //
-// kCommit (9 bytes):
-//   [op:1][version:8]
+// kCommit (10 bytes):
+//   [op:1][producer_id:1][version:8]
 //
 // Thread-safety: Not thread-safe. All batch recording and commit calls must
 // be externally serialized (which they are — called only from flush and GC
@@ -58,10 +67,8 @@ public:
     ~GlobalIndexWAL();
 
     // Open WAL directory, recovering state from the Manifest.
-    // `name` distinguishes coexisting WAL instances (e.g. "flush", "gc");
-    // each gets its own subdirectory and manifest key namespace.
     Status open(const std::string& db_path, Manifest& manifest,
-                const Options& options, const std::string& name);
+                const Options& options);
 
     // Close the active WAL file.
     Status close();
@@ -70,19 +77,20 @@ public:
     // No-ops when the WAL file is not open.
 
     void appendPut(std::string_view key, uint64_t packed_version,
-                   uint32_t segment_id);
+                   uint32_t segment_id, uint8_t producer_id);
 
     void appendRelocate(std::string_view key, uint64_t packed_version,
-                        uint32_t old_segment_id, uint32_t new_segment_id);
+                        uint32_t old_segment_id, uint32_t new_segment_id,
+                        uint8_t producer_id);
 
     void appendEliminate(std::string_view key, uint64_t packed_version,
-                         uint32_t segment_id);
+                         uint32_t segment_id, uint8_t producer_id);
 
     // Flush batch + commit record to disk in one write.
     // version is the max packed_version covered by this batch.
     // Rolls over to a new file if the current file exceeds max_file_size.
     // No-op when the WAL file is not open.
-    Status commit(uint64_t version, bool sync = false);
+    Status commit(uint64_t version, uint8_t producer_id, bool sync = false);
 
     // Return a pull-based stream over all WAL records, ordered by file then position.
     // Each record carries its transaction's commit_version for merge ordering.
@@ -103,7 +111,7 @@ public:
     // Check if WAL is open
     bool isOpen() const { return wal_.isOpen(); }
 
-    // WAL directory path: <db_path>/wal/<name>/
+    // WAL directory path: <db_path>/gi/wal/
     std::string walDir() const;
 
     // Path for a specific WAL file: <db_path>/wal/NNNNNNNN.log
@@ -118,9 +126,8 @@ private:
 
     Manifest* manifest_ = nullptr;
     std::string db_path_;
-    std::string name_;
-    std::string next_file_id_key_;   // "wal.<name>.next_file_id"
-    std::string file_prefix_;        // "wal.<name>.file."
+    std::string next_file_id_key_;   // "gi.wal.next_file_id"
+    std::string file_prefix_;        // "gi.wal.file."
     Options options_;
 
     WAL wal_;

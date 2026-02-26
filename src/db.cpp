@@ -83,17 +83,6 @@ Status DB::open(const std::string& path, const Options& options) {
         return s;
     }
 
-    s = global_index_->recover();
-    if (!s.ok()) {
-        versions_->close();
-        global_index_->close();
-        versions_.reset();
-        global_index_.reset();
-        manifest_->close();
-        manifest_.reset();
-        return s;
-    }
-
     // Initialize storage manager
     storage_ = std::make_unique<internal::SegmentStorageManager>(*manifest_);
 
@@ -109,23 +98,6 @@ Status DB::open(const std::string& path, const Options& options) {
         manifest_->close();
         manifest_.reset();
         return s;
-    }
-
-    // Rebuild GlobalIndex from recovered segments.
-    // SegmentIndex stores packed versions — pass them through to GI directly.
-    {
-        auto segment_ids = storage_->getSegmentIds();
-        for (uint32_t id : segment_ids) {
-            auto* seg = storage_->getSegment(id);
-            if (!seg) continue;
-            seg->index().forEach([&](uint32_t offset, uint64_t packed_ver) {
-                internal::LogEntry entry;
-                Status rs = seg->readEntry(offset, entry);
-                if (rs.ok()) {
-                    global_index_->put(entry.key, packed_ver, id);
-                }
-            });
-        }
     }
 
     // Initialize write buffer and allocate first segment ID
@@ -452,7 +424,7 @@ Status DB::flush() {
         return key;
     };
     s = write_buffer_->flush(*seg, current_segment_id_, *global_index_,
-                             global_index_->flushWAL(), resolver);
+                             global_index_->wal(), resolver);
     if (!s.ok()) {
         return s;
     }

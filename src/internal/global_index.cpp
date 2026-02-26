@@ -5,7 +5,6 @@
 #include <fstream>
 
 #include "internal/global_index_wal.h"
-#include "internal/wal_stream.h"
 
 namespace kvlite {
 namespace internal {
@@ -65,8 +64,7 @@ struct CRC32Reader {
 };
 
 GlobalIndex::GlobalIndex()
-    : flush_wal_(std::make_unique<GlobalIndexWAL>()),
-      gc_wal_(std::make_unique<GlobalIndexWAL>()) {}
+    : wal_(std::make_unique<GlobalIndexWAL>()) {}
 
 GlobalIndex::~GlobalIndex() {
     if (is_open_) {
@@ -85,25 +83,11 @@ Status GlobalIndex::open(const std::string& db_path, Manifest& manifest,
     options_ = options;
 
     GlobalIndexWAL::Options wal_opts;
-    Status s = flush_wal_->open(db_path, manifest, wal_opts, "flush");
+    Status s = wal_->open(db_path, manifest, wal_opts);
     if (!s.ok()) return s;
-
-    s = gc_wal_->open(db_path, manifest, wal_opts, "gc");
-    if (!s.ok()) {
-        flush_wal_->close();
-        return s;
-    }
 
     is_open_ = true;
     return Status::OK();
-}
-
-Status GlobalIndex::recover() {
-    std::string path = snapshotPath();
-    Status s = loadSnapshot(path);
-    // No snapshot or corrupted — start with empty index.
-    // Either way, replay WALs to apply any changes since the last snapshot.
-    return replayWALs();
 }
 
 Status GlobalIndex::close() {
@@ -113,17 +97,13 @@ Status GlobalIndex::close() {
     // Persist index to snapshot before closing.
     Status s = saveSnapshot(snapshotPath());
     if (!s.ok()) {
-        flush_wal_->close();
-        gc_wal_->close();
-        flush_wal_.reset();
-        gc_wal_.reset();
+        wal_->close();
+        wal_.reset();
         is_open_ = false;
         return s;
     }
-    flush_wal_->close();
-    gc_wal_->close();
-    flush_wal_.reset();
-    gc_wal_.reset();
+    wal_->close();
+    wal_.reset();
     is_open_ = false;
     return Status::OK();
 }
@@ -135,7 +115,7 @@ bool GlobalIndex::isOpen() const {
 // --- Index Operations ---
 
 Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_t segment_id) {
-    flush_wal_->appendPut(key, packed_version, segment_id);
+    wal_->appendPut(key, packed_version, segment_id, WalProducer::kWB);
     applyPut(key, packed_version, segment_id);
     updates_since_snapshot_++;
     return Status::OK();
@@ -143,7 +123,7 @@ Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_
 
 Status GlobalIndex::putChecked(const std::string& key, uint64_t packed_version,
                                uint32_t segment_id, const KeyResolver& resolver) {
-    flush_wal_->appendPut(key, packed_version, segment_id);
+    wal_->appendPut(key, packed_version, segment_id, WalProducer::kWB);
     if (dht_.addEntryChecked(key, packed_version, segment_id, resolver)) {
         ++key_count_;
     }
@@ -196,7 +176,7 @@ bool GlobalIndex::contains(const std::string& key) const {
 
 Status GlobalIndex::relocate(const std::string& key, uint64_t packed_version,
                               uint32_t old_segment_id, uint32_t new_segment_id) {
-    gc_wal_->appendRelocate(key, packed_version, old_segment_id, new_segment_id);
+    wal_->appendRelocate(key, packed_version, old_segment_id, new_segment_id, WalProducer::kGC);
     applyRelocate(key, packed_version, old_segment_id, new_segment_id);
     updates_since_snapshot_++;
     return Status::OK();
@@ -204,7 +184,7 @@ Status GlobalIndex::relocate(const std::string& key, uint64_t packed_version,
 
 Status GlobalIndex::eliminate(const std::string& key, uint64_t packed_version,
                                uint32_t segment_id) {
-    gc_wal_->appendEliminate(key, packed_version, segment_id);
+    wal_->appendEliminate(key, packed_version, segment_id, WalProducer::kGC);
     applyEliminate(key, packed_version, segment_id);
     updates_since_snapshot_++;
     return Status::OK();
@@ -234,9 +214,7 @@ void GlobalIndex::clear() {
 Status GlobalIndex::snapshot() {
     Status s = saveSnapshot(snapshotPath());
     if (!s.ok()) return s;
-    s = flush_wal_->truncate();
-    if (!s.ok()) return s;
-    s = gc_wal_->truncate();
+    s = wal_->truncate();
     if (!s.ok()) return s;
     updates_since_snapshot_ = 0;
     return Status::OK();
@@ -383,45 +361,13 @@ void GlobalIndex::applyEliminate(std::string_view key, uint64_t packed_version,
     }
 }
 
-Status GlobalIndex::replayWALs() {
-    auto flush_stream = flush_wal_->replayStream();
-    auto gc_stream = gc_wal_->replayStream();
-
-    std::vector<std::unique_ptr<WALStream>> inputs;
-    inputs.push_back(std::move(flush_stream));
-    inputs.push_back(std::move(gc_stream));
-    auto merged = stream::walMerge(std::move(inputs));
-
-    while (merged->valid()) {
-        const WALRecord& rec = merged->record();
-        switch (rec.op) {
-            case WalOp::kPut:
-                applyPut(rec.key, rec.packed_version, rec.segment_id);
-                break;
-            case WalOp::kRelocate:
-                applyRelocate(rec.key, rec.packed_version,
-                              rec.segment_id, rec.new_segment_id);
-                break;
-            case WalOp::kEliminate:
-                applyEliminate(rec.key, rec.packed_version, rec.segment_id);
-                break;
-            default:
-                break;
-        }
-        Status s = merged->next();
-        if (!s.ok()) return s;
-    }
-
-    return Status::OK();
-}
-
 Status GlobalIndex::maybeSnapshot() {
     // Stub: no auto-snapshot yet.
     return Status::OK();
 }
 
 std::string GlobalIndex::snapshotPath() const {
-    return db_path_ + "/global_index.snapshot";
+    return db_path_ + "/gi/snapshot";
 }
 
 }  // namespace internal

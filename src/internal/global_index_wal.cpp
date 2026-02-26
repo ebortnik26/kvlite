@@ -21,17 +21,15 @@ GlobalIndexWAL::~GlobalIndexWAL() {
 }
 
 Status GlobalIndexWAL::open(const std::string& db_path, Manifest& manifest,
-                             const Options& options, const std::string& name) {
+                             const Options& options) {
     db_path_ = db_path;
     manifest_ = &manifest;
     options_ = options;
-    name_ = name;
-    next_file_id_key_ = "wal." + name + ".next_file_id";
-    file_prefix_ = "wal." + name + ".file.";
+    next_file_id_key_ = "gi.wal.next_file_id";
+    file_prefix_ = "gi.wal.file.";
 
-    // Create wal/ parent, then wal/<name>/ child.
-    std::string parent = db_path + "/wal";
-    ::mkdir(parent.c_str(), 0755);
+    // Create gi/, gi/wal/.
+    ::mkdir((db_path + "/gi").c_str(), 0755);
     std::string dir = walDir();
     ::mkdir(dir.c_str(), 0755);
 
@@ -97,11 +95,11 @@ Status GlobalIndexWAL::close() {
 // --- Batch recording (in-memory, no I/O) ---
 
 void GlobalIndexWAL::appendPut(std::string_view key, uint64_t packed_version,
-                                uint32_t segment_id) {
+                                uint32_t segment_id, uint8_t producer_id) {
     if (!wal_.isOpen()) return;
 
-    // Domain payload: [op:1][packed_version:8][segment_id:4][key_len:2][key:var]
-    size_t payload_len = 1 + 8 + 4 + 2 + key.size();
+    // Domain payload: [op:1][producer_id:1][packed_version:8][segment_id:4][key_len:2][key:var]
+    size_t payload_len = 1 + 1 + 8 + 4 + 2 + key.size();
     uint8_t buf[256];
     std::vector<uint8_t> heap_buf;
     uint8_t* p;
@@ -113,6 +111,7 @@ void GlobalIndexWAL::appendPut(std::string_view key, uint64_t packed_version,
     }
 
     *p++ = static_cast<uint8_t>(WalOp::kPut);
+    *p++ = producer_id;
     std::memcpy(p, &packed_version, 8); p += 8;
     std::memcpy(p, &segment_id, 4); p += 4;
     uint16_t key_len = static_cast<uint16_t>(key.size());
@@ -125,11 +124,12 @@ void GlobalIndexWAL::appendPut(std::string_view key, uint64_t packed_version,
 }
 
 void GlobalIndexWAL::appendRelocate(std::string_view key, uint64_t packed_version,
-                                     uint32_t old_segment_id, uint32_t new_segment_id) {
+                                     uint32_t old_segment_id, uint32_t new_segment_id,
+                                     uint8_t producer_id) {
     if (!wal_.isOpen()) return;
 
-    // Domain payload: [op:1][packed_version:8][old_seg:4][new_seg:4][key_len:2][key:var]
-    size_t payload_len = 1 + 8 + 4 + 4 + 2 + key.size();
+    // Domain payload: [op:1][producer_id:1][packed_version:8][old_seg:4][new_seg:4][key_len:2][key:var]
+    size_t payload_len = 1 + 1 + 8 + 4 + 4 + 2 + key.size();
     uint8_t buf[256];
     std::vector<uint8_t> heap_buf;
     uint8_t* p;
@@ -141,6 +141,7 @@ void GlobalIndexWAL::appendRelocate(std::string_view key, uint64_t packed_versio
     }
 
     *p++ = static_cast<uint8_t>(WalOp::kRelocate);
+    *p++ = producer_id;
     std::memcpy(p, &packed_version, 8); p += 8;
     std::memcpy(p, &old_segment_id, 4); p += 4;
     std::memcpy(p, &new_segment_id, 4); p += 4;
@@ -154,11 +155,11 @@ void GlobalIndexWAL::appendRelocate(std::string_view key, uint64_t packed_versio
 }
 
 void GlobalIndexWAL::appendEliminate(std::string_view key, uint64_t packed_version,
-                                      uint32_t segment_id) {
+                                      uint32_t segment_id, uint8_t producer_id) {
     if (!wal_.isOpen()) return;
 
-    // Domain payload: [op:1][packed_version:8][segment_id:4][key_len:2][key:var]
-    size_t payload_len = 1 + 8 + 4 + 2 + key.size();
+    // Domain payload: [op:1][producer_id:1][packed_version:8][segment_id:4][key_len:2][key:var]
+    size_t payload_len = 1 + 1 + 8 + 4 + 2 + key.size();
     uint8_t buf[256];
     std::vector<uint8_t> heap_buf;
     uint8_t* p;
@@ -170,6 +171,7 @@ void GlobalIndexWAL::appendEliminate(std::string_view key, uint64_t packed_versi
     }
 
     *p++ = static_cast<uint8_t>(WalOp::kEliminate);
+    *p++ = producer_id;
     std::memcpy(p, &packed_version, 8); p += 8;
     std::memcpy(p, &segment_id, 4); p += 4;
     uint16_t key_len = static_cast<uint16_t>(key.size());
@@ -181,14 +183,15 @@ void GlobalIndexWAL::appendEliminate(std::string_view key, uint64_t packed_versi
     ++entry_count_;
 }
 
-Status GlobalIndexWAL::commit(uint64_t version, bool sync) {
+Status GlobalIndexWAL::commit(uint64_t version, uint8_t producer_id, bool sync) {
     if (!wal_.isOpen()) return Status::OK();
 
-    // Append kCommit domain payload: [op:1][version:8]
-    uint8_t commit_buf[9];
+    // Append kCommit domain payload: [op:1][producer_id:1][version:8]
+    uint8_t commit_buf[10];
     commit_buf[0] = static_cast<uint8_t>(WalOp::kCommit);
-    std::memcpy(commit_buf + 1, &version, 8);
-    wal_.put(commit_buf, 9);
+    commit_buf[1] = producer_id;
+    std::memcpy(commit_buf + 2, &version, 8);
+    wal_.put(commit_buf, 10);
 
     Status s = wal_.commit(sync);
     if (!s.ok()) return s;
@@ -245,7 +248,7 @@ uint64_t GlobalIndexWAL::size() const {
 }
 
 std::string GlobalIndexWAL::walDir() const {
-    return db_path_ + "/wal/" + name_;
+    return db_path_ + "/gi/wal";
 }
 
 std::string GlobalIndexWAL::walFilePath(const std::string& wal_dir, uint32_t file_id) {

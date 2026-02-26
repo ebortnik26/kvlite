@@ -560,7 +560,7 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
     }
 
     // Commit WAL batch for the GlobalIndex updates.
-    s = wal.commit(max_version);
+    s = wal.commit(max_version, WalProducer::kWB);
     if (!s.ok()) return s;
 
     return Status::OK();

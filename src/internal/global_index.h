@@ -54,7 +54,6 @@ public:
 
     Status open(const std::string& db_path, Manifest& manifest,
                 const Options& options);
-    Status recover();
     Status close();
     bool isOpen() const;
 
@@ -101,9 +100,8 @@ public:
 
     Status snapshot();
 
-    // Direct WAL access — callers commit the appropriate WAL themselves.
-    GlobalIndexWAL& flushWAL() { return *flush_wal_; }
-    GlobalIndexWAL& gcWAL() { return *gc_wal_; }
+    // Direct WAL access — callers commit the WAL themselves.
+    GlobalIndexWAL& wal() { return *wal_; }
 
     // --- Statistics ---
 
@@ -137,8 +135,6 @@ private:
     void applyEliminate(std::string_view key, uint64_t packed_version,
                         uint32_t segment_id);
 
-    // Replay both flush and GC WALs in chronological order (merged by commit_version).
-    Status replayWALs();
     Status maybeSnapshot();
     std::string snapshotPath() const;
 
@@ -150,8 +146,7 @@ private:
     std::string db_path_;
     Options options_;
     bool is_open_ = false;
-    std::unique_ptr<GlobalIndexWAL> flush_wal_;
-    std::unique_ptr<GlobalIndexWAL> gc_wal_;
+    std::unique_ptr<GlobalIndexWAL> wal_;
     uint64_t updates_since_snapshot_ = 0;
 };
 

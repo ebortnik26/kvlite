@@ -17,10 +17,11 @@ using kvlite::Status;
 using kvlite::internal::GlobalIndexWAL;
 using kvlite::internal::Manifest;
 using kvlite::internal::WalOp;
-using kvlite::internal::WALMergeStream;
 using kvlite::internal::WALReplayStream;
 using kvlite::internal::WALRecord;
 using kvlite::internal::WALStream;
+
+namespace WalProducer = kvlite::internal::WalProducer;
 
 class WALStreamTest : public ::testing::Test {
 protected:
@@ -40,9 +41,11 @@ protected:
         std::vector<uint32_t> file_ids;
     };
 
-    WALSetup createWAL(const std::string& name,
-                       const std::vector<std::tuple<WalOp, std::string, uint64_t, uint32_t, uint32_t, uint64_t>>& ops) {
-        // ops: (op, key, packed_version, segment_id, new_segment_id, commit_version)
+    // ops: (op, key, packed_version, segment_id, new_segment_id, commit_version)
+    // Optional producer_id (defaults to WalProducer::kWB).
+    WALSetup createWAL(
+        const std::vector<std::tuple<WalOp, std::string, uint64_t, uint32_t, uint32_t, uint64_t>>& ops,
+        uint8_t producer_id = WalProducer::kWB) {
         // Group consecutive ops with same commit_version into a batch.
         Manifest manifest;
         EXPECT_TRUE(manifest.create(dir_.string()).ok());
@@ -50,7 +53,7 @@ protected:
         GlobalIndexWAL wal;
         GlobalIndexWAL::Options opts;
         opts.max_file_size = 1ULL << 30;
-        EXPECT_TRUE(wal.open(dir_.string(), manifest, opts, name).ok());
+        EXPECT_TRUE(wal.open(dir_.string(), manifest, opts).ok());
 
         uint64_t current_cv = 0;
         bool in_batch = false;
@@ -58,7 +61,7 @@ protected:
         for (const auto& [op, key, pv, seg, new_seg, cv] : ops) {
             if (in_batch && cv != current_cv) {
                 // Commit the previous batch.
-                EXPECT_TRUE(wal.commit(current_cv).ok());
+                EXPECT_TRUE(wal.commit(current_cv, producer_id).ok());
                 in_batch = false;
             }
             current_cv = cv;
@@ -66,20 +69,20 @@ protected:
 
             switch (op) {
                 case WalOp::kPut:
-                    wal.appendPut(key, pv, seg);
+                    wal.appendPut(key, pv, seg, producer_id);
                     break;
                 case WalOp::kRelocate:
-                    wal.appendRelocate(key, pv, seg, new_seg);
+                    wal.appendRelocate(key, pv, seg, new_seg, producer_id);
                     break;
                 case WalOp::kEliminate:
-                    wal.appendEliminate(key, pv, seg);
+                    wal.appendEliminate(key, pv, seg, producer_id);
                     break;
                 default:
                     break;
             }
         }
         if (in_batch) {
-            EXPECT_TRUE(wal.commit(current_cv).ok());
+            EXPECT_TRUE(wal.commit(current_cv, producer_id).ok());
         }
 
         WALSetup setup;
@@ -95,19 +98,68 @@ protected:
         return setup;
     }
 
+    // Helper for multi-producer: write raw ops with per-record producer_id.
+    struct RawOp {
+        WalOp op;
+        uint8_t producer_id;
+        std::string key;
+        uint64_t packed_version;
+        uint32_t segment_id;
+        uint32_t new_segment_id;
+        uint64_t commit_version;  // 0 for data records, non-zero triggers commit
+    };
+
+    WALSetup createMultiProducerWAL(std::vector<RawOp> ops) {
+        Manifest manifest;
+        EXPECT_TRUE(manifest.create(dir_.string()).ok());
+
+        GlobalIndexWAL wal;
+        GlobalIndexWAL::Options opts;
+        opts.max_file_size = 1ULL << 30;
+        EXPECT_TRUE(wal.open(dir_.string(), manifest, opts).ok());
+
+        for (const auto& r : ops) {
+            switch (r.op) {
+                case WalOp::kPut:
+                    wal.appendPut(r.key, r.packed_version, r.segment_id, r.producer_id);
+                    break;
+                case WalOp::kRelocate:
+                    wal.appendRelocate(r.key, r.packed_version, r.segment_id,
+                                       r.new_segment_id, r.producer_id);
+                    break;
+                case WalOp::kEliminate:
+                    wal.appendEliminate(r.key, r.packed_version, r.segment_id, r.producer_id);
+                    break;
+                case WalOp::kCommit:
+                    EXPECT_TRUE(wal.commit(r.commit_version, r.producer_id).ok());
+                    break;
+            }
+        }
+
+        WALSetup setup;
+        setup.wal_dir = wal.walDir();
+        for (uint32_t i = 0; i < wal.fileCount(); ++i) {
+            setup.file_ids.push_back(i);
+        }
+
+        EXPECT_TRUE(wal.close().ok());
+        manifest.close();
+        return setup;
+    }
+
     fs::path dir_;
 };
 
 // --- WALReplayStream tests ---
 
 TEST_F(WALStreamTest, EmptyWAL) {
-    auto setup = createWAL("empty", {});
+    auto setup = createWAL({});
     auto stream = kvlite::internal::stream::walReplay(setup.wal_dir, setup.file_ids);
     EXPECT_FALSE(stream->valid());
 }
 
 TEST_F(WALStreamTest, SinglePut) {
-    auto setup = createWAL("single", {
+    auto setup = createWAL({
         {WalOp::kPut, "key1", 100, 1, 0, 50},
     });
 
@@ -126,7 +178,7 @@ TEST_F(WALStreamTest, SinglePut) {
 }
 
 TEST_F(WALStreamTest, MultipleBatches) {
-    auto setup = createWAL("multi", {
+    auto setup = createWAL({
         {WalOp::kPut, "k1", 10, 1, 0, 100},
         {WalOp::kPut, "k2", 20, 2, 0, 200},
         {WalOp::kPut, "k3", 30, 3, 0, 300},
@@ -157,7 +209,7 @@ TEST_F(WALStreamTest, MultipleBatches) {
 }
 
 TEST_F(WALStreamTest, MultipleRecordsInOneBatch) {
-    auto setup = createWAL("batch", {
+    auto setup = createWAL({
         {WalOp::kPut, "a", 10, 1, 0, 500},
         {WalOp::kPut, "b", 20, 2, 0, 500},
     });
@@ -178,7 +230,7 @@ TEST_F(WALStreamTest, MultipleRecordsInOneBatch) {
 }
 
 TEST_F(WALStreamTest, RelocateAndEliminate) {
-    auto setup = createWAL("reloc", {
+    auto setup = createWAL({
         {WalOp::kPut, "key", 10, 1, 0, 100},
         {WalOp::kRelocate, "key", 10, 1, 5, 200},
         {WalOp::kEliminate, "key", 10, 5, 0, 300},
@@ -208,165 +260,112 @@ TEST_F(WALStreamTest, RelocateAndEliminate) {
     EXPECT_FALSE(stream->valid());
 }
 
-// --- WALMergeStream tests ---
+// --- Producer demux tests ---
 
-TEST_F(WALStreamTest, MergeEmpty) {
-    std::vector<std::unique_ptr<WALStream>> inputs;
-    auto merged = kvlite::internal::stream::walMerge(std::move(inputs));
-    EXPECT_FALSE(merged->valid());
-}
-
-TEST_F(WALStreamTest, MergeSingleStream) {
-    auto setup = createWAL("single_merge", {
+TEST_F(WALStreamTest, SingleProducerReplay) {
+    // Same as basic replay but verify producer_id is propagated.
+    auto setup = createWAL({
         {WalOp::kPut, "a", 10, 1, 0, 100},
         {WalOp::kPut, "b", 20, 2, 0, 200},
-    });
+    }, WalProducer::kGC);
 
-    std::vector<std::unique_ptr<WALStream>> inputs;
-    inputs.push_back(kvlite::internal::stream::walReplay(setup.wal_dir, setup.file_ids));
+    auto stream = kvlite::internal::stream::walReplay(setup.wal_dir, setup.file_ids);
 
-    auto merged = kvlite::internal::stream::walMerge(std::move(inputs));
+    ASSERT_TRUE(stream->valid());
+    EXPECT_EQ(stream->record().key, "a");
+    EXPECT_EQ(stream->record().producer_id, WalProducer::kGC);
+    EXPECT_EQ(stream->record().commit_version, 100u);
 
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "a");
-    EXPECT_EQ(merged->record().commit_version, 100u);
+    ASSERT_TRUE(stream->next().ok());
+    ASSERT_TRUE(stream->valid());
+    EXPECT_EQ(stream->record().key, "b");
+    EXPECT_EQ(stream->record().producer_id, WalProducer::kGC);
+    EXPECT_EQ(stream->record().commit_version, 200u);
 
-    ASSERT_TRUE(merged->next().ok());
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "b");
-    EXPECT_EQ(merged->record().commit_version, 200u);
-
-    ASSERT_TRUE(merged->next().ok());
-    EXPECT_FALSE(merged->valid());
+    ASSERT_TRUE(stream->next().ok());
+    EXPECT_FALSE(stream->valid());
 }
 
-TEST_F(WALStreamTest, MergeTwoStreamsInterleaved) {
-    // Flush WAL: commits at version 100, 300
-    auto flush = createWAL("flush", {
-        {WalOp::kPut, "f1", 10, 1, 0, 100},
-        {WalOp::kPut, "f2", 30, 3, 0, 300},
+TEST_F(WALStreamTest, MultiProducerInterleaved) {
+    // Two producers interleaved in a single WAL, batches ordered by commit_version.
+    // WB commits at 100, 300; GC commits at 200, 400.
+    auto setup = createMultiProducerWAL({
+        // WB batch (cv=100)
+        {WalOp::kPut,    WalProducer::kWB, "f1", 10, 1, 0, 0},
+        {WalOp::kCommit, WalProducer::kWB, "",    0, 0, 0, 100},
+        // GC batch (cv=200)
+        {WalOp::kRelocate, WalProducer::kGC, "g1", 10, 1, 5, 0},
+        {WalOp::kCommit,   WalProducer::kGC, "",    0, 0, 0, 200},
+        // WB batch (cv=300)
+        {WalOp::kPut,    WalProducer::kWB, "f2", 30, 3, 0, 0},
+        {WalOp::kCommit, WalProducer::kWB, "",    0, 0, 0, 300},
+        // GC batch (cv=400)
+        {WalOp::kEliminate, WalProducer::kGC, "g2", 20, 2, 0, 0},
+        {WalOp::kCommit,    WalProducer::kGC, "",    0, 0, 0, 400},
     });
 
-    // GC WAL: commits at version 200, 400
-    auto gc = createWAL("gc", {
-        {WalOp::kRelocate, "g1", 10, 1, 5, 200},
-        {WalOp::kEliminate, "g2", 20, 2, 0, 400},
-    });
-
-    std::vector<std::unique_ptr<WALStream>> inputs;
-    inputs.push_back(kvlite::internal::stream::walReplay(flush.wal_dir, flush.file_ids));
-    inputs.push_back(kvlite::internal::stream::walReplay(gc.wal_dir, gc.file_ids));
-
-    auto merged = kvlite::internal::stream::walMerge(std::move(inputs));
+    auto stream = kvlite::internal::stream::walReplay(setup.wal_dir, setup.file_ids);
 
     // Expected order by commit_version: 100, 200, 300, 400
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "f1");
-    EXPECT_EQ(merged->record().commit_version, 100u);
+    ASSERT_TRUE(stream->valid());
+    EXPECT_EQ(stream->record().key, "f1");
+    EXPECT_EQ(stream->record().producer_id, WalProducer::kWB);
+    EXPECT_EQ(stream->record().commit_version, 100u);
 
-    ASSERT_TRUE(merged->next().ok());
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "g1");
-    EXPECT_EQ(merged->record().commit_version, 200u);
+    ASSERT_TRUE(stream->next().ok());
+    ASSERT_TRUE(stream->valid());
+    EXPECT_EQ(stream->record().key, "g1");
+    EXPECT_EQ(stream->record().producer_id, WalProducer::kGC);
+    EXPECT_EQ(stream->record().commit_version, 200u);
+    EXPECT_EQ(stream->record().op, WalOp::kRelocate);
+    EXPECT_EQ(stream->record().segment_id, 1u);
+    EXPECT_EQ(stream->record().new_segment_id, 5u);
 
-    ASSERT_TRUE(merged->next().ok());
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "f2");
-    EXPECT_EQ(merged->record().commit_version, 300u);
+    ASSERT_TRUE(stream->next().ok());
+    ASSERT_TRUE(stream->valid());
+    EXPECT_EQ(stream->record().key, "f2");
+    EXPECT_EQ(stream->record().producer_id, WalProducer::kWB);
+    EXPECT_EQ(stream->record().commit_version, 300u);
 
-    ASSERT_TRUE(merged->next().ok());
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "g2");
-    EXPECT_EQ(merged->record().commit_version, 400u);
+    ASSERT_TRUE(stream->next().ok());
+    ASSERT_TRUE(stream->valid());
+    EXPECT_EQ(stream->record().key, "g2");
+    EXPECT_EQ(stream->record().producer_id, WalProducer::kGC);
+    EXPECT_EQ(stream->record().commit_version, 400u);
 
-    ASSERT_TRUE(merged->next().ok());
-    EXPECT_FALSE(merged->valid());
+    ASSERT_TRUE(stream->next().ok());
+    EXPECT_FALSE(stream->valid());
 }
 
-TEST_F(WALStreamTest, MergeSameCommitVersion) {
-    // Both WALs commit at the same version — both records should appear.
-    auto wal_a = createWAL("a", {
-        {WalOp::kPut, "a1", 10, 1, 0, 100},
-    });
-    auto wal_b = createWAL("b", {
-        {WalOp::kPut, "b1", 20, 2, 0, 100},
-    });
-
-    std::vector<std::unique_ptr<WALStream>> inputs;
-    inputs.push_back(kvlite::internal::stream::walReplay(wal_a.wal_dir, wal_a.file_ids));
-    inputs.push_back(kvlite::internal::stream::walReplay(wal_b.wal_dir, wal_b.file_ids));
-
-    auto merged = kvlite::internal::stream::walMerge(std::move(inputs));
-
-    ASSERT_TRUE(merged->valid());
-    auto key1 = std::string(merged->record().key);
-    EXPECT_EQ(merged->record().commit_version, 100u);
-
-    ASSERT_TRUE(merged->next().ok());
-    ASSERT_TRUE(merged->valid());
-    auto key2 = std::string(merged->record().key);
-    EXPECT_EQ(merged->record().commit_version, 100u);
-
-    ASSERT_TRUE(merged->next().ok());
-    EXPECT_FALSE(merged->valid());
-
-    // Both keys should appear (order within same version is unspecified).
-    EXPECT_TRUE((key1 == "a1" && key2 == "b1") || (key1 == "b1" && key2 == "a1"));
-}
-
-TEST_F(WALStreamTest, MergeWithOneEmptyStream) {
-    auto flush = createWAL("flush_data", {
-        {WalOp::kPut, "x", 10, 1, 0, 100},
-    });
-    auto gc = createWAL("gc_empty", {});
-
-    std::vector<std::unique_ptr<WALStream>> inputs;
-    inputs.push_back(kvlite::internal::stream::walReplay(flush.wal_dir, flush.file_ids));
-    inputs.push_back(kvlite::internal::stream::walReplay(gc.wal_dir, gc.file_ids));
-
-    auto merged = kvlite::internal::stream::walMerge(std::move(inputs));
-
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "x");
-
-    ASSERT_TRUE(merged->next().ok());
-    EXPECT_FALSE(merged->valid());
-}
-
-TEST_F(WALStreamTest, MergeMultiRecordBatches) {
-    // Flush WAL: one batch with 2 records at commit_version 100
-    auto flush = createWAL("flush_multi", {
-        {WalOp::kPut, "f1", 10, 1, 0, 100},
-        {WalOp::kPut, "f2", 20, 2, 0, 100},
+TEST_F(WALStreamTest, MultiProducerMultiRecordBatches) {
+    // GC batch (cv=50) with 1 record, then WB batch (cv=100) with 2 records.
+    auto setup = createMultiProducerWAL({
+        {WalOp::kRelocate, WalProducer::kGC, "g1", 5, 1, 3, 0},
+        {WalOp::kCommit,   WalProducer::kGC, "",   0, 0, 0, 50},
+        {WalOp::kPut,    WalProducer::kWB, "f1", 10, 1, 0, 0},
+        {WalOp::kPut,    WalProducer::kWB, "f2", 20, 2, 0, 0},
+        {WalOp::kCommit, WalProducer::kWB, "",    0, 0, 0, 100},
     });
 
-    // GC WAL: one batch with 1 record at commit_version 50 (should come first)
-    auto gc = createWAL("gc_multi", {
-        {WalOp::kRelocate, "g1", 5, 1, 3, 50},
-    });
-
-    std::vector<std::unique_ptr<WALStream>> inputs;
-    inputs.push_back(kvlite::internal::stream::walReplay(flush.wal_dir, flush.file_ids));
-    inputs.push_back(kvlite::internal::stream::walReplay(gc.wal_dir, gc.file_ids));
-
-    auto merged = kvlite::internal::stream::walMerge(std::move(inputs));
+    auto stream = kvlite::internal::stream::walReplay(setup.wal_dir, setup.file_ids);
 
     // GC record (cv=50) comes first
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "g1");
-    EXPECT_EQ(merged->record().commit_version, 50u);
+    ASSERT_TRUE(stream->valid());
+    EXPECT_EQ(stream->record().key, "g1");
+    EXPECT_EQ(stream->record().commit_version, 50u);
+    EXPECT_EQ(stream->record().producer_id, WalProducer::kGC);
 
-    // Then flush records (cv=100)
-    ASSERT_TRUE(merged->next().ok());
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "f1");
-    EXPECT_EQ(merged->record().commit_version, 100u);
+    // Then WB records (cv=100)
+    ASSERT_TRUE(stream->next().ok());
+    ASSERT_TRUE(stream->valid());
+    EXPECT_EQ(stream->record().key, "f1");
+    EXPECT_EQ(stream->record().commit_version, 100u);
 
-    ASSERT_TRUE(merged->next().ok());
-    ASSERT_TRUE(merged->valid());
-    EXPECT_EQ(merged->record().key, "f2");
-    EXPECT_EQ(merged->record().commit_version, 100u);
+    ASSERT_TRUE(stream->next().ok());
+    ASSERT_TRUE(stream->valid());
+    EXPECT_EQ(stream->record().key, "f2");
+    EXPECT_EQ(stream->record().commit_version, 100u);
 
-    ASSERT_TRUE(merged->next().ok());
-    EXPECT_FALSE(merged->valid());
+    ASSERT_TRUE(stream->next().ok());
+    EXPECT_FALSE(stream->valid());
 }
