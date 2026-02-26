@@ -98,7 +98,7 @@ public:
     // --- Maintenance ---
 
     Status snapshot();
-    Status sync();
+    Status commit(uint64_t version);
 
     // --- Statistics ---
 

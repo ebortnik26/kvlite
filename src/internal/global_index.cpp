@@ -63,7 +63,8 @@ struct CRC32Reader {
     uint32_t finalize() const { return ~crc; }
 };
 
-GlobalIndex::GlobalIndex() = default;
+GlobalIndex::GlobalIndex()
+    : wal_(std::make_unique<GlobalIndexWAL>()) {}
 
 GlobalIndex::~GlobalIndex() {
     if (is_open_) {
@@ -79,6 +80,10 @@ Status GlobalIndex::open(const std::string& db_path, const Options& options) {
     }
     db_path_ = db_path;
     options_ = options;
+
+    Status s = wal_->open(walPath());
+    if (!s.ok()) return s;
+
     is_open_ = true;
     return Status::OK();
 }
@@ -101,10 +106,12 @@ Status GlobalIndex::close() {
     // Persist index to snapshot before closing.
     Status s = saveSnapshot(snapshotPath());
     if (!s.ok()) {
+        wal_->close();
         wal_.reset();
         is_open_ = false;
         return s;
     }
+    wal_->close();
     wal_.reset();
     is_open_ = false;
     return Status::OK();
@@ -117,6 +124,7 @@ bool GlobalIndex::isOpen() const {
 // --- Index Operations ---
 
 Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_t segment_id) {
+    wal_->appendPut(key, packed_version, segment_id);
     if (dht_.addEntryIsNew(key, packed_version, segment_id)) {
         ++key_count_;
     }
@@ -126,6 +134,7 @@ Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_
 
 Status GlobalIndex::putChecked(const std::string& key, uint64_t packed_version,
                                uint32_t segment_id, const KeyResolver& resolver) {
+    wal_->appendPut(key, packed_version, segment_id);
     if (dht_.addEntryChecked(key, packed_version, segment_id, resolver)) {
         ++key_count_;
     }
@@ -178,6 +187,7 @@ bool GlobalIndex::contains(const std::string& key) const {
 
 Status GlobalIndex::relocate(const std::string& key, uint64_t packed_version,
                               uint32_t old_segment_id, uint32_t new_segment_id) {
+    wal_->appendRelocate(key, packed_version, old_segment_id, new_segment_id);
     dht_.updateEntryId(key, packed_version, old_segment_id, new_segment_id);
     updates_since_snapshot_++;
     return Status::OK();
@@ -185,6 +195,7 @@ Status GlobalIndex::relocate(const std::string& key, uint64_t packed_version,
 
 Status GlobalIndex::eliminate(const std::string& key, uint64_t packed_version,
                                uint32_t segment_id) {
+    wal_->appendEliminate(key, packed_version, segment_id);
     bool group_empty = dht_.removeEntry(key, packed_version, segment_id);
     if (group_empty) {
         --key_count_;
@@ -215,14 +226,16 @@ void GlobalIndex::clear() {
 // --- Maintenance ---
 
 Status GlobalIndex::snapshot() {
-    // Stub: no auto-snapshot yet.
+    Status s = saveSnapshot(snapshotPath());
+    if (!s.ok()) return s;
+    s = wal_->truncate();
+    if (!s.ok()) return s;
     updates_since_snapshot_ = 0;
     return Status::OK();
 }
 
-Status GlobalIndex::sync() {
-    // Stub: no WAL yet.
-    return Status::OK();
+Status GlobalIndex::commit(uint64_t version) {
+    return wal_->commit(version, options_.sync_writes);
 }
 
 // --- Statistics ---

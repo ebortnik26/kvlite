@@ -545,6 +545,7 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
     if (!s.ok()) return s;
 
     // Register every flushed entry in GlobalIndex (packed version preserves tombstone).
+    uint64_t max_version = 0;
     std::string_view prev_key;
     for (const auto& e : global_index_entries) {
         if (resolver && e.key != prev_key) {
@@ -553,8 +554,13 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
             s = global_index.put(e.key, e.packed_ver, segment_id);
         }
         if (!s.ok()) return s;
+        if (e.packed_ver > max_version) max_version = e.packed_ver;
         prev_key = e.key;
     }
+
+    // Commit WAL batch for the GlobalIndex updates.
+    s = global_index.commit(max_version);
+    if (!s.ok()) return s;
 
     return Status::OK();
 }

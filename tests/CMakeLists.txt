@@ -56,6 +56,7 @@ add_executable(kvlite_dht_test
     ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 

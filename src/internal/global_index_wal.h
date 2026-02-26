@@ -3,33 +3,47 @@
 
 #include <cstdint>
 #include <string>
-#include <mutex>
+#include <string_view>
+#include <vector>
 
 #include "kvlite/status.h"
-#include "global_index.h"
+#include "internal/log_file.h"
 
 namespace kvlite {
 namespace internal {
 
+class GlobalIndex;
+
 // WAL operation types for GlobalIndex
 enum class WalOp : uint8_t {
-    kPut = 1,     // Add entry: key, version, segment_id
-    kRemove = 2,  // Remove key (all versions) - used during GC
+    kPut       = 1,   // key, packed_version, segment_id
+    kRelocate  = 2,   // key, packed_version, old_segment_id, new_segment_id
+    kEliminate = 3,   // key, packed_version, segment_id
+    kCommit    = 4,   // batch boundary marker (version payload)
 };
 
 // Write-Ahead Log for GlobalIndex.
 //
-// The WAL records all changes to the GlobalIndex as append-only entries.
-// On recovery, the WAL is replayed on top of the last snapshot to
-// reconstruct the GlobalIndex.
+// Batch-buffered design: append methods accumulate serialized records in an
+// in-memory buffer (no I/O). commit() appends a kCommit marker, writes the
+// entire batch to disk in a single LogFile::append(), and clears the buffer.
 //
-// WAL entry format:
-// ┌────┬─────────┬─────────┬─────┬─────────┬──────────┐
-// │ op │ version │ segment_id │ len │   key   │ checksum │
-// │ 1  │    8    │    4    │  4  │   var   │    4     │
-// └────┴─────────┴─────────┴─────┴─────────┴──────────┘
+// On-disk record format (variable-length, per-record CRC):
 //
-// Thread-safety: All operations are thread-safe.
+// kPut / kEliminate (19 + key_len bytes):
+//   [op:1][packed_version:8][segment_id:4][key_len:2][key:var][crc32:4]
+//
+// kRelocate (23 + key_len bytes):
+//   [op:1][packed_version:8][old_segment_id:4][new_segment_id:4][key_len:2][key:var][crc32:4]
+//
+// kCommit (13 bytes):
+//   [op:1][version:8][crc32:4]
+//
+// CRC covers all bytes of the record preceding the checksum field.
+//
+// Thread-safety: Not thread-safe. All batch recording and commit calls must
+// be externally serialized (which they are — called only from flush and GC
+// merge, both single-threaded producers).
 class GlobalIndexWAL {
 public:
     GlobalIndexWAL();
@@ -41,45 +55,50 @@ public:
     // Close WAL file
     Status close();
 
-    // Append a put operation
-    Status appendPut(const std::string& key, uint64_t version,
-                     uint32_t segment_id);
+    // --- Batch recording (in-memory only, no I/O) ---
+    // No-ops when the WAL file is not open.
 
-    // Append a remove operation (for GC)
-    Status appendRemove(const std::string& key);
+    void appendPut(std::string_view key, uint64_t packed_version,
+                   uint32_t segment_id);
 
-    // Sync WAL to disk
-    Status sync();
+    void appendRelocate(std::string_view key, uint64_t packed_version,
+                        uint32_t old_segment_id, uint32_t new_segment_id);
 
-    // Replay WAL entries into a GlobalIndex
-    // This is called during recovery to rebuild the index
+    void appendEliminate(std::string_view key, uint64_t packed_version,
+                         uint32_t segment_id);
+
+    // Flush batch + commit record to disk in one write.
+    // version is the max packed_version covered by this batch.
+    // No-op when the WAL file is not open.
+    Status commit(uint64_t version, bool sync = false);
+
+    // Replay WAL entries into a GlobalIndex (stub — deferred)
     Status replay(GlobalIndex& index);
 
     // Truncate WAL (called after successful snapshot)
     Status truncate();
 
-    // Get current WAL size
+    // Get current WAL file size on disk
     uint64_t size() const;
 
-    // Get number of entries in WAL
+    // Get number of data entries written (excludes commit records)
     uint64_t entryCount() const { return entry_count_; }
 
     // Check if WAL is open
-    bool isOpen() const { return fd_ >= 0; }
+    bool isOpen() const { return log_file_.isOpen(); }
 
-    // WAL file path
+    // WAL file path helper
     static std::string makePath(const std::string& db_path);
 
 private:
-    Status writeEntry(WalOp op, const std::string& key,
-                      uint64_t version, uint32_t segment_id);
-    Status readEntry(WalOp& op, std::string& key,
-                     uint64_t& version, uint32_t& segment_id);
+    void serializeRecord(WalOp op, std::string_view key,
+                         uint64_t packed_version,
+                         uint32_t segment_id,
+                         uint32_t new_segment_id);
 
-    int fd_ = -1;
-    std::string path_;
+    LogFile log_file_;
+    std::vector<uint8_t> batch_buf_;
     uint64_t entry_count_ = 0;
-    mutable std::mutex mutex_;
 };
 
 } // namespace internal
