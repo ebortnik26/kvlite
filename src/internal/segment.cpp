@@ -164,30 +164,41 @@ Status Segment::put(std::string_view key, uint64_t version,
 // --- Read ---
 
 Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {
-    // Read header to learn key/value lengths.
-    uint8_t hdr[LogEntry::kHeaderSize];
-    Status s = log_file_.readAt(offset, hdr, LogEntry::kHeaderSize);
+    // Speculative read: fetch up to 4KB in one I/O.  Most entries (header +
+    // key + value + CRC) fit entirely, so this avoids a second pread.
+    static constexpr size_t kReadAhead = 4096;
+    uint8_t stack_buf[kReadAhead];
+
+    // Clamp to bytes remaining in the data region to avoid reading past EOF.
+    size_t avail = (offset < data_size_) ? static_cast<size_t>(data_size_ - offset) : 0;
+    size_t first_read = (avail < kReadAhead) ? avail : kReadAhead;
+    if (first_read < LogEntry::kHeaderSize + LogEntry::kChecksumSize) {
+        return Status::Corruption("Segment: truncated entry at offset " +
+                                  std::to_string(offset));
+    }
+    Status s = log_file_.readAt(offset, stack_buf, first_read);
     if (!s.ok()) return s;
 
+    // Parse header from the speculative buffer.
     uint64_t packed_ver;
     uint16_t kl;
     uint32_t vl;
-    std::memcpy(&packed_ver, hdr, 8);
-    std::memcpy(&kl, hdr + 8, 2);
-    std::memcpy(&vl, hdr + 10, 4);
+    std::memcpy(&packed_ver, stack_buf, 8);
+    std::memcpy(&kl, stack_buf + 8, 2);
+    std::memcpy(&vl, stack_buf + 10, 4);
 
-    // Read full entry for CRC validation.
     size_t entry_size = LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
-    uint8_t stack_buf[4096];
-    std::unique_ptr<uint8_t[]> heap_buf;
+
+    // If the entry fits in the speculative buffer, use it directly (one I/O).
+    // Otherwise fall back to a heap allocation + second pread.
     uint8_t* buf = stack_buf;
-    if (entry_size > sizeof(stack_buf)) {
+    std::unique_ptr<uint8_t[]> heap_buf;
+    if (entry_size > first_read) {
         heap_buf = std::make_unique<uint8_t[]>(entry_size);
         buf = heap_buf.get();
+        s = log_file_.readAt(offset, buf, entry_size);
+        if (!s.ok()) return s;
     }
-
-    s = log_file_.readAt(offset, buf, entry_size);
-    if (!s.ok()) return s;
 
     // Validate CRC.
     size_t payload_len = LogEntry::kHeaderSize + kl + vl;
