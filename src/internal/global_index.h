@@ -96,12 +96,10 @@ public:
 
     void clear();
 
-    // --- Maintenance ---
+    // --- WAL commit (hides producer IDs from callers) ---
 
-    Status snapshot();
-
-    // Direct WAL access — callers commit the WAL themselves.
-    GlobalIndexWAL& wal() { return *wal_; }
+    Status commitWB();
+    Status commitGC();
 
     // --- Statistics ---
 

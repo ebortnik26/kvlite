@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -11,6 +12,7 @@
 #include "internal/crc32.h"
 #include "internal/delta_hash_table.h"
 #include "internal/global_index.h"
+#include "internal/manifest.h"
 #include "internal/segment.h"
 #include "internal/write_buffer.h"
 
@@ -463,11 +465,20 @@ protected:
     void SetUp() override {
         path_ = ::testing::TempDir() + "/flush_test_" +
                 std::to_string(reinterpret_cast<uintptr_t>(this)) + ".data";
+        db_dir_ = ::testing::TempDir() + "/flush_test_db_" +
+                  std::to_string(reinterpret_cast<uintptr_t>(this));
+        std::filesystem::create_directories(db_dir_);
+        ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        kvlite::internal::GlobalIndex::Options gi_opts;
+        ASSERT_TRUE(global_index_.open(db_dir_, manifest_, gi_opts).ok());
     }
 
     void TearDown() override {
         if (seg_.isOpen()) seg_.close();
+        if (global_index_.isOpen()) global_index_.close();
+        manifest_.close();
         std::remove(path_.c_str());
+        std::filesystem::remove_all(db_dir_);
     }
 
     // Read raw bytes from the segment file via pread.
@@ -517,6 +528,8 @@ protected:
     }
 
     std::string path_;
+    std::string db_dir_;
+    kvlite::internal::Manifest manifest_;
     Segment seg_;
     GlobalIndex global_index_;
 };
@@ -526,7 +539,7 @@ protected:
 TEST_F(FlushTest, EmptyBuffer) {
     WriteBuffer wb;
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.wal()).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
     EXPECT_EQ(seg_.dataSize(), 0u);
     EXPECT_EQ(seg_.entryCount(), 0u);
 }
@@ -536,7 +549,7 @@ TEST_F(FlushTest, SingleEntry) {
     wb.put("hello", 42, "world", false);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.wal()).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
 
     size_t expected_size = LogEntry::kHeaderSize + 5 + 5 + LogEntry::kChecksumSize;
     EXPECT_EQ(seg_.dataSize(), expected_size);
@@ -563,7 +576,7 @@ TEST_F(FlushTest, TombstoneEntry) {
     wb.put("deleted", 7, "", true);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.wal()).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
 
     LogEntry entry;
     readEntry(0, entry);
@@ -583,7 +596,7 @@ TEST_F(FlushTest, SortOrderHashThenVersion) {
     wb.put("ccc", 20, "v20", false);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.wal()).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
 
     // Read all entries back
     std::vector<std::pair<uint64_t, uint64_t>> order; // (hash, version)
@@ -615,7 +628,7 @@ TEST_F(FlushTest, RoundTrip) {
     wb.put("key2", 3, "val3", true);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.wal()).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
 
     // Read all entries back and verify contents
     std::vector<LogEntry> entries;
@@ -681,7 +694,7 @@ TEST_F(FlushTest, SealAndOpen) {
     wb.put("beta", 10, "vb", true);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.wal()).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
     uint64_t data_size = seg_.dataSize();
     seg_.close();
 
@@ -724,7 +737,7 @@ TEST_F(FlushTest, GlobalIndexPopulated) {
     wb.put("key3", 4, "val4", false);
 
     ASSERT_TRUE(seg_.create(path_, 77).ok());
-    ASSERT_TRUE(wb.flush(seg_, 77, global_index_, global_index_.wal()).ok());
+    ASSERT_TRUE(wb.flush(seg_, 77, global_index_).ok());
 
     // Every entry should be registered in GlobalIndex with packed version.
     // Packed version = (logical_version << 1) | tombstone_bit.

@@ -2,12 +2,16 @@
 
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
+#include <list>
 #include <set>
 #include <unistd.h>
 #include <vector>
 
 #include "internal/bit_stream.h"
+#include "internal/global_index.h"
 #include "internal/lslot_codec.h"
+#include "internal/manifest.h"
 #include "internal/read_only_delta_hash_table.h"
 #include "internal/segment_index.h"
 #include "internal/gc.h"
@@ -591,6 +595,30 @@ protected:
         for (auto& path : output_paths_) {
             ::unlink(path.c_str());
         }
+        for (auto& gi : gi_instances_) {
+            if (gi.index.isOpen()) gi.index.close();
+            gi.manifest.close();
+            std::filesystem::remove_all(gi.dir);
+        }
+    }
+
+    struct OpenedGI {
+        std::string dir;
+        kvlite::internal::Manifest manifest;
+        GlobalIndex index;
+    };
+
+    GlobalIndex& createOpenGI() {
+        gi_instances_.emplace_back();
+        auto& gi = gi_instances_.back();
+        gi.dir = base_ + "gi_" + std::to_string(gi_instances_.size());
+        std::filesystem::create_directories(gi.dir);
+        auto s = gi.manifest.create(gi.dir);
+        EXPECT_TRUE(s.ok()) << s.toString();
+        GlobalIndex::Options opts;
+        s = gi.index.open(gi.dir, gi.manifest, opts);
+        EXPECT_TRUE(s.ok()) << s.toString();
+        return gi.index;
     }
 
     size_t createSegment(
@@ -623,6 +651,7 @@ protected:
     std::vector<Segment> segments_;
     std::string base_;
     std::vector<std::string> paths_;
+    std::list<OpenedGI> gi_instances_;
     std::vector<std::string> output_paths_;
     uint32_t next_id_ = 100;
     GC::Result last_result_;
@@ -953,11 +982,9 @@ TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
 
 // --- GC + GlobalIndex integration tests ---
 
-#include "internal/global_index.h"
-
 TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
     // Put entries into GlobalIndex with specific segment_ids.
-    GlobalIndex gi;
+    auto& gi = createOpenGI();
     gi.put("key1", PackedVersion(1, false).data, 1);
     gi.put("key2", PackedVersion(2, false).data, 1);
 
@@ -975,11 +1002,11 @@ TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&gi](std::string_view key, uint64_t packed_version,
+        [&](std::string_view key, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
             gi.relocate(std::string(key), packed_version, old_id, new_id);
         },
-        [&gi](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
             gi.eliminate(std::string(key), packed_version, old_id);
         },
         last_result_);
@@ -1001,7 +1028,7 @@ TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
 }
 
 TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
-    GlobalIndex gi;
+    auto& gi = createOpenGI();
     gi.put("key1", PackedVersion(1, false).data, 1);
     gi.put("key1", PackedVersion(2, false).data, 2);
 
@@ -1017,11 +1044,11 @@ TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&gi](std::string_view key, uint64_t packed_version,
+        [&](std::string_view key, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
             gi.relocate(std::string(key), packed_version, old_id, new_id);
         },
-        [&gi](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
             gi.eliminate(std::string(key), packed_version, old_id);
         },
         last_result_);
@@ -1041,7 +1068,7 @@ TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
 }
 
 TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
-    GlobalIndex gi;
+    auto& gi = createOpenGI();
     // Two versions of "key1" in same segment — both will be compacted,
     // but only the latest survives the single-snapshot classification.
     // To eliminate ALL versions, we need a tombstone as latest.
@@ -1064,11 +1091,11 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&gi](std::string_view key, uint64_t packed_version,
+        [&](std::string_view key, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
             gi.relocate(std::string(key), packed_version, old_id, new_id);
         },
-        [&gi](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
             gi.eliminate(std::string(key), packed_version, old_id);
         },
         last_result_);
@@ -1097,7 +1124,7 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
 TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
     // Simulate: after a first GC pass, a key has only a tombstone left
     // in the output segment. A second GC pass eliminates it entirely.
-    GlobalIndex gi;
+    auto& gi = createOpenGI();
     uint32_t first_seg_id = 50;
     gi.put("key1", PackedVersion(2, true).data, first_seg_id);  // tombstone only
 
@@ -1121,11 +1148,11 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&gi](std::string_view key, uint64_t packed_version,
+        [&](std::string_view key, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
             gi.relocate(std::string(key), packed_version, old_id, new_id);
         },
-        [&gi](std::string_view key, uint64_t packed_version, uint32_t old_id) {
+        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
             gi.eliminate(std::string(key), packed_version, old_id);
         },
         last_result_);

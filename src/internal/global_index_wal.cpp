@@ -15,7 +15,7 @@ namespace internal {
 GlobalIndexWAL::GlobalIndexWAL() = default;
 
 GlobalIndexWAL::~GlobalIndexWAL() {
-    if (wal_.isOpen()) {
+    if (open_) {
         close();
     }
 }
@@ -45,7 +45,7 @@ Status GlobalIndexWAL::open(const std::string& db_path, Manifest& manifest,
     file_ids_.clear();
     auto keys = manifest_->getKeysWithPrefix(file_prefix_);
     for (const auto& key : keys) {
-        // key = "wal.<name>.file.<id>"
+        // key = "gi.wal.file.<id>"
         std::string id_str = key.substr(file_prefix_.size());
         uint32_t id = static_cast<uint32_t>(std::stoul(id_str));
         file_ids_.push_back(id);
@@ -84,116 +84,120 @@ Status GlobalIndexWAL::open(const std::string& db_path, Manifest& manifest,
         if (!s.ok()) return s;
     }
 
+    open_ = true;
     return Status::OK();
 }
 
 Status GlobalIndexWAL::close() {
+    // Exclusive lock waits for all in-flight append/commit operations,
+    // then prevents new ones.
+    std::unique_lock lock(rw_mu_);
+    if (!open_) return Status::OK();
+    open_ = false;
+
+    // No producers can be active — flush remaining staged records directly.
+    for (uint8_t i = 0; i < WalProducer::kMaxProducers; ++i) {
+        if (producers_[i].record_count > 0) {
+            wal_.put(producers_[i].data.data(), producers_[i].data.size());
+            producers_[i].data.clear();
+            producers_[i].record_count = 0;
+            Status s = wal_.commit(true);
+            if (!s.ok()) {
+                wal_.abort();
+                wal_.close();
+                return s;
+            }
+        }
+    }
     wal_.abort();
     return wal_.close();
 }
 
-// --- Batch recording (in-memory, no I/O) ---
+// --- Per-producer staging ---
 
-void GlobalIndexWAL::appendPut(std::string_view key, uint64_t packed_version,
-                                uint32_t segment_id, uint8_t producer_id) {
-    if (!wal_.isOpen()) return;
+void GlobalIndexWAL::serializeRecord(ProducerBuf& buf, WalOp op,
+                                      uint8_t producer_id,
+                                      uint64_t packed_version,
+                                      std::string_view key,
+                                      const uint32_t* seg_ids,
+                                      size_t seg_count) {
+    size_t rec_len = 1 + 1 + 8 + seg_count * 4 + 2 + key.size();
+    size_t off = buf.data.size();
+    buf.data.resize(off + rec_len);
+    uint8_t* p = buf.data.data() + off;
 
-    // Domain payload: [op:1][producer_id:1][packed_version:8][segment_id:4][key_len:2][key:var]
-    size_t payload_len = 1 + 1 + 8 + 4 + 2 + key.size();
-    uint8_t buf[256];
-    std::vector<uint8_t> heap_buf;
-    uint8_t* p;
-    if (payload_len <= sizeof(buf)) {
-        p = buf;
-    } else {
-        heap_buf.resize(payload_len);
-        p = heap_buf.data();
-    }
-
-    *p++ = static_cast<uint8_t>(WalOp::kPut);
+    *p++ = static_cast<uint8_t>(op);
     *p++ = producer_id;
     std::memcpy(p, &packed_version, 8); p += 8;
-    std::memcpy(p, &segment_id, 4); p += 4;
+    for (size_t i = 0; i < seg_count; ++i) {
+        std::memcpy(p, &seg_ids[i], 4); p += 4;
+    }
     uint16_t key_len = static_cast<uint16_t>(key.size());
     std::memcpy(p, &key_len, 2); p += 2;
     std::memcpy(p, key.data(), key.size());
 
-    uint8_t* base = (heap_buf.empty()) ? buf : heap_buf.data();
-    wal_.put(base, payload_len);
-    ++entry_count_;
+    ++buf.record_count;
 }
 
-void GlobalIndexWAL::appendRelocate(std::string_view key, uint64_t packed_version,
-                                     uint32_t old_segment_id, uint32_t new_segment_id,
-                                     uint8_t producer_id) {
-    if (!wal_.isOpen()) return;
-
-    // Domain payload: [op:1][producer_id:1][packed_version:8][old_seg:4][new_seg:4][key_len:2][key:var]
-    size_t payload_len = 1 + 1 + 8 + 4 + 4 + 2 + key.size();
-    uint8_t buf[256];
-    std::vector<uint8_t> heap_buf;
-    uint8_t* p;
-    if (payload_len <= sizeof(buf)) {
-        p = buf;
-    } else {
-        heap_buf.resize(payload_len);
-        p = heap_buf.data();
+Status GlobalIndexWAL::appendPut(std::string_view key, uint64_t packed_version,
+                                  uint32_t segment_id, uint8_t producer_id) {
+    std::shared_lock lock(rw_mu_);
+    if (!open_) return Status::IOError("WAL not open");
+    serializeRecord(producers_[producer_id], WalOp::kPut, producer_id,
+                    packed_version, key, &segment_id, 1);
+    ++entry_count_;
+    if (producers_[producer_id].record_count >= options_.batch_size) {
+        return flushProducer(producer_id);
     }
-
-    *p++ = static_cast<uint8_t>(WalOp::kRelocate);
-    *p++ = producer_id;
-    std::memcpy(p, &packed_version, 8); p += 8;
-    std::memcpy(p, &old_segment_id, 4); p += 4;
-    std::memcpy(p, &new_segment_id, 4); p += 4;
-    uint16_t key_len = static_cast<uint16_t>(key.size());
-    std::memcpy(p, &key_len, 2); p += 2;
-    std::memcpy(p, key.data(), key.size());
-
-    uint8_t* base = (heap_buf.empty()) ? buf : heap_buf.data();
-    wal_.put(base, payload_len);
-    ++entry_count_;
+    return Status::OK();
 }
 
-void GlobalIndexWAL::appendEliminate(std::string_view key, uint64_t packed_version,
-                                      uint32_t segment_id, uint8_t producer_id) {
-    if (!wal_.isOpen()) return;
-
-    // Domain payload: [op:1][producer_id:1][packed_version:8][segment_id:4][key_len:2][key:var]
-    size_t payload_len = 1 + 1 + 8 + 4 + 2 + key.size();
-    uint8_t buf[256];
-    std::vector<uint8_t> heap_buf;
-    uint8_t* p;
-    if (payload_len <= sizeof(buf)) {
-        p = buf;
-    } else {
-        heap_buf.resize(payload_len);
-        p = heap_buf.data();
+Status GlobalIndexWAL::appendRelocate(std::string_view key, uint64_t packed_version,
+                                       uint32_t old_segment_id, uint32_t new_segment_id,
+                                       uint8_t producer_id) {
+    std::shared_lock lock(rw_mu_);
+    if (!open_) return Status::IOError("WAL not open");
+    uint32_t segs[2] = {old_segment_id, new_segment_id};
+    serializeRecord(producers_[producer_id], WalOp::kRelocate, producer_id,
+                    packed_version, key, segs, 2);
+    ++entry_count_;
+    if (producers_[producer_id].record_count >= options_.batch_size) {
+        return flushProducer(producer_id);
     }
-
-    *p++ = static_cast<uint8_t>(WalOp::kEliminate);
-    *p++ = producer_id;
-    std::memcpy(p, &packed_version, 8); p += 8;
-    std::memcpy(p, &segment_id, 4); p += 4;
-    uint16_t key_len = static_cast<uint16_t>(key.size());
-    std::memcpy(p, &key_len, 2); p += 2;
-    std::memcpy(p, key.data(), key.size());
-
-    uint8_t* base = (heap_buf.empty()) ? buf : heap_buf.data();
-    wal_.put(base, payload_len);
-    ++entry_count_;
+    return Status::OK();
 }
 
-Status GlobalIndexWAL::commit(uint64_t version, uint8_t producer_id, bool sync) {
-    if (!wal_.isOpen()) return Status::OK();
+Status GlobalIndexWAL::appendEliminate(std::string_view key, uint64_t packed_version,
+                                        uint32_t segment_id, uint8_t producer_id) {
+    std::shared_lock lock(rw_mu_);
+    if (!open_) return Status::IOError("WAL not open");
+    serializeRecord(producers_[producer_id], WalOp::kEliminate, producer_id,
+                    packed_version, key, &segment_id, 1);
+    ++entry_count_;
+    if (producers_[producer_id].record_count >= options_.batch_size) {
+        return flushProducer(producer_id);
+    }
+    return Status::OK();
+}
 
-    // Append kCommit domain payload: [op:1][producer_id:1][version:8]
-    uint8_t commit_buf[10];
-    commit_buf[0] = static_cast<uint8_t>(WalOp::kCommit);
-    commit_buf[1] = producer_id;
-    std::memcpy(commit_buf + 2, &version, 8);
-    wal_.put(commit_buf, 10);
+Status GlobalIndexWAL::commit(uint8_t producer_id) {
+    std::shared_lock lock(rw_mu_);
+    if (!open_) return Status::IOError("WAL not open");
+    if (producers_[producer_id].record_count == 0) return Status::OK();
+    return flushProducer(producer_id);
+}
 
-    Status s = wal_.commit(sync);
+Status GlobalIndexWAL::flushProducer(uint8_t producer_id) {
+    ProducerBuf& buf = producers_[producer_id];
+
+    std::lock_guard<std::mutex> lock(mu_);
+
+    // Write entire staging buffer as a single WAL data record.
+    wal_.put(buf.data.data(), buf.data.size());
+    buf.data.clear();
+    buf.record_count = 0;
+
+    Status s = wal_.commit(true);
     if (!s.ok()) return s;
 
     // Rollover if the current file exceeds the size limit.
@@ -239,6 +243,10 @@ std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
 Status GlobalIndexWAL::truncate() {
     entry_count_ = 0;
     total_size_ = 0;
+    for (auto& p : producers_) {
+        p.data.clear();
+        p.record_count = 0;
+    }
     wal_.abort();
     return Status::OK();
 }

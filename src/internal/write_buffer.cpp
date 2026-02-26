@@ -5,7 +5,6 @@
 
 #include "internal/entry_stream.h"
 #include "internal/global_index.h"
-#include "internal/global_index_wal.h"
 #include "internal/segment.h"
 
 namespace kvlite {
@@ -485,7 +484,7 @@ std::unique_ptr<EntryStream> WriteBuffer::createStream(uint64_t snapshot_version
 }
 
 Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
-                          GlobalIndex& global_index, GlobalIndexWAL& wal,
+                          GlobalIndex& global_index,
                           const DeltaHashTable::KeyResolver& resolver) {
     Status s;
 
@@ -546,7 +545,6 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
     if (!s.ok()) return s;
 
     // Register every flushed entry in GlobalIndex (packed version preserves tombstone).
-    uint64_t max_version = 0;
     std::string_view prev_key;
     for (const auto& e : global_index_entries) {
         if (resolver && e.key != prev_key) {
@@ -555,12 +553,11 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
             s = global_index.put(e.key, e.packed_ver, segment_id);
         }
         if (!s.ok()) return s;
-        if (e.packed_ver > max_version) max_version = e.packed_ver;
         prev_key = e.key;
     }
 
     // Commit WAL batch for the GlobalIndex updates.
-    s = wal.commit(max_version, WalProducer::kWB);
+    s = global_index.commitWB();
     if (!s.ok()) return s;
 
     return Status::OK();

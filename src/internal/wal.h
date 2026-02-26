@@ -18,12 +18,12 @@ namespace internal {
 // On-disk record format:
 //
 // Data record:   [body_len:4][type:1 = 0x01][payload:var][crc32:4]
-// Commit record: [body_len:4][type:1 = 0x02][seq:8][crc32:4]
+// Commit record: [body_len:4][type:1 = 0x02][crc32:4]
 //
 // body_len = 1 + payload_len + 4  (data record)
-//          = 1 + 8 + 4 = 13       (commit record)
+//          = 1 + 4 = 5             (commit record)
 //
-// crc32 covers: type byte + payload/seq (everything between body_len and crc32)
+// crc32 covers: type byte + payload (everything between body_len and crc32)
 //
 // Single implicit transaction: put() buffers data records in memory (no I/O).
 // commit() appends all buffered records + a commit record to disk atomically,
@@ -64,10 +64,9 @@ public:
     // Discard buffered records without writing.
     void abort();
 
-    // Replay callback receives a monotonic sequence number and a vector of
-    // string_views into the payloads of data records in that transaction.
+    // Replay callback receives a vector of string_views into the payloads
+    // of data records in that transaction.
     using ReplayCallback = std::function<Status(
-        uint64_t seq,
         const std::vector<std::string_view>& records)>;
 
     // Replay all committed transactions from the file.
@@ -89,7 +88,6 @@ private:
 
     LogFile log_file_;
     std::vector<uint8_t> batch_buf_;
-    uint64_t next_seq_ = 0;
 };
 
 } // namespace internal

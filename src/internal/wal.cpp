@@ -17,10 +17,7 @@ WAL::~WAL() {
 
 WAL::WAL(WAL&& other) noexcept
     : log_file_(std::move(other.log_file_)),
-      batch_buf_(std::move(other.batch_buf_)),
-      next_seq_(other.next_seq_) {
-    other.next_seq_ = 0;
-}
+      batch_buf_(std::move(other.batch_buf_)) {}
 
 WAL& WAL::operator=(WAL&& other) noexcept {
     if (this != &other) {
@@ -29,8 +26,6 @@ WAL& WAL::operator=(WAL&& other) noexcept {
         }
         log_file_ = std::move(other.log_file_);
         batch_buf_ = std::move(other.batch_buf_);
-        next_seq_ = other.next_seq_;
-        other.next_seq_ = 0;
     }
     return *this;
 }
@@ -38,7 +33,6 @@ WAL& WAL::operator=(WAL&& other) noexcept {
 Status WAL::create(const std::string& path) {
     Status s = log_file_.create(path);
     if (!s.ok()) return s;
-    next_seq_ = 0;
     batch_buf_.clear();
     return Status::OK();
 }
@@ -46,7 +40,6 @@ Status WAL::create(const std::string& path) {
 Status WAL::open(const std::string& path) {
     Status s = log_file_.open(path);
     if (!s.ok()) return s;
-    next_seq_ = 0;
     batch_buf_.clear();
     return Status::OK();
 }
@@ -90,8 +83,8 @@ void WAL::put(const void* data, size_t len) {
 }
 
 Status WAL::commit(bool do_sync) {
-    // Commit record: [body_len:4][type:1][seq:8][crc32:4]
-    uint32_t body_len = 1 + 8 + 4; // type + seq + crc = 13
+    // Commit record: [body_len:4][type:1][crc32:4]
+    uint32_t body_len = 1 + 4; // type + crc = 5
     size_t offset = batch_buf_.size();
     size_t total = 4 + body_len;
     batch_buf_.resize(offset + total);
@@ -104,13 +97,9 @@ Status WAL::commit(bool do_sync) {
     // type
     *p = kTypeCommit;
 
-    // seq
-    uint64_t seq = next_seq_++;
-    std::memcpy(p + 1, &seq, 8);
-
-    // crc32 covers type + seq
-    uint32_t checksum = crc32(p, 1 + 8);
-    std::memcpy(p + 9, &checksum, 4);
+    // crc32 covers type byte
+    uint32_t checksum = crc32(p, 1);
+    std::memcpy(p + 1, &checksum, 4);
 
     // Write entire batch to disk
     uint64_t write_offset;
@@ -173,13 +162,11 @@ Status WAL::replay(const ReplayCallback& cb, uint64_t& valid_end) const {
             const char* payload_ptr = reinterpret_cast<const char*>(body + 1);
             pending.emplace_back(payload_ptr, payload_len);
         } else if (type == kTypeCommit) {
-            if (body_len != 13) {
+            if (body_len != 5) {
                 break; // malformed commit record
             }
-            uint64_t seq;
-            std::memcpy(&seq, body + 1, 8);
 
-            s = cb(seq, pending);
+            s = cb(pending);
             if (!s.ok()) return s;
 
             pending.clear();

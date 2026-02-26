@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <filesystem>
 #include <map>
 #include <set>
 #include <thread>
@@ -9,6 +10,7 @@
 #include "internal/bit_stream.h"
 #include "internal/global_index.h"
 #include "internal/lslot_codec.h"
+#include "internal/manifest.h"
 #include "internal/read_only_delta_hash_table.h"
 #include "internal/read_write_delta_hash_table.h"
 
@@ -75,8 +77,29 @@ TEST(EliasGamma, RoundTrip64) {
 
 using kvlite::Status;
 
-TEST(GlobalIndexDHT, PutAndGetLatest) {
+class GlobalIndexDHT : public ::testing::Test {
+protected:
+    void SetUp() override {
+        db_dir_ = ::testing::TempDir() + "/gi_dht_test_" +
+                  std::to_string(reinterpret_cast<uintptr_t>(this));
+        std::filesystem::create_directories(db_dir_);
+        ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        GlobalIndex::Options opts;
+        ASSERT_TRUE(index.open(db_dir_, manifest_, opts).ok());
+    }
+
+    void TearDown() override {
+        if (index.isOpen()) index.close();
+        manifest_.close();
+        std::filesystem::remove_all(db_dir_);
+    }
+
+    std::string db_dir_;
+    kvlite::internal::Manifest manifest_;
     GlobalIndex index;
+};
+
+TEST_F(GlobalIndexDHT, PutAndGetLatest) {
 
     // version=100 in seg 1, version=200 in seg 2, version=300 in seg 3
     index.put("key1", 100, 1);
@@ -98,9 +121,7 @@ TEST(GlobalIndexDHT, PutAndGetLatest) {
     EXPECT_EQ(vers[2], 100u);  EXPECT_EQ(seg_ids[2], 1u);
 }
 
-TEST(GlobalIndexDHT, PutMultipleVersions) {
-    GlobalIndex index;
-
+TEST_F(GlobalIndexDHT, PutMultipleVersions) {
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
     index.put("key1", 300, 3);
@@ -109,8 +130,7 @@ TEST(GlobalIndexDHT, PutMultipleVersions) {
     EXPECT_EQ(index.keyCount(), 1u);
 }
 
-TEST(GlobalIndexDHT, GetLatest) {
-    GlobalIndex index;
+TEST_F(GlobalIndexDHT, GetLatest) {
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
 
@@ -123,8 +143,7 @@ TEST(GlobalIndexDHT, GetLatest) {
     EXPECT_TRUE(index.getLatest("missing", ver, seg).isNotFound());
 }
 
-TEST(GlobalIndexDHT, GetWithUpperBound) {
-    GlobalIndex index;
+TEST_F(GlobalIndexDHT, GetWithUpperBound) {
     index.put("key1", 100, 1);
     index.put("key1", 200, 2);
     index.put("key1", 300, 3);
@@ -145,99 +164,81 @@ TEST(GlobalIndexDHT, GetWithUpperBound) {
     EXPECT_FALSE(index.get("key1", 50, ver, seg));
 }
 
-TEST(GlobalIndexDHT, Contains) {
-    GlobalIndex index;
+TEST_F(GlobalIndexDHT, Contains) {
     EXPECT_FALSE(index.contains("key1"));
     index.put("key1", 100, 1);
     EXPECT_TRUE(index.contains("key1"));
 }
 
-TEST(GlobalIndexDHT, GetNonExistent) {
-    GlobalIndex index;
+TEST_F(GlobalIndexDHT, GetNonExistent) {
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> vers;
     EXPECT_FALSE(index.get("missing", seg_ids, vers));
 }
 
-#include <filesystem>
+TEST_F(GlobalIndexDHT, Snapshot) {
+    std::string path = db_dir_ + "/test_snapshot.dat";
 
-TEST(GlobalIndexDHT, Snapshot) {
-    std::string path = "/tmp/test_global_index_snapshot_dht.dat";
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
+    index.put("key2", 300, 3);
 
-    {
-        GlobalIndex index;
-        index.put("key1", 100, 1);
-        index.put("key1", 200, 2);
-        index.put("key2", 300, 3);
+    Status s = index.saveSnapshot(path);
+    ASSERT_TRUE(s.ok()) << s.toString();
 
-        Status s = index.saveSnapshot(path);
-        ASSERT_TRUE(s.ok()) << s.toString();
-    }
+    // Load into a fresh index (no open needed for loadSnapshot — it only reads the DHT).
+    GlobalIndex index2;
+    s = index2.loadSnapshot(path);
+    ASSERT_TRUE(s.ok()) << s.toString();
 
-    {
-        GlobalIndex index;
-        Status s = index.loadSnapshot(path);
-        ASSERT_TRUE(s.ok()) << s.toString();
+    EXPECT_EQ(index2.keyCount(), 2u);
+    EXPECT_EQ(index2.entryCount(), 3u);
 
-        EXPECT_EQ(index.keyCount(), 2u);
-        EXPECT_EQ(index.entryCount(), 3u);
+    uint64_t ver;
+    uint32_t seg;
+    EXPECT_TRUE(index2.getLatest("key1", ver, seg).ok());
+    EXPECT_EQ(ver, 200u);
+    EXPECT_EQ(seg, 2u);
 
-        uint64_t ver;
-        uint32_t seg;
-        EXPECT_TRUE(index.getLatest("key1", ver, seg).ok());
-        EXPECT_EQ(ver, 200u);
-        EXPECT_EQ(seg, 2u);
-
-        EXPECT_TRUE(index.getLatest("key2", ver, seg).ok());
-        EXPECT_EQ(ver, 300u);
-        EXPECT_EQ(seg, 3u);
-    }
-
-    std::filesystem::remove(path);
+    EXPECT_TRUE(index2.getLatest("key2", ver, seg).ok());
+    EXPECT_EQ(ver, 300u);
+    EXPECT_EQ(seg, 3u);
 }
 
-TEST(GlobalIndexDHT, SnapshotWithManyEntries) {
-    std::string path = "/tmp/test_global_index_snapshot_many.dat";
+TEST_F(GlobalIndexDHT, SnapshotWithManyEntries) {
+    std::string path = db_dir_ + "/test_snapshot_many.dat";
 
-    {
-        GlobalIndex index;
-        index.put("key1", 100, 1);
-        index.put("key1", 200, 2);
-        index.put("key1", 300, 3);
-        index.put("key2", 400, 4);
+    index.put("key1", 100, 1);
+    index.put("key1", 200, 2);
+    index.put("key1", 300, 3);
+    index.put("key2", 400, 4);
 
-        Status s = index.saveSnapshot(path);
-        ASSERT_TRUE(s.ok()) << s.toString();
-    }
+    Status s = index.saveSnapshot(path);
+    ASSERT_TRUE(s.ok()) << s.toString();
 
-    {
-        GlobalIndex index;
-        Status s = index.loadSnapshot(path);
-        ASSERT_TRUE(s.ok()) << s.toString();
+    GlobalIndex index2;
+    s = index2.loadSnapshot(path);
+    ASSERT_TRUE(s.ok()) << s.toString();
 
-        EXPECT_EQ(index.keyCount(), 2u);
-        EXPECT_EQ(index.entryCount(), 4u);
+    EXPECT_EQ(index2.keyCount(), 2u);
+    EXPECT_EQ(index2.entryCount(), 4u);
 
-        std::vector<uint32_t> seg_ids;
-        std::vector<uint64_t> vers;
-        ASSERT_TRUE(index.get("key1", seg_ids, vers));
-        ASSERT_EQ(seg_ids.size(), 3u);
-        EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
-        EXPECT_EQ(vers[1], 200u);  EXPECT_EQ(seg_ids[1], 2u);
-        EXPECT_EQ(vers[2], 100u);  EXPECT_EQ(seg_ids[2], 1u);
+    std::vector<uint32_t> seg_ids;
+    std::vector<uint64_t> vers;
+    ASSERT_TRUE(index2.get("key1", seg_ids, vers));
+    ASSERT_EQ(seg_ids.size(), 3u);
+    EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
+    EXPECT_EQ(vers[1], 200u);  EXPECT_EQ(seg_ids[1], 2u);
+    EXPECT_EQ(vers[2], 100u);  EXPECT_EQ(seg_ids[2], 1u);
 
-        uint64_t ver;
-        uint32_t seg;
-        EXPECT_TRUE(index.getLatest("key2", ver, seg).ok());
-        EXPECT_EQ(ver, 400u);
-        EXPECT_EQ(seg, 4u);
-    }
-
-    std::filesystem::remove(path);
+    uint64_t ver;
+    uint32_t seg;
+    EXPECT_TRUE(index2.getLatest("key2", ver, seg).ok());
+    EXPECT_EQ(ver, 400u);
+    EXPECT_EQ(seg, 4u);
 }
 
-TEST(GlobalIndexDHT, Clear) {
-    GlobalIndex index;
+TEST_F(GlobalIndexDHT, Clear) {
     for (int i = 0; i < 50; ++i) {
         index.put("key" + std::to_string(i), static_cast<uint64_t>(i * 10),
                   static_cast<uint32_t>(i));
@@ -579,8 +580,7 @@ TEST(ReadOnlyDHTOverflow, ForEachGroupMergesChain) {
 // ============================================================
 
 // Many versions of the same key, all in the same segment.
-TEST(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
-    GlobalIndex index;
+TEST_F(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
     for (int i = 1; i <= 200; ++i) {
         index.put("key", static_cast<uint64_t>(i), /*segment_id=*/1);
     }
@@ -604,8 +604,7 @@ TEST(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
 }
 
 // Same key, different segments (unique segment_ids).
-TEST(GlobalIndexDHT, ManyVersionsDifferentSegments) {
-    GlobalIndex index;
+TEST_F(GlobalIndexDHT, ManyVersionsDifferentSegments) {
     for (int i = 1; i <= 200; ++i) {
         index.put("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
@@ -622,8 +621,7 @@ TEST(GlobalIndexDHT, ManyVersionsDifferentSegments) {
     EXPECT_EQ(seg, 150u);
 }
 
-TEST(GlobalIndexDHT, LargeScale) {
-    GlobalIndex index;
+TEST_F(GlobalIndexDHT, LargeScale) {
     const int N = 1000;
 
     for (int i = 0; i < N; ++i) {
@@ -778,8 +776,7 @@ TEST(ReadOnlyDHT, AddEntryIsNewAfterOverflow) {
     }
 }
 
-TEST(GlobalIndexDHT, PutKeyCountWithAddEntryIsNew) {
-    GlobalIndex index;
+TEST_F(GlobalIndexDHT, PutKeyCountWithAddEntryIsNew) {
     const int K = 50;
     const int V = 5;
     for (int k = 0; k < K; ++k) {

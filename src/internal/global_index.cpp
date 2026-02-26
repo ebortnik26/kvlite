@@ -98,12 +98,10 @@ Status GlobalIndex::close() {
     Status s = saveSnapshot(snapshotPath());
     if (!s.ok()) {
         wal_->close();
-        wal_.reset();
         is_open_ = false;
         return s;
     }
     wal_->close();
-    wal_.reset();
     is_open_ = false;
     return Status::OK();
 }
@@ -115,7 +113,8 @@ bool GlobalIndex::isOpen() const {
 // --- Index Operations ---
 
 Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_t segment_id) {
-    wal_->appendPut(key, packed_version, segment_id, WalProducer::kWB);
+    Status s = wal_->appendPut(key, packed_version, segment_id, WalProducer::kWB);
+    if (!s.ok()) return s;
     applyPut(key, packed_version, segment_id);
     updates_since_snapshot_++;
     return Status::OK();
@@ -123,7 +122,8 @@ Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_
 
 Status GlobalIndex::putChecked(const std::string& key, uint64_t packed_version,
                                uint32_t segment_id, const KeyResolver& resolver) {
-    wal_->appendPut(key, packed_version, segment_id, WalProducer::kWB);
+    Status s = wal_->appendPut(key, packed_version, segment_id, WalProducer::kWB);
+    if (!s.ok()) return s;
     if (dht_.addEntryChecked(key, packed_version, segment_id, resolver)) {
         ++key_count_;
     }
@@ -176,7 +176,8 @@ bool GlobalIndex::contains(const std::string& key) const {
 
 Status GlobalIndex::relocate(const std::string& key, uint64_t packed_version,
                               uint32_t old_segment_id, uint32_t new_segment_id) {
-    wal_->appendRelocate(key, packed_version, old_segment_id, new_segment_id, WalProducer::kGC);
+    Status s = wal_->appendRelocate(key, packed_version, old_segment_id, new_segment_id, WalProducer::kGC);
+    if (!s.ok()) return s;
     applyRelocate(key, packed_version, old_segment_id, new_segment_id);
     updates_since_snapshot_++;
     return Status::OK();
@@ -184,7 +185,8 @@ Status GlobalIndex::relocate(const std::string& key, uint64_t packed_version,
 
 Status GlobalIndex::eliminate(const std::string& key, uint64_t packed_version,
                                uint32_t segment_id) {
-    wal_->appendEliminate(key, packed_version, segment_id, WalProducer::kGC);
+    Status s = wal_->appendEliminate(key, packed_version, segment_id, WalProducer::kGC);
+    if (!s.ok()) return s;
     applyEliminate(key, packed_version, segment_id);
     updates_since_snapshot_++;
     return Status::OK();
@@ -209,15 +211,14 @@ void GlobalIndex::clear() {
     key_count_ = 0;
 }
 
-// --- Maintenance ---
+// --- WAL commit ---
 
-Status GlobalIndex::snapshot() {
-    Status s = saveSnapshot(snapshotPath());
-    if (!s.ok()) return s;
-    s = wal_->truncate();
-    if (!s.ok()) return s;
-    updates_since_snapshot_ = 0;
-    return Status::OK();
+Status GlobalIndex::commitWB() {
+    return wal_->commit(WalProducer::kWB);
+}
+
+Status GlobalIndex::commitGC() {
+    return wal_->commit(WalProducer::kGC);
 }
 
 // --- Statistics ---

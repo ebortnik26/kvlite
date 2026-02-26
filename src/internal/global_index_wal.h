@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,13 +24,13 @@ enum class WalOp : uint8_t {
     kPut       = 1,   // key, packed_version, segment_id
     kRelocate  = 2,   // key, packed_version, old_segment_id, new_segment_id
     kEliminate = 3,   // key, packed_version, segment_id
-    kCommit    = 4,   // batch boundary marker (version payload)
 };
 
 // Producer IDs for the single multiplexed WAL.
 namespace WalProducer {
     constexpr uint8_t kWB = 0;   // WriteBuffer flush
     constexpr uint8_t kGC = 1;   // Garbage collection
+    constexpr uint8_t kMaxProducers = 2;
 }
 
 // Write-Ahead Log for GlobalIndex.
@@ -42,7 +44,12 @@ namespace WalProducer {
 // file. Each file is tracked in the Manifest.
 //
 // Built on the generic WAL primitive which provides CRC-protected records
-// with transaction semantics. Domain payloads (no per-record CRC) are:
+// with transaction semantics.
+//
+// Each WAL data record contains a batch of concatenated domain records:
+//   [record_1][record_2]...[record_N]
+//
+// Domain record formats:
 //
 // kPut / kEliminate (16 + key_len bytes):
 //   [op:1][producer_id:1][packed_version:8][segment_id:4][key_len:2][key:var]
@@ -50,17 +57,20 @@ namespace WalProducer {
 // kRelocate (20 + key_len bytes):
 //   [op:1][producer_id:1][packed_version:8][old_segment_id:4][new_segment_id:4][key_len:2][key:var]
 //
-// kCommit (10 bytes):
-//   [op:1][producer_id:1][version:8]
-//
-// Thread-safety: Not thread-safe. All batch recording and commit calls must
-// be externally serialized (which they are — called only from flush and GC
-// merge, both single-threaded producers).
+// Thread-safety: All public methods are thread-safe. A shared_mutex serves
+// as a lifecycle lock: append/commit take a shared lock (concurrent producers),
+// close() takes an exclusive lock (waits for in-flight operations, then blocks
+// new ones). commit() additionally acquires an inner mutex to serialize WAL
+// file writes. After close(), all write operations return IOError.
 class GlobalIndexWAL {
 public:
+    static constexpr uint32_t kDefaultBatchSize = 1024;
+
     struct Options {
         // Maximum size of a single WAL file before rollover (default 1 GB).
         uint64_t max_file_size = 1ULL << 30;
+        // Number of records before auto-commit per producer.
+        uint32_t batch_size = kDefaultBatchSize;
     };
 
     GlobalIndexWAL();
@@ -70,30 +80,32 @@ public:
     Status open(const std::string& db_path, Manifest& manifest,
                 const Options& options);
 
-    // Close the active WAL file.
+    // Close the active WAL file. Takes exclusive lock to wait for in-flight
+    // operations, flushes pending staged records, then closes. After close()
+    // (open_ becomes false), all append/commit calls return IOError.
     Status close();
 
-    // --- Batch recording (in-memory only, no I/O) ---
-    // No-ops when the WAL file is not open.
+    // --- Batch recording ---
+    // Records are staged in per-producer buffers (no I/O, no locking).
+    // When the staging buffer reaches batch_size records, auto-commits.
+    // Returns an error only if auto-commit fails.
 
-    void appendPut(std::string_view key, uint64_t packed_version,
-                   uint32_t segment_id, uint8_t producer_id);
+    Status appendPut(std::string_view key, uint64_t packed_version,
+                     uint32_t segment_id, uint8_t producer_id);
 
-    void appendRelocate(std::string_view key, uint64_t packed_version,
-                        uint32_t old_segment_id, uint32_t new_segment_id,
-                        uint8_t producer_id);
+    Status appendRelocate(std::string_view key, uint64_t packed_version,
+                          uint32_t old_segment_id, uint32_t new_segment_id,
+                          uint8_t producer_id);
 
-    void appendEliminate(std::string_view key, uint64_t packed_version,
-                         uint32_t segment_id, uint8_t producer_id);
+    Status appendEliminate(std::string_view key, uint64_t packed_version,
+                           uint32_t segment_id, uint8_t producer_id);
 
-    // Flush batch + commit record to disk in one write.
-    // version is the max packed_version covered by this batch.
-    // Rolls over to a new file if the current file exceeds max_file_size.
-    // No-op when the WAL file is not open.
-    Status commit(uint64_t version, uint8_t producer_id, bool sync = false);
+    // Flush a producer's staged records to disk and sync.
+    // Acquires the WAL mutex, writes the batch as a single WAL record,
+    // commits and fsyncs the WAL transaction.
+    Status commit(uint8_t producer_id);
 
     // Return a pull-based stream over all WAL records, ordered by file then position.
-    // Each record carries its transaction's commit_version for merge ordering.
     std::unique_ptr<WALStream> replayStream() const;
 
     // Truncate WAL (resets counters).
@@ -109,16 +121,32 @@ public:
     uint32_t fileCount() const { return static_cast<uint32_t>(file_ids_.size()); }
 
     // Check if WAL is open
-    bool isOpen() const { return wal_.isOpen(); }
+    bool isOpen() const { return open_; }
 
     // WAL directory path: <db_path>/gi/wal/
     std::string walDir() const;
 
-    // Path for a specific WAL file: <db_path>/wal/NNNNNNNN.log
+    // Path for a specific WAL file: <db_path>/gi/wal/NNNNNNNN.log
     static std::string walFilePath(const std::string& wal_dir, uint32_t file_id);
 
 private:
+    // Per-producer staging buffer (serialized domain records, no WAL framing).
+    struct ProducerBuf {
+        std::vector<uint8_t> data;
+        uint32_t record_count = 0;
+    };
+
+    // Serialize a domain record into a producer's staging buffer.
+    static void serializeRecord(ProducerBuf& buf, WalOp op, uint8_t producer_id,
+                                uint64_t packed_version, std::string_view key,
+                                const uint32_t* seg_ids, size_t seg_count);
+
+    // Flush a producer's staging buffer under the WAL mutex.
+    // Caller must hold rw_mu_ in shared mode.
+    Status flushProducer(uint8_t producer_id);
+
     // Roll over to a new WAL file (close current, allocate next, create new).
+    // Caller must hold mu_.
     Status rollover();
 
     // Allocate the next file ID (increments next_file_id_ and persists to Manifest).
@@ -130,16 +158,25 @@ private:
     std::string file_prefix_;        // "gi.wal.file."
     Options options_;
 
+    // Lifecycle lock: shared for append/commit, exclusive for close.
+    std::shared_mutex rw_mu_;
+    bool open_ = false;  // protected by rw_mu_
+
+    std::mutex mu_;  // serializes WAL file writes
     WAL wal_;
     uint64_t entry_count_ = 0;
 
+    // Per-producer staging buffers (indexed by producer_id).
+    // Protected by rw_mu_ (shared for owning producer, exclusive for close).
+    ProducerBuf producers_[WalProducer::kMaxProducers];
+
     // File ID of the currently open WAL file.
     uint32_t current_file_id_ = 0;
-    // Next file ID to allocate (persisted in Manifest as "wal.next_file_id").
+    // Next file ID to allocate (persisted in Manifest as "gi.wal.next_file_id").
     uint32_t next_file_id_ = 0;
     // Sum of sizes of all closed WAL files.
     uint64_t total_size_ = 0;
-    // Set of all live WAL file IDs (from Manifest "wal.file.<id>" keys).
+    // Set of all live WAL file IDs (from Manifest "gi.wal.file.<id>" keys).
     std::vector<uint32_t> file_ids_;
 };
 

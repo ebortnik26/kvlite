@@ -17,13 +17,12 @@ namespace internal {
 // Unlike EntryStream::Entry which carries key/value data, WALRecord carries
 // index operations (put, relocate, eliminate) with no value data.
 struct WALRecord {
-    WalOp op;                // kPut, kRelocate, kEliminate (kCommit is consumed internally)
+    WalOp op;                // kPut, kRelocate, kEliminate
     uint8_t producer_id;     // WalProducer::kWB or kGC
     uint64_t packed_version;
     uint32_t segment_id;     // for put/eliminate: the segment; for relocate: old_seg
     uint32_t new_segment_id; // for relocate only (0 otherwise)
     std::string_view key;    // points into owned storage
-    uint64_t commit_version; // from the kCommit record — ordering key for merge
 };
 
 // Abstract pull-based iterator over WAL replay records.
@@ -36,41 +35,70 @@ public:
     virtual Status next() = 0;
 };
 
-// Materializes a single GlobalIndexWAL (all its WAL files) into a pull-based
-// stream of WALRecords, ordered by file-then-position within each file.
+// Streams WALRecords from a sequence of WAL files using a 1 MB read-ahead
+// buffer. Records are yielded one committed batch at a time — only complete
+// WAL transactions (those with a WAL-level commit record) are emitted.
 //
-// Strategy: replay one entire WAL file at a time into a vector of OwnedRecords,
-// then iterate. When the vector is exhausted, open the next file.
+// Memory usage is bounded: O(1 MB buffer + largest single batch).
 class WALReplayStream : public WALStream {
 public:
     WALReplayStream(const std::string& wal_dir,
                     const std::vector<uint32_t>& file_ids);
+    ~WALReplayStream();
 
     bool valid() const override;
     const WALRecord& record() const override;
     Status next() override;
 
 private:
-    Status loadNextFile();
-    void updateCurrent();
+    // 1 MB read-ahead buffered file reader.
+    struct FileReader {
+        static constexpr size_t kBufSize = 1 << 20;
+        int fd = -1;
+        std::unique_ptr<uint8_t[]> buf;
+        size_t buf_len = 0;
+        size_t buf_pos = 0;
 
-    std::string wal_dir_;
-    std::vector<uint32_t> file_ids_;
-    size_t file_idx_ = 0;
+        FileReader();
+        bool open(const std::string& path);
+        void close();
+        bool readExact(void* dst, size_t len);
+    };
 
-    // Owned records from the current WAL file.
     struct OwnedRecord {
         WalOp op;
         uint8_t producer_id;
         uint64_t packed_version;
         uint32_t segment_id;
         uint32_t new_segment_id;
-        std::string key;           // owns the key data
-        uint64_t commit_version;
+        std::string key;
     };
-    std::vector<OwnedRecord> records_;
-    size_t rec_idx_ = 0;
-    WALRecord current_;            // holds string_view into records_[rec_idx_]
+
+    // Read one raw WAL record: body_len + body + CRC check.
+    // Returns type byte via out param, payload points into body_.
+    // Returns false on EOF or CRC error.
+    bool readRawRecord(uint8_t& type, const uint8_t*& payload, size_t& payload_len);
+
+    // Parse one domain record from a payload buffer.
+    // Returns bytes consumed, or 0 if the payload is malformed.
+    static size_t parseDomainRecord(const uint8_t* payload, size_t len, OwnedRecord& out);
+
+    bool openNextFile();
+    bool readNextBatch();
+    void updateCurrent();
+
+    std::string wal_dir_;
+    std::vector<uint32_t> file_ids_;
+    size_t file_idx_ = 0;
+
+    FileReader reader_;
+    std::vector<uint8_t> body_;  // reusable buffer for raw WAL record bodies
+
+    // Current batch being yielded.
+    std::vector<OwnedRecord> batch_;
+    size_t batch_idx_ = 0;
+
+    WALRecord current_;
     bool valid_ = false;
 };
 

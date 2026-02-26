@@ -63,8 +63,8 @@ TEST_F(WALTest, PutAndCommitSingle) {
     wal.put(data, 3);
     ASSERT_TRUE(wal.commit().ok());
 
-    // File should have: data record (4+1+3+4=12) + commit record (4+13=17) = 29 bytes
-    EXPECT_EQ(wal.size(), 29u);
+    // File should have: data record (4+1+3+4=12) + commit record (4+5=9) = 21 bytes
+    EXPECT_EQ(wal.size(), 21u);
     ASSERT_TRUE(wal.close().ok());
 }
 
@@ -78,8 +78,8 @@ TEST_F(WALTest, PutMultipleAndCommit) {
     wal.put(d2, 2);
     ASSERT_TRUE(wal.commit().ok());
 
-    // d1: 4+1+1+4=10, d2: 4+1+2+4=11, commit: 17, total=38
-    EXPECT_EQ(wal.size(), 38u);
+    // d1: 4+1+1+4=10, d2: 4+1+2+4=11, commit: 4+5=9, total=30
+    EXPECT_EQ(wal.size(), 30u);
     ASSERT_TRUE(wal.close().ok());
 }
 
@@ -109,7 +109,7 @@ TEST_F(WALTest, EmptyCommit) {
 
     // Commit with no data records — just a commit record
     ASSERT_TRUE(wal.commit().ok());
-    EXPECT_EQ(wal.size(), 17u); // just the commit record
+    EXPECT_EQ(wal.size(), 9u); // just the commit record (4+5)
 
     ASSERT_TRUE(wal.close().ok());
 }
@@ -132,8 +132,7 @@ TEST_F(WALTest, ReplaySingleBatch) {
     int callback_count = 0;
     uint64_t valid_end = 0;
     Status s = wal2.replay(
-        [&](uint64_t seq, const std::vector<std::string_view>& records) -> Status {
-            EXPECT_EQ(seq, 0u);
+        [&](const std::vector<std::string_view>& records) -> Status {
             EXPECT_EQ(records.size(), 2u);
             EXPECT_EQ(records[0].size(), 2u);
             EXPECT_EQ(static_cast<uint8_t>(records[0][0]), 10);
@@ -173,21 +172,17 @@ TEST_F(WALTest, ReplayMultipleBatches) {
     WAL wal2;
     ASSERT_TRUE(wal2.open(path_).ok());
 
-    std::vector<uint64_t> seqs;
     std::vector<size_t> record_counts;
     uint64_t valid_end = 0;
     Status s = wal2.replay(
-        [&](uint64_t seq, const std::vector<std::string_view>& records) -> Status {
-            seqs.push_back(seq);
+        [&](const std::vector<std::string_view>& records) -> Status {
             record_counts.push_back(records.size());
             return Status::OK();
         },
         valid_end);
 
     ASSERT_TRUE(s.ok());
-    ASSERT_EQ(seqs.size(), 2u);
-    EXPECT_EQ(seqs[0], 0u);
-    EXPECT_EQ(seqs[1], 1u);
+    ASSERT_EQ(record_counts.size(), 2u);
     EXPECT_EQ(record_counts[0], 1u);
     EXPECT_EQ(record_counts[1], 2u);
     EXPECT_EQ(valid_end, wal2.size());
@@ -205,7 +200,7 @@ TEST_F(WALTest, ReplayEmptyFile) {
     int callback_count = 0;
     uint64_t valid_end = 0;
     Status s = wal2.replay(
-        [&](uint64_t, const std::vector<std::string_view>&) -> Status {
+        [&](const std::vector<std::string_view>&) -> Status {
             ++callback_count;
             return Status::OK();
         },
@@ -247,7 +242,7 @@ TEST_F(WALTest, ReplayTruncatedRecord) {
     int callback_count = 0;
     uint64_t valid_end = 0;
     Status s = wal2.replay(
-        [&](uint64_t, const std::vector<std::string_view>& records) -> Status {
+        [&](const std::vector<std::string_view>& records) -> Status {
             ++callback_count;
             EXPECT_EQ(records.size(), 1u);
             return Status::OK();
@@ -288,7 +283,7 @@ TEST_F(WALTest, ReplayAndTruncate) {
 
     int callback_count = 0;
     Status s = wal2.replayAndTruncate(
-        [&](uint64_t, const std::vector<std::string_view>&) -> Status {
+        [&](const std::vector<std::string_view>&) -> Status {
             ++callback_count;
             return Status::OK();
         });
@@ -379,7 +374,7 @@ TEST_F(WALTest, LargePayload) {
 
     uint64_t valid_end = 0;
     Status s = wal2.replay(
-        [&](uint64_t, const std::vector<std::string_view>& records) -> Status {
+        [&](const std::vector<std::string_view>& records) -> Status {
             EXPECT_EQ(records.size(), 1u);
             EXPECT_EQ(records[0].size(), big.size());
             for (size_t i = 0; i < big.size(); ++i) {
@@ -426,7 +421,7 @@ TEST_F(WALTest, CorruptedCRC) {
     int callback_count = 0;
     uint64_t valid_end = 0;
     Status s = wal2.replay(
-        [&](uint64_t, const std::vector<std::string_view>&) -> Status {
+        [&](const std::vector<std::string_view>&) -> Status {
             ++callback_count;
             return Status::OK();
         },
@@ -451,7 +446,7 @@ TEST_F(WALTest, CallbackError) {
 
     uint64_t valid_end = 0;
     Status s = wal2.replay(
-        [&](uint64_t, const std::vector<std::string_view>&) -> Status {
+        [&](const std::vector<std::string_view>&) -> Status {
             return Status::Corruption("test error");
         },
         valid_end);
@@ -460,7 +455,7 @@ TEST_F(WALTest, CallbackError) {
     ASSERT_TRUE(wal2.close().ok());
 }
 
-TEST_F(WALTest, SequenceNumbersIncrement) {
+TEST_F(WALTest, MultipleCommitsReplay) {
     WAL wal;
     ASSERT_TRUE(wal.create(path_).ok());
 
@@ -474,20 +469,20 @@ TEST_F(WALTest, SequenceNumbersIncrement) {
     WAL wal2;
     ASSERT_TRUE(wal2.open(path_).ok());
 
-    std::vector<uint64_t> seqs;
+    int batch_count = 0;
     uint64_t valid_end = 0;
     Status s = wal2.replay(
-        [&](uint64_t seq, const std::vector<std::string_view>&) -> Status {
-            seqs.push_back(seq);
+        [&](const std::vector<std::string_view>& records) -> Status {
+            EXPECT_EQ(records.size(), 1u);
+            EXPECT_EQ(static_cast<uint8_t>(records[0][0]),
+                       static_cast<uint8_t>(batch_count));
+            ++batch_count;
             return Status::OK();
         },
         valid_end);
 
     ASSERT_TRUE(s.ok());
-    ASSERT_EQ(seqs.size(), 5u);
-    for (uint64_t i = 0; i < 5; ++i) {
-        EXPECT_EQ(seqs[i], i);
-    }
+    EXPECT_EQ(batch_count, 5);
     ASSERT_TRUE(wal2.close().ok());
 }
 
@@ -511,7 +506,7 @@ TEST_F(WALTest, UncommittedDataDiscarded) {
     int callback_count = 0;
     uint64_t valid_end = 0;
     Status s = wal2.replay(
-        [&](uint64_t, const std::vector<std::string_view>& records) -> Status {
+        [&](const std::vector<std::string_view>& records) -> Status {
             ++callback_count;
             EXPECT_EQ(records.size(), 1u);
             EXPECT_EQ(static_cast<uint8_t>(records[0][0]), 1);

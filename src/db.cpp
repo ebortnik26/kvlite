@@ -423,8 +423,7 @@ Status DB::flush() {
         s->readKeyByVersion(packed_version, key);
         return key;
     };
-    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_,
-                             global_index_->wal(), resolver);
+    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_, resolver);
     if (!s.ok()) {
         return s;
     }
