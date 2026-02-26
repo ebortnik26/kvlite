@@ -845,6 +845,7 @@ size_t DeltaHashTable::memoryUsage() const {
 
 void DeltaHashTable::clearBuckets() {
     for (auto& bucket : buckets_) {
+        setExtensionPtr(bucket, 0);
         initBucket(bucket);
     }
     extensions_.clear();

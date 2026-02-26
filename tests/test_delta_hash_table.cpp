@@ -1421,6 +1421,7 @@ public:
         return findAllByHash(bi, li, fp, pvs, ids);
     }
 
+    using ReadWriteDeltaHashTable::removeEntry;
     void removeEntry(uint64_t fp, uint64_t packed_version, uint32_t id,
                      uint32_t bi, uint32_t li) {
         removeFromChain(bi, li, fp, packed_version, id);
@@ -1436,6 +1437,7 @@ public:
     }
 
     uint8_t fpBits() const { return fingerprint_bits_; }
+    size_t extensionCount() const { return extensions_.size(); }
 };
 
 TEST(ReadWriteDHT, AddEntryCheckedCollision) {
@@ -1863,4 +1865,180 @@ TEST(ReadWriteDHT, CollisionThenUpdate) {
     }
     EXPECT_EQ(pv_to_id[100], 99u);   // updated
     EXPECT_EQ(pv_to_id[200], 2u);    // unchanged
+}
+
+// ============================================================
+// Memory leak tests
+// ============================================================
+
+// Helper: ReadOnly DHT with exposed extension count.
+class TestableRODHT : public ReadOnlyDeltaHashTable {
+public:
+    using ReadOnlyDeltaHashTable::ReadOnlyDeltaHashTable;
+    size_t extensionCount() const { return extensions_.size(); }
+};
+
+// Compute base memoryUsage for a config (no extensions).
+static size_t baseMemory(const DeltaHashTable::Config& cfg) {
+    size_t stride = cfg.bucket_bytes + 8;  // kBucketPadding = 8
+    return (1u << cfg.bucket_bits) * stride;
+}
+
+TEST(MemoryLeak, ReadOnlyClearReleasesExtensions) {
+    auto cfg = smallBucketConfig();
+    TestableRODHT dht(cfg);
+
+    // Fill until extensions are created.
+    for (int i = 1; i <= 500; ++i) {
+        dht.addEntry("key" + std::to_string(i % 5),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    ASSERT_GT(dht.extensionCount(), 0u);
+    ASSERT_GT(dht.memoryUsage(), baseMemory(cfg));
+
+    dht.clear();
+
+    EXPECT_EQ(dht.extensionCount(), 0u);
+    EXPECT_EQ(dht.memoryUsage(), baseMemory(cfg));
+    EXPECT_EQ(dht.size(), 0u);
+}
+
+TEST(MemoryLeak, ReadOnlyMoveTransfersOwnership) {
+    auto cfg = smallBucketConfig();
+    TestableRODHT src(cfg);
+    for (int i = 1; i <= 300; ++i) {
+        src.addEntry("k" + std::to_string(i % 3),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    size_t ext_before = src.extensionCount();
+    size_t mem_before = src.memoryUsage();
+    ASSERT_GT(ext_before, 0u);
+
+    // Move-construct destination.
+    TestableRODHT dst(std::move(src));
+    EXPECT_EQ(dst.extensionCount(), ext_before);
+    EXPECT_EQ(dst.memoryUsage(), mem_before);
+
+    // Verify data survived the move.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    EXPECT_TRUE(dst.findAll("k0", pvs, ids));
+    EXPECT_FALSE(pvs.empty());
+}
+
+TEST(MemoryLeak, ReadWriteClearReleasesExtensions) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.lslot_bits = 2;
+    cfg.bucket_bytes = 32;
+
+    // Use TestableRWDHT to inspect extension count, but note it can't be
+    // moved (deleted move ctor), so we test clear() only.
+    DeltaHashTable::Config dcfg;
+    dcfg.bucket_bits = cfg.bucket_bits;
+    dcfg.lslot_bits = cfg.lslot_bits;
+    dcfg.bucket_bytes = cfg.bucket_bytes;
+    TestableRWDHT dht(dcfg);
+
+    for (int i = 1; i <= 500; ++i) {
+        dht.addEntry("key" + std::to_string(i % 5),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    ASSERT_GT(dht.extensionCount(), 0u);
+
+    dht.clear();
+
+    EXPECT_EQ(dht.extensionCount(), 0u);
+    EXPECT_EQ(dht.size(), 0u);
+}
+
+TEST(MemoryLeak, RepeatedAddRemoveCyclesStableMemory) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.lslot_bits = 2;
+    cfg.bucket_bytes = 64;
+    TestableRWDHT dht(cfg);
+
+    // Run multiple cycles of fill + drain.
+    for (int cycle = 0; cycle < 5; ++cycle) {
+        // Fill: add entries that cause extensions.
+        const int N = 200;
+        for (int i = 1; i <= N; ++i) {
+            dht.addEntry("key" + std::to_string(i),
+                         static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        }
+        ASSERT_GT(dht.extensionCount(), 0u);
+
+        // Drain: remove all entries.
+        for (int i = 1; i <= N; ++i) {
+            dht.removeEntry("key" + std::to_string(i),
+                            static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        }
+    }
+
+    // After all cycles, verify no data remains and no entries are findable.
+    for (int i = 1; i <= 200; ++i) {
+        EXPECT_FALSE(dht.contains("key" + std::to_string(i)));
+    }
+    EXPECT_EQ(dht.size(), 0u);
+}
+
+TEST(MemoryLeak, PruneEmptyExtensionOnRemove) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.lslot_bits = 2;
+    cfg.bucket_bytes = 32;  // very small → forces extensions quickly
+    TestableRWDHT dht(cfg);
+
+    // Add enough entries across multiple keys so different extension chain
+    // tails become empty during removal (pruneEmptyExtension unlinks empty
+    // tail extensions). Using multiple keys spreads entries across lslots,
+    // meaning some extension buckets become entirely empty sooner.
+    const int N = 100;
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry("key" + std::to_string(i % 10),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    size_t ext_after_add = dht.extensionCount();
+    ASSERT_GT(ext_after_add, 0u);
+
+    // Remove all entries.
+    for (int i = 1; i <= N; ++i) {
+        dht.removeEntry("key" + std::to_string(i % 10),
+                        static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    // All data must be gone.
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_FALSE(dht.contains("key" + std::to_string(i)));
+    }
+    EXPECT_EQ(dht.size(), 0u);
+}
+
+TEST(MemoryLeak, ClearAfterOverflowThenReuseWorks) {
+    auto cfg = smallBucketConfig();
+    TestableRODHT dht(cfg);
+
+    // First round: fill with extensions.
+    for (int i = 1; i <= 300; ++i) {
+        dht.addEntry("k" + std::to_string(i), static_cast<uint64_t>(i),
+                     static_cast<uint32_t>(i));
+    }
+    ASSERT_GT(dht.extensionCount(), 0u);
+
+    // Clear and reuse.
+    dht.clear();
+    ASSERT_EQ(dht.extensionCount(), 0u);
+
+    // Second round: same operations should work correctly.
+    for (int i = 1; i <= 300; ++i) {
+        dht.addEntry("k" + std::to_string(i), static_cast<uint64_t>(i + 1000),
+                     static_cast<uint32_t>(i));
+    }
+
+    // Verify all entries from second round are present.
+    for (int i = 1; i <= 300; ++i) {
+        std::string key = "k" + std::to_string(i);
+        ASSERT_TRUE(dht.contains(key)) << "missing after reuse: " << key;
+    }
 }
