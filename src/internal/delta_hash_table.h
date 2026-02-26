@@ -90,6 +90,15 @@ public:
 
     size_t memoryUsage() const;
 
+    // --- Public accessors for binary snapshot ---
+
+    const uint8_t* arenaData() const;
+    size_t arenaBytes() const;
+    uint32_t numBuckets() const;
+    uint32_t bucketStride() const;
+    const Config& config() const;
+    uint8_t fingerprintBits() const;
+
 protected:
     static constexpr uint32_t kBucketPadding = 8;
 
@@ -110,7 +119,6 @@ protected:
 
     // --- Bucket data ---
 
-    uint32_t bucketStride() const;
     uint64_t getExtensionPtr(const Bucket& bucket) const;
     void setExtensionPtr(Bucket& bucket, uint64_t ptr) const;
     size_t bucketDataBits() const;
@@ -175,6 +183,7 @@ protected:
     // --- Bulk helpers ---
 
     void clearBuckets();
+    void loadArenaData(const uint8_t* data, size_t len);
 
     // --- Members ---
 

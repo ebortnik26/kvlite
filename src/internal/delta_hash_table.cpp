@@ -847,6 +847,32 @@ void DeltaHashTable::clearBuckets() {
     ext_arena_->clear();
 }
 
+// --- Public accessors for binary snapshot ---
+
+const uint8_t* DeltaHashTable::arenaData() const {
+    return arena_.get();
+}
+
+size_t DeltaHashTable::arenaBytes() const {
+    return static_cast<size_t>(1u << config_.bucket_bits) * bucketStride();
+}
+
+uint32_t DeltaHashTable::numBuckets() const {
+    return 1u << config_.bucket_bits;
+}
+
+const DeltaHashTable::Config& DeltaHashTable::config() const {
+    return config_;
+}
+
+uint8_t DeltaHashTable::fingerprintBits() const {
+    return fingerprint_bits_;
+}
+
+void DeltaHashTable::loadArenaData(const uint8_t* data, size_t len) {
+    std::memcpy(arena_.get(), data, len);
+}
+
 void DeltaHashTable::initBucket(Bucket& bucket) {
     size_t data_bytes = config_.bucket_bytes - 8;
     uint64_t ext_ptr = getExtensionPtr(bucket);

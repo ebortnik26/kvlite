@@ -152,6 +152,12 @@ private:
     // Allocate the next file ID (increments next_file_id_ and persists to Manifest).
     Status allocateFileId(uint32_t& file_id);
 
+    // Load file IDs and next_file_id from Manifest.
+    void loadManifestState();
+
+    // Open the last existing WAL file, or create the first one.
+    Status openActiveFile();
+
     Manifest* manifest_ = nullptr;
     std::string db_path_;
     std::string next_file_id_key_;   // "gi.wal.next_file_id"

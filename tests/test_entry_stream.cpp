@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <memory>
 #include <set>
 #include <string>
@@ -10,6 +11,7 @@
 #include "internal/gc_stream.h"
 #include "internal/global_index.h"
 #include "internal/log_file.h"
+#include "internal/manifest.h"
 #include "internal/segment.h"
 #include "internal/write_buffer.h"
 
@@ -22,6 +24,12 @@ class EntryStreamTest : public ::testing::Test {
 protected:
     void SetUp() override {
         base_ = "/tmp/es_test_" + std::to_string(getpid()) + "_";
+        db_dir_ = base_ + "db";
+        std::filesystem::create_directories(db_dir_);
+        ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        gi_ = std::make_unique<GlobalIndex>(manifest_);
+        GlobalIndex::Options opts;
+        ASSERT_TRUE(gi_->open(db_dir_, opts).ok());
     }
     void TearDown() override {
         for (auto& seg : segments_) {
@@ -30,6 +38,10 @@ protected:
         for (auto& path : paths_) {
             ::unlink(path.c_str());
         }
+        if (gi_ && gi_->isOpen()) gi_->close();
+        gi_.reset();
+        manifest_.close();
+        std::filesystem::remove_all(db_dir_);
     }
 
     // Create a segment, write entries, seal it, and register in GlobalIndex.
@@ -45,13 +57,15 @@ protected:
         EXPECT_TRUE(seg.create(path, segment_id).ok());
         for (const auto& [key, version, value, tombstone] : entries) {
             EXPECT_TRUE(seg.put(key, version, value, tombstone).ok());
-            gi_.put(key, version, segment_id);
+            gi_->put(key, version, segment_id);
         }
         EXPECT_TRUE(seg.seal().ok());
         return idx;
     }
 
-    GlobalIndex gi_;
+    std::string db_dir_;
+    Manifest manifest_;
+    std::unique_ptr<GlobalIndex> gi_;
     std::vector<Segment> segments_;
     std::string base_;
     std::vector<std::string> paths_;

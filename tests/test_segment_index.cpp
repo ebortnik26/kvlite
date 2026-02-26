@@ -596,7 +596,7 @@ protected:
             ::unlink(path.c_str());
         }
         for (auto& gi : gi_instances_) {
-            if (gi.index.isOpen()) gi.index.close();
+            if (gi.index && gi.index->isOpen()) gi.index->close();
             gi.manifest.close();
             std::filesystem::remove_all(gi.dir);
         }
@@ -605,7 +605,7 @@ protected:
     struct OpenedGI {
         std::string dir;
         kvlite::internal::Manifest manifest;
-        GlobalIndex index;
+        std::unique_ptr<GlobalIndex> index;
     };
 
     GlobalIndex& createOpenGI() {
@@ -615,10 +615,11 @@ protected:
         std::filesystem::create_directories(gi.dir);
         auto s = gi.manifest.create(gi.dir);
         EXPECT_TRUE(s.ok()) << s.toString();
+        gi.index = std::make_unique<GlobalIndex>(gi.manifest);
         GlobalIndex::Options opts;
-        s = gi.index.open(gi.dir, gi.manifest, opts);
+        s = gi.index->open(gi.dir, opts);
         EXPECT_TRUE(s.ok()) << s.toString();
-        return gi.index;
+        return *gi.index;
     }
 
     size_t createSegment(

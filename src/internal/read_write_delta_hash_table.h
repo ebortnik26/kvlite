@@ -65,6 +65,13 @@ public:
     size_t memoryUsage() const;
     void clear();
 
+    // --- Binary snapshot support ---
+
+    uint32_t extCount() const;
+    const uint8_t* extSlotData(uint32_t one_based) const;
+    void loadExtensions(const uint8_t* data, uint32_t count, uint32_t data_stride);
+    void setSize(size_t n);
+
 private:
     bool addImpl(uint32_t bi, uint32_t li, uint64_t fp,
                  uint64_t packed_version, uint32_t id);

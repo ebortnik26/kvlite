@@ -68,12 +68,12 @@ Status DB::open(const std::string& path, const Options& options) {
     }
 
     // Initialize GlobalIndex
-    global_index_ = std::make_unique<internal::GlobalIndex>();
+    global_index_ = std::make_unique<internal::GlobalIndex>(*manifest_);
     internal::GlobalIndex::Options global_index_opts;
     global_index_opts.snapshot_interval = options.global_index_snapshot_interval;
     global_index_opts.sync_writes = options.sync_writes;
 
-    s = global_index_->open(path, *manifest_, global_index_opts);
+    s = global_index_->open(path, global_index_opts);
     if (!s.ok()) {
         versions_->close();
         versions_.reset();

@@ -27,6 +27,7 @@ inline const uint32_t* crc32Table() {
 
 } // namespace detail
 
+// One-shot CRC32.
 inline uint32_t crc32(const void* data, size_t len) {
     const uint32_t* table = detail::crc32Table();
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -34,6 +35,21 @@ inline uint32_t crc32(const void* data, size_t len) {
     for (size_t i = 0; i < len; ++i) {
         crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
     }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+// Incremental CRC32: pass running state between calls.
+// Start with crc = 0xFFFFFFFF, call finalizeCrc32() when done.
+inline uint32_t updateCrc32(uint32_t crc, const void* data, size_t len) {
+    const uint32_t* table = detail::crc32Table();
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+inline uint32_t finalizeCrc32(uint32_t crc) {
     return crc ^ 0xFFFFFFFFu;
 }
 

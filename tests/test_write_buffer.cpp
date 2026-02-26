@@ -469,13 +469,15 @@ protected:
                   std::to_string(reinterpret_cast<uintptr_t>(this));
         std::filesystem::create_directories(db_dir_);
         ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        global_index_ = std::make_unique<GlobalIndex>(manifest_);
         kvlite::internal::GlobalIndex::Options gi_opts;
-        ASSERT_TRUE(global_index_.open(db_dir_, manifest_, gi_opts).ok());
+        ASSERT_TRUE(global_index_->open(db_dir_, gi_opts).ok());
     }
 
     void TearDown() override {
         if (seg_.isOpen()) seg_.close();
-        if (global_index_.isOpen()) global_index_.close();
+        if (global_index_ && global_index_->isOpen()) global_index_->close();
+        global_index_.reset();
         manifest_.close();
         std::remove(path_.c_str());
         std::filesystem::remove_all(db_dir_);
@@ -531,7 +533,7 @@ protected:
     std::string db_dir_;
     kvlite::internal::Manifest manifest_;
     Segment seg_;
-    GlobalIndex global_index_;
+    std::unique_ptr<GlobalIndex> global_index_;
 };
 
 } // namespace
@@ -539,7 +541,7 @@ protected:
 TEST_F(FlushTest, EmptyBuffer) {
     WriteBuffer wb;
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
     EXPECT_EQ(seg_.dataSize(), 0u);
     EXPECT_EQ(seg_.entryCount(), 0u);
 }
@@ -549,7 +551,7 @@ TEST_F(FlushTest, SingleEntry) {
     wb.put("hello", 42, "world", false);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
 
     size_t expected_size = LogEntry::kHeaderSize + 5 + 5 + LogEntry::kChecksumSize;
     EXPECT_EQ(seg_.dataSize(), expected_size);
@@ -576,7 +578,7 @@ TEST_F(FlushTest, TombstoneEntry) {
     wb.put("deleted", 7, "", true);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
 
     LogEntry entry;
     readEntry(0, entry);
@@ -596,7 +598,7 @@ TEST_F(FlushTest, SortOrderHashThenVersion) {
     wb.put("ccc", 20, "v20", false);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
 
     // Read all entries back
     std::vector<std::pair<uint64_t, uint64_t>> order; // (hash, version)
@@ -628,7 +630,7 @@ TEST_F(FlushTest, RoundTrip) {
     wb.put("key2", 3, "val3", true);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
 
     // Read all entries back and verify contents
     std::vector<LogEntry> entries;
@@ -694,7 +696,7 @@ TEST_F(FlushTest, SealAndOpen) {
     wb.put("beta", 10, "vb", true);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
     uint64_t data_size = seg_.dataSize();
     seg_.close();
 
@@ -737,33 +739,33 @@ TEST_F(FlushTest, GlobalIndexPopulated) {
     wb.put("key3", 4, "val4", false);
 
     ASSERT_TRUE(seg_.create(path_, 77).ok());
-    ASSERT_TRUE(wb.flush(seg_, 77, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 77, *global_index_).ok());
 
     // Every entry should be registered in GlobalIndex with packed version.
     // Packed version = (logical_version << 1) | tombstone_bit.
     uint64_t version;
     uint32_t segment_id;
-    ASSERT_TRUE(global_index_.getLatest("key1", version, segment_id).ok());
+    ASSERT_TRUE(global_index_->getLatest("key1", version, segment_id).ok());
     EXPECT_EQ(version, 2u << 1);  // latest version for key1 (packed, non-tombstone)
     EXPECT_EQ(segment_id, 77u);
 
-    ASSERT_TRUE(global_index_.getLatest("key2", version, segment_id).ok());
+    ASSERT_TRUE(global_index_->getLatest("key2", version, segment_id).ok());
     EXPECT_EQ(version, (3u << 1) | 1);  // packed, tombstone
     EXPECT_EQ(segment_id, 77u);
 
-    ASSERT_TRUE(global_index_.getLatest("key3", version, segment_id).ok());
+    ASSERT_TRUE(global_index_->getLatest("key3", version, segment_id).ok());
     EXPECT_EQ(version, 4u << 1);  // packed, non-tombstone
     EXPECT_EQ(segment_id, 77u);
 
-    EXPECT_TRUE(global_index_.getLatest("missing", version, segment_id).isNotFound());
+    EXPECT_TRUE(global_index_->getLatest("missing", version, segment_id).isNotFound());
 
-    EXPECT_EQ(global_index_.keyCount(), 3u);
-    EXPECT_EQ(global_index_.entryCount(), 4u);  // 4 total entries (key1 has 2 versions)
+    EXPECT_EQ(global_index_->keyCount(), 3u);
+    EXPECT_EQ(global_index_->entryCount(), 4u);  // 4 total entries (key1 has 2 versions)
 
     // Verify all versions for key1 (packed).
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> versions;
-    ASSERT_TRUE(global_index_.get("key1", seg_ids, versions));
+    ASSERT_TRUE(global_index_->get("key1", seg_ids, versions));
     ASSERT_EQ(seg_ids.size(), 2u);
     // Latest first.
     EXPECT_EQ(versions[0], 2u << 1);
@@ -773,9 +775,9 @@ TEST_F(FlushTest, GlobalIndexPopulated) {
 
     // Verify version-bounded get (upper_bound is packed).
     uint64_t ver64;
-    ASSERT_TRUE(global_index_.get("key1", (1ULL << 1) | 1, ver64, segment_id));
+    ASSERT_TRUE(global_index_->get("key1", (1ULL << 1) | 1, ver64, segment_id));
     EXPECT_EQ(ver64, 1u << 1);
     EXPECT_EQ(segment_id, 77u);
 
-    ASSERT_FALSE(global_index_.get("key1", (0ULL << 1) | 1, ver64, segment_id));
+    ASSERT_FALSE(global_index_->get("key1", (0ULL << 1) | 1, ver64, segment_id));
 }

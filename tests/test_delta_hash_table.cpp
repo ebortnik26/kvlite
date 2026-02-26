@@ -84,37 +84,39 @@ protected:
                   std::to_string(reinterpret_cast<uintptr_t>(this));
         std::filesystem::create_directories(db_dir_);
         ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        index = std::make_unique<GlobalIndex>(manifest_);
         GlobalIndex::Options opts;
-        ASSERT_TRUE(index.open(db_dir_, manifest_, opts).ok());
+        ASSERT_TRUE(index->open(db_dir_, opts).ok());
     }
 
     void TearDown() override {
-        if (index.isOpen()) index.close();
+        if (index && index->isOpen()) index->close();
+        index.reset();
         manifest_.close();
         std::filesystem::remove_all(db_dir_);
     }
 
     std::string db_dir_;
     kvlite::internal::Manifest manifest_;
-    GlobalIndex index;
+    std::unique_ptr<GlobalIndex> index;
 };
 
 TEST_F(GlobalIndexDHT, PutAndGetLatest) {
 
     // version=100 in seg 1, version=200 in seg 2, version=300 in seg 3
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-    index.put("key1", 300, 3);
+    index->put("key1", 100, 1);
+    index->put("key1", 200, 2);
+    index->put("key1", 300, 3);
 
     uint64_t ver;
     uint32_t seg;
-    EXPECT_TRUE(index.getLatest("key1", ver, seg).ok());
+    EXPECT_TRUE(index->getLatest("key1", ver, seg).ok());
     EXPECT_EQ(ver, 300u);
     EXPECT_EQ(seg, 3u);
 
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> vers;
-    ASSERT_TRUE(index.get("key1", seg_ids, vers));
+    ASSERT_TRUE(index->get("key1", seg_ids, vers));
     ASSERT_EQ(seg_ids.size(), 3u);
     EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
     EXPECT_EQ(vers[1], 200u);  EXPECT_EQ(seg_ids[1], 2u);
@@ -122,72 +124,72 @@ TEST_F(GlobalIndexDHT, PutAndGetLatest) {
 }
 
 TEST_F(GlobalIndexDHT, PutMultipleVersions) {
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-    index.put("key1", 300, 3);
+    index->put("key1", 100, 1);
+    index->put("key1", 200, 2);
+    index->put("key1", 300, 3);
 
-    EXPECT_EQ(index.entryCount(), 3u);
-    EXPECT_EQ(index.keyCount(), 1u);
+    EXPECT_EQ(index->entryCount(), 3u);
+    EXPECT_EQ(index->keyCount(), 1u);
 }
 
 TEST_F(GlobalIndexDHT, GetLatest) {
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
+    index->put("key1", 100, 1);
+    index->put("key1", 200, 2);
 
     uint64_t ver;
     uint32_t seg;
-    EXPECT_TRUE(index.getLatest("key1", ver, seg).ok());
+    EXPECT_TRUE(index->getLatest("key1", ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 2u);
 
-    EXPECT_TRUE(index.getLatest("missing", ver, seg).isNotFound());
+    EXPECT_TRUE(index->getLatest("missing", ver, seg).isNotFound());
 }
 
 TEST_F(GlobalIndexDHT, GetWithUpperBound) {
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-    index.put("key1", 300, 3);
+    index->put("key1", 100, 1);
+    index->put("key1", 200, 2);
+    index->put("key1", 300, 3);
 
     uint64_t ver;
     uint32_t seg;
     // Upper bound 250 → should get version 200
-    EXPECT_TRUE(index.get("key1", 250, ver, seg));
+    EXPECT_TRUE(index->get("key1", 250, ver, seg));
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 2u);
 
     // Upper bound 300 → should get version 300
-    EXPECT_TRUE(index.get("key1", 300, ver, seg));
+    EXPECT_TRUE(index->get("key1", 300, ver, seg));
     EXPECT_EQ(ver, 300u);
     EXPECT_EQ(seg, 3u);
 
     // Upper bound 50 → nothing
-    EXPECT_FALSE(index.get("key1", 50, ver, seg));
+    EXPECT_FALSE(index->get("key1", 50, ver, seg));
 }
 
 TEST_F(GlobalIndexDHT, Contains) {
-    EXPECT_FALSE(index.contains("key1"));
-    index.put("key1", 100, 1);
-    EXPECT_TRUE(index.contains("key1"));
+    EXPECT_FALSE(index->contains("key1"));
+    index->put("key1", 100, 1);
+    EXPECT_TRUE(index->contains("key1"));
 }
 
 TEST_F(GlobalIndexDHT, GetNonExistent) {
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> vers;
-    EXPECT_FALSE(index.get("missing", seg_ids, vers));
+    EXPECT_FALSE(index->get("missing", seg_ids, vers));
 }
 
 TEST_F(GlobalIndexDHT, Snapshot) {
     std::string path = db_dir_ + "/test_snapshot.dat";
 
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-    index.put("key2", 300, 3);
+    index->put("key1", 100, 1);
+    index->put("key1", 200, 2);
+    index->put("key2", 300, 3);
 
-    Status s = index.saveSnapshot(path);
+    Status s = index->saveSnapshot(path);
     ASSERT_TRUE(s.ok()) << s.toString();
 
     // Load into a fresh index (no open needed for loadSnapshot — it only reads the DHT).
-    GlobalIndex index2;
+    GlobalIndex index2(manifest_);
     s = index2.loadSnapshot(path);
     ASSERT_TRUE(s.ok()) << s.toString();
 
@@ -208,15 +210,15 @@ TEST_F(GlobalIndexDHT, Snapshot) {
 TEST_F(GlobalIndexDHT, SnapshotWithManyEntries) {
     std::string path = db_dir_ + "/test_snapshot_many.dat";
 
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-    index.put("key1", 300, 3);
-    index.put("key2", 400, 4);
+    index->put("key1", 100, 1);
+    index->put("key1", 200, 2);
+    index->put("key1", 300, 3);
+    index->put("key2", 400, 4);
 
-    Status s = index.saveSnapshot(path);
+    Status s = index->saveSnapshot(path);
     ASSERT_TRUE(s.ok()) << s.toString();
 
-    GlobalIndex index2;
+    GlobalIndex index2(manifest_);
     s = index2.loadSnapshot(path);
     ASSERT_TRUE(s.ok()) << s.toString();
 
@@ -240,14 +242,14 @@ TEST_F(GlobalIndexDHT, SnapshotWithManyEntries) {
 
 TEST_F(GlobalIndexDHT, Clear) {
     for (int i = 0; i < 50; ++i) {
-        index.put("key" + std::to_string(i), static_cast<uint64_t>(i * 10),
+        index->put("key" + std::to_string(i), static_cast<uint64_t>(i * 10),
                   static_cast<uint32_t>(i));
     }
-    EXPECT_EQ(index.keyCount(), 50u);
+    EXPECT_EQ(index->keyCount(), 50u);
 
-    index.clear();
-    EXPECT_EQ(index.keyCount(), 0u);
-    EXPECT_EQ(index.entryCount(), 0u);
+    index->clear();
+    EXPECT_EQ(index->keyCount(), 0u);
+    EXPECT_EQ(index->entryCount(), 0u);
 }
 
 // ============================================================
@@ -582,22 +584,22 @@ TEST(ReadOnlyDHTOverflow, ForEachGroupMergesChain) {
 // Many versions of the same key, all in the same segment.
 TEST_F(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
     for (int i = 1; i <= 200; ++i) {
-        index.put("key", static_cast<uint64_t>(i), /*segment_id=*/1);
+        index->put("key", static_cast<uint64_t>(i), /*segment_id=*/1);
     }
 
-    EXPECT_EQ(index.entryCount(), 200u);
-    EXPECT_EQ(index.keyCount(), 1u);
+    EXPECT_EQ(index->entryCount(), 200u);
+    EXPECT_EQ(index->keyCount(), 1u);
 
     uint64_t ver;
     uint32_t seg;
-    ASSERT_TRUE(index.getLatest("key", ver, seg).ok());
+    ASSERT_TRUE(index->getLatest("key", ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 1u);
 
     // Verify all versions are retrievable.
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> vers;
-    ASSERT_TRUE(index.get("key", seg_ids, vers));
+    ASSERT_TRUE(index->get("key", seg_ids, vers));
     EXPECT_EQ(vers.size(), 200u);
     EXPECT_EQ(vers[0], 200u);   // latest first
     EXPECT_EQ(vers[199], 1u);   // earliest last
@@ -606,17 +608,17 @@ TEST_F(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
 // Same key, different segments (unique segment_ids).
 TEST_F(GlobalIndexDHT, ManyVersionsDifferentSegments) {
     for (int i = 1; i <= 200; ++i) {
-        index.put("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        index->put("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     uint64_t ver;
     uint32_t seg;
-    ASSERT_TRUE(index.getLatest("key", ver, seg).ok());
+    ASSERT_TRUE(index->getLatest("key", ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 200u);
 
     // Verify upper-bound query works across the full range.
-    ASSERT_TRUE(index.get("key", 150, ver, seg));
+    ASSERT_TRUE(index->get("key", 150, ver, seg));
     EXPECT_EQ(ver, 150u);
     EXPECT_EQ(seg, 150u);
 }
@@ -626,16 +628,16 @@ TEST_F(GlobalIndexDHT, LargeScale) {
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        index.put(key, static_cast<uint64_t>(i * 10), static_cast<uint32_t>(i));
+        index->put(key, static_cast<uint64_t>(i * 10), static_cast<uint32_t>(i));
     }
 
-    EXPECT_EQ(index.keyCount(), static_cast<size_t>(N));
+    EXPECT_EQ(index->keyCount(), static_cast<size_t>(N));
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
         uint64_t ver;
         uint32_t seg;
-        ASSERT_TRUE(index.getLatest(key, ver, seg).ok());
+        ASSERT_TRUE(index->getLatest(key, ver, seg).ok());
         EXPECT_EQ(ver, static_cast<uint64_t>(i * 10));
         EXPECT_EQ(seg, static_cast<uint32_t>(i));
     }
@@ -781,13 +783,13 @@ TEST_F(GlobalIndexDHT, PutKeyCountWithAddEntryIsNew) {
     const int V = 5;
     for (int k = 0; k < K; ++k) {
         for (int v = 0; v < V; ++v) {
-            index.put("key" + std::to_string(k),
+            index->put("key" + std::to_string(k),
                       static_cast<uint64_t>(k * V + v),
                       static_cast<uint32_t>(k));
         }
     }
-    EXPECT_EQ(index.keyCount(), static_cast<size_t>(K));
-    EXPECT_EQ(index.entryCount(), static_cast<size_t>(K * V));
+    EXPECT_EQ(index->keyCount(), static_cast<size_t>(K));
+    EXPECT_EQ(index->entryCount(), static_cast<size_t>(K * V));
 }
 
 // ============================================================
@@ -2281,4 +2283,298 @@ TEST(BucketArena, ConcurrentAllocate) {
         ASSERT_TRUE(all_ptrs.insert(b).second)
             << "duplicate pointer for index " << idx;
     }
+}
+
+// ============================================================
+// Binary snapshot (v8) tests
+// ============================================================
+
+class BinarySnapshotTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        db_dir_ = ::testing::TempDir() + "/gi_snap_v8_" +
+                  std::to_string(reinterpret_cast<uintptr_t>(this));
+        std::filesystem::create_directories(db_dir_);
+        ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        index_ = std::make_unique<GlobalIndex>(manifest_);
+        GlobalIndex::Options opts;
+        ASSERT_TRUE(index_->open(db_dir_, opts).ok());
+    }
+
+    void TearDown() override {
+        if (index_ && index_->isOpen()) index_->close();
+        index_.reset();
+        manifest_.close();
+        std::filesystem::remove_all(db_dir_);
+    }
+
+    std::string db_dir_;
+    Manifest manifest_;
+    std::unique_ptr<GlobalIndex> index_;
+};
+
+TEST_F(BinarySnapshotTest, RoundTripBasic) {
+    // Populate with some entries.
+    const int N = 1000;
+    for (int i = 0; i < N; ++i) {
+        std::string key = "key_" + std::to_string(i);
+        ASSERT_TRUE(index_->put(key, i * 10 + 1, i + 1).ok());
+    }
+
+    ASSERT_EQ(index_->entryCount(), static_cast<size_t>(N));
+    ASSERT_EQ(index_->keyCount(), static_cast<size_t>(N));
+
+    // Take binary snapshot.
+    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+
+    // Close the index.
+    ASSERT_TRUE(index_->close().ok());
+    manifest_.close();
+
+    // Re-open and load snapshot.
+    Manifest manifest2;
+    ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    GlobalIndex index2(manifest2);
+    GlobalIndex::Options opts;
+    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+
+    // Verify all entries are present.
+    EXPECT_EQ(index2.entryCount(), static_cast<size_t>(N));
+    EXPECT_EQ(index2.keyCount(), static_cast<size_t>(N));
+
+    for (int i = 0; i < N; ++i) {
+        std::string key = "key_" + std::to_string(i);
+        uint64_t pv;
+        uint32_t seg;
+        ASSERT_TRUE(index2.getLatest(key, pv, seg).ok()) << "missing key: " << key;
+        EXPECT_EQ(pv, static_cast<uint64_t>(i * 10 + 1));
+        EXPECT_EQ(seg, static_cast<uint32_t>(i + 1));
+    }
+
+    index2.close();
+    manifest2.close();
+}
+
+TEST_F(BinarySnapshotTest, RoundTripMultiVersion) {
+    // Multiple versions per key.
+    for (int i = 0; i < 100; ++i) {
+        std::string key = "key_" + std::to_string(i);
+        for (int v = 0; v < 5; ++v) {
+            ASSERT_TRUE(index_->put(key, v * 100 + i + 1, v * 10 + i).ok());
+        }
+    }
+
+    ASSERT_EQ(index_->entryCount(), 500u);
+    ASSERT_EQ(index_->keyCount(), 100u);
+
+    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->close().ok());
+    manifest_.close();
+
+    Manifest manifest2;
+    ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    GlobalIndex index2(manifest2);
+    GlobalIndex::Options opts;
+    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+
+    EXPECT_EQ(index2.entryCount(), 500u);
+    EXPECT_EQ(index2.keyCount(), 100u);
+
+    // Verify latest version for each key.
+    for (int i = 0; i < 100; ++i) {
+        std::string key = "key_" + std::to_string(i);
+        uint64_t pv;
+        uint32_t seg;
+        ASSERT_TRUE(index2.getLatest(key, pv, seg).ok());
+        EXPECT_EQ(pv, static_cast<uint64_t>(4 * 100 + i + 1));
+    }
+
+    index2.close();
+    manifest2.close();
+}
+
+TEST_F(BinarySnapshotTest, SnapshotWithExtensions) {
+    // Use enough entries with colliding hash prefixes to force extension buckets.
+    // With default config (bucket_bits=20, 1M buckets), we need enough entries
+    // to overflow some buckets. We'll add many entries per key to force overflow.
+    const int N = 200;
+    for (int i = 0; i < N; ++i) {
+        std::string key = "extkey_" + std::to_string(i);
+        // Add many versions to increase bucket fill.
+        for (int v = 0; v < 50; ++v) {
+            ASSERT_TRUE(index_->put(key, v * 1000 + i + 1, v).ok());
+        }
+    }
+
+    size_t entry_count = index_->entryCount();
+    size_t key_count = index_->keyCount();
+    ASSERT_GT(entry_count, 0u);
+
+    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->close().ok());
+    manifest_.close();
+
+    Manifest manifest2;
+    ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    GlobalIndex index2(manifest2);
+    GlobalIndex::Options opts;
+    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+
+    EXPECT_EQ(index2.entryCount(), entry_count);
+    EXPECT_EQ(index2.keyCount(), key_count);
+
+    // Verify every entry can be looked up.
+    for (int i = 0; i < N; ++i) {
+        std::string key = "extkey_" + std::to_string(i);
+        uint64_t pv;
+        uint32_t seg;
+        ASSERT_TRUE(index2.getLatest(key, pv, seg).ok()) << "missing key: " << key;
+    }
+
+    index2.close();
+    manifest2.close();
+}
+
+TEST_F(BinarySnapshotTest, SnapshotBlocksConcurrentPut) {
+    // Populate with some data.
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+    }
+
+    // Verify that snapshot() blocks concurrent put().
+    // Strategy: start snapshot on main thread, try to put from another thread,
+    // verify the put completes only after snapshot.
+    std::atomic<bool> snapshot_started{false};
+    std::atomic<bool> snapshot_done{false};
+    std::atomic<bool> put_started{false};
+    std::atomic<bool> put_done{false};
+
+    // Writer thread: waits for snapshot to start, then tries to put.
+    std::thread writer([&]() {
+        while (!snapshot_started.load(std::memory_order_acquire)) {
+            // spin-wait
+        }
+        put_started.store(true, std::memory_order_release);
+        // This put should block until snapshot completes.
+        index_->put("blocked_key", 999, 42);
+        put_done.store(true, std::memory_order_release);
+    });
+
+    // Take snapshot (this will hold the exclusive lock).
+    snapshot_started.store(true, std::memory_order_release);
+    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    snapshot_done.store(true, std::memory_order_release);
+
+    writer.join();
+
+    // The put should have completed after snapshot.
+    EXPECT_TRUE(put_done.load());
+
+    // Verify the blocked_key was eventually written.
+    uint64_t pv;
+    uint32_t seg;
+    EXPECT_TRUE(index_->getLatest("blocked_key", pv, seg).ok());
+    EXPECT_EQ(pv, 999u);
+    EXPECT_EQ(seg, 42u);
+}
+
+TEST_F(BinarySnapshotTest, AtomicSwapLeavesValidDir) {
+    // Verify that after snapshot(), the valid directory exists and tmp/old do not.
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+    }
+
+    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+
+    std::string valid_dir = db_dir_ + "/gi/snapshot.v8";
+    std::string tmp_dir = valid_dir + ".tmp";
+    std::string old_dir = valid_dir + ".old";
+
+    EXPECT_TRUE(std::filesystem::exists(valid_dir));
+    EXPECT_TRUE(std::filesystem::is_directory(valid_dir));
+    EXPECT_FALSE(std::filesystem::exists(tmp_dir));
+    EXPECT_FALSE(std::filesystem::exists(old_dir));
+
+    // Take a second snapshot and verify same invariant.
+    for (int i = 10; i < 20; ++i) {
+        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+    }
+    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+
+    EXPECT_TRUE(std::filesystem::exists(valid_dir));
+    EXPECT_FALSE(std::filesystem::exists(tmp_dir));
+    EXPECT_FALSE(std::filesystem::exists(old_dir));
+}
+
+TEST_F(BinarySnapshotTest, SnapshotResetsWALCounter) {
+    for (int i = 0; i < 100; ++i) {
+        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+    }
+    EXPECT_EQ(index_->updatesSinceSnapshot(), 100u);
+
+    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    EXPECT_EQ(index_->updatesSinceSnapshot(), 0u);
+
+    // New puts after snapshot increment the counter.
+    ASSERT_TRUE(index_->put("new_key", 1, 1).ok());
+    EXPECT_EQ(index_->updatesSinceSnapshot(), 1u);
+}
+
+TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
+    // storeSnapshot creates v8 dir, loadSnapshot reads it.
+    for (int i = 0; i < 50; ++i) {
+        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+    }
+
+    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->close().ok());
+
+    std::string valid_dir = db_dir_ + "/gi/snapshot.v8";
+    EXPECT_TRUE(std::filesystem::exists(valid_dir));
+
+    // Re-open and verify data is loaded from v8 snapshot.
+    manifest_.close();
+    Manifest manifest2;
+    ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    GlobalIndex index2(manifest2);
+    GlobalIndex::Options opts;
+    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+
+    EXPECT_EQ(index2.entryCount(), 50u);
+    EXPECT_EQ(index2.keyCount(), 50u);
+
+    for (int i = 0; i < 50; ++i) {
+        std::string key = "key_" + std::to_string(i);
+        uint64_t pv;
+        uint32_t seg;
+        ASSERT_TRUE(index2.getLatest(key, pv, seg).ok());
+    }
+
+    index2.close();
+    manifest2.close();
+}
+
+TEST_F(BinarySnapshotTest, EmptyIndexSnapshot) {
+    // Snapshot an empty index — should produce valid snapshot with 0 entries.
+    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+
+    ASSERT_TRUE(index_->close().ok());
+    manifest_.close();
+
+    Manifest manifest2;
+    ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    GlobalIndex index2(manifest2);
+    GlobalIndex::Options opts;
+    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+
+    EXPECT_EQ(index2.entryCount(), 0u);
+    EXPECT_EQ(index2.keyCount(), 0u);
+
+    index2.close();
+    manifest2.close();
 }

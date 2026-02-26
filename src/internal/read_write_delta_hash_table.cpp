@@ -1,6 +1,7 @@
 #include "internal/read_write_delta_hash_table.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace kvlite {
 namespace internal {
@@ -146,6 +147,31 @@ size_t ReadWriteDeltaHashTable::memoryUsage() const {
 void ReadWriteDeltaHashTable::clear() {
     clearBuckets();
     size_.store(0, std::memory_order_relaxed);
+}
+
+// --- Binary snapshot support ---
+
+uint32_t ReadWriteDeltaHashTable::extCount() const {
+    return ext_arena_owned_.size();
+}
+
+const uint8_t* ReadWriteDeltaHashTable::extSlotData(uint32_t one_based) const {
+    const Bucket* b = ext_arena_owned_.get(one_based);
+    return b->data;
+}
+
+void ReadWriteDeltaHashTable::loadExtensions(const uint8_t* data, uint32_t count,
+                                              uint32_t data_stride) {
+    ext_arena_owned_.clear();
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t idx = ext_arena_owned_.allocate();
+        Bucket* b = ext_arena_owned_.get(idx);
+        std::memcpy(b->data, data + static_cast<size_t>(i) * data_stride, data_stride);
+    }
+}
+
+void ReadWriteDeltaHashTable::setSize(size_t n) {
+    size_.store(n, std::memory_order_relaxed);
 }
 
 }  // namespace internal

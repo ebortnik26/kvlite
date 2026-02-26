@@ -20,6 +20,50 @@ GlobalIndexWAL::~GlobalIndexWAL() {
     }
 }
 
+void GlobalIndexWAL::loadManifestState() {
+    std::string val;
+    if (manifest_->get(next_file_id_key_, val)) {
+        next_file_id_ = static_cast<uint32_t>(std::stoul(val));
+    } else {
+        next_file_id_ = 0;
+    }
+
+    file_ids_.clear();
+    auto keys = manifest_->getKeysWithPrefix(file_prefix_);
+    for (const auto& key : keys) {
+        std::string id_str = key.substr(file_prefix_.size());
+        file_ids_.push_back(static_cast<uint32_t>(std::stoul(id_str)));
+    }
+    std::sort(file_ids_.begin(), file_ids_.end());
+}
+
+Status GlobalIndexWAL::openActiveFile() {
+    std::string dir = walDir();
+    total_size_ = 0;
+
+    if (!file_ids_.empty()) {
+        for (size_t i = 0; i + 1 < file_ids_.size(); ++i) {
+            struct stat st;
+            if (::stat(walFilePath(dir, file_ids_[i]).c_str(), &st) == 0) {
+                total_size_ += static_cast<uint64_t>(st.st_size);
+            }
+        }
+        current_file_id_ = file_ids_.back();
+        return wal_.open(walFilePath(dir, current_file_id_));
+    }
+
+    uint32_t id;
+    Status s = allocateFileId(id);
+    if (!s.ok()) return s;
+    current_file_id_ = id;
+    file_ids_.push_back(id);
+
+    s = manifest_->set(file_prefix_ + std::to_string(id), "");
+    if (!s.ok()) return s;
+
+    return wal_.create(walFilePath(dir, id));
+}
+
 Status GlobalIndexWAL::open(const std::string& db_path, Manifest& manifest,
                              const Options& options) {
     db_path_ = db_path;
@@ -28,61 +72,13 @@ Status GlobalIndexWAL::open(const std::string& db_path, Manifest& manifest,
     next_file_id_key_ = "gi.wal.next_file_id";
     file_prefix_ = "gi.wal.file.";
 
-    // Create gi/, gi/wal/.
     ::mkdir((db_path + "/gi").c_str(), 0755);
-    std::string dir = walDir();
-    ::mkdir(dir.c_str(), 0755);
+    ::mkdir(walDir().c_str(), 0755);
 
-    // Read next_file_id from Manifest (0 if absent).
-    std::string val;
-    if (manifest_->get(next_file_id_key_, val)) {
-        next_file_id_ = static_cast<uint32_t>(std::stoul(val));
-    } else {
-        next_file_id_ = 0;
-    }
+    loadManifestState();
 
-    // Enumerate existing WAL files from Manifest.
-    file_ids_.clear();
-    auto keys = manifest_->getKeysWithPrefix(file_prefix_);
-    for (const auto& key : keys) {
-        // key = "gi.wal.file.<id>"
-        std::string id_str = key.substr(file_prefix_.size());
-        uint32_t id = static_cast<uint32_t>(std::stoul(id_str));
-        file_ids_.push_back(id);
-    }
-    std::sort(file_ids_.begin(), file_ids_.end());
-
-    // Compute total_size_ for closed files (all except the last, which we'll open).
-    total_size_ = 0;
-
-    if (!file_ids_.empty()) {
-        // Sum sizes of all files except the last (which becomes active).
-        for (size_t i = 0; i + 1 < file_ids_.size(); ++i) {
-            struct stat st;
-            std::string path = walFilePath(dir, file_ids_[i]);
-            if (::stat(path.c_str(), &st) == 0) {
-                total_size_ += static_cast<uint64_t>(st.st_size);
-            }
-        }
-        // Open the last file for appending.
-        current_file_id_ = file_ids_.back();
-        Status s = wal_.open(walFilePath(dir, current_file_id_));
-        if (!s.ok()) return s;
-    } else {
-        // No files exist yet — allocate the first one.
-        uint32_t id;
-        Status s = allocateFileId(id);
-        if (!s.ok()) return s;
-        current_file_id_ = id;
-        file_ids_.push_back(id);
-
-        // Register in Manifest.
-        s = manifest_->set(file_prefix_ + std::to_string(id), "");
-        if (!s.ok()) return s;
-
-        s = wal_.create(walFilePath(dir, id));
-        if (!s.ok()) return s;
-    }
+    Status s = openActiveFile();
+    if (!s.ok()) return s;
 
     open_ = true;
     return Status::OK();
