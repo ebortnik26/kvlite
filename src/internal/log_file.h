@@ -43,6 +43,9 @@ public:
     // Read bytes at a given offset (pread). Const: pread doesn't mutate state.
     Status readAt(uint64_t offset, void* buf, size_t len) const;
 
+    // Truncate file to the given offset. offset must be <= size().
+    Status truncateTo(uint64_t offset);
+
     // Sync data to disk (fdatasync).
     Status sync();
 

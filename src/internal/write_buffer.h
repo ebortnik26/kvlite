@@ -19,6 +19,7 @@ namespace kvlite {
 namespace internal {
 
 class GlobalIndex;
+class GlobalIndexWAL;
 class Segment;
 
 // In-memory buffer for pending writes before flush to log files.
@@ -81,7 +82,7 @@ public:
     // If resolver is provided, uses collision-aware insertion for the first
     // occurrence of each distinct key in the batch.
     Status flush(Segment& out, uint32_t segment_id,
-                 GlobalIndex& global_index,
+                 GlobalIndex& global_index, GlobalIndexWAL& wal,
                  const DeltaHashTable::KeyResolver& resolver = {});
 
     // Create a stream of entries visible at snapshot_version.

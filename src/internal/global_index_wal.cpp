@@ -1,8 +1,13 @@
 #include "internal/global_index_wal.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <sys/stat.h>
 
-#include "internal/crc32.h"
+#include "internal/global_index.h"
+#include "internal/manifest.h"
+#include "internal/wal_stream.h"
 
 namespace kvlite {
 namespace internal {
@@ -10,133 +15,243 @@ namespace internal {
 GlobalIndexWAL::GlobalIndexWAL() = default;
 
 GlobalIndexWAL::~GlobalIndexWAL() {
-    if (log_file_.isOpen()) {
+    if (wal_.isOpen()) {
         close();
     }
 }
 
-Status GlobalIndexWAL::open(const std::string& path) {
-    return log_file_.create(path);
-}
+Status GlobalIndexWAL::open(const std::string& db_path, Manifest& manifest,
+                             const Options& options, const std::string& name) {
+    db_path_ = db_path;
+    manifest_ = &manifest;
+    options_ = options;
+    name_ = name;
+    next_file_id_key_ = "wal." + name + ".next_file_id";
+    file_prefix_ = "wal." + name + ".file.";
 
-Status GlobalIndexWAL::close() {
-    batch_buf_.clear();
-    return log_file_.close();
-}
+    // Create wal/ parent, then wal/<name>/ child.
+    std::string parent = db_path + "/wal";
+    ::mkdir(parent.c_str(), 0755);
+    std::string dir = walDir();
+    ::mkdir(dir.c_str(), 0755);
 
-// --- Batch recording (in-memory, no I/O) ---
-
-void GlobalIndexWAL::appendPut(std::string_view key, uint64_t packed_version,
-                                uint32_t segment_id) {
-    if (!log_file_.isOpen()) return;
-    serializeRecord(WalOp::kPut, key, packed_version, segment_id, 0);
-    ++entry_count_;
-}
-
-void GlobalIndexWAL::appendRelocate(std::string_view key, uint64_t packed_version,
-                                     uint32_t old_segment_id, uint32_t new_segment_id) {
-    if (!log_file_.isOpen()) return;
-    serializeRecord(WalOp::kRelocate, key, packed_version, old_segment_id, new_segment_id);
-    ++entry_count_;
-}
-
-void GlobalIndexWAL::appendEliminate(std::string_view key, uint64_t packed_version,
-                                      uint32_t segment_id) {
-    if (!log_file_.isOpen()) return;
-    serializeRecord(WalOp::kEliminate, key, packed_version, segment_id, 0);
-    ++entry_count_;
-}
-
-void GlobalIndexWAL::serializeRecord(WalOp op, std::string_view key,
-                                      uint64_t packed_version,
-                                      uint32_t segment_id,
-                                      uint32_t new_segment_id) {
-    // Compute record body size (excluding CRC)
-    size_t body_size = 1; // op
-    if (op == WalOp::kCommit) {
-        body_size += 8; // version
+    // Read next_file_id from Manifest (0 if absent).
+    std::string val;
+    if (manifest_->get(next_file_id_key_, val)) {
+        next_file_id_ = static_cast<uint32_t>(std::stoul(val));
     } else {
-        body_size += 8; // packed_version
-        body_size += 4; // segment_id
-        if (op == WalOp::kRelocate) {
-            body_size += 4; // new_segment_id
-        }
-        body_size += 2; // key_len
-        body_size += key.size();
-    }
-    size_t total = body_size + 4; // + crc32
-
-    size_t offset = batch_buf_.size();
-    batch_buf_.resize(offset + total);
-    uint8_t* p = batch_buf_.data() + offset;
-
-    // op
-    *p++ = static_cast<uint8_t>(op);
-
-    if (op == WalOp::kCommit) {
-        // version (packed_version param carries the commit version)
-        std::memcpy(p, &packed_version, 8); p += 8;
-    } else {
-        // packed_version
-        std::memcpy(p, &packed_version, 8); p += 8;
-        // segment_id (or old_segment_id for relocate)
-        std::memcpy(p, &segment_id, 4); p += 4;
-        if (op == WalOp::kRelocate) {
-            std::memcpy(p, &new_segment_id, 4); p += 4;
-        }
-        // key_len + key
-        uint16_t key_len = static_cast<uint16_t>(key.size());
-        std::memcpy(p, &key_len, 2); p += 2;
-        std::memcpy(p, key.data(), key.size()); p += key.size();
+        next_file_id_ = 0;
     }
 
-    // CRC covers all bytes before the checksum
-    uint32_t checksum = crc32(batch_buf_.data() + offset, body_size);
-    std::memcpy(p, &checksum, 4);
-}
+    // Enumerate existing WAL files from Manifest.
+    file_ids_.clear();
+    auto keys = manifest_->getKeysWithPrefix(file_prefix_);
+    for (const auto& key : keys) {
+        // key = "wal.<name>.file.<id>"
+        std::string id_str = key.substr(file_prefix_.size());
+        uint32_t id = static_cast<uint32_t>(std::stoul(id_str));
+        file_ids_.push_back(id);
+    }
+    std::sort(file_ids_.begin(), file_ids_.end());
 
-Status GlobalIndexWAL::commit(uint64_t version, bool sync) {
-    if (!log_file_.isOpen()) return Status::OK();
+    // Compute total_size_ for closed files (all except the last, which we'll open).
+    total_size_ = 0;
 
-    // Append kCommit marker with version to the batch
-    serializeRecord(WalOp::kCommit, {}, version, 0, 0);
+    if (!file_ids_.empty()) {
+        // Sum sizes of all files except the last (which becomes active).
+        for (size_t i = 0; i + 1 < file_ids_.size(); ++i) {
+            struct stat st;
+            std::string path = walFilePath(dir, file_ids_[i]);
+            if (::stat(path.c_str(), &st) == 0) {
+                total_size_ += static_cast<uint64_t>(st.st_size);
+            }
+        }
+        // Open the last file for appending.
+        current_file_id_ = file_ids_.back();
+        Status s = wal_.open(walFilePath(dir, current_file_id_));
+        if (!s.ok()) return s;
+    } else {
+        // No files exist yet — allocate the first one.
+        uint32_t id;
+        Status s = allocateFileId(id);
+        if (!s.ok()) return s;
+        current_file_id_ = id;
+        file_ids_.push_back(id);
 
-    // Write entire batch to disk in one append
-    uint64_t offset;
-    Status s = log_file_.append(batch_buf_.data(), batch_buf_.size(), offset);
-    batch_buf_.clear();
-    if (!s.ok()) return s;
+        // Register in Manifest.
+        s = manifest_->set(file_prefix_ + std::to_string(id), "");
+        if (!s.ok()) return s;
 
-    if (sync) {
-        s = log_file_.sync();
+        s = wal_.create(walFilePath(dir, id));
         if (!s.ok()) return s;
     }
 
     return Status::OK();
 }
 
-Status GlobalIndexWAL::replay(GlobalIndex& /*index*/) {
-    // Stub — recovery implementation deferred.
+Status GlobalIndexWAL::close() {
+    wal_.abort();
+    return wal_.close();
+}
+
+// --- Batch recording (in-memory, no I/O) ---
+
+void GlobalIndexWAL::appendPut(std::string_view key, uint64_t packed_version,
+                                uint32_t segment_id) {
+    if (!wal_.isOpen()) return;
+
+    // Domain payload: [op:1][packed_version:8][segment_id:4][key_len:2][key:var]
+    size_t payload_len = 1 + 8 + 4 + 2 + key.size();
+    uint8_t buf[256];
+    std::vector<uint8_t> heap_buf;
+    uint8_t* p;
+    if (payload_len <= sizeof(buf)) {
+        p = buf;
+    } else {
+        heap_buf.resize(payload_len);
+        p = heap_buf.data();
+    }
+
+    *p++ = static_cast<uint8_t>(WalOp::kPut);
+    std::memcpy(p, &packed_version, 8); p += 8;
+    std::memcpy(p, &segment_id, 4); p += 4;
+    uint16_t key_len = static_cast<uint16_t>(key.size());
+    std::memcpy(p, &key_len, 2); p += 2;
+    std::memcpy(p, key.data(), key.size());
+
+    uint8_t* base = (heap_buf.empty()) ? buf : heap_buf.data();
+    wal_.put(base, payload_len);
+    ++entry_count_;
+}
+
+void GlobalIndexWAL::appendRelocate(std::string_view key, uint64_t packed_version,
+                                     uint32_t old_segment_id, uint32_t new_segment_id) {
+    if (!wal_.isOpen()) return;
+
+    // Domain payload: [op:1][packed_version:8][old_seg:4][new_seg:4][key_len:2][key:var]
+    size_t payload_len = 1 + 8 + 4 + 4 + 2 + key.size();
+    uint8_t buf[256];
+    std::vector<uint8_t> heap_buf;
+    uint8_t* p;
+    if (payload_len <= sizeof(buf)) {
+        p = buf;
+    } else {
+        heap_buf.resize(payload_len);
+        p = heap_buf.data();
+    }
+
+    *p++ = static_cast<uint8_t>(WalOp::kRelocate);
+    std::memcpy(p, &packed_version, 8); p += 8;
+    std::memcpy(p, &old_segment_id, 4); p += 4;
+    std::memcpy(p, &new_segment_id, 4); p += 4;
+    uint16_t key_len = static_cast<uint16_t>(key.size());
+    std::memcpy(p, &key_len, 2); p += 2;
+    std::memcpy(p, key.data(), key.size());
+
+    uint8_t* base = (heap_buf.empty()) ? buf : heap_buf.data();
+    wal_.put(base, payload_len);
+    ++entry_count_;
+}
+
+void GlobalIndexWAL::appendEliminate(std::string_view key, uint64_t packed_version,
+                                      uint32_t segment_id) {
+    if (!wal_.isOpen()) return;
+
+    // Domain payload: [op:1][packed_version:8][segment_id:4][key_len:2][key:var]
+    size_t payload_len = 1 + 8 + 4 + 2 + key.size();
+    uint8_t buf[256];
+    std::vector<uint8_t> heap_buf;
+    uint8_t* p;
+    if (payload_len <= sizeof(buf)) {
+        p = buf;
+    } else {
+        heap_buf.resize(payload_len);
+        p = heap_buf.data();
+    }
+
+    *p++ = static_cast<uint8_t>(WalOp::kEliminate);
+    std::memcpy(p, &packed_version, 8); p += 8;
+    std::memcpy(p, &segment_id, 4); p += 4;
+    uint16_t key_len = static_cast<uint16_t>(key.size());
+    std::memcpy(p, &key_len, 2); p += 2;
+    std::memcpy(p, key.data(), key.size());
+
+    uint8_t* base = (heap_buf.empty()) ? buf : heap_buf.data();
+    wal_.put(base, payload_len);
+    ++entry_count_;
+}
+
+Status GlobalIndexWAL::commit(uint64_t version, bool sync) {
+    if (!wal_.isOpen()) return Status::OK();
+
+    // Append kCommit domain payload: [op:1][version:8]
+    uint8_t commit_buf[9];
+    commit_buf[0] = static_cast<uint8_t>(WalOp::kCommit);
+    std::memcpy(commit_buf + 1, &version, 8);
+    wal_.put(commit_buf, 9);
+
+    Status s = wal_.commit(sync);
+    if (!s.ok()) return s;
+
+    // Rollover if the current file exceeds the size limit.
+    if (wal_.size() >= options_.max_file_size) {
+        s = rollover();
+        if (!s.ok()) return s;
+    }
+
     return Status::OK();
 }
 
+Status GlobalIndexWAL::rollover() {
+    // Accumulate size of the file we're closing.
+    total_size_ += wal_.size();
+
+    Status s = wal_.close();
+    if (!s.ok()) return s;
+
+    // Allocate a new file ID.
+    uint32_t new_id;
+    s = allocateFileId(new_id);
+    if (!s.ok()) return s;
+
+    // Register in Manifest.
+    s = manifest_->set(file_prefix_ + std::to_string(new_id), "");
+    if (!s.ok()) return s;
+
+    // Create the new file.
+    current_file_id_ = new_id;
+    file_ids_.push_back(new_id);
+    return wal_.create(walFilePath(walDir(), new_id));
+}
+
+Status GlobalIndexWAL::allocateFileId(uint32_t& file_id) {
+    file_id = next_file_id_++;
+    return manifest_->set(next_file_id_key_, std::to_string(next_file_id_));
+}
+
+std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
+    return stream::walReplay(walDir(), file_ids_);
+}
+
 Status GlobalIndexWAL::truncate() {
-    std::string path = log_file_.path();
-    Status s = log_file_.close();
-    if (!s.ok()) return s;
-    s = log_file_.create(path);
-    if (!s.ok()) return s;
     entry_count_ = 0;
-    batch_buf_.clear();
+    total_size_ = 0;
+    wal_.abort();
     return Status::OK();
 }
 
 uint64_t GlobalIndexWAL::size() const {
-    return log_file_.size();
+    return total_size_ + wal_.size();
 }
 
-std::string GlobalIndexWAL::makePath(const std::string& db_path) {
-    return db_path + "/global_index.wal";
+std::string GlobalIndexWAL::walDir() const {
+    return db_path_ + "/wal/" + name_;
+}
+
+std::string GlobalIndexWAL::walFilePath(const std::string& wal_dir, uint32_t file_id) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%08u", file_id);
+    return wal_dir + "/" + buf + ".log";
 }
 
 }  // namespace internal

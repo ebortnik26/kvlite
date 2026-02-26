@@ -680,7 +680,9 @@ TEST_F(DBTest, CleanCloseFlag) {
 // Helper: collect segment data-file paths under a DB directory.
 static std::vector<fs::path> segmentFiles(const fs::path& dir) {
     std::vector<fs::path> result;
-    for (const auto& entry : fs::directory_iterator(dir)) {
+    fs::path seg_dir = dir / "segments";
+    if (!fs::exists(seg_dir)) return result;
+    for (const auto& entry : fs::directory_iterator(seg_dir)) {
         auto name = entry.path().filename().string();
         if (name.size() > 5 &&
             name.substr(name.size() - 5) == ".data" &&

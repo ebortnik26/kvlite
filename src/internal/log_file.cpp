@@ -143,6 +143,23 @@ Status LogFile::readAt(uint64_t offset, void* buf, size_t len) const {
     return Status::OK();
 }
 
+Status LogFile::truncateTo(uint64_t offset) {
+    if (!isOpen()) {
+        return Status::IOError("file not open");
+    }
+    if (offset > size_) {
+        return Status::InvalidArgument("truncateTo offset exceeds file size");
+    }
+    if (::ftruncate(fd_, static_cast<off_t>(offset)) < 0) {
+        return Status::IOError("ftruncate failed: " + path_ + ": " + std::strerror(errno));
+    }
+    if (::lseek(fd_, static_cast<off_t>(offset), SEEK_SET) < 0) {
+        return Status::IOError("lseek failed: " + path_ + ": " + std::strerror(errno));
+    }
+    size_ = offset;
+    return Status::OK();
+}
+
 Status LogFile::sync() {
     if (!isOpen()) {
         return Status::IOError("file not open");

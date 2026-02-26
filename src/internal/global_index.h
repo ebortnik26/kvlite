@@ -14,6 +14,7 @@ namespace kvlite {
 namespace internal {
 
 class GlobalIndexWAL;
+class Manifest;
 
 // GlobalIndex: In-memory index mapping keys to (segment_id, packed_version) lists,
 // with built-in concurrency control and persistence.
@@ -51,7 +52,8 @@ public:
 
     // --- Lifecycle ---
 
-    Status open(const std::string& db_path, const Options& options);
+    Status open(const std::string& db_path, Manifest& manifest,
+                const Options& options);
     Status recover();
     Status close();
     bool isOpen() const;
@@ -98,7 +100,10 @@ public:
     // --- Maintenance ---
 
     Status snapshot();
-    Status commit(uint64_t version);
+
+    // Direct WAL access — callers commit the appropriate WAL themselves.
+    GlobalIndexWAL& flushWAL() { return *flush_wal_; }
+    GlobalIndexWAL& gcWAL() { return *gc_wal_; }
 
     // --- Statistics ---
 
@@ -124,9 +129,18 @@ public:
     // [checksum: 4 bytes]
 
 private:
+    // --- Core DHT mutations (no WAL, no snapshot counter) ---
+    // Used by both the public API (which also writes to WAL) and WAL replay.
+    void applyPut(std::string_view key, uint64_t packed_version, uint32_t segment_id);
+    void applyRelocate(std::string_view key, uint64_t packed_version,
+                       uint32_t old_segment_id, uint32_t new_segment_id);
+    void applyEliminate(std::string_view key, uint64_t packed_version,
+                        uint32_t segment_id);
+
+    // Replay both flush and GC WALs in chronological order (merged by commit_version).
+    Status replayWALs();
     Status maybeSnapshot();
     std::string snapshotPath() const;
-    std::string walPath() const;
 
     // --- Data ---
     ReadWriteDeltaHashTable dht_;
@@ -136,7 +150,8 @@ private:
     std::string db_path_;
     Options options_;
     bool is_open_ = false;
-    std::unique_ptr<GlobalIndexWAL> wal_;
+    std::unique_ptr<GlobalIndexWAL> flush_wal_;
+    std::unique_ptr<GlobalIndexWAL> gc_wal_;
     uint64_t updates_since_snapshot_ = 0;
 };
 

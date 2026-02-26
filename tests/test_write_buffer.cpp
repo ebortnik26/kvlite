@@ -526,7 +526,7 @@ protected:
 TEST_F(FlushTest, EmptyBuffer) {
     WriteBuffer wb;
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.flushWAL()).ok());
     EXPECT_EQ(seg_.dataSize(), 0u);
     EXPECT_EQ(seg_.entryCount(), 0u);
 }
@@ -536,7 +536,7 @@ TEST_F(FlushTest, SingleEntry) {
     wb.put("hello", 42, "world", false);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.flushWAL()).ok());
 
     size_t expected_size = LogEntry::kHeaderSize + 5 + 5 + LogEntry::kChecksumSize;
     EXPECT_EQ(seg_.dataSize(), expected_size);
@@ -563,7 +563,7 @@ TEST_F(FlushTest, TombstoneEntry) {
     wb.put("deleted", 7, "", true);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.flushWAL()).ok());
 
     LogEntry entry;
     readEntry(0, entry);
@@ -583,7 +583,7 @@ TEST_F(FlushTest, SortOrderHashThenVersion) {
     wb.put("ccc", 20, "v20", false);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.flushWAL()).ok());
 
     // Read all entries back
     std::vector<std::pair<uint64_t, uint64_t>> order; // (hash, version)
@@ -615,7 +615,7 @@ TEST_F(FlushTest, RoundTrip) {
     wb.put("key2", 3, "val3", true);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.flushWAL()).ok());
 
     // Read all entries back and verify contents
     std::vector<LogEntry> entries;
@@ -681,7 +681,7 @@ TEST_F(FlushTest, SealAndOpen) {
     wb.put("beta", 10, "vb", true);
 
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 1, global_index_, global_index_.flushWAL()).ok());
     uint64_t data_size = seg_.dataSize();
     seg_.close();
 
@@ -724,7 +724,7 @@ TEST_F(FlushTest, GlobalIndexPopulated) {
     wb.put("key3", 4, "val4", false);
 
     ASSERT_TRUE(seg_.create(path_, 77).ok());
-    ASSERT_TRUE(wb.flush(seg_, 77, global_index_).ok());
+    ASSERT_TRUE(wb.flush(seg_, 77, global_index_, global_index_.flushWAL()).ok());
 
     // Every entry should be registered in GlobalIndex with packed version.
     // Packed version = (logical_version << 1) | tombstone_bit.

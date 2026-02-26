@@ -25,6 +25,10 @@ Status SegmentStorageManager::open(const std::string& db_path,
     options_ = options;
     is_open_ = true;
 
+    // Create segments/ subdirectory if needed.
+    std::error_code ec;
+    std::filesystem::create_directories(segmentsDir(), ec);
+
     Status s = recover();
     if (!s.ok()) {
         is_open_ = false;
@@ -67,7 +71,7 @@ Status SegmentStorageManager::recover() {
     if (options_.purge_untracked_files) {
         std::error_code ec;
         for (const auto& entry :
-             std::filesystem::directory_iterator(db_path_, ec)) {
+             std::filesystem::directory_iterator(segmentsDir(), ec)) {
             if (!entry.is_regular_file()) continue;
             std::string fname = entry.path().filename().string();
             if (fname.rfind("segment_", 0) == 0 &&
@@ -96,7 +100,7 @@ bool SegmentStorageManager::isOpen() const {
     return is_open_;
 }
 
-Status SegmentStorageManager::createSegment(uint32_t id) {
+Status SegmentStorageManager::createSegment(uint32_t id, bool register_in_manifest) {
     std::string path = segmentPath(id);
     Segment seg;
     Status s = seg.create(path, id);
@@ -106,7 +110,16 @@ Status SegmentStorageManager::createSegment(uint32_t id) {
     segments_.emplace(id, std::move(seg));
     lock.unlock();
 
-    manifest_.set(std::string(kSegmentPrefix) + std::to_string(id), "");
+    if (register_in_manifest) {
+        manifest_.set(std::string(kSegmentPrefix) + std::to_string(id), "");
+    }
+    return Status::OK();
+}
+
+Status SegmentStorageManager::registerSegments(const std::vector<uint32_t>& ids) {
+    for (uint32_t id : ids) {
+        manifest_.set(std::string(kSegmentPrefix) + std::to_string(id), "");
+    }
     return Status::OK();
 }
 
@@ -201,7 +214,11 @@ uint32_t SegmentStorageManager::allocateSegmentId() {
 }
 
 std::string SegmentStorageManager::segmentPath(uint32_t segment_id) const {
-    return db_path_ + "/segment_" + std::to_string(segment_id) + ".data";
+    return segmentsDir() + "/segment_" + std::to_string(segment_id) + ".data";
+}
+
+std::string SegmentStorageManager::segmentsDir() const {
+    return db_path_ + "/segments";
 }
 
 }  // namespace internal

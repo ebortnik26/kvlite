@@ -55,7 +55,10 @@ add_executable(kvlite_dht_test
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
@@ -83,7 +86,9 @@ add_executable(kvlite_segment_index_test
     ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/entry_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
@@ -119,7 +124,10 @@ add_executable(kvlite_wb_test
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
@@ -265,7 +273,10 @@ add_executable(kvlite_entry_stream_test
     ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
@@ -278,6 +289,51 @@ target_include_directories(kvlite_entry_stream_test
 )
 
 target_link_libraries(kvlite_entry_stream_test
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
+# WAL tests
+add_executable(kvlite_wal_test
+    test_wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/status.cpp
+)
+
+target_include_directories(kvlite_wal_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_wal_test
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
+# WAL Stream tests
+add_executable(kvlite_wal_stream_test
+    test_wal_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/status.cpp
+)
+
+target_include_directories(kvlite_wal_stream_test
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_wal_stream_test
     PRIVATE
         GTest::gtest
         GTest::gtest_main
@@ -298,6 +354,8 @@ add_test(NAME segment_tests COMMAND kvlite_seg_test)
 add_test(NAME log_file_tests COMMAND kvlite_lf_test)
 add_test(NAME version_manager_tests COMMAND kvlite_vm_test)
 add_test(NAME manifest_tests COMMAND kvlite_manifest_test)
+add_test(NAME wal_tests COMMAND kvlite_wal_test)
+add_test(NAME wal_stream_tests COMMAND kvlite_wal_stream_test)
 
 # Default parallel level for ctest
 set(CTEST_PARALLEL_LEVEL 2 CACHE STRING "Number of tests to run in parallel")

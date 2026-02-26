@@ -53,7 +53,12 @@ public:
     // --- Segment Registry ---
 
     // Create a new segment file in Writing state and register it.
-    Status createSegment(uint32_t id);
+    // When register_in_manifest is false, the segment is created on disk
+    // but not persisted to the manifest (for deferred GC registration).
+    Status createSegment(uint32_t id, bool register_in_manifest = true);
+
+    // Batch-register previously deferred segments in the manifest.
+    Status registerSegments(const std::vector<uint32_t>& ids);
 
     // Close and unregister a segment, deleting its file from disk.
     Status removeSegment(uint32_t id);
@@ -76,8 +81,11 @@ public:
     // Allocate a monotonically increasing segment ID.
     uint32_t allocateSegmentId();
 
-    // Return the file path for a given segment ID under db_path_.
+    // Return the file path for a given segment ID under db_path_/segments/.
     std::string segmentPath(uint32_t segment_id) const;
+
+    // Segments directory: <db_path>/segments/
+    std::string segmentsDir() const;
 
 private:
     Status recover();

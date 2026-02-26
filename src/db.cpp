@@ -73,7 +73,7 @@ Status DB::open(const std::string& path, const Options& options) {
     global_index_opts.snapshot_interval = options.global_index_snapshot_interval;
     global_index_opts.sync_writes = options.sync_writes;
 
-    s = global_index_->open(path, global_index_opts);
+    s = global_index_->open(path, *manifest_, global_index_opts);
     if (!s.ok()) {
         versions_->close();
         versions_.reset();
@@ -451,7 +451,8 @@ Status DB::flush() {
         s->readKeyByVersion(packed_version, key);
         return key;
     };
-    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_, resolver);
+    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_,
+                             global_index_->flushWAL(), resolver);
     if (!s.ok()) {
         return s;
     }

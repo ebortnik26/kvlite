@@ -52,8 +52,10 @@ protected:
 
     // Helper: create an orphan .data file not tracked by manifest.
     void createOrphanFile(uint32_t fake_id) {
+        std::string seg_dir = path_ + "/segments";
+        std::filesystem::create_directories(seg_dir);
         std::string orphan =
-            path_ + "/segment_" + std::to_string(fake_id) + ".data";
+            seg_dir + "/segment_" + std::to_string(fake_id) + ".data";
         std::ofstream(orphan) << "orphan";
     }
 
@@ -93,7 +95,7 @@ TEST_F(SegmentStorageManagerTest, RecoverPurgesOrphanFiles) {
     // Plant an orphan file.
     createOrphanFile(999);
     ASSERT_TRUE(std::filesystem::exists(
-        path_ + "/segment_999.data"));
+        path_ + "/segments/segment_999.data"));
 
     // Phase 2: reopen with purge enabled.
     {
@@ -103,7 +105,7 @@ TEST_F(SegmentStorageManagerTest, RecoverPurgesOrphanFiles) {
 
         // Orphan should be gone.
         EXPECT_FALSE(std::filesystem::exists(
-            path_ + "/segment_999.data"));
+            path_ + "/segments/segment_999.data"));
 
         // Tracked segment should still exist.
         EXPECT_EQ(sm_->segmentCount(), 1u);
@@ -127,7 +129,7 @@ TEST_F(SegmentStorageManagerTest, RecoverKeepsOrphansByDefault) {
 
         // Orphan should still be present.
         EXPECT_TRUE(std::filesystem::exists(
-            path_ + "/segment_999.data"));
+            path_ + "/segments/segment_999.data"));
 
         closeSM();
     }
@@ -142,7 +144,7 @@ TEST_F(SegmentStorageManagerTest, RecoverMissingManifestFile) {
         closeSM();
 
         // Delete the segment file behind the manifest's back.
-        std::filesystem::remove(path_ + "/segment_" + std::to_string(id) + ".data");
+        std::filesystem::remove(path_ + "/segments/segment_" + std::to_string(id) + ".data");
     }
 
     // Reopen — recover should report an error for the missing file.
