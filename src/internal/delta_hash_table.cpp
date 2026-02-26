@@ -228,8 +228,289 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint32_t li, uint64_t fp,
     }
 }
 
+// --- addToChainChecked helpers ---
+//
+// Collision resolution uses "variable-length fingerprints": when two keys
+// share the same base fingerprint (hash collision), we extend their
+// fingerprints with bits from a secondary hash to disambiguate them.
+// The extension width (fp_extra_bits) is the minimum number of secondary
+// hash bits needed to make all entries in the group pairwise unique.
+//
+// Helper call graph:
+//   addToChainChecked
+//   ├── findSameKeyMatch       — check if new key matches any existing entry
+//   ├── appendToEntry          — add version to existing key's entry
+//   │   ├── buildCandidateSlot — build modified slot offline (no mutation)
+//   │   └── tryCommitSlot      — check fit and reencode if OK
+//   └── resolveCollision       — extend fingerprints for all colliding keys
+//       ├── findMinExtraBits   — find min bits to disambiguate all keys
+//       └── extendAndInsert    — apply extension and add new entry
+
+// Find minimum extra_bits such that new_sec and all entries in sec_hashes
+// produce unique values when masked to extra_bits width. Tries widths
+// starting at start_bits, incrementing until all N+1 values are distinct.
+static uint8_t findMinExtraBits(
+    const std::vector<uint64_t>& sec_hashes,
+    uint64_t new_sec,
+    uint8_t start_bits = 1) {
+    uint8_t extra_bits = start_bits;
+    while (extra_bits < 64) {
+        uint64_t ext_mask = (1ULL << extra_bits) - 1;
+        uint64_t new_ext = new_sec & ext_mask;
+        bool all_unique = true;
+        for (uint64_t sh : sec_hashes) {
+            if ((sh & ext_mask) == new_ext) {
+                all_unique = false;
+                break;
+            }
+        }
+        if (all_unique) {
+            bool existing_unique = true;
+            for (size_t a = 0; a < sec_hashes.size() && existing_unique; ++a) {
+                for (size_t b = a + 1; b < sec_hashes.size(); ++b) {
+                    if ((sec_hashes[a] & ext_mask) ==
+                        (sec_hashes[b] & ext_mask)) {
+                        existing_unique = false;
+                        break;
+                    }
+                }
+            }
+            if (existing_unique) return extra_bits;
+        }
+        extra_bits++;
+    }
+    return extra_bits;
+}
+
+// Extend all matched entries' fingerprints with secondary hash bits and insert
+// the new entry. Modifies all_slots in place. Returns the full (extended)
+// fingerprint assigned to the new entry. Caller checks fit and handles overflow.
+static uint64_t extendAndInsert(
+    std::vector<DeltaHashTable::LSlotContents>& all_slots, uint32_t li,
+    const std::vector<size_t>& match_indices,
+    const std::vector<uint64_t>& sec_hashes,
+    uint64_t fp, uint64_t new_key_secondary_hash,
+    uint64_t packed_version, uint32_t id,
+    uint8_t fingerprint_bits, uint8_t start_bits) {
+
+    uint8_t extra_bits = findMinExtraBits(sec_hashes, new_key_secondary_hash,
+                                          start_bits);
+    uint64_t ext_mask = (1ULL << extra_bits) - 1;
+    auto& entries = all_slots[li].entries;
+
+    // Update existing entries with extended fingerprints.
+    for (size_t i = 0; i < match_indices.size(); ++i) {
+        entries[match_indices[i]].fp_extra_bits = extra_bits;
+        entries[match_indices[i]].fingerprint =
+            fp | ((sec_hashes[i] & ext_mask) << fingerprint_bits);
+    }
+
+    // Create and insert new entry.
+    DeltaHashTable::TrieEntry new_entry;
+    new_entry.fingerprint = fp | ((new_key_secondary_hash & ext_mask) << fingerprint_bits);
+    new_entry.fp_extra_bits = extra_bits;
+    new_entry.packed_versions.push_back(packed_version);
+    new_entry.ids.push_back(id);
+    uint64_t new_fp = new_entry.fingerprint;
+    entries.push_back(std::move(new_entry));
+
+    std::sort(entries.begin(), entries.end(),
+              [](const DeltaHashTable::TrieEntry& a,
+                 const DeltaHashTable::TrieEntry& b) {
+                  return a.fingerprint < b.fingerprint;
+              });
+
+    return new_fp;
+}
+
+// Build a candidate lslot offline (pure function — no bucket mutation).
+// Returns a copy of the slot with (packed_version, id) inserted into the
+// entry matching full_fp, or with a new TrieEntry if no match exists.
+static DeltaHashTable::LSlotContents buildCandidateSlot(
+    const DeltaHashTable::LSlotContents& slot,
+    uint64_t full_fp, uint8_t fp_extra_bits,
+    uint64_t packed_version, uint32_t id) {
+    DeltaHashTable::LSlotContents candidate = slot;
+    bool found = false;
+    for (auto& e : candidate.entries) {
+        if (e.fingerprint == full_fp) {
+            auto it = std::lower_bound(e.packed_versions.begin(),
+                                       e.packed_versions.end(),
+                                       packed_version,
+                                       std::greater<uint64_t>());
+            size_t pos = it - e.packed_versions.begin();
+            e.packed_versions.insert(it, packed_version);
+            e.ids.insert(e.ids.begin() + pos, id);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        DeltaHashTable::TrieEntry new_entry;
+        new_entry.fingerprint = full_fp;
+        new_entry.fp_extra_bits = fp_extra_bits;
+        new_entry.packed_versions.push_back(packed_version);
+        new_entry.ids.push_back(id);
+        candidate.entries.push_back(std::move(new_entry));
+        std::sort(candidate.entries.begin(), candidate.entries.end(),
+                  [](const DeltaHashTable::TrieEntry& a,
+                     const DeltaHashTable::TrieEntry& b) {
+                      return a.fingerprint < b.fingerprint;
+                  });
+    }
+    return candidate;
+}
+
+// Try replacing the lslot in a bucket with a candidate. Computes the total
+// bit cost with the candidate substituted in; if it fits in bucket data area,
+// commits (reencodes) and returns true. Otherwise returns false with no mutation.
+bool DeltaHashTable::tryCommitSlot(
+    Bucket* bucket, uint32_t li,
+    std::vector<LSlotContents>& all_slots,
+    LSlotContents&& candidate) {
+    size_t old_bits = LSlotCodec::bitsNeeded(all_slots[li], fingerprint_bits_);
+    size_t new_bits = LSlotCodec::bitsNeeded(candidate, fingerprint_bits_);
+    size_t total = totalBitsNeeded(all_slots) - old_bits + new_bits;
+    if (total <= bucketDataBits()) {
+        all_slots[li] = std::move(candidate);
+        reencodeAllLSlots(*bucket, all_slots);
+        return true;
+    }
+    return false;
+}
+
+// Append a new (packed_version, id) to an existing key's TrieEntry.
+// Builds a candidate offline, attempts to commit to the current bucket.
+// On overflow, walks the extension chain to find a bucket with space.
+void DeltaHashTable::appendToEntry(
+    TrieEntry& entry,
+    std::vector<LSlotContents>& all_slots,
+    Bucket* bucket, uint32_t li,
+    uint64_t packed_version, uint32_t id,
+    const std::function<Bucket*(Bucket&)>& createExtFn) {
+
+    auto candidate = buildCandidateSlot(all_slots[li], entry.fingerprint,
+                                        entry.fp_extra_bits,
+                                        packed_version, id);
+    if (tryCommitSlot(bucket, li, all_slots, std::move(candidate))) {
+        return;
+    }
+
+    // Doesn't fit — add the version to extension chain.
+    uint64_t full_fp = entry.fingerprint;
+    uint8_t extra_bits = entry.fp_extra_bits;
+    Bucket* target = nextBucketMut(*bucket);
+    if (!target) {
+        target = createExtFn(*bucket);
+    }
+    while (true) {
+        auto ext_slots = decodeAllLSlots(*target);
+        auto ext_candidate = buildCandidateSlot(ext_slots[li], full_fp,
+                                                extra_bits,
+                                                packed_version, id);
+        if (tryCommitSlot(target, li, ext_slots, std::move(ext_candidate))) {
+            return;
+        }
+        Bucket* next = nextBucketMut(*target);
+        if (!next) {
+            next = createExtFn(*target);
+        }
+        target = next;
+    }
+}
+
 // --- addToChainChecked ---
 
+// For entries with extended fingerprints, compare extension bits directly.
+// For entries with fp_extra_bits==0 (never extended), resolve the actual key
+// via the resolver and compare secondary hashes.
+// Returns the entry index if found, -1 otherwise.
+int DeltaHashTable::findSameKeyMatch(
+    const std::vector<LSlotContents>& all_slots, uint32_t li,
+    const std::vector<size_t>& match_indices,
+    const KeyResolver& resolver,
+    uint64_t new_key_secondary_hash) const {
+    auto& entries = all_slots[li].entries;
+    for (size_t ei : match_indices) {
+        auto& existing = entries[ei];
+        if (existing.fp_extra_bits > 0) {
+            uint64_t ext_existing = existing.fingerprint >> fingerprint_bits_;
+            uint64_t ext_new = new_key_secondary_hash &
+                ((1ULL << existing.fp_extra_bits) - 1);
+            if (ext_existing == ext_new) return static_cast<int>(ei);
+            continue;
+        }
+        std::string key = resolver(existing.ids[0], existing.packed_versions[0]);
+        uint64_t sec = dhtSecondaryHash(key.data(), key.size());
+        if (sec == new_key_secondary_hash) return static_cast<int>(ei);
+    }
+    return -1;
+}
+
+// Handle a fingerprint collision: all matched entries belong to different keys.
+// Resolves each key to get its secondary hash, finds the minimum extension width
+// that disambiguates all keys, updates existing entries' fingerprints, creates
+// the new entry, and commits. On overflow, spills the new entry to extension.
+void DeltaHashTable::resolveCollision(
+    std::vector<LSlotContents>& all_slots,
+    Bucket* bucket, uint32_t li, uint64_t fp,
+    const std::vector<size_t>& match_indices,
+    const KeyResolver& resolver,
+    uint64_t new_key_secondary_hash,
+    uint64_t packed_version, uint32_t id,
+    const std::function<Bucket*(Bucket&)>& createExtFn) {
+
+    auto& entries = all_slots[li].entries;
+    std::vector<uint64_t> sec_hashes;
+    uint8_t max_extra = 0;
+    for (size_t mi : match_indices) {
+        std::string k = resolver(entries[mi].ids[0],
+                                 entries[mi].packed_versions[0]);
+        sec_hashes.push_back(dhtSecondaryHash(k.data(), k.size()));
+        if (entries[mi].fp_extra_bits > max_extra)
+            max_extra = entries[mi].fp_extra_bits;
+    }
+    uint8_t start_bits = max_extra > 0 ? max_extra : 1;
+
+    uint64_t new_fp = extendAndInsert(
+        all_slots, li, match_indices, sec_hashes,
+        fp, new_key_secondary_hash, packed_version, id,
+        fingerprint_bits_, start_bits);
+
+    if (totalBitsNeeded(all_slots) <= bucketDataBits()) {
+        reencodeAllLSlots(*bucket, all_slots);
+        return;
+    }
+
+    // Remove the new entry before reencoding, then spill it to extension.
+    auto& ents = all_slots[li].entries;
+    TrieEntry spilled;
+    for (auto eit = ents.begin(); eit != ents.end(); ++eit) {
+        if (eit->fingerprint == new_fp) {
+            spilled = std::move(*eit);
+            ents.erase(eit);
+            break;
+        }
+    }
+    reencodeAllLSlots(*bucket, all_slots);
+
+    Bucket* ext = nextBucketMut(*bucket);
+    if (!ext) ext = createExtFn(*bucket);
+    auto ext_slots = decodeAllLSlots(*ext);
+    ext_slots[li].entries.push_back(std::move(spilled));
+    std::sort(ext_slots[li].entries.begin(), ext_slots[li].entries.end(),
+              [](const TrieEntry& a, const TrieEntry& b) {
+                  return a.fingerprint < b.fingerprint;
+              });
+    reencodeAllLSlots(*ext, ext_slots);
+}
+
+// Collision-aware insertion. Walks the bucket chain looking for entries with
+// matching base fingerprint. Three outcomes per bucket:
+//   1. No matches → walk to next bucket.
+//   2. Same key found → append version (appendToEntry).
+//   3. All matches are different keys → collision (resolveCollision).
+// If no bucket has matches, falls through to addToChain (new key, no collision).
 bool DeltaHashTable::addToChainChecked(
     uint32_t bi, uint32_t li, uint64_t fp,
     uint64_t packed_version, uint32_t id,
@@ -239,19 +520,15 @@ bool DeltaHashTable::addToChainChecked(
 
     uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
 
-    // Scan all buckets in the chain to find TrieEntries with matching base fp.
-    // We need to check ALL matches across ALL buckets before deciding.
     Bucket* bucket = &buckets_[bi];
     while (bucket) {
         auto all_slots = decodeAllLSlots(*bucket);
         auto& entries = all_slots[li].entries;
 
-        // Collect indices of all entries with matching base fingerprint.
         std::vector<size_t> match_indices;
         for (size_t ei = 0; ei < entries.size(); ++ei) {
-            if ((entries[ei].fingerprint & base_mask) == fp) {
+            if ((entries[ei].fingerprint & base_mask) == fp)
                 match_indices.push_back(ei);
-            }
         }
 
         if (match_indices.empty()) {
@@ -259,280 +536,20 @@ bool DeltaHashTable::addToChainChecked(
             continue;
         }
 
-        // Check each matching entry to see if it's the same key.
-        for (size_t ei : match_indices) {
-            auto& existing = entries[ei];
-
-            if (existing.fp_extra_bits > 0) {
-                // Check if extended fingerprint matches the new key.
-                uint64_t ext_bits_existing = existing.fingerprint >> fingerprint_bits_;
-                uint64_t ext_bits_new = new_key_secondary_hash &
-                    ((1ULL << existing.fp_extra_bits) - 1);
-                if (ext_bits_existing == ext_bits_new) {
-                    // Same key — append entry.
-                    auto it = std::lower_bound(existing.packed_versions.begin(),
-                                               existing.packed_versions.end(),
-                                               packed_version,
-                                               std::greater<uint64_t>());
-                    size_t pos = it - existing.packed_versions.begin();
-                    existing.packed_versions.insert(it, packed_version);
-                    existing.ids.insert(existing.ids.begin() + pos, id);
-
-                    size_t total = totalBitsNeeded(all_slots);
-                    if (total <= bucketDataBits()) {
-                        reencodeAllLSlots(*bucket, all_slots);
-                        return false;
-                    }
-                    reencodeAllLSlots(*bucket, all_slots);
-                    return false;
-                }
-                // Different key — continue to next match.
-                continue;
-            }
-
-            // Entry has fp_extra_bits==0. Resolve the actual key.
-            std::string existing_key = resolver(existing.ids[0],
-                                                existing.packed_versions[0]);
-            uint64_t existing_secondary = dhtSecondaryHash(
-                existing_key.data(), existing_key.size());
-
-            if (existing_secondary == new_key_secondary_hash) {
-                // Same key — append entry.
-                auto it = std::lower_bound(existing.packed_versions.begin(),
-                                           existing.packed_versions.end(),
-                                           packed_version,
-                                           std::greater<uint64_t>());
-                size_t pos = it - existing.packed_versions.begin();
-                existing.packed_versions.insert(it, packed_version);
-                existing.ids.insert(existing.ids.begin() + pos, id);
-
-                size_t total = totalBitsNeeded(all_slots);
-                if (total <= bucketDataBits()) {
-                    reencodeAllLSlots(*bucket, all_slots);
-                    return false;
-                }
-                reencodeAllLSlots(*bucket, all_slots);
-                return false;
-            }
-
-            // Collision detected: different secondary hash.
-            // Need to extend fingerprints for ALL entries with this base fp.
-            // Collect all secondary hashes (including new key's).
-            struct SecInfo {
-                size_t entry_idx;
-                uint64_t secondary;
-            };
-            std::vector<SecInfo> sec_infos;
-            for (size_t mi : match_indices) {
-                auto& e = entries[mi];
-                if (e.fp_extra_bits > 0) {
-                    // Already extended — we know its secondary hash extension.
-                    // We need the full secondary hash, so resolve it.
-                    std::string k = resolver(e.ids[0], e.packed_versions[0]);
-                    sec_infos.push_back({mi, dhtSecondaryHash(k.data(), k.size())});
-                } else {
-                    if (mi == ei) {
-                        sec_infos.push_back({mi, existing_secondary});
-                    } else {
-                        std::string k = resolver(entries[mi].ids[0],
-                                                 entries[mi].packed_versions[0]);
-                        sec_infos.push_back({mi, dhtSecondaryHash(k.data(), k.size())});
-                    }
-                }
-            }
-
-            // Find minimum extra_bits that disambiguates ALL keys + new key.
-            uint8_t extra_bits = 1;
-            while (extra_bits < 64) {
-                uint64_t ext_mask = (1ULL << extra_bits) - 1;
-                uint64_t new_ext = new_key_secondary_hash & ext_mask;
-                bool all_unique = true;
-                // Check new key against all existing.
-                for (const auto& si : sec_infos) {
-                    if ((si.secondary & ext_mask) == new_ext) {
-                        all_unique = false;
-                        break;
-                    }
-                }
-                if (!all_unique) {
-                    extra_bits++;
-                    continue;
-                }
-                // Check all pairs of existing keys.
-                bool existing_unique = true;
-                for (size_t a = 0; a < sec_infos.size() && existing_unique; ++a) {
-                    for (size_t b = a + 1; b < sec_infos.size(); ++b) {
-                        if ((sec_infos[a].secondary & ext_mask) ==
-                            (sec_infos[b].secondary & ext_mask)) {
-                            existing_unique = false;
-                            break;
-                        }
-                    }
-                }
-                if (existing_unique) break;
-                extra_bits++;
-            }
-
-            uint64_t ext_mask = (1ULL << extra_bits) - 1;
-
-            // Update all existing entries with extended fingerprints.
-            for (const auto& si : sec_infos) {
-                entries[si.entry_idx].fp_extra_bits = extra_bits;
-                entries[si.entry_idx].fingerprint =
-                    fp | ((si.secondary & ext_mask) << fingerprint_bits_);
-            }
-
-            // Create new entry with extended fingerprint.
-            TrieEntry new_entry;
-            new_entry.fingerprint = fp | ((new_key_secondary_hash & ext_mask) << fingerprint_bits_);
-            new_entry.fp_extra_bits = extra_bits;
-            new_entry.packed_versions.push_back(packed_version);
-            new_entry.ids.push_back(id);
-            entries.push_back(std::move(new_entry));
-
-            // Sort entries by fingerprint.
-            std::sort(entries.begin(), entries.end(),
-                      [](const TrieEntry& a, const TrieEntry& b) {
-                          return a.fingerprint < b.fingerprint;
-                      });
-
-            size_t total = totalBitsNeeded(all_slots);
-            if (total <= bucketDataBits()) {
-                reencodeAllLSlots(*bucket, all_slots);
-                return true;  // new key
-            }
-
-            // Overflow: spill new entry to extension bucket.
-            reencodeAllLSlots(*bucket, all_slots);
-            Bucket* ext = nextBucketMut(*bucket);
-            if (!ext) {
-                ext = createExtFn(*bucket);
-            }
-            {
-                auto slots2 = decodeAllLSlots(*bucket);
-                auto& ents2 = slots2[li].entries;
-                TrieEntry spilled;
-                uint64_t new_fp = fp | ((new_key_secondary_hash & ext_mask) << fingerprint_bits_);
-                for (auto it = ents2.begin(); it != ents2.end(); ++it) {
-                    if (it->fingerprint == new_fp) {
-                        spilled = std::move(*it);
-                        ents2.erase(it);
-                        break;
-                    }
-                }
-                reencodeAllLSlots(*bucket, slots2);
-
-                auto ext_slots = decodeAllLSlots(*ext);
-                ext_slots[li].entries.push_back(std::move(spilled));
-                std::sort(ext_slots[li].entries.begin(),
-                          ext_slots[li].entries.end(),
-                          [](const TrieEntry& a, const TrieEntry& b) {
-                              return a.fingerprint < b.fingerprint;
-                          });
-                reencodeAllLSlots(*ext, ext_slots);
-            }
-            return true;  // new key
+        int same_key = findSameKeyMatch(all_slots, li, match_indices,
+                                            resolver, new_key_secondary_hash);
+        if (same_key >= 0) {
+            appendToEntry(entries[same_key], all_slots, bucket, li,
+                          packed_version, id, createExtFn);
+            return false;
         }
 
-        // All matches were extended entries and none matched the new key.
-        // This is a new collision — need to extend all to accommodate.
-        // Collect secondary hashes for all existing matches.
-        {
-            struct SecInfo {
-                size_t entry_idx;
-                uint64_t secondary;
-            };
-            std::vector<SecInfo> sec_infos;
-            for (size_t mi : match_indices) {
-                std::string k = resolver(entries[mi].ids[0],
-                                         entries[mi].packed_versions[0]);
-                sec_infos.push_back({mi, dhtSecondaryHash(k.data(), k.size())});
-            }
-
-            // Find minimum extra_bits.
-            uint8_t extra_bits = entries[match_indices[0]].fp_extra_bits;
-            if (extra_bits == 0) extra_bits = 1;
-            while (extra_bits < 64) {
-                uint64_t ext_mask = (1ULL << extra_bits) - 1;
-                uint64_t new_ext = new_key_secondary_hash & ext_mask;
-                bool all_unique = true;
-                for (const auto& si : sec_infos) {
-                    if ((si.secondary & ext_mask) == new_ext) {
-                        all_unique = false;
-                        break;
-                    }
-                }
-                if (!all_unique) { extra_bits++; continue; }
-                bool existing_unique = true;
-                for (size_t a = 0; a < sec_infos.size() && existing_unique; ++a) {
-                    for (size_t b = a + 1; b < sec_infos.size(); ++b) {
-                        if ((sec_infos[a].secondary & ext_mask) ==
-                            (sec_infos[b].secondary & ext_mask)) {
-                            existing_unique = false;
-                            break;
-                        }
-                    }
-                }
-                if (existing_unique) break;
-                extra_bits++;
-            }
-
-            uint64_t ext_mask = (1ULL << extra_bits) - 1;
-            for (const auto& si : sec_infos) {
-                entries[si.entry_idx].fp_extra_bits = extra_bits;
-                entries[si.entry_idx].fingerprint =
-                    fp | ((si.secondary & ext_mask) << fingerprint_bits_);
-            }
-
-            TrieEntry new_entry;
-            new_entry.fingerprint = fp | ((new_key_secondary_hash & ext_mask) << fingerprint_bits_);
-            new_entry.fp_extra_bits = extra_bits;
-            new_entry.packed_versions.push_back(packed_version);
-            new_entry.ids.push_back(id);
-            entries.push_back(std::move(new_entry));
-
-            std::sort(entries.begin(), entries.end(),
-                      [](const TrieEntry& a, const TrieEntry& b) {
-                          return a.fingerprint < b.fingerprint;
-                      });
-
-            size_t total = totalBitsNeeded(all_slots);
-            if (total <= bucketDataBits()) {
-                reencodeAllLSlots(*bucket, all_slots);
-                return true;
-            }
-            reencodeAllLSlots(*bucket, all_slots);
-
-            Bucket* ext = nextBucketMut(*bucket);
-            if (!ext) ext = createExtFn(*bucket);
-            {
-                auto slots2 = decodeAllLSlots(*bucket);
-                auto& ents2 = slots2[li].entries;
-                TrieEntry spilled;
-                uint64_t new_fp = fp | ((new_key_secondary_hash & ext_mask) << fingerprint_bits_);
-                for (auto it = ents2.begin(); it != ents2.end(); ++it) {
-                    if (it->fingerprint == new_fp) {
-                        spilled = std::move(*it);
-                        ents2.erase(it);
-                        break;
-                    }
-                }
-                reencodeAllLSlots(*bucket, slots2);
-
-                auto ext_slots = decodeAllLSlots(*ext);
-                ext_slots[li].entries.push_back(std::move(spilled));
-                std::sort(ext_slots[li].entries.begin(),
-                          ext_slots[li].entries.end(),
-                          [](const TrieEntry& a, const TrieEntry& b) {
-                              return a.fingerprint < b.fingerprint;
-                          });
-                reencodeAllLSlots(*ext, ext_slots);
-            }
-            return true;
-        }
+        resolveCollision(all_slots, bucket, li, fp, match_indices,
+                         resolver, new_key_secondary_hash,
+                         packed_version, id, createExtFn);
+        return true;
     }
 
-    // No base-fingerprint match found — new key, insert normally with fp_extra_bits=0.
     return addToChain(bi, li, fp, packed_version, id, createExtFn);
 }
 

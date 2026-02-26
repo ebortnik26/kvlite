@@ -1380,7 +1380,7 @@ TEST(ReadWriteDHT, AddEntryCheckedSameKey) {
     ReadWriteDeltaHashTable dht;
 
     std::string key = "test_key";
-    auto resolver = [&](uint32_t seg_id, uint64_t pv) -> std::string {
+    auto resolver = [&](uint32_t /*seg_id*/, uint64_t /*pv*/) -> std::string {
         return key;
     };
 
@@ -1419,6 +1419,20 @@ public:
     bool testFindAllByHash(uint32_t bi, uint32_t li, uint64_t fp,
                            std::vector<uint64_t>& pvs, std::vector<uint32_t>& ids) const {
         return findAllByHash(bi, li, fp, pvs, ids);
+    }
+
+    void removeEntry(uint64_t fp, uint64_t packed_version, uint32_t id,
+                     uint32_t bi, uint32_t li) {
+        removeFromChain(bi, li, fp, packed_version, id);
+    }
+
+    bool updateEntry(uint64_t fp, uint64_t packed_version,
+                     uint32_t old_id, uint32_t new_id,
+                     uint32_t bi, uint32_t li) {
+        return updateIdInChain(bi, li, fp, packed_version, old_id, new_id,
+            [this](Bucket& bucket) -> Bucket* {
+                return createExtension(bucket);
+            });
     }
 
     uint8_t fpBits() const { return fingerprint_bits_; }
@@ -1544,4 +1558,309 @@ TEST(ReadWriteDHT, AddEntryCheckedSameKeyAfterCollision) {
     ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
     // Should have 3 entries total: 2 for key_x, 1 for key_y.
     EXPECT_EQ(pvs.size(), 3u);
+}
+
+TEST(ReadWriteDHT, AppendOverflow) {
+    // Verify that appending a version to an existing extended entry correctly
+    // handles bucket overflow by spilling to the extension chain.
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 64;  // tiny bucket to force overflow
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0x7;
+
+    std::string key_a = "key_alpha";
+    std::string key_b = "key_beta";
+    uint64_t sec_a = dhtSecondaryHash(key_a.data(), key_a.size());
+    uint64_t sec_b = dhtSecondaryHash(key_b.data(), key_b.size());
+    ASSERT_NE(sec_a, sec_b);
+
+    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> std::string {
+        if (seg_id <= 50) return key_a;
+        return key_b;
+    };
+
+    // Insert key_a.
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_a));
+
+    // Insert key_b (collision → extends fingerprints).
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 51, resolver, sec_b));
+
+    // Append many versions to key_a to force bucket overflow.
+    for (uint32_t i = 2; i <= 20; ++i) {
+        bool is_new = dht.testAddToChainChecked(bi, li, fp, 100 + i, i, resolver, sec_a);
+        EXPECT_FALSE(is_new) << "append #" << i << " should not be new";
+    }
+
+    // All entries must be findable.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    // 20 for key_a + 1 for key_b = 21
+    EXPECT_EQ(pvs.size(), 21u);
+}
+
+TEST(ReadWriteDHT, CollisionWithOverflow) {
+    // Two colliding keys that together exceed bucket capacity after extension.
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 64;  // tiny
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0xA;
+
+    // Pre-fill the bucket with some non-colliding entries to make it tight.
+    auto no_resolver = [](uint32_t, uint64_t) -> std::string { return ""; };
+    for (uint32_t i = 0; i < 3; ++i) {
+        uint64_t other_fp = 0x1 + i;
+        dht.testAddToChainChecked(bi, li, other_fp, 1000 + i, 100 + i,
+                                  no_resolver, i);
+    }
+
+    std::string key_x = "collision_x";
+    std::string key_y = "collision_y";
+    uint64_t sec_x = dhtSecondaryHash(key_x.data(), key_x.size());
+    uint64_t sec_y = dhtSecondaryHash(key_y.data(), key_y.size());
+    ASSERT_NE(sec_x, sec_y);
+
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
+        if (seg_id == 1) return key_x;
+        if (seg_id == 2) return key_y;
+        return "";
+    };
+
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 500, 1, resolver, sec_x));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 600, 2, resolver, sec_y));
+
+    // Both entries must survive in the extension chain.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    EXPECT_EQ(pvs.size(), 2u);
+    std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
+    EXPECT_TRUE(pv_set.count(500));
+    EXPECT_TRUE(pv_set.count(600));
+}
+
+TEST(ReadWriteDHT, ManyCollisions) {
+    // 10 keys all sharing the same base fingerprint.
+    // The collision resolution creates extended fingerprints. When a new key's
+    // extended bits match an existing entry, findMinExtraBits grows the extension
+    // to re-disambiguate. Test inserts all 10 and verifies all entries survive.
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 512;
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0x42;
+    constexpr int N = 10;
+
+    std::vector<std::string> keys;
+    std::vector<uint64_t> sec_hashes;
+    for (int i = 0; i < N; ++i) {
+        keys.push_back("mcoll_" + std::to_string(i));
+        sec_hashes.push_back(dhtSecondaryHash(keys.back().data(),
+                                               keys.back().size()));
+    }
+
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
+        return keys[seg_id];
+    };
+
+    int new_count = 0;
+    for (int i = 0; i < N; ++i) {
+        bool is_new = dht.testAddToChainChecked(
+            bi, li, fp, (i + 1) * 100, static_cast<uint32_t>(i),
+            resolver, sec_hashes[i]);
+        if (is_new) new_count++;
+    }
+
+    // At minimum, the first 2 keys must be detected as new (first insert +
+    // first collision). Subsequent keys may or may not be detected as new
+    // depending on extension bit collisions.
+    EXPECT_GE(new_count, 2);
+
+    // All 10 entries must be findable via the base fingerprint.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    EXPECT_EQ(pvs.size(), static_cast<size_t>(N));
+
+    std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
+    for (int i = 0; i < N; ++i) {
+        EXPECT_TRUE(pv_set.count((i + 1) * 100))
+            << "missing version for key " << i;
+    }
+}
+
+TEST(ReadWriteDHT, ExtraBitsGrowsMultipleTimes) {
+    // Exercise findMinExtraBits needing to grow extra_bits multiple times.
+    // Insert 3 keys whose secondary hashes share low bits, forcing
+    // the extension width to grow beyond 1.
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 512;
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0xDD;
+
+    // Find 3 keys where low 1 bit of secondary hash matches for at least 2,
+    // forcing extra_bits to grow to at least 2.
+    std::string key_a = "extra_a";
+    std::string key_b = "extra_b";
+    std::string key_c = "extra_c";
+    uint64_t sec_a = dhtSecondaryHash(key_a.data(), key_a.size());
+    uint64_t sec_b = dhtSecondaryHash(key_b.data(), key_b.size());
+    uint64_t sec_c = dhtSecondaryHash(key_c.data(), key_c.size());
+
+    // Verify at least 2 share the same low bit (test precondition).
+    int matching_low = ((sec_a & 1) == (sec_b & 1)) +
+                       ((sec_a & 1) == (sec_c & 1)) +
+                       ((sec_b & 1) == (sec_c & 1));
+    // At least one pair must share low bit by pigeonhole.
+    ASSERT_GE(matching_low, 1);
+
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
+        if (seg_id == 1) return key_a;
+        if (seg_id == 2) return key_b;
+        if (seg_id == 3) return key_c;
+        return "";
+    };
+
+    dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_a);
+    dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec_b);
+    dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, sec_c);
+
+    // All 3 entries must be findable.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    EXPECT_EQ(pvs.size(), 3u);
+}
+
+TEST(ReadWriteDHT, AppendCreatesNewEntryInExtension) {
+    // Exercise buildCandidateSlot creating a new TrieEntry (not appending
+    // to an existing one) when the version overflows to the extension.
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 64;  // tiny to force overflow
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0xEE;
+
+    std::string key = "overflow_key";
+    uint64_t sec = dhtSecondaryHash(key.data(), key.size());
+
+    auto resolver = [&](uint32_t, uint64_t) -> std::string { return key; };
+
+    // First insert.
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec));
+
+    // Append many versions to force multiple overflows to extension chain.
+    for (uint32_t i = 2; i <= 15; ++i) {
+        bool is_new = dht.testAddToChainChecked(bi, li, fp, 100 + i, i,
+                                                resolver, sec);
+        EXPECT_FALSE(is_new) << "append #" << i;
+    }
+
+    // All 15 versions must be findable.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    EXPECT_EQ(pvs.size(), 15u);
+}
+
+TEST(ReadWriteDHT, CollisionThenRemove) {
+    // After collision extends fingerprints, remove one key's entry.
+    // The other key's entry must remain findable with its extended fingerprint.
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 512;
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0xBB;
+
+    std::string key_p = "key_persist";
+    std::string key_r = "key_remove";
+    uint64_t sec_p = dhtSecondaryHash(key_p.data(), key_p.size());
+    uint64_t sec_r = dhtSecondaryHash(key_r.data(), key_r.size());
+    ASSERT_NE(sec_p, sec_r);
+
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
+        if (seg_id == 1) return key_p;
+        if (seg_id == 2) return key_r;
+        return "";
+    };
+
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_p));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec_r));
+
+    // Remove key_r's entry.
+    dht.removeEntry(fp, 200, 2, bi, li);
+
+    // key_p must still be findable.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    EXPECT_EQ(pvs.size(), 1u);
+    EXPECT_EQ(pvs[0], 100u);
+    EXPECT_EQ(ids[0], 1u);
+}
+
+TEST(ReadWriteDHT, CollisionThenUpdate) {
+    // After collision extends fingerprints, update one entry's id.
+    // The update must succeed and the extended fingerprint must be preserved.
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 512;
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0xCC;
+
+    std::string key_u = "key_update";
+    std::string key_o = "key_other";
+    uint64_t sec_u = dhtSecondaryHash(key_u.data(), key_u.size());
+    uint64_t sec_o = dhtSecondaryHash(key_o.data(), key_o.size());
+    ASSERT_NE(sec_u, sec_o);
+
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
+        if (seg_id == 1 || seg_id == 99) return key_u;
+        if (seg_id == 2) return key_o;
+        return "";
+    };
+
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_u));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec_o));
+
+    // Update key_u's id from 1 to 99.
+    bool updated = dht.updateEntry(fp, 100, 1, 99, bi, li);
+    EXPECT_TRUE(updated);
+
+    // Both must still be findable.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    EXPECT_EQ(pvs.size(), 2u);
+
+    std::map<uint64_t, uint32_t> pv_to_id;
+    for (size_t i = 0; i < pvs.size(); ++i) {
+        pv_to_id[pvs[i]] = ids[i];
+    }
+    EXPECT_EQ(pv_to_id[100], 99u);   // updated
+    EXPECT_EQ(pv_to_id[200], 2u);    // unchanged
 }

@@ -191,6 +191,35 @@ protected:
 
 private:
     void initBucket(Bucket& bucket);
+
+    // Try committing a candidate lslot to a bucket. Returns true if it fits.
+    bool tryCommitSlot(Bucket* bucket, uint32_t li,
+                       std::vector<LSlotContents>& all_slots,
+                       LSlotContents&& candidate);
+
+    // Append (packed_version, id) to an existing TrieEntry, handling overflow.
+    void appendToEntry(TrieEntry& entry,
+                       std::vector<LSlotContents>& all_slots,
+                       Bucket* bucket, uint32_t li,
+                       uint64_t packed_version, uint32_t id,
+                       const std::function<Bucket*(Bucket&)>& createExtFn);
+
+    // Find which matched entry is the same key. Returns index or -1.
+    int findSameKeyMatch(
+        const std::vector<LSlotContents>& all_slots, uint32_t li,
+        const std::vector<size_t>& match_indices,
+        const KeyResolver& resolver,
+        uint64_t new_key_secondary_hash) const;
+
+    // Resolve a collision by extending fingerprints and committing.
+    void resolveCollision(
+        std::vector<LSlotContents>& all_slots,
+        Bucket* bucket, uint32_t li, uint64_t fp,
+        const std::vector<size_t>& match_indices,
+        const KeyResolver& resolver,
+        uint64_t new_key_secondary_hash,
+        uint64_t packed_version, uint32_t id,
+        const std::function<Bucket*(Bucket&)>& createExtFn);
 };
 
 }  // namespace internal
