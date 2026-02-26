@@ -12,7 +12,7 @@ ReadWriteDeltaHashTable::ReadWriteDeltaHashTable(const Config& config)
     : DeltaHashTable(config),
       ext_arena_owned_(sizeof(Bucket) + bucketStride(), /*concurrent=*/true) {
     ext_arena_ = &ext_arena_owned_;
-    bucket_locks_ = std::make_unique<BucketLock[]>(1u << config.bucket_bits);
+    bucket_locks_ = std::make_unique<Spinlock[]>(1u << config.bucket_bits);
 }
 
 ReadWriteDeltaHashTable::~ReadWriteDeltaHashTable() = default;
@@ -27,8 +27,7 @@ bool ReadWriteDeltaHashTable::findAll(std::string_view key,
     uint32_t li = lslotIndex(h);
     uint64_t fp = fingerprint(h);
 
-    BucketLockGuard guard(
-        const_cast<ReadWriteDeltaHashTable*>(this)->bucket_locks_[bi]);
+    SpinlockGuard guard(bucket_locks_[bi]);
     return findAllByHash(bi, li, fp, packed_versions, ids);
 }
 
@@ -40,8 +39,7 @@ bool ReadWriteDeltaHashTable::findFirst(std::string_view key,
     uint32_t li = lslotIndex(h);
     uint64_t fp = fingerprint(h);
 
-    BucketLockGuard guard(
-        const_cast<ReadWriteDeltaHashTable*>(this)->bucket_locks_[bi]);
+    SpinlockGuard guard(bucket_locks_[bi]);
     return findFirstByHash(bi, li, fp, packed_version, id);
 }
 
@@ -81,7 +79,7 @@ bool ReadWriteDeltaHashTable::removeEntry(std::string_view key,
     uint32_t li = lslotIndex(h);
     uint64_t fp = fingerprint(h);
 
-    BucketLockGuard guard(bucket_locks_[bi]);
+    SpinlockGuard guard(bucket_locks_[bi]);
     bool group_empty = removeFromChain(bi, li, fp, packed_version, id);
     size_.fetch_sub(1, std::memory_order_relaxed);
     return group_empty;
@@ -95,7 +93,7 @@ bool ReadWriteDeltaHashTable::updateEntryId(std::string_view key,
     uint32_t li = lslotIndex(h);
     uint64_t fp = fingerprint(h);
 
-    BucketLockGuard guard(bucket_locks_[bi]);
+    SpinlockGuard guard(bucket_locks_[bi]);
     return updateIdInChain(bi, li, fp, packed_version, old_id, new_id,
         [this](Bucket& bucket) -> Bucket* {
             return createExtension(bucket);
@@ -111,7 +109,7 @@ bool ReadWriteDeltaHashTable::addEntryChecked(
     uint64_t fp = fingerprint(h);
     uint64_t sec = secondaryHash(key);
 
-    BucketLockGuard guard(bucket_locks_[bi]);
+    SpinlockGuard guard(bucket_locks_[bi]);
 
     bool is_new = addToChainChecked(bi, li, fp, packed_version, id,
         [this](Bucket& bucket) -> Bucket* {
@@ -124,7 +122,7 @@ bool ReadWriteDeltaHashTable::addEntryChecked(
 
 bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint32_t li, uint64_t fp,
                                        uint64_t packed_version, uint32_t id) {
-    BucketLockGuard guard(bucket_locks_[bi]);
+    SpinlockGuard guard(bucket_locks_[bi]);
 
     bool is_new = addToChain(bi, li, fp, packed_version, id,
         [this](Bucket& bucket) -> Bucket* {
@@ -142,7 +140,7 @@ size_t ReadWriteDeltaHashTable::size() const {
 
 size_t ReadWriteDeltaHashTable::memoryUsage() const {
     return DeltaHashTable::memoryUsage()
-         + (1u << config_.bucket_bits) * sizeof(BucketLock);
+         + (1u << config_.bucket_bits) * sizeof(Spinlock);
 }
 
 void ReadWriteDeltaHashTable::clear() {

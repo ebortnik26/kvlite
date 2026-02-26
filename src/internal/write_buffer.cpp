@@ -14,7 +14,7 @@ WriteBuffer::WriteBuffer()
     : data_(new uint8_t[kDefaultDataCapacity]),  // uninitialized — pages allocated lazily
       data_capacity_(kDefaultDataCapacity),
       buckets_(std::make_unique<Bucket[]>(kNumBuckets)),   // zero-initialized
-      locks_(std::make_unique<BucketLock[]>(kNumBuckets)) {
+      locks_(std::make_unique<Spinlock[]>(kNumBuckets)) {
     std::memset(overflow_blocks_, 0, sizeof(overflow_blocks_));
 }
 

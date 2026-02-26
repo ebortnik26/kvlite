@@ -11,6 +11,7 @@
 
 #include "internal/delta_hash_table.h"
 #include "internal/entry_stream.h"
+#include "internal/spinlock.h"
 #include "log_entry.h"
 #include "kvlite/status.h"
 
@@ -127,20 +128,6 @@ private:
     };
     // sizeof(Bucket) = 8 + 63*8 = 512
 
-    struct BucketLock {
-        mutable std::atomic<uint8_t> locked{0};
-
-        void lock() const {
-            while (locked.exchange(1, std::memory_order_acquire) != 0) {
-                while (locked.load(std::memory_order_relaxed) != 0) {}
-            }
-        }
-
-        void unlock() const {
-            locked.store(0, std::memory_order_release);
-        }
-    };
-
     // --- Data buffer (append-only) ---
     std::unique_ptr<uint8_t[]> data_;
     size_t data_capacity_;
@@ -148,12 +135,12 @@ private:
 
     // --- Hash index (contiguous) ---
     std::unique_ptr<Bucket[]> buckets_;
-    std::unique_ptr<BucketLock[]> locks_;
+    std::unique_ptr<Spinlock[]> locks_;
 
     // --- Overflow pool (block-allocated) ---
     Bucket* overflow_blocks_[kMaxOverflowBlocks];
     std::atomic<uint32_t> overflow_count_{0};
-    BucketLock overflow_alloc_lock_;
+    Spinlock overflow_alloc_lock_;
 
     // --- Stats ---
     std::atomic<size_t> size_{0};
