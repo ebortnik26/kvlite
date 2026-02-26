@@ -9,11 +9,33 @@ ReadOnlyDeltaHashTable::ReadOnlyDeltaHashTable()
     : ReadOnlyDeltaHashTable(Config{}) {}
 
 ReadOnlyDeltaHashTable::ReadOnlyDeltaHashTable(const Config& config)
-    : DeltaHashTable(config) {}
+    : DeltaHashTable(config),
+      ext_arena_owned_(sizeof(Bucket) + bucketStride(), /*concurrent=*/false) {
+    ext_arena_ = &ext_arena_owned_;
+}
 
 ReadOnlyDeltaHashTable::~ReadOnlyDeltaHashTable() = default;
-ReadOnlyDeltaHashTable::ReadOnlyDeltaHashTable(ReadOnlyDeltaHashTable&&) noexcept = default;
-ReadOnlyDeltaHashTable& ReadOnlyDeltaHashTable::operator=(ReadOnlyDeltaHashTable&&) noexcept = default;
+
+ReadOnlyDeltaHashTable::ReadOnlyDeltaHashTable(ReadOnlyDeltaHashTable&& o) noexcept
+    : DeltaHashTable(std::move(o)),
+      ext_arena_owned_(std::move(o.ext_arena_owned_)),
+      sealed_(o.sealed_),
+      size_(o.size_) {
+    ext_arena_ = &ext_arena_owned_;
+    o.size_ = 0;
+}
+
+ReadOnlyDeltaHashTable& ReadOnlyDeltaHashTable::operator=(ReadOnlyDeltaHashTable&& o) noexcept {
+    if (this != &o) {
+        DeltaHashTable::operator=(std::move(o));
+        ext_arena_owned_ = std::move(o.ext_arena_owned_);
+        sealed_ = o.sealed_;
+        size_ = o.size_;
+        ext_arena_ = &ext_arena_owned_;
+        o.size_ = 0;
+    }
+    return *this;
+}
 
 void ReadOnlyDeltaHashTable::addEntry(std::string_view key,
                                        uint64_t packed_version, uint32_t id) {

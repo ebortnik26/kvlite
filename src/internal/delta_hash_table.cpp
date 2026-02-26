@@ -15,7 +15,7 @@ DeltaHashTable::DeltaHashTable(const Config& config)
     : config_(config),
       fingerprint_bits_(64 - config.bucket_bits - config.lslot_bits),
       lslot_codec_(fingerprint_bits_),
-      ext_arena_(bucketStride()) {
+      ext_arena_(nullptr) {
     uint32_t num_buckets = 1u << config_.bucket_bits;
     uint32_t stride = bucketStride();
     arena_ = std::make_unique<uint8_t[]>(
@@ -26,64 +26,15 @@ DeltaHashTable::DeltaHashTable(const Config& config)
     for (uint32_t i = 0; i < num_buckets; ++i) {
         buckets_[i].data = arena_.get() + static_cast<size_t>(i) * stride;
     }
-    clearBuckets();
+    // Init buckets directly — ext_arena_ is not set yet (derived class owns it).
+    for (auto& bucket : buckets_) {
+        initBucket(bucket);
+    }
 }
 
 DeltaHashTable::~DeltaHashTable() = default;
 DeltaHashTable::DeltaHashTable(DeltaHashTable&&) noexcept = default;
 DeltaHashTable& DeltaHashTable::operator=(DeltaHashTable&&) noexcept = default;
-
-// --- BucketArena ---
-
-DeltaHashTable::BucketArena::BucketArena(uint32_t bucket_stride)
-    : stride_(static_cast<uint32_t>(sizeof(Bucket)) + bucket_stride) {
-    chunks_.reserve(256);
-}
-
-uint32_t DeltaHashTable::BucketArena::allocate() {
-    uint32_t slot_in_chunk = size_ % kBucketsPerChunk;
-    if (slot_in_chunk == 0) {
-        // Need a new chunk.
-        size_t chunk_bytes = static_cast<size_t>(kBucketsPerChunk) * stride_;
-        auto chunk = std::make_unique<uint8_t[]>(chunk_bytes);
-        std::memset(chunk.get(), 0, chunk_bytes);
-        chunks_.push_back(std::move(chunk));
-    }
-    ++size_;
-    // Wire up Bucket::data to point at the data portion of this slot.
-    Bucket* b = get(size_);  // 1-based
-    uint8_t* slot_base = reinterpret_cast<uint8_t*>(b);
-    b->data = slot_base + sizeof(Bucket);
-    return size_;  // 1-based index
-}
-
-DeltaHashTable::Bucket* DeltaHashTable::BucketArena::get(uint32_t one_based) {
-    uint32_t idx = one_based - 1;
-    uint32_t chunk = idx / kBucketsPerChunk;
-    uint32_t offset = idx % kBucketsPerChunk;
-    return reinterpret_cast<Bucket*>(
-        chunks_[chunk].get() + static_cast<size_t>(offset) * stride_);
-}
-
-const DeltaHashTable::Bucket* DeltaHashTable::BucketArena::get(
-    uint32_t one_based) const {
-    uint32_t idx = one_based - 1;
-    uint32_t chunk = idx / kBucketsPerChunk;
-    uint32_t offset = idx % kBucketsPerChunk;
-    return reinterpret_cast<const Bucket*>(
-        chunks_[chunk].get() + static_cast<size_t>(offset) * stride_);
-}
-
-uint32_t DeltaHashTable::BucketArena::size() const { return size_; }
-
-size_t DeltaHashTable::BucketArena::dataBytes() const {
-    return static_cast<size_t>(size_) * (stride_ - sizeof(Bucket));
-}
-
-void DeltaHashTable::BucketArena::clear() {
-    chunks_.clear();
-    size_ = 0;
-}
 
 // --- Hash decomposition ---
 
@@ -173,21 +124,21 @@ size_t DeltaHashTable::totalBitsNeeded(
 
 // --- Extension chain ---
 
-const DeltaHashTable::Bucket* DeltaHashTable::nextBucket(
+const Bucket* DeltaHashTable::nextBucket(
     const Bucket& bucket) const {
     uint64_t ext = getExtensionPtr(bucket);
-    return ext ? ext_arena_.get(static_cast<uint32_t>(ext)) : nullptr;
+    return ext ? ext_arena_->get(static_cast<uint32_t>(ext)) : nullptr;
 }
 
-DeltaHashTable::Bucket* DeltaHashTable::nextBucketMut(Bucket& bucket) {
+Bucket* DeltaHashTable::nextBucketMut(Bucket& bucket) {
     uint64_t ext = getExtensionPtr(bucket);
-    return ext ? ext_arena_.get(static_cast<uint32_t>(ext)) : nullptr;
+    return ext ? ext_arena_->get(static_cast<uint32_t>(ext)) : nullptr;
 }
 
-DeltaHashTable::Bucket* DeltaHashTable::createExtension(Bucket& bucket) {
-    uint32_t ext_ptr = ext_arena_.allocate();
+Bucket* DeltaHashTable::createExtension(Bucket& bucket) {
+    uint32_t ext_ptr = ext_arena_->allocate();
     setExtensionPtr(bucket, ext_ptr);
-    Bucket* ext_bucket = ext_arena_.get(ext_ptr);
+    Bucket* ext_bucket = ext_arena_->get(ext_ptr);
     initBucket(*ext_bucket);
     return ext_bucket;
 }
@@ -885,7 +836,7 @@ void DeltaHashTable::forEachGroup(
 
 size_t DeltaHashTable::memoryUsage() const {
     size_t stride = config_.bucket_bytes + kBucketPadding;
-    return buckets_.size() * stride + ext_arena_.dataBytes();
+    return buckets_.size() * stride + ext_arena_->dataBytes();
 }
 
 void DeltaHashTable::clearBuckets() {
@@ -893,7 +844,7 @@ void DeltaHashTable::clearBuckets() {
         setExtensionPtr(bucket, 0);
         initBucket(bucket);
     }
-    ext_arena_.clear();
+    ext_arena_->clear();
 }
 
 void DeltaHashTable::initBucket(Bucket& bucket) {

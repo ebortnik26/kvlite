@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "internal/bucket_arena.h"
 #include "internal/lslot_codec.h"
 
 namespace kvlite {
@@ -91,10 +92,6 @@ public:
 
 protected:
     static constexpr uint32_t kBucketPadding = 8;
-
-    struct Bucket {
-        uint8_t* data = nullptr;
-    };
 
     explicit DeltaHashTable(const Config& config);
     ~DeltaHashTable();
@@ -186,31 +183,7 @@ protected:
     LSlotCodec lslot_codec_;
     std::unique_ptr<uint8_t[]> arena_;
     std::vector<Bucket> buckets_;
-    class BucketArena {
-    public:
-        static constexpr uint32_t kBucketsPerChunk = 64;
-
-        explicit BucketArena(uint32_t bucket_stride);
-
-        BucketArena(const BucketArena&) = delete;
-        BucketArena& operator=(const BucketArena&) = delete;
-        BucketArena(BucketArena&&) noexcept = default;
-        BucketArena& operator=(BucketArena&&) noexcept = default;
-
-        uint32_t allocate();                   // returns 1-based index
-        Bucket* get(uint32_t one_based);       // stable pointer
-        const Bucket* get(uint32_t one_based) const;
-        uint32_t size() const;
-        size_t dataBytes() const;              // size_ * stride_
-        void clear();
-
-    private:
-        uint32_t stride_;       // bytes per slot (sizeof(Bucket) + bucket_stride)
-        uint32_t size_ = 0;    // total allocated slots
-        std::vector<std::unique_ptr<uint8_t[]>> chunks_;
-    };
-
-    BucketArena ext_arena_;
+    BucketArena* ext_arena_;    // non-owning; set by derived class
 
 private:
     void initBucket(Bucket& bucket);

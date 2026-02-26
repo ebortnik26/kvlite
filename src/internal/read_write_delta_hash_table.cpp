@@ -9,7 +9,9 @@ ReadWriteDeltaHashTable::ReadWriteDeltaHashTable()
     : ReadWriteDeltaHashTable(Config{}) {}
 
 ReadWriteDeltaHashTable::ReadWriteDeltaHashTable(const Config& config)
-    : DeltaHashTable(config) {
+    : DeltaHashTable(config),
+      ext_arena_owned_(sizeof(Bucket) + bucketStride(), /*concurrent=*/true) {
+    ext_arena_ = &ext_arena_owned_;
     bucket_locks_ = std::make_unique<BucketLock[]>(1u << config.bucket_bits);
 }
 
@@ -96,7 +98,6 @@ bool ReadWriteDeltaHashTable::updateEntryId(std::string_view key,
     BucketLockGuard guard(bucket_locks_[bi]);
     return updateIdInChain(bi, li, fp, packed_version, old_id, new_id,
         [this](Bucket& bucket) -> Bucket* {
-            std::lock_guard<std::mutex> g(ext_mutex_);
             return createExtension(bucket);
         });
 }
@@ -114,7 +115,6 @@ bool ReadWriteDeltaHashTable::addEntryChecked(
 
     bool is_new = addToChainChecked(bi, li, fp, packed_version, id,
         [this](Bucket& bucket) -> Bucket* {
-            std::lock_guard<std::mutex> g(ext_mutex_);
             return createExtension(bucket);
         },
         resolver, sec);
@@ -128,7 +128,6 @@ bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint32_t li, uint64_t fp,
 
     bool is_new = addToChain(bi, li, fp, packed_version, id,
         [this](Bucket& bucket) -> Bucket* {
-            std::lock_guard<std::mutex> g(ext_mutex_);
             return createExtension(bucket);
         });
     size_.fetch_add(1, std::memory_order_relaxed);

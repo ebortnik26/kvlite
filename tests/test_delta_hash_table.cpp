@@ -1437,7 +1437,8 @@ public:
     }
 
     uint8_t fpBits() const { return fingerprint_bits_; }
-    size_t extensionCount() const { return ext_arena_.size(); }
+    size_t extensionCount() const { return ext_arena_->size(); }
+    const BucketArena& arena() const { return *ext_arena_; }
 };
 
 TEST(ReadWriteDHT, AddEntryCheckedCollision) {
@@ -1875,7 +1876,8 @@ TEST(ReadWriteDHT, CollisionThenUpdate) {
 class TestableRODHT : public ReadOnlyDeltaHashTable {
 public:
     using ReadOnlyDeltaHashTable::ReadOnlyDeltaHashTable;
-    size_t extensionCount() const { return ext_arena_.size(); }
+    size_t extensionCount() const { return ext_arena_->size(); }
+    const BucketArena& arena() const { return *ext_arena_; }
 };
 
 // Compute base memoryUsage for a config (no extensions).
@@ -2040,5 +2042,246 @@ TEST(MemoryLeak, ClearAfterOverflowThenReuseWorks) {
     for (int i = 1; i <= 300; ++i) {
         std::string key = "k" + std::to_string(i);
         ASSERT_TRUE(dht.contains(key)) << "missing after reuse: " << key;
+    }
+}
+
+// ============================================================
+// BucketArena tests
+// ============================================================
+
+// Basic allocation: size and dataBytes track correctly.
+TEST(BucketArena, SizeAndDataBytesTrackAllocations) {
+    auto cfg = smallBucketConfig();
+    TestableRODHT dht(cfg);
+
+    EXPECT_EQ(dht.arena().size(), 0u);
+    EXPECT_EQ(dht.arena().dataBytes(), 0u);
+
+    // Force extensions by filling small buckets.
+    for (int i = 1; i <= 300; ++i) {
+        dht.addEntry("k" + std::to_string(i),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    uint32_t ext_count = dht.arena().size();
+    ASSERT_GT(ext_count, 0u);
+
+    size_t stride = cfg.bucket_bytes + 8;  // kBucketPadding
+    EXPECT_EQ(dht.arena().dataBytes(), static_cast<size_t>(ext_count) * stride);
+}
+
+// Pointer stability: pointers from early allocations remain valid after
+// further allocations that span multiple chunks.
+TEST(BucketArena, PointerStabilityAcrossChunks) {
+    auto cfg = smallBucketConfig();
+    TestableRODHT dht(cfg);
+
+    // Insert enough entries to create >64 extensions (multiple chunks).
+    // With 16 buckets and 128-byte buckets, many keys will force chains.
+    for (int i = 1; i <= 2000; ++i) {
+        dht.addEntry("k" + std::to_string(i),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    uint32_t ext_count = dht.arena().size();
+    ASSERT_GT(ext_count, 64u) << "need multiple chunks for this test";
+
+    // Collect all Bucket* pointers.
+    std::vector<const void*> ptrs;
+    for (uint32_t i = 1; i <= ext_count; ++i) {
+        ptrs.push_back(dht.arena().get(i));
+    }
+
+    // All pointers must be non-null and unique.
+    for (uint32_t i = 0; i < ext_count; ++i) {
+        ASSERT_NE(ptrs[i], nullptr) << "null pointer at index " << (i + 1);
+    }
+    std::set<const void*> unique_ptrs(ptrs.begin(), ptrs.end());
+    EXPECT_EQ(unique_ptrs.size(), ptrs.size()) << "duplicate Bucket* pointers";
+
+    // All data must still be readable (pointers are stable).
+    for (int i = 1; i <= 2000; ++i) {
+        ASSERT_TRUE(dht.contains("k" + std::to_string(i)))
+            << "missing key after multi-chunk allocation: k" << i;
+    }
+}
+
+// Clear resets the arena completely; subsequent allocations work.
+TEST(BucketArena, ClearResetsAndReallocWorks) {
+    auto cfg = smallBucketConfig();
+    TestableRODHT dht(cfg);
+
+    for (int i = 1; i <= 500; ++i) {
+        dht.addEntry("k" + std::to_string(i),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    uint32_t ext_before = dht.arena().size();
+    ASSERT_GT(ext_before, 0u);
+
+    dht.clear();
+    EXPECT_EQ(dht.arena().size(), 0u);
+    EXPECT_EQ(dht.arena().dataBytes(), 0u);
+
+    // Reallocate — should work identically.
+    for (int i = 1; i <= 500; ++i) {
+        dht.addEntry("k" + std::to_string(i),
+                     static_cast<uint64_t>(i + 1000), static_cast<uint32_t>(i));
+    }
+    EXPECT_GT(dht.arena().size(), 0u);
+
+    for (int i = 1; i <= 500; ++i) {
+        ASSERT_TRUE(dht.contains("k" + std::to_string(i)));
+    }
+}
+
+// Repeated clear/fill cycles don't corrupt data or leak (ASAN will catch leaks).
+TEST(BucketArena, RepeatedClearFillCycles) {
+    auto cfg = smallBucketConfig();
+    TestableRODHT dht(cfg);
+
+    for (int cycle = 0; cycle < 10; ++cycle) {
+        for (int i = 1; i <= 200; ++i) {
+            dht.addEntry("k" + std::to_string(i),
+                         static_cast<uint64_t>(cycle * 1000 + i),
+                         static_cast<uint32_t>(i));
+        }
+        ASSERT_GT(dht.arena().size(), 0u)
+            << "no extensions on cycle " << cycle;
+
+        // Verify all data from this cycle.
+        for (int i = 1; i <= 200; ++i) {
+            uint64_t pv;
+            uint32_t id;
+            ASSERT_TRUE(dht.findFirst("k" + std::to_string(i), pv, id))
+                << "missing on cycle " << cycle << " key k" << i;
+        }
+
+        dht.clear();
+        EXPECT_EQ(dht.arena().size(), 0u);
+    }
+}
+
+// memoryUsage is consistent with arena dataBytes.
+TEST(BucketArena, MemoryUsageConsistency) {
+    auto cfg = smallBucketConfig();
+    TestableRODHT dht(cfg);
+
+    size_t base = baseMemory(cfg);
+    EXPECT_EQ(dht.memoryUsage(), base);
+
+    for (int i = 1; i <= 500; ++i) {
+        dht.addEntry("k" + std::to_string(i),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    EXPECT_EQ(dht.memoryUsage(), base + dht.arena().dataBytes());
+
+    dht.clear();
+    EXPECT_EQ(dht.memoryUsage(), base);
+}
+
+// Extensions created via ReadWrite DHT also use the arena correctly.
+TEST(BucketArena, ReadWriteArenaTracking) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.lslot_bits = 2;
+    cfg.bucket_bytes = 32;
+    TestableRWDHT dht(cfg);
+
+    EXPECT_EQ(dht.arena().size(), 0u);
+
+    // Fill until extensions are created.
+    for (int i = 1; i <= 500; ++i) {
+        dht.addEntry("key" + std::to_string(i % 5),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    uint32_t ext_after_fill = dht.arena().size();
+    ASSERT_GT(ext_after_fill, 0u);
+
+    // Remove all entries.
+    for (int i = 1; i <= 500; ++i) {
+        dht.removeEntry("key" + std::to_string(i % 5),
+                        static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    // Arena size doesn't shrink on individual removes (bump allocator),
+    // but data should be gone.
+    EXPECT_EQ(dht.size(), 0u);
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_FALSE(dht.contains("key" + std::to_string(i)));
+    }
+
+    // clear() resets the arena.
+    dht.clear();
+    EXPECT_EQ(dht.arena().size(), 0u);
+    EXPECT_EQ(dht.arena().dataBytes(), 0u);
+}
+
+// Chunk boundary: exactly kBucketsPerChunk extensions, then one more.
+TEST(BucketArena, ChunkBoundaryTransition) {
+    // Use a very small bucket to force many extensions quickly.
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 2;   // 4 buckets
+    cfg.lslot_bits = 1;    // 2 lslots
+    cfg.bucket_bytes = 32; // tiny
+    TestableRODHT dht(cfg);
+
+    // Keep inserting until we cross the 64-extension chunk boundary.
+    int i = 1;
+    while (dht.arena().size() <= 64) {
+        dht.addEntry("k" + std::to_string(i),
+                     static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        ++i;
+    }
+    ASSERT_GT(dht.arena().size(), 64u)
+        << "need >64 extensions to test chunk boundary";
+
+    // All inserted data must still be readable.
+    for (int j = 1; j < i; ++j) {
+        ASSERT_TRUE(dht.contains("k" + std::to_string(j)))
+            << "missing key k" << j << " after crossing chunk boundary";
+    }
+}
+
+// Concurrent allocate: N threads each call allocate() M times.
+// All returned indices must be unique and size() == N*M.
+TEST(BucketArena, ConcurrentAllocate) {
+    const uint32_t slot_size = 64;
+    BucketArena arena(slot_size, /*concurrent=*/true);
+
+    constexpr int N = 8;   // threads
+    constexpr int M = 500; // allocations per thread
+
+    std::vector<std::vector<uint32_t>> per_thread(N);
+    std::vector<std::thread> threads;
+    threads.reserve(N);
+
+    for (int t = 0; t < N; ++t) {
+        threads.emplace_back([&arena, &per_thread, t]() {
+            per_thread[t].reserve(M);
+            for (int i = 0; i < M; ++i) {
+                per_thread[t].push_back(arena.allocate());
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    EXPECT_EQ(arena.size(), static_cast<uint32_t>(N * M));
+
+    // All indices must be unique.
+    std::set<uint32_t> all_indices;
+    for (int t = 0; t < N; ++t) {
+        for (uint32_t idx : per_thread[t]) {
+            ASSERT_TRUE(all_indices.insert(idx).second)
+                << "duplicate index " << idx;
+        }
+    }
+    EXPECT_EQ(all_indices.size(), static_cast<size_t>(N * M));
+
+    // All pointers must be valid and unique.
+    std::set<const void*> all_ptrs;
+    for (uint32_t idx : all_indices) {
+        const Bucket* b = arena.get(idx);
+        ASSERT_NE(b, nullptr);
+        ASSERT_TRUE(all_ptrs.insert(b).second)
+            << "duplicate pointer for index " << idx;
     }
 }

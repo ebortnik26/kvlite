@@ -96,7 +96,7 @@ private:
                  uint64_t packed_version, uint32_t id);
 
     std::unique_ptr<BucketLock[]> bucket_locks_;
-    std::mutex ext_mutex_;
+    BucketArena ext_arena_owned_;
     std::atomic<size_t> size_{0};
 };
 

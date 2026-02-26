@@ -45,6 +45,7 @@ public:
     void clear();
 
 private:
+    BucketArena ext_arena_owned_;
     bool sealed_ = false;
     size_t size_ = 0;
 };
