@@ -58,7 +58,13 @@ public:
 
     // --- Index Operations ---
 
+    using KeyResolver = DeltaHashTable::KeyResolver;
+
     Status put(const std::string& key, uint64_t packed_version, uint32_t segment_id);
+
+    // Collision-aware put. Uses resolver to detect fingerprint collisions.
+    Status putChecked(const std::string& key, uint64_t packed_version,
+                      uint32_t segment_id, const KeyResolver& resolver);
 
     bool get(const std::string& key,
              std::vector<uint32_t>& segment_ids,

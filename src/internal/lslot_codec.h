@@ -25,6 +25,7 @@ public:
     // A single fingerprint group with parallel packed_version and id lists.
     struct TrieEntry {
         uint64_t fingerprint;
+        uint8_t fp_extra_bits = 0;  // extra bits beyond base fingerprint_bits_
         std::vector<uint64_t> packed_versions;  // sorted desc, parallel with ids
         std::vector<uint32_t> ids;              // sorted desc, parallel with packed_versions
     };

@@ -1305,3 +1305,243 @@ TEST(ReadOnlyDHT, MaxPackedVersion) {
     EXPECT_EQ(pv, max_pv);
     EXPECT_EQ(id, 42u);
 }
+
+// --- Variable-Width Fingerprint Tests ---
+
+TEST(LSlotCodecTest, VariableWidthFingerprintRoundtrip) {
+    LSlotCodec codec(39);
+    LSlotCodec::LSlotContents contents;
+
+    // Entry with no extra bits (common case).
+    LSlotCodec::TrieEntry e0;
+    e0.fingerprint = 0x1234567;
+    e0.fp_extra_bits = 0;
+    e0.packed_versions = {100};
+    e0.ids = {1};
+    contents.entries.push_back(e0);
+
+    // Entry with 3 extra bits.
+    LSlotCodec::TrieEntry e1;
+    e1.fingerprint = 0x1234567 | (5ULL << 39);  // 3 extra bits = 5 (0b101)
+    e1.fp_extra_bits = 3;
+    e1.packed_versions = {200};
+    e1.ids = {2};
+    contents.entries.push_back(e1);
+
+    // Entry with 7 extra bits.
+    LSlotCodec::TrieEntry e2;
+    e2.fingerprint = 0x7654321 | (0x5AULL << 39);  // 7 extra bits
+    e2.fp_extra_bits = 7;
+    e2.packed_versions = {300, 250};
+    e2.ids = {4, 3};  // sorted desc, parallel with packed_versions
+    contents.entries.push_back(e2);
+
+    // Sort by fingerprint for encoding.
+    std::sort(contents.entries.begin(), contents.entries.end(),
+              [](const LSlotCodec::TrieEntry& a, const LSlotCodec::TrieEntry& b) {
+                  return a.fingerprint < b.fingerprint;
+              });
+
+    uint8_t buf[512] = {};
+    size_t end_offset = codec.encode(buf, 0, contents);
+    EXPECT_GT(end_offset, 0u);
+
+    // Verify bitsNeeded matches encode output.
+    size_t expected_bits = LSlotCodec::bitsNeeded(contents, 39);
+    EXPECT_EQ(expected_bits, end_offset)
+        << "bitsNeeded and encode disagree on total bits";
+
+    // Decode and verify round-trip.
+    size_t decode_end;
+    auto decoded = codec.decode(buf, 0, &decode_end);
+    EXPECT_EQ(decode_end, end_offset)
+        << "decode and encode disagree on total bits";
+    ASSERT_EQ(decoded.entries.size(), 3u);
+
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(decoded.entries[i].fingerprint,
+                  contents.entries[i].fingerprint)
+            << "fingerprint mismatch at entry " << i;
+        EXPECT_EQ(decoded.entries[i].fp_extra_bits,
+                  contents.entries[i].fp_extra_bits)
+            << "fp_extra_bits mismatch at entry " << i;
+        EXPECT_EQ(decoded.entries[i].packed_versions,
+                  contents.entries[i].packed_versions)
+            << "packed_versions mismatch at entry " << i;
+        EXPECT_EQ(decoded.entries[i].ids,
+                  contents.entries[i].ids)
+            << "ids mismatch at entry " << i;
+    }
+}
+
+// --- Collision-Aware Insertion Tests ---
+
+TEST(ReadWriteDHT, AddEntryCheckedSameKey) {
+    ReadWriteDeltaHashTable dht;
+
+    std::string key = "test_key";
+    auto resolver = [&](uint32_t seg_id, uint64_t pv) -> std::string {
+        return key;
+    };
+
+    // First insert — should be new.
+    bool is_new = dht.addEntryChecked(key, 100, 1, resolver);
+    EXPECT_TRUE(is_new);
+
+    // Second insert with same key — should NOT be new.
+    is_new = dht.addEntryChecked(key, 200, 2, resolver);
+    EXPECT_FALSE(is_new);
+
+    // Both entries should be findable.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(key, pvs, ids));
+    EXPECT_EQ(pvs.size(), 2u);
+    EXPECT_EQ(ids.size(), 2u);
+}
+
+// Test helper: exposes protected DeltaHashTable methods for collision testing.
+class TestableRWDHT : public ReadWriteDeltaHashTable {
+public:
+    using ReadWriteDeltaHashTable::ReadWriteDeltaHashTable;
+
+    bool testAddToChainChecked(uint32_t bi, uint32_t li, uint64_t fp,
+                               uint64_t packed_version, uint32_t id,
+                               const KeyResolver& resolver,
+                               uint64_t new_key_secondary_hash) {
+        return addToChainChecked(bi, li, fp, packed_version, id,
+            [this](Bucket& bucket) -> Bucket* {
+                return createExtension(bucket);
+            },
+            resolver, new_key_secondary_hash);
+    }
+
+    bool testFindAllByHash(uint32_t bi, uint32_t li, uint64_t fp,
+                           std::vector<uint64_t>& pvs, std::vector<uint32_t>& ids) const {
+        return findAllByHash(bi, li, fp, pvs, ids);
+    }
+
+    uint8_t fpBits() const { return fingerprint_bits_; }
+};
+
+TEST(ReadWriteDHT, AddEntryCheckedCollision) {
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 512;
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0x123;  // same base fingerprint for both "keys"
+
+    // Secondary hashes for the two different "keys" — must differ.
+    uint64_t sec1 = 0xAAAAAAAAAAAAAAAAULL;
+    uint64_t sec2 = 0x5555555555555555ULL;
+
+    auto resolver = [](uint32_t seg_id, uint64_t /*pv*/) -> std::string {
+        // Return different "keys" based on segment_id.
+        if (seg_id == 1) return "key_alpha";
+        if (seg_id == 2) return "key_beta";
+        return "";
+    };
+
+    // Insert first key.
+    bool is_new = dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec1);
+    EXPECT_TRUE(is_new);
+
+    // Insert second key with same base fp — collision detected.
+    is_new = dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec2);
+    EXPECT_TRUE(is_new);  // new key!
+
+    // Both should be findable via base fingerprint.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    EXPECT_EQ(pvs.size(), 2u);
+    // Check we got both entries.
+    std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
+    EXPECT_TRUE(pv_set.count(100));
+    EXPECT_TRUE(pv_set.count(200));
+}
+
+TEST(ReadWriteDHT, AddEntryCheckedTripleCollision) {
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 512;
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0x456;
+
+    // Three different secondary hashes.
+    uint64_t sec1 = 0x1111111111111111ULL;
+    uint64_t sec2 = 0x2222222222222222ULL;
+    uint64_t sec3 = 0x3333333333333333ULL;
+
+    auto resolver = [](uint32_t seg_id, uint64_t /*pv*/) -> std::string {
+        return "key_" + std::to_string(seg_id);
+    };
+
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec1));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec2));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, sec3));
+
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    EXPECT_EQ(pvs.size(), 3u);
+
+    std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
+    EXPECT_TRUE(pv_set.count(100));
+    EXPECT_TRUE(pv_set.count(200));
+    EXPECT_TRUE(pv_set.count(300));
+}
+
+TEST(ReadWriteDHT, AddEntryCheckedSameKeyAfterCollision) {
+    // After a collision extends fingerprints, inserting the same key again
+    // should append to the existing extended entry rather than creating a new one.
+    DeltaHashTable::Config config;
+    config.bucket_bits = 4;
+    config.lslot_bits = 2;
+    config.bucket_bytes = 512;
+    TestableRWDHT dht(config);
+
+    uint32_t bi = 0, li = 0;
+    uint64_t fp = 0x789;
+
+    // Use actual secondary hashes computed from key strings, so the
+    // resolver and the caller agree on what the secondary hash should be.
+    std::string key_x = "key_x";
+    std::string key_y = "key_y";
+    uint64_t sec_x = dhtSecondaryHash(key_x.data(), key_x.size());
+    uint64_t sec_y = dhtSecondaryHash(key_y.data(), key_y.size());
+    ASSERT_NE(sec_x, sec_y) << "test requires different secondary hashes";
+
+    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> std::string {
+        if (seg_id == 1 || seg_id == 3) return key_x;
+        if (seg_id == 2) return key_y;
+        return "";
+    };
+
+    // Insert key_x.
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_x));
+
+    // Insert key_y (collision).
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec_y));
+
+    // Verify both are findable.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    EXPECT_EQ(pvs.size(), 2u);
+
+    // Insert key_x again (same secondary hash).
+    // The extended entry for key_x should match and this should NOT be new.
+    bool is_new = dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, sec_x);
+    EXPECT_FALSE(is_new) << "third insert of same key should not be new";
+
+    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
+    // Should have 3 entries total: 2 for key_x, 1 for key_y.
+    EXPECT_EQ(pvs.size(), 3u);
+}

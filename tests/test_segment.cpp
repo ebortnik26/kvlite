@@ -482,3 +482,32 @@ TEST_F(SegmentTest, MoveAssign) {
     EXPECT_EQ(entry.version(), 1u);
     other.close();
 }
+
+// --- readKeyByVersion Tests ---
+
+TEST_F(SegmentTest, ReadKeyByVersion) {
+    ASSERT_TRUE(seg_.create(path_, 1).ok());
+    writeEntry("alpha", 10, "val_a", false);
+    writeEntry("beta",  20, "val_b", false);
+    writeEntry("gamma", 30, "val_c", true);
+    ASSERT_TRUE(seg_.seal().ok());
+
+    // Read each key by its packed version.
+    PackedVersion pv_a(10, false);
+    PackedVersion pv_b(20, false);
+    PackedVersion pv_c(30, true);
+
+    std::string key;
+    ASSERT_TRUE(seg_.readKeyByVersion(pv_a.data, key).ok());
+    EXPECT_EQ(key, "alpha");
+
+    ASSERT_TRUE(seg_.readKeyByVersion(pv_b.data, key).ok());
+    EXPECT_EQ(key, "beta");
+
+    ASSERT_TRUE(seg_.readKeyByVersion(pv_c.data, key).ok());
+    EXPECT_EQ(key, "gamma");
+
+    // Non-existent version.
+    PackedVersion pv_missing(999, false);
+    EXPECT_TRUE(seg_.readKeyByVersion(pv_missing.data, key).isNotFound());
+}

@@ -29,6 +29,21 @@ inline uint64_t dhtHashBytes(const void* data, size_t len) {
     return hash;
 }
 
+// Secondary hash for fingerprint extension (collision disambiguation).
+// Uses a different FNV offset basis to be independent of the primary hash.
+inline uint64_t dhtSecondaryHash(const void* data, size_t len) {
+    uint64_t hash = 6364136223846793005ULL;
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    hash ^= hash >> 33;
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= hash >> 33;
+    return hash;
+}
+
 // Base class for Delta Hash Tables.
 //
 // Provides all bucket management, hash decomposition, extension chain
@@ -42,6 +57,10 @@ class DeltaHashTable {
 public:
     using TrieEntry = LSlotCodec::TrieEntry;
     using LSlotContents = LSlotCodec::LSlotContents;
+
+    // Resolves the actual key for a given (segment_id, packed_version) pair.
+    // Used during collision detection to compare keys.
+    using KeyResolver = std::function<std::string(uint32_t segment_id, uint64_t packed_version)>;
 
     struct Config {
         uint8_t bucket_bits = 20;
@@ -123,6 +142,9 @@ protected:
     bool findFirstByHash(uint32_t bi, uint32_t li, uint64_t fp,
                          uint64_t& packed_version, uint32_t& id) const;
 
+    // --- Hash helpers ---
+    uint64_t secondaryHash(std::string_view key) const;
+
     // --- Protected write helpers ---
     // Adds an entry to the chain at (bi, li) for fingerprint fp.
     // createExtFn is called (with bucket lock held by caller if needed)
@@ -131,6 +153,15 @@ protected:
     bool addToChain(uint32_t bi, uint32_t li, uint64_t fp,
                     uint64_t packed_version, uint32_t id,
                     const std::function<Bucket*(Bucket&)>& createExtFn);
+
+    // Like addToChain, but detects fingerprint collisions by resolving existing keys.
+    // When a collision is detected, extends fingerprints with secondary hash bits.
+    // Returns true if the key is new (no prior entry for this key).
+    bool addToChainChecked(uint32_t bi, uint32_t li, uint64_t fp,
+                           uint64_t packed_version, uint32_t id,
+                           const std::function<Bucket*(Bucket&)>& createExtFn,
+                           const KeyResolver& resolver,
+                           uint64_t new_key_secondary_hash);
 
     // Remove entry matching (fp, packed_version, id) from chain at (bi, li).
     // Returns true if the fingerprint group is now empty (all entries removed).

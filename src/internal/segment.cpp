@@ -279,5 +279,30 @@ size_t Segment::entryCount() const {
     return index_.entryCount();
 }
 
+Status Segment::readKeyByVersion(uint64_t packed_version, std::string& key) const {
+    size_t offset = 0;
+    while (offset < data_size_) {
+        uint8_t hdr[LogEntry::kHeaderSize];
+        Status s = log_file_.readAt(offset, hdr, LogEntry::kHeaderSize);
+        if (!s.ok()) return s;
+
+        uint64_t pv;
+        std::memcpy(&pv, hdr, 8);
+        uint16_t kl;
+        std::memcpy(&kl, hdr + 8, 2);
+        uint32_t vl;
+        std::memcpy(&vl, hdr + 10, 4);
+
+        if (pv == packed_version) {
+            key.resize(kl);
+            s = log_file_.readAt(offset + LogEntry::kHeaderSize,
+                                 key.data(), kl);
+            return s;
+        }
+        offset += LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
+    }
+    return Status::NotFound("Version not found in segment");
+}
+
 }  // namespace internal
 }  // namespace kvlite

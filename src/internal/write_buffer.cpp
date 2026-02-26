@@ -484,7 +484,8 @@ std::unique_ptr<EntryStream> WriteBuffer::createStream(uint64_t snapshot_version
 }
 
 Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
-                          GlobalIndex& global_index) {
+                          GlobalIndex& global_index,
+                          const DeltaHashTable::KeyResolver& resolver) {
     Status s;
 
     struct FlatEntry {
@@ -544,9 +545,15 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
     if (!s.ok()) return s;
 
     // Register every flushed entry in GlobalIndex (packed version preserves tombstone).
+    std::string_view prev_key;
     for (const auto& e : global_index_entries) {
-        s = global_index.put(e.key, e.packed_ver, segment_id);
+        if (resolver && e.key != prev_key) {
+            s = global_index.putChecked(e.key, e.packed_ver, segment_id, resolver);
+        } else {
+            s = global_index.put(e.key, e.packed_ver, segment_id);
+        }
         if (!s.ok()) return s;
+        prev_key = e.key;
     }
 
     return Status::OK();

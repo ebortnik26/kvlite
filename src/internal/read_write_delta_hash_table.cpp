@@ -101,6 +101,27 @@ bool ReadWriteDeltaHashTable::updateEntryId(std::string_view key,
         });
 }
 
+bool ReadWriteDeltaHashTable::addEntryChecked(
+    std::string_view key, uint64_t packed_version, uint32_t id,
+    const DeltaHashTable::KeyResolver& resolver) {
+    uint64_t h = hashKey(key);
+    uint32_t bi = bucketIndex(h);
+    uint32_t li = lslotIndex(h);
+    uint64_t fp = fingerprint(h);
+    uint64_t sec = secondaryHash(key);
+
+    BucketLockGuard guard(bucket_locks_[bi]);
+
+    bool is_new = addToChainChecked(bi, li, fp, packed_version, id,
+        [this](Bucket& bucket) -> Bucket* {
+            std::lock_guard<std::mutex> g(ext_mutex_);
+            return createExtension(bucket);
+        },
+        resolver, sec);
+    size_.fetch_add(1, std::memory_order_relaxed);
+    return is_new;
+}
+
 bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint32_t li, uint64_t fp,
                                        uint64_t packed_version, uint32_t id) {
     BucketLockGuard guard(bucket_locks_[bi]);

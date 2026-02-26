@@ -444,7 +444,14 @@ Status DB::flush() {
     if (!s.ok()) return s;
 
     auto* seg = storage_->getSegment(current_segment_id_);
-    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_);
+    auto resolver = [this](uint32_t seg_id, uint64_t packed_version) -> std::string {
+        const internal::Segment* s = storage_->getSegment(seg_id);
+        if (!s) return "";
+        std::string key;
+        s->readKeyByVersion(packed_version, key);
+        return key;
+    };
+    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_, resolver);
     if (!s.ok()) {
         return s;
     }

@@ -122,8 +122,8 @@ TEST(LSlotCodec, BitsNeeded) {
     contents.entries.push_back(entry);
 
     size_t bits = LSlotCodec::bitsNeeded(contents, 39);
-    // unary(1)=2 + fp=39 + unary(1)=2 + packed_version_raw=64 + id_raw=32 = 139
-    EXPECT_EQ(bits, 139u);
+    // unary(1)=2 + gamma(1)=1 + fp=39 + unary(1)=2 + packed_version_raw=64 + id_raw=32 = 140
+    EXPECT_EQ(bits, 140u);
 }
 
 TEST(LSlotCodec, BitOffsetAndTotalBits) {

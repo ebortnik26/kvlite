@@ -39,6 +39,11 @@ public:
     // Like addEntry, but returns true if the key's fingerprint group is new.
     bool addEntryIsNew(std::string_view key, uint64_t packed_version, uint32_t id);
 
+    // Thread-safe collision-aware insertion.
+    // Returns true if the key is new (fingerprint group newly created).
+    bool addEntryChecked(std::string_view key, uint64_t packed_version, uint32_t id,
+                         const DeltaHashTable::KeyResolver& resolver);
+
     // Remove entry (packed_version, id) for key. Returns true if fp group is now empty.
     bool removeEntry(std::string_view key, uint64_t packed_version, uint32_t id);
 

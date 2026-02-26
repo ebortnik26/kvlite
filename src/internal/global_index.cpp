@@ -124,6 +124,15 @@ Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_
     return Status::OK();
 }
 
+Status GlobalIndex::putChecked(const std::string& key, uint64_t packed_version,
+                               uint32_t segment_id, const KeyResolver& resolver) {
+    if (dht_.addEntryChecked(key, packed_version, segment_id, resolver)) {
+        ++key_count_;
+    }
+    updates_since_snapshot_++;
+    return Status::OK();
+}
+
 bool GlobalIndex::get(const std::string& key,
                   std::vector<uint32_t>& segment_ids,
                   std::vector<uint64_t>& packed_versions) const {

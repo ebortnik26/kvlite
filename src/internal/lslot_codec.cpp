@@ -19,7 +19,9 @@ LSlotCodec::LSlotContents LSlotCodec::decode(
 
     for (uint64_t i = 0; i < num_fps; ++i) {
         auto& entry = contents.entries[i];
-        entry.fingerprint = reader.read(fingerprint_bits_);
+        uint64_t extra = reader.readEliasGamma64() - 1;
+        entry.fp_extra_bits = static_cast<uint8_t>(extra);
+        entry.fingerprint = reader.read(fingerprint_bits_ + extra);
         uint64_t num_entries = reader.readUnary();
         entry.packed_versions.resize(num_entries);
         entry.ids.resize(num_entries);
@@ -56,7 +58,8 @@ size_t LSlotCodec::encode(
 
     for (uint64_t i = 0; i < num_fps; ++i) {
         const auto& entry = contents.entries[i];
-        writer.write(entry.fingerprint, fingerprint_bits_);
+        writer.writeEliasGamma64(entry.fp_extra_bits + 1);
+        writer.write(entry.fingerprint, fingerprint_bits_ + entry.fp_extra_bits);
         uint64_t num_entries = entry.packed_versions.size();
         writer.writeUnary(num_entries);
         if (num_entries > 0) {
@@ -94,7 +97,8 @@ size_t LSlotCodec::bitsNeeded(const LSlotContents& contents,
                                  uint8_t fp_bits) {
     size_t bits = contents.entries.size() + 1;  // unary(K)
     for (const auto& entry : contents.entries) {
-        bits += fp_bits;                               // fingerprint
+        bits += eliasGammaBits64(entry.fp_extra_bits + 1);  // gamma(extra+1)
+        bits += fp_bits + entry.fp_extra_bits;              // fingerprint
         bits += entry.packed_versions.size() + 1;      // unary(M)
         if (!entry.packed_versions.empty()) {
             // Packed versions: 64-bit raw first + gamma(delta+1) deltas
@@ -118,7 +122,8 @@ size_t LSlotCodec::skipLSlot(const uint8_t* data, size_t bit_offset) const {
     BitReader reader(data, bit_offset);
     uint64_t num_fps = reader.readUnary();
     for (uint64_t i = 0; i < num_fps; ++i) {
-        reader.read(fingerprint_bits_);
+        uint64_t extra = reader.readEliasGamma64() - 1;
+        reader.read(fingerprint_bits_ + extra);
         uint64_t M = reader.readUnary();
         if (M > 0) {
             reader.read(64);                                // first packed_version

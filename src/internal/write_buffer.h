@@ -77,8 +77,11 @@ public:
     // Writes entries sorted by (hash, version) ascending, records each
     // in the Segment's SegmentIndex, seals it, and registers every
     // flushed key in the GlobalIndex under segment_id.
+    // If resolver is provided, uses collision-aware insertion for the first
+    // occurrence of each distinct key in the batch.
     Status flush(Segment& out, uint32_t segment_id,
-                 GlobalIndex& global_index);
+                 GlobalIndex& global_index,
+                 const DeltaHashTable::KeyResolver& resolver = {});
 
     // Create a stream of entries visible at snapshot_version.
     // Thread-safe: locks each bucket during collection.
