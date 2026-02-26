@@ -186,8 +186,31 @@ protected:
     LSlotCodec lslot_codec_;
     std::unique_ptr<uint8_t[]> arena_;
     std::vector<Bucket> buckets_;
-    std::vector<std::unique_ptr<Bucket>> extensions_;
-    std::vector<std::unique_ptr<uint8_t[]>> ext_storage_;
+    class BucketArena {
+    public:
+        static constexpr uint32_t kBucketsPerChunk = 64;
+
+        explicit BucketArena(uint32_t bucket_stride);
+
+        BucketArena(const BucketArena&) = delete;
+        BucketArena& operator=(const BucketArena&) = delete;
+        BucketArena(BucketArena&&) noexcept = default;
+        BucketArena& operator=(BucketArena&&) noexcept = default;
+
+        uint32_t allocate();                   // returns 1-based index
+        Bucket* get(uint32_t one_based);       // stable pointer
+        const Bucket* get(uint32_t one_based) const;
+        uint32_t size() const;
+        size_t dataBytes() const;              // size_ * stride_
+        void clear();
+
+    private:
+        uint32_t stride_;       // bytes per slot (sizeof(Bucket) + bucket_stride)
+        uint32_t size_ = 0;    // total allocated slots
+        std::vector<std::unique_ptr<uint8_t[]>> chunks_;
+    };
+
+    BucketArena ext_arena_;
 
 private:
     void initBucket(Bucket& bucket);

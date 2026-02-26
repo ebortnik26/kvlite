@@ -1437,7 +1437,7 @@ public:
     }
 
     uint8_t fpBits() const { return fingerprint_bits_; }
-    size_t extensionCount() const { return extensions_.size(); }
+    size_t extensionCount() const { return ext_arena_.size(); }
 };
 
 TEST(ReadWriteDHT, AddEntryCheckedCollision) {
@@ -1875,7 +1875,7 @@ TEST(ReadWriteDHT, CollisionThenUpdate) {
 class TestableRODHT : public ReadOnlyDeltaHashTable {
 public:
     using ReadOnlyDeltaHashTable::ReadOnlyDeltaHashTable;
-    size_t extensionCount() const { return extensions_.size(); }
+    size_t extensionCount() const { return ext_arena_.size(); }
 };
 
 // Compute base memoryUsage for a config (no extensions).
