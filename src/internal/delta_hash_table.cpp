@@ -153,6 +153,12 @@ uint64_t DeltaHashTable::secondaryHash(std::string_view key) const {
     return dhtSecondaryHash(key.data(), key.size());
 }
 
+// Forward declaration — defined in the addToChainChecked helpers section below.
+static DeltaHashTable::LSlotContents buildCandidateSlot(
+    const DeltaHashTable::LSlotContents& slot,
+    uint64_t full_fp, uint8_t fp_extra_bits,
+    uint64_t packed_version, uint32_t id);
+
 // --- addToChain ---
 
 bool DeltaHashTable::addToChain(uint32_t bi, uint32_t li, uint64_t fp,
@@ -165,7 +171,6 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint32_t li, uint64_t fp,
     while (true) {
         auto all_slots = decodeAllLSlots(*bucket);
 
-        // Check if fingerprint already exists in this bucket's lslot.
         if (is_new) {
             for (const auto& entry : all_slots[li].entries) {
                 if ((entry.fingerprint & base_mask) == fp) {
@@ -175,55 +180,14 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint32_t li, uint64_t fp,
             }
         }
 
-        // Compute current bit cost of the target lslot before insertion.
-        size_t old_slot_bits = LSlotCodec::bitsNeeded(all_slots[li],
-                                                       fingerprint_bits_);
-
-        // Build a candidate copy with the new entry inserted.
-        LSlotContents candidate = all_slots[li];
-        auto& entries = candidate.entries;
-        bool found = false;
-        for (auto& entry : entries) {
-            if ((entry.fingerprint & base_mask) == fp) {
-                auto it = std::lower_bound(entry.packed_versions.begin(),
-                                           entry.packed_versions.end(),
-                                           packed_version,
-                                           std::greater<uint64_t>());
-                size_t pos = it - entry.packed_versions.begin();
-                entry.packed_versions.insert(it, packed_version);
-                entry.ids.insert(entry.ids.begin() + pos, id);
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            TrieEntry new_entry;
-            new_entry.fingerprint = fp;
-            new_entry.packed_versions.push_back(packed_version);
-            new_entry.ids.push_back(id);
-            entries.push_back(std::move(new_entry));
-            std::sort(entries.begin(), entries.end(),
-                      [](const TrieEntry& a, const TrieEntry& b) {
-                          return a.fingerprint < b.fingerprint;
-                      });
-        }
-
-        size_t new_slot_bits = LSlotCodec::bitsNeeded(candidate,
-                                                       fingerprint_bits_);
-        size_t total_bits = totalBitsNeeded(all_slots) - old_slot_bits
-                            + new_slot_bits;
-
-        if (total_bits <= bucketDataBits()) {
-            all_slots[li] = std::move(candidate);
-            reencodeAllLSlots(*bucket, all_slots);
+        auto candidate = buildCandidateSlot(all_slots[li], fp, 0,
+                                            packed_version, id);
+        if (tryCommitSlot(bucket, li, all_slots, std::move(candidate))) {
             return is_new;
         }
 
-        // Doesn't fit — discard candidate, walk to extension bucket.
         Bucket* ext = nextBucketMut(*bucket);
-        if (!ext) {
-            ext = createExtFn(*bucket);
-        }
+        if (!ext) ext = createExtFn(*bucket);
         bucket = ext;
     }
 }
@@ -553,6 +517,108 @@ bool DeltaHashTable::addToChainChecked(
     return addToChain(bi, li, fp, packed_version, id, createExtFn);
 }
 
+// --- Chain-walk helpers (static) ---
+
+// Remove (packed_version, id) from the first entry whose base fingerprint
+// matches fp. Erases the TrieEntry if it becomes empty.
+// Returns true if the pair was found and removed.
+static bool removeVersionFromSlot(
+    DeltaHashTable::LSlotContents& slot,
+    uint64_t base_mask, uint64_t fp,
+    uint64_t packed_version, uint32_t id) {
+    auto& entries = slot.entries;
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if ((it->fingerprint & base_mask) != fp) continue;
+        for (size_t j = 0; j < it->packed_versions.size(); ++j) {
+            if (it->packed_versions[j] == packed_version && it->ids[j] == id) {
+                it->packed_versions.erase(it->packed_versions.begin() + j);
+                it->ids.erase(it->ids.begin() + j);
+                if (it->packed_versions.empty()) {
+                    entries.erase(it);
+                }
+                return true;
+            }
+        }
+        return false;  // right entry, pair not found
+    }
+    return false;
+}
+
+// Find (packed_version, old_id) in the first entry whose base fingerprint
+// matches fp and replace old_id with new_id.
+// Returns true if the pair was found and updated.
+static bool updateIdInSlot(
+    DeltaHashTable::LSlotContents& slot,
+    uint64_t base_mask, uint64_t fp,
+    uint64_t packed_version, uint32_t old_id, uint32_t new_id) {
+    for (auto& entry : slot.entries) {
+        if ((entry.fingerprint & base_mask) != fp) continue;
+        for (size_t j = 0; j < entry.packed_versions.size(); ++j) {
+            if (entry.packed_versions[j] == packed_version &&
+                entry.ids[j] == old_id) {
+                entry.ids[j] = new_id;
+                return true;
+            }
+        }
+        return false;  // right entry, pair not found
+    }
+    return false;
+}
+
+// --- Chain-walk member helpers ---
+
+void DeltaHashTable::pruneEmptyExtension(Bucket* bucket) {
+    Bucket* ext = nextBucketMut(*bucket);
+    if (!ext) return;
+    auto ext_slots = decodeAllLSlots(*ext);
+    bool ext_empty = true;
+    for (const auto& slot : ext_slots) {
+        if (!slot.entries.empty()) { ext_empty = false; break; }
+    }
+    if (ext_empty && !nextBucket(*ext)) {
+        setExtensionPtr(*bucket, 0);
+    }
+}
+
+bool DeltaHashTable::isGroupEmpty(uint32_t bi, uint32_t li, uint64_t fp) const {
+    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
+    const Bucket* b = &buckets_[bi];
+    while (b) {
+        LSlotContents contents = decodeLSlot(*b, li);
+        for (const auto& entry : contents.entries) {
+            if ((entry.fingerprint & base_mask) == fp) return false;
+        }
+        b = nextBucket(*b);
+    }
+    return true;
+}
+
+void DeltaHashTable::spillEntryToExtension(
+    Bucket* bucket, uint32_t li, uint64_t base_mask, uint64_t fp,
+    const std::function<Bucket*(Bucket&)>& createExtFn) {
+    auto all_slots = decodeAllLSlots(*bucket);
+    auto& entries = all_slots[li].entries;
+    TrieEntry spilled;
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        if ((it->fingerprint & base_mask) == fp) {
+            spilled = std::move(*it);
+            entries.erase(it);
+            break;
+        }
+    }
+    reencodeAllLSlots(*bucket, all_slots);
+
+    Bucket* ext = nextBucketMut(*bucket);
+    if (!ext) ext = createExtFn(*bucket);
+    auto ext_slots = decodeAllLSlots(*ext);
+    ext_slots[li].entries.push_back(std::move(spilled));
+    std::sort(ext_slots[li].entries.begin(), ext_slots[li].entries.end(),
+              [](const TrieEntry& a, const TrieEntry& b) {
+                  return a.fingerprint < b.fingerprint;
+              });
+    reencodeAllLSlots(*ext, ext_slots);
+}
+
 // --- removeFromChain ---
 
 bool DeltaHashTable::removeFromChain(uint32_t bi, uint32_t li, uint64_t fp,
@@ -562,62 +628,15 @@ bool DeltaHashTable::removeFromChain(uint32_t bi, uint32_t li, uint64_t fp,
 
     while (bucket) {
         auto all_slots = decodeAllLSlots(*bucket);
-        auto& entries = all_slots[li].entries;
-        bool modified = false;
-
-        for (auto it = entries.begin(); it != entries.end(); ++it) {
-            if ((it->fingerprint & base_mask) != fp) continue;
-            // Find and remove the (packed_version, id) pair.
-            for (size_t j = 0; j < it->packed_versions.size(); ++j) {
-                if (it->packed_versions[j] == packed_version && it->ids[j] == id) {
-                    it->packed_versions.erase(it->packed_versions.begin() + j);
-                    it->ids.erase(it->ids.begin() + j);
-                    modified = true;
-                    break;
-                }
-            }
-            if (modified && it->packed_versions.empty()) {
-                entries.erase(it);
-            }
-            break;
-        }
-
-        if (modified) {
+        if (removeVersionFromSlot(all_slots[li], base_mask, fp,
+                                  packed_version, id)) {
             reencodeAllLSlots(*bucket, all_slots);
         }
-
-        // Check whether this bucket's extension is now entirely empty.
-        Bucket* ext = nextBucketMut(*bucket);
-        if (ext) {
-            auto ext_slots = decodeAllLSlots(*ext);
-            bool ext_empty = true;
-            for (const auto& slot : ext_slots) {
-                if (!slot.entries.empty()) {
-                    ext_empty = false;
-                    break;
-                }
-            }
-            if (ext_empty && !nextBucket(*ext)) {
-                // Tail extension is empty — unlink it.
-                setExtensionPtr(*bucket, 0);
-            }
-        }
-
+        pruneEmptyExtension(bucket);
         bucket = nextBucketMut(*bucket);
     }
 
-    // Check if the fingerprint group is completely gone across all buckets.
-    const Bucket* b = &buckets_[bi];
-    while (b) {
-        LSlotContents contents = decodeLSlot(*b, li);
-        for (const auto& entry : contents.entries) {
-            if ((entry.fingerprint & base_mask) == fp) {
-                return false;  // group still exists
-            }
-        }
-        b = nextBucket(*b);
-    }
-    return true;
+    return isGroupEmpty(bi, li, fp);
 }
 
 // --- updateIdInChain ---
@@ -631,69 +650,18 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint32_t li, uint64_t fp,
 
     while (bucket) {
         auto all_slots = decodeAllLSlots(*bucket);
-        auto& entries = all_slots[li].entries;
-        bool found = false;
-
-        for (auto& entry : entries) {
-            if ((entry.fingerprint & base_mask) != fp) continue;
-            for (size_t j = 0; j < entry.packed_versions.size(); ++j) {
-                if (entry.packed_versions[j] == packed_version && entry.ids[j] == old_id) {
-                    entry.ids[j] = new_id;
-                    found = true;
-                    break;
-                }
-            }
-            break;
-        }
-
-        if (!found) {
+        if (!updateIdInSlot(all_slots[li], base_mask, fp,
+                            packed_version, old_id, new_id)) {
             bucket = nextBucketMut(*bucket);
             continue;
         }
 
-        // Re-encode. Check if it still fits.
-        size_t total_bits = totalBitsNeeded(all_slots);
-        if (total_bits <= bucketDataBits()) {
+        if (totalBitsNeeded(all_slots) <= bucketDataBits()) {
             reencodeAllLSlots(*bucket, all_slots);
             return true;
         }
 
-        // Overflow: spill the target lslot entry to extension bucket.
-        // Remove the modified entry from this bucket's lslot and reencode.
-        LSlotContents spill;
-        // Find the modified TrieEntry and move it to spill.
-        auto& slot_entries = all_slots[li].entries;
-        for (auto it = slot_entries.begin(); it != slot_entries.end(); ++it) {
-            if ((it->fingerprint & base_mask) == fp) {
-                spill.entries.push_back(std::move(*it));
-                slot_entries.erase(it);
-                break;
-            }
-        }
-        reencodeAllLSlots(*bucket, all_slots);
-
-        // Write spilled entry to extension.
-        Bucket* ext = nextBucketMut(*bucket);
-        if (!ext) {
-            ext = createExtFn(*bucket);
-        }
-        auto ext_slots = decodeAllLSlots(*ext);
-        ext_slots[li].entries.insert(ext_slots[li].entries.end(),
-                                     spill.entries.begin(), spill.entries.end());
-        // Sort by fingerprint.
-        std::sort(ext_slots[li].entries.begin(), ext_slots[li].entries.end(),
-                  [](const TrieEntry& a, const TrieEntry& b) {
-                      return a.fingerprint < b.fingerprint;
-                  });
-
-        size_t ext_bits = totalBitsNeeded(ext_slots);
-        if (ext_bits <= bucketDataBits()) {
-            reencodeAllLSlots(*ext, ext_slots);
-        } else {
-            // Recursively handle overflow via addToChain for each entry.
-            // This should be extremely rare.
-            reencodeAllLSlots(*ext, ext_slots);
-        }
+        spillEntryToExtension(bucket, li, base_mask, fp, createExtFn);
         return true;
     }
 

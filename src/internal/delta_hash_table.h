@@ -192,6 +192,18 @@ protected:
 private:
     void initBucket(Bucket& bucket);
 
+    // Prune an empty tail extension from a bucket's chain.
+    void pruneEmptyExtension(Bucket* bucket);
+
+    // Check whether any entry with matching base fp exists in the chain.
+    bool isGroupEmpty(uint32_t bi, uint32_t li, uint64_t fp) const;
+
+    // Remove one TrieEntry (by base fp match) from bucket's lslot,
+    // reencode bucket, write entry to extension.
+    void spillEntryToExtension(
+        Bucket* bucket, uint32_t li, uint64_t base_mask, uint64_t fp,
+        const std::function<Bucket*(Bucket&)>& createExtFn);
+
     // Try committing a candidate lslot to a bucket. Returns true if it fits.
     bool tryCommitSlot(Bucket* bucket, uint32_t li,
                        std::vector<LSlotContents>& all_slots,
