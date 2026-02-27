@@ -6,6 +6,7 @@
 #include "internal/entry_stream.h"
 #include "internal/global_index.h"
 #include "internal/segment.h"
+#include "internal/segment_storage_manager.h"
 
 namespace kvlite {
 namespace internal {
@@ -485,6 +486,7 @@ std::unique_ptr<EntryStream> WriteBuffer::createStream(uint64_t snapshot_version
 
 Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
                           GlobalIndex& global_index,
+                          SegmentStorageManager& storage,
                           const DeltaHashTable::KeyResolver& resolver) {
     Status s;
 
@@ -544,7 +546,11 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
     s = out.seal();
     if (!s.ok()) return s;
 
-    // Register every flushed entry in GlobalIndex (packed version preserves tombstone).
+    // Phase 2: Register the sealed segment with Manifest.
+    s = storage.registerSegments({segment_id});
+    if (!s.ok()) return s;
+
+    // Phase 3: Register every flushed entry in GlobalIndex (packed version preserves tombstone).
     std::string_view prev_key;
     for (const auto& e : global_index_entries) {
         if (resolver && e.key != prev_key) {

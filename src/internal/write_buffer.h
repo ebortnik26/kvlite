@@ -20,6 +20,7 @@ namespace internal {
 
 class GlobalIndex;
 class Segment;
+class SegmentStorageManager;
 
 // In-memory buffer for pending writes before flush to log files.
 //
@@ -82,6 +83,7 @@ public:
     // occurrence of each distinct key in the batch.
     Status flush(Segment& out, uint32_t segment_id,
                  GlobalIndex& global_index,
+                 SegmentStorageManager& storage,
                  const DeltaHashTable::KeyResolver& resolver = {});
 
     // Create a stream of entries visible at snapshot_version.

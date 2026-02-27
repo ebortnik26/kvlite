@@ -129,6 +129,7 @@ add_executable(kvlite_wb_test
     ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_storage_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 
@@ -279,6 +280,7 @@ add_executable(kvlite_entry_stream_test
     ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/segment_storage_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 

@@ -14,6 +14,7 @@
 #include "internal/global_index.h"
 #include "internal/manifest.h"
 #include "internal/segment.h"
+#include "internal/segment_storage_manager.h"
 #include "internal/write_buffer.h"
 
 using kvlite::internal::WriteBuffer;
@@ -454,6 +455,7 @@ using kvlite::internal::GlobalIndex;
 using kvlite::internal::LogEntry;
 using kvlite::internal::PackedVersion;
 using kvlite::internal::Segment;
+using kvlite::internal::SegmentStorageManager;
 using kvlite::internal::crc32;
 using kvlite::internal::dhtHashBytes;
 using kvlite::Status;
@@ -463,29 +465,39 @@ namespace {
 class FlushTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        path_ = ::testing::TempDir() + "/flush_test_" +
-                std::to_string(reinterpret_cast<uintptr_t>(this)) + ".data";
         db_dir_ = ::testing::TempDir() + "/flush_test_db_" +
                   std::to_string(reinterpret_cast<uintptr_t>(this));
         std::filesystem::create_directories(db_dir_);
         ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        storage_ = std::make_unique<SegmentStorageManager>(manifest_);
+        ASSERT_TRUE(storage_->open(db_dir_).ok());
         global_index_ = std::make_unique<GlobalIndex>(manifest_);
         kvlite::internal::GlobalIndex::Options gi_opts;
         ASSERT_TRUE(global_index_->open(db_dir_, gi_opts).ok());
     }
 
     void TearDown() override {
-        if (seg_.isOpen()) seg_.close();
         if (global_index_ && global_index_->isOpen()) global_index_->close();
         global_index_.reset();
+        if (storage_ && storage_->isOpen()) storage_->close();
+        storage_.reset();
         manifest_.close();
-        std::remove(path_.c_str());
         std::filesystem::remove_all(db_dir_);
     }
 
+    Segment* createTestSegment(uint32_t id) {
+        auto s = storage_->createSegment(id, false);
+        EXPECT_TRUE(s.ok()) << s.toString();
+        return storage_->getSegment(id);
+    }
+
+    std::string segmentPath(uint32_t id) {
+        return storage_->segmentPath(id);
+    }
+
     // Read raw bytes from the segment file via pread.
-    void rawRead(uint64_t offset, void* buf, size_t len) {
-        int fd = ::open(path_.c_str(), O_RDONLY);
+    void rawRead(const std::string& path, uint64_t offset, void* buf, size_t len) {
+        int fd = ::open(path.c_str(), O_RDONLY);
         ASSERT_GE(fd, 0);
         ssize_t n = ::pread(fd, buf, len, static_cast<off_t>(offset));
         ::close(fd);
@@ -493,9 +505,9 @@ protected:
     }
 
     // Read one LogEntry from a given offset, return bytes consumed.
-    size_t readEntry(uint64_t offset, LogEntry& out) {
+    size_t readEntry(const std::string& path, uint64_t offset, LogEntry& out) {
         uint8_t hdr[LogEntry::kHeaderSize];
-        rawRead(offset, hdr, LogEntry::kHeaderSize);
+        rawRead(path, offset, hdr, LogEntry::kHeaderSize);
 
         uint64_t packed_ver;
         uint16_t kl;
@@ -509,19 +521,19 @@ protected:
         out.value.resize(vl);
 
         if (kl > 0) {
-            rawRead(offset + LogEntry::kHeaderSize, out.key.data(), kl);
+            rawRead(path, offset + LogEntry::kHeaderSize, out.key.data(), kl);
         }
         if (vl > 0) {
-            rawRead(offset + LogEntry::kHeaderSize + kl, out.value.data(), vl);
+            rawRead(path, offset + LogEntry::kHeaderSize + kl, out.value.data(), vl);
         }
 
         return LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
     }
 
     // Verify CRC of an entry at a given offset with known total size.
-    void verifyCrc(uint64_t offset, size_t total_size) {
+    void verifyCrc(const std::string& path, uint64_t offset, size_t total_size) {
         std::vector<uint8_t> buf(total_size);
-        rawRead(offset, buf.data(), total_size);
+        rawRead(path, offset, buf.data(), total_size);
         size_t payload_len = total_size - LogEntry::kChecksumSize;
         uint32_t expected;
         std::memcpy(&expected, buf.data() + payload_len, 4);
@@ -529,10 +541,9 @@ protected:
         EXPECT_EQ(actual, expected);
     }
 
-    std::string path_;
     std::string db_dir_;
     kvlite::internal::Manifest manifest_;
-    Segment seg_;
+    std::unique_ptr<SegmentStorageManager> storage_;
     std::unique_ptr<GlobalIndex> global_index_;
 };
 
@@ -540,36 +551,37 @@ protected:
 
 TEST_F(FlushTest, EmptyBuffer) {
     WriteBuffer wb;
-    ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
-    EXPECT_EQ(seg_.dataSize(), 0u);
-    EXPECT_EQ(seg_.entryCount(), 0u);
+    auto* seg = createTestSegment(1);
+    ASSERT_TRUE(wb.flush(*seg, 1, *global_index_, *storage_).ok());
+    EXPECT_EQ(seg->dataSize(), 0u);
+    EXPECT_EQ(seg->entryCount(), 0u);
 }
 
 TEST_F(FlushTest, SingleEntry) {
     WriteBuffer wb;
     wb.put("hello", 42, "world", false);
 
-    ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
+    auto* seg = createTestSegment(1);
+    std::string path = segmentPath(1);
+    ASSERT_TRUE(wb.flush(*seg, 1, *global_index_, *storage_).ok());
 
     size_t expected_size = LogEntry::kHeaderSize + 5 + 5 + LogEntry::kChecksumSize;
-    EXPECT_EQ(seg_.dataSize(), expected_size);
+    EXPECT_EQ(seg->dataSize(), expected_size);
 
     LogEntry entry;
-    size_t consumed = readEntry(0, entry);
+    size_t consumed = readEntry(path, 0, entry);
     EXPECT_EQ(consumed, expected_size);
     EXPECT_EQ(entry.key, "hello");
     EXPECT_EQ(entry.value, "world");
     EXPECT_EQ(entry.version(), 42u);
     EXPECT_FALSE(entry.tombstone());
 
-    verifyCrc(0, expected_size);
+    verifyCrc(path, 0, expected_size);
 
     // Verify SegmentIndex
-    EXPECT_EQ(seg_.entryCount(), 1u);
+    EXPECT_EQ(seg->entryCount(), 1u);
     LogEntry latest;
-    ASSERT_TRUE(seg_.getLatest("hello", latest).ok());
+    ASSERT_TRUE(seg->getLatest("hello", latest).ok());
     EXPECT_EQ(latest.version(), 42u);
 }
 
@@ -577,11 +589,12 @@ TEST_F(FlushTest, TombstoneEntry) {
     WriteBuffer wb;
     wb.put("deleted", 7, "", true);
 
-    ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
+    auto* seg = createTestSegment(1);
+    std::string path = segmentPath(1);
+    ASSERT_TRUE(wb.flush(*seg, 1, *global_index_, *storage_).ok());
 
     LogEntry entry;
-    readEntry(0, entry);
+    readEntry(path, 0, entry);
     EXPECT_EQ(entry.key, "deleted");
     EXPECT_EQ(entry.value, "");
     EXPECT_EQ(entry.version(), 7u);
@@ -597,18 +610,19 @@ TEST_F(FlushTest, SortOrderHashThenVersion) {
     wb.put("bbb", 1, "v1", false);
     wb.put("ccc", 20, "v20", false);
 
-    ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
+    auto* seg = createTestSegment(1);
+    std::string path = segmentPath(1);
+    ASSERT_TRUE(wb.flush(*seg, 1, *global_index_, *storage_).ok());
 
     // Read all entries back
     std::vector<std::pair<uint64_t, uint64_t>> order; // (hash, version)
     uint64_t offset = 0;
-    while (offset < seg_.dataSize()) {
+    while (offset < seg->dataSize()) {
         LogEntry entry;
-        size_t sz = readEntry(offset, entry);
+        size_t sz = readEntry(path, offset, entry);
         uint64_t h = dhtHashBytes(entry.key.data(), entry.key.size());
         order.push_back({h, entry.version()});
-        verifyCrc(offset, sz);
+        verifyCrc(path, offset, sz);
         offset += sz;
     }
 
@@ -629,16 +643,17 @@ TEST_F(FlushTest, RoundTrip) {
     wb.put("key1", 2, "val2", false);
     wb.put("key2", 3, "val3", true);
 
-    ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
+    auto* seg = createTestSegment(1);
+    std::string path = segmentPath(1);
+    ASSERT_TRUE(wb.flush(*seg, 1, *global_index_, *storage_).ok());
 
     // Read all entries back and verify contents
     std::vector<LogEntry> entries;
     uint64_t offset = 0;
-    while (offset < seg_.dataSize()) {
+    while (offset < seg->dataSize()) {
         LogEntry entry;
-        size_t sz = readEntry(offset, entry);
-        verifyCrc(offset, sz);
+        size_t sz = readEntry(path, offset, entry);
+        verifyCrc(path, offset, sz);
         entries.push_back(std::move(entry));
         offset += sz;
     }
@@ -668,21 +683,21 @@ TEST_F(FlushTest, RoundTrip) {
     }
 
     // Verify SegmentIndex was populated correctly
-    EXPECT_EQ(seg_.entryCount(), 3u);
-    EXPECT_EQ(seg_.keyCount(), 2u);
+    EXPECT_EQ(seg->entryCount(), 3u);
+    EXPECT_EQ(seg->keyCount(), 2u);
 
     // key1 should have 2 entries; latest version is 2
     LogEntry latest;
-    ASSERT_TRUE(seg_.getLatest("key1", latest).ok());
+    ASSERT_TRUE(seg->getLatest("key1", latest).ok());
     EXPECT_EQ(latest.version(), 2u);
 
     // key2 should have 1 entry
-    ASSERT_TRUE(seg_.getLatest("key2", latest).ok());
+    ASSERT_TRUE(seg->getLatest("key2", latest).ok());
     EXPECT_EQ(latest.version(), 3u);
 
     // Verify all entries for key1 via get
     std::vector<LogEntry> key1_entries;
-    ASSERT_TRUE(seg_.get("key1", key1_entries).ok());
+    ASSERT_TRUE(seg->get("key1", key1_entries).ok());
     ASSERT_EQ(key1_entries.size(), 2u);
     for (const auto& e : key1_entries) {
         EXPECT_EQ(e.key, "key1");
@@ -695,14 +710,14 @@ TEST_F(FlushTest, SealAndOpen) {
     wb.put("alpha", 2, "v2", false);
     wb.put("beta", 10, "vb", true);
 
-    ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(wb.flush(seg_, 1, *global_index_).ok());
-    uint64_t data_size = seg_.dataSize();
-    seg_.close();
+    auto* seg = createTestSegment(1);
+    std::string path = segmentPath(1);
+    ASSERT_TRUE(wb.flush(*seg, 1, *global_index_, *storage_).ok());
+    uint64_t data_size = seg->dataSize();
 
-    // Open into a fresh Segment.
+    // Open into a fresh Segment (outside storage manager).
     Segment loaded;
-    ASSERT_TRUE(loaded.open(path_).ok());
+    ASSERT_TRUE(loaded.open(path).ok());
 
     // Verify data size matches (excludes index + footer).
     EXPECT_EQ(loaded.dataSize(), data_size);
@@ -738,8 +753,8 @@ TEST_F(FlushTest, GlobalIndexPopulated) {
     wb.put("key2", 3, "val3", true);
     wb.put("key3", 4, "val4", false);
 
-    ASSERT_TRUE(seg_.create(path_, 77).ok());
-    ASSERT_TRUE(wb.flush(seg_, 77, *global_index_).ok());
+    auto* seg = createTestSegment(77);
+    ASSERT_TRUE(wb.flush(*seg, 77, *global_index_, *storage_).ok());
 
     // Every entry should be registered in GlobalIndex with packed version.
     // Packed version = (logical_version << 1) | tombstone_bit.

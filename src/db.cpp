@@ -412,7 +412,7 @@ Status DB::flush() {
         return Status::OK();
     }
 
-    Status s = storage_->createSegment(current_segment_id_);
+    Status s = storage_->createSegment(current_segment_id_, false);
     if (!s.ok()) return s;
 
     auto* seg = storage_->getSegment(current_segment_id_);
@@ -423,7 +423,7 @@ Status DB::flush() {
         s->readKeyByVersion(packed_version, key);
         return key;
     };
-    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_, resolver);
+    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_, *storage_, resolver);
     if (!s.ok()) {
         return s;
     }
