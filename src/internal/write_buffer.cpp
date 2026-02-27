@@ -3,10 +3,9 @@
 #include <algorithm>
 #include <unordered_map>
 
+#include "internal/delta_hash_table.h"
 #include "internal/entry_stream.h"
-#include "internal/global_index.h"
 #include "internal/segment.h"
-#include "internal/segment_storage_manager.h"
 
 namespace kvlite {
 namespace internal {
@@ -484,10 +483,7 @@ std::unique_ptr<EntryStream> WriteBuffer::createStream(uint64_t snapshot_version
     return std::make_unique<WriteBufferStream>(data_ptr, std::move(deduped));
 }
 
-Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
-                          GlobalIndex& global_index,
-                          SegmentStorageManager& storage,
-                          const DeltaHashTable::KeyResolver& resolver) {
+WriteBuffer::FlushResult WriteBuffer::flush(Segment& out) {
     Status s;
 
     struct FlatEntry {
@@ -498,13 +494,8 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
         std::string value;
     };
 
-    // Collect every (key, packed_version) to register in GlobalIndex after seal.
-    struct GlobalIndexEntry {
-        std::string key;
-        uint64_t packed_ver;
-    };
-    std::vector<GlobalIndexEntry> global_index_entries;
-    global_index_entries.reserve(size_.load(std::memory_order_relaxed));
+    std::vector<FlushedEntry> flushed;
+    flushed.reserve(size_.load(std::memory_order_relaxed));
 
     // Process one bucket at a time. Iterating buckets 0..N gives hash-prefix
     // order; we only need to sort within each bucket by (hash, version).
@@ -538,35 +529,15 @@ Status WriteBuffer::flush(Segment& out, uint32_t segment_id,
 
         for (const auto& e : bucket_entries) {
             s = out.put(e.key, e.pv.version(), e.value, e.pv.tombstone());
-            if (!s.ok()) return s;
-            global_index_entries.push_back({e.key, e.packed_ver});
+            if (!s.ok()) return {s, {}};
+            flushed.push_back({e.key, e.packed_ver});
         }
     }
 
     s = out.seal();
-    if (!s.ok()) return s;
+    if (!s.ok()) return {s, {}};
 
-    // Phase 2: Register the sealed segment with Manifest.
-    s = storage.registerSegments({segment_id});
-    if (!s.ok()) return s;
-
-    // Phase 3: Register every flushed entry in GlobalIndex (packed version preserves tombstone).
-    std::string_view prev_key;
-    for (const auto& e : global_index_entries) {
-        if (resolver && e.key != prev_key) {
-            s = global_index.putChecked(e.key, e.packed_ver, segment_id, resolver);
-        } else {
-            s = global_index.put(e.key, e.packed_ver, segment_id);
-        }
-        if (!s.ok()) return s;
-        prev_key = e.key;
-    }
-
-    // Commit WAL batch for the GlobalIndex updates.
-    s = global_index.commitWB();
-    if (!s.ok()) return s;
-
-    return Status::OK();
+    return {Status::OK(), std::move(flushed)};
 }
 
 } // namespace internal

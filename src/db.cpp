@@ -416,6 +416,12 @@ Status DB::flush() {
     if (!s.ok()) return s;
 
     auto* seg = storage_->getSegment(current_segment_id_);
+    auto result = write_buffer_->flush(*seg);
+    if (!result.status.ok()) return result.status;
+
+    s = storage_->registerSegments({current_segment_id_});
+    if (!s.ok()) return s;
+
     auto resolver = [this](uint32_t seg_id, uint64_t packed_version) -> std::string {
         const internal::Segment* s = storage_->getSegment(seg_id);
         if (!s) return "";
@@ -423,10 +429,23 @@ Status DB::flush() {
         s->readKeyByVersion(packed_version, key);
         return key;
     };
-    s = write_buffer_->flush(*seg, current_segment_id_, *global_index_, *storage_, resolver);
-    if (!s.ok()) {
-        return s;
+
+    // Entries are ordered by (hash asc, packed_ver asc) — same key is adjacent.
+    // Use putChecked for the first occurrence of each key (collision-aware),
+    // plain put for subsequent versions of the same key.
+    std::string_view prev_key;
+    for (const auto& e : result.entries) {
+        if (e.key != prev_key) {
+            s = global_index_->putChecked(e.key, e.packed_ver, current_segment_id_, resolver);
+        } else {
+            s = global_index_->put(e.key, e.packed_ver, current_segment_id_);
+        }
+        if (!s.ok()) return s;
+        prev_key = e.key;
     }
+
+    s = global_index_->commitWB();
+    if (!s.ok()) return s;
 
     current_segment_id_ = storage_->allocateSegmentId();
 

@@ -9,7 +9,6 @@
 #include <string>
 #include <vector>
 
-#include "internal/delta_hash_table.h"
 #include "internal/entry_stream.h"
 #include "internal/spinlock.h"
 #include "log_entry.h"
@@ -18,9 +17,7 @@
 namespace kvlite {
 namespace internal {
 
-class GlobalIndex;
 class Segment;
-class SegmentStorageManager;
 
 // In-memory buffer for pending writes before flush to log files.
 //
@@ -75,16 +72,20 @@ public:
 
     void clear();
 
+    struct FlushedEntry { std::string key; uint64_t packed_ver; };
+
+    struct FlushResult {
+        Status status;
+        std::vector<FlushedEntry> entries;
+    };
+
     // Flush all entries to a Segment that is already in Writing state.
     // Writes entries sorted by (hash, version) ascending, records each
-    // in the Segment's SegmentIndex, seals it, and registers every
-    // flushed key in the GlobalIndex under segment_id.
-    // If resolver is provided, uses collision-aware insertion for the first
-    // occurrence of each distinct key in the batch.
-    Status flush(Segment& out, uint32_t segment_id,
-                 GlobalIndex& global_index,
-                 SegmentStorageManager& storage,
-                 const DeltaHashTable::KeyResolver& resolver = {});
+    // in the Segment's SegmentIndex, and seals it.
+    // Returns a vector of (key, packed_ver) pairs ordered by
+    // (hash asc, packed_ver asc) — entries for the same key are adjacent.
+    // The caller uses this to register flushed entries in the GlobalIndex.
+    FlushResult flush(Segment& out);
 
     // Create a stream of entries visible at snapshot_version.
     // Thread-safe: locks each bucket during collection.

@@ -122,14 +122,7 @@ add_executable(kvlite_wb_test
     ${CMAKE_SOURCE_DIR}/src/internal/lslot_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/segment_storage_manager.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
 )
 
