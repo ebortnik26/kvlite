@@ -81,10 +81,6 @@ public:
     Status get(const std::string& key, uint64_t upper_bound,
                LogEntry& entry) const;
 
-    // Read the tombstone flag from the entry header at the given file offset.
-    // Header-only read (14 bytes), no value extraction, no CRC.
-    Status readTombstone(uint64_t offset, bool& tombstone) const;
-
     // Check if a key exists (any version).
     bool contains(const std::string& key) const;
 
@@ -99,10 +95,6 @@ public:
 
     // Read and CRC-validate a LogEntry at the given file offset.
     Status readEntry(uint64_t offset, LogEntry& entry) const;
-
-    // Read the key for a specific packed_version by scanning the log file.
-    // Used only for collision detection (very rare).
-    Status readKeyByVersion(uint64_t packed_version, std::string& key) const;
 
 private:
     static constexpr uint32_t kFooterMagic = 0x53454746;  // "SEGF"

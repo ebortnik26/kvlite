@@ -15,7 +15,7 @@ namespace internal {
 
 // Read-write delta hash table: always-mutable, thread-safe via per-bucket spinlocks.
 //
-// Stores (packed_version, id) pairs per key fingerprint.
+// Stores (packed_version, id) pairs per key suffix.
 // Thread-safe: per-bucket spinlocks protect concurrent access.
 class ReadWriteDeltaHashTable : public DeltaHashTable {
 public:
@@ -33,15 +33,10 @@ public:
 
     void addEntry(uint64_t hash, uint64_t packed_version, uint32_t id);
 
-    // Like addEntry, but returns true if the key's fingerprint group is new.
+    // Like addEntry, but returns true if the key's suffix group is new.
     bool addEntryIsNew(uint64_t hash, uint64_t packed_version, uint32_t id);
 
-    // Thread-safe collision-aware insertion.
-    // Returns true if the key is new (fingerprint group newly created).
-    bool addEntryChecked(uint64_t hash, uint64_t packed_version, uint32_t id,
-                         const DeltaHashTable::KeyResolver& resolver);
-
-    // Remove entry (packed_version, id) for hash. Returns true if fp group is now empty.
+    // Remove entry (packed_version, id) for hash. Returns true if suffix group is now empty.
     bool removeEntry(uint64_t hash, uint64_t packed_version, uint32_t id);
 
     // Update id for entry (packed_version, old_id) for hash. Returns true if found.
@@ -70,7 +65,7 @@ public:
     void setSize(size_t n);
 
 private:
-    bool addImpl(uint32_t bi, uint32_t li, uint64_t fp,
+    bool addImpl(uint32_t bi, uint64_t suffix,
                  uint64_t packed_version, uint32_t id);
 
     std::unique_ptr<Spinlock[]> bucket_locks_;

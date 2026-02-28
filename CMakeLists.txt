@@ -30,7 +30,6 @@ set(KVLITE_SOURCES
     src/db_iterator.cpp
     src/status.cpp
     src/internal/bucket_arena.cpp
-    src/internal/lslot_codec.cpp
     src/internal/delta_hash_table.cpp
     src/internal/read_only_delta_hash_table.cpp
     src/internal/read_write_delta_hash_table.cpp

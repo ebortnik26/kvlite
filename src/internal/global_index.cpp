@@ -112,19 +112,6 @@ Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment
     return Status::OK();
 }
 
-Status GlobalIndex::putChecked(uint64_t hkey, uint64_t packed_version,
-                               uint32_t segment_id,
-                               const KeyResolver& resolver) {
-    std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
-    Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
-    if (!s.ok()) return s;
-    if (dht_.addEntryChecked(hkey, packed_version, segment_id, resolver)) {
-        ++key_count_;
-    }
-    updates_since_snapshot_++;
-    return Status::OK();
-}
-
 bool GlobalIndex::get(uint64_t hkey,
                   std::vector<uint32_t>& segment_ids,
                   std::vector<uint64_t>& packed_versions) const {
@@ -230,7 +217,7 @@ Status GlobalIndex::storeSnapshot(uint64_t snapshot_version) {
     Status ts = manifest_.set("gi.snapshot.version", std::to_string(snapshot_version));
     if (!ts.ok()) return ts;
 
-    std::string valid_dir = snapshotDirV8();
+    std::string valid_dir = snapshotDirV9();
     std::string tmp_dir = valid_dir + ".tmp";
     std::string old_dir = valid_dir + ".old";
 
@@ -286,7 +273,7 @@ uint64_t GlobalIndex::updatesSinceSnapshot() const {
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
 static constexpr uint32_t kVersionV7 = 7;
-static constexpr uint32_t kVersionV8 = 8;
+static constexpr uint32_t kVersionV9 = 9;
 static constexpr uint64_t kMaxFileSize = 1ULL << 30;  // 1 GB
 
 Status GlobalIndex::saveSnapshot(const std::string& path) const {
@@ -329,17 +316,17 @@ Status GlobalIndex::saveSnapshot(const std::string& path) const {
 //
 // Multi-file binary snapshot format (v8):
 //
-// Directory: <db_path>/gi/snapshot.v8/
+// Directory: <db_path>/gi/snapshot.v9/
 // Files: 00000000.dat, 00000001.dat, ...
 //
 // Each file:
-//   Global header (34 bytes) + File header (12 bytes) +
+//   Global header (29 bytes) + File header (12 bytes) +
 //   Main arena data (bucket_count × stride bytes) +
 //   Extension data (last file only, ext_count × stride bytes) +
 //   CRC32 footer (4 bytes)
 
 std::vector<GlobalIndex::SnapshotFileDesc> GlobalIndex::computeFileLayout() const {
-    static constexpr size_t kOverhead = 34 + 12 + 4;  // headers + footer
+    static constexpr size_t kOverhead = 33 + 12 + 4;  // headers + footer
 
     uint32_t num_buckets = dht_.numBuckets();
     uint32_t stride = dht_.bucketStride();
@@ -384,13 +371,12 @@ Status GlobalIndex::writeSnapshotFile(const std::string& dir,
 
     CRC32Writer writer(file);
 
-    // Global header (34 bytes)
+    // Global header (33 bytes)
     writer.write(kMagic, 4);
-    writer.writeVal(kVersionV8);
+    writer.writeVal(kVersionV9);
     writer.writeVal(num_entries);
     writer.writeVal(key_count);
     writer.writeVal(cfg.bucket_bits);
-    writer.writeVal(cfg.lslot_bits);
     writer.writeVal(cfg.bucket_bytes);
     writer.writeVal(ext_count);
 
@@ -491,27 +477,27 @@ Status GlobalIndex::loadSnapshotFile(const std::string& fpath,
 
     CRC32Reader reader(file);
 
-    // Global header (34 bytes)
+    // Global header (33 bytes)
     char magic[4];
     if (!reader.read(magic, 4) || std::memcmp(magic, kMagic, 4) != 0) {
         return Status::Corruption("Invalid snapshot magic in: " + fpath);
     }
     uint32_t format_version;
-    if (!reader.readVal(format_version) || format_version != kVersionV8) {
+    if (!reader.readVal(format_version) || format_version != kVersionV9) {
         return Status::Corruption("Unsupported snapshot version in: " + fpath);
     }
 
-    uint8_t bucket_bits, lslot_bits;
+    uint8_t bucket_bits;
     uint32_t bucket_bytes, ext_count;
     if (!reader.readVal(out_entries) || !reader.readVal(out_key_count) ||
-        !reader.readVal(bucket_bits) || !reader.readVal(lslot_bits) ||
+        !reader.readVal(bucket_bits) ||
         !reader.readVal(bucket_bytes) || !reader.readVal(ext_count)) {
         return Status::Corruption("Failed to read header in: " + fpath);
     }
     out_ext_count = ext_count;
 
     const auto& cfg = dht_.config();
-    if (bucket_bits != cfg.bucket_bits || lslot_bits != cfg.lslot_bits ||
+    if (bucket_bits != cfg.bucket_bits ||
         bucket_bytes != cfg.bucket_bytes) {
         return Status::Corruption("Snapshot config mismatch in: " + fpath);
     }
@@ -639,9 +625,9 @@ Status GlobalIndex::loadV7Snapshot(const std::string& path) {
 Status GlobalIndex::loadSnapshot(const std::string& path) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    std::string dir_v8 = snapshotDirV8();
-    if (fs::exists(dir_v8, ec) && fs::is_directory(dir_v8, ec)) {
-        return loadBinarySnapshot(dir_v8);
+    std::string dir_v9 = snapshotDirV9();
+    if (fs::exists(dir_v9, ec) && fs::is_directory(dir_v9, ec)) {
+        return loadBinarySnapshot(dir_v9);
     }
     return loadV7Snapshot(path);
 }
@@ -676,8 +662,8 @@ std::string GlobalIndex::snapshotPath() const {
     return db_path_ + "/gi/snapshot";
 }
 
-std::string GlobalIndex::snapshotDirV8() const {
-    return db_path_ + "/gi/snapshot.v8";
+std::string GlobalIndex::snapshotDirV9() const {
+    return db_path_ + "/gi/snapshot.v9";
 }
 
 }  // namespace internal

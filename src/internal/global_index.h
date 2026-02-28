@@ -37,8 +37,8 @@ class Manifest;
 //
 // Snapshot locking: snapshot() takes an exclusive lock on snapshot_mu_ to
 // block WB flush and GC writes. Normal reads are unaffected (per-bucket
-// spinlocks suffice). Writers (put/putChecked/relocate/eliminate) and
-// commit methods take a shared lock on snapshot_mu_.
+// spinlocks suffice). Writers (put/relocate/eliminate) and commit methods
+// take a shared lock on snapshot_mu_.
 class GlobalIndex {
 public:
     struct Options {
@@ -67,13 +67,7 @@ public:
 
     // --- Index Operations ---
 
-    using KeyResolver = DeltaHashTable::KeyResolver;
-
     Status put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
-
-    // Collision-aware put. Uses resolver to detect fingerprint collisions.
-    Status putChecked(uint64_t hkey, uint64_t packed_version,
-                      uint32_t segment_id, const KeyResolver& resolver);
 
     bool get(uint64_t hkey,
              std::vector<uint32_t>& segment_ids,
@@ -112,7 +106,7 @@ public:
     // --- Binary snapshot ---
 
     // Takes exclusive lock on snapshot_mu_, records snapshot_version in Manifest,
-    // writes binary v8 snapshot to disk, truncates WAL, resets update counter.
+    // writes binary v9 snapshot to disk, truncates WAL, resets update counter.
     // snapshot_version is the DB version at the time of snapshot (from VersionManager).
     Status storeSnapshot(uint64_t snapshot_version);
 
@@ -139,8 +133,8 @@ public:
     //   [segment_id: 4 bytes]
     // [checksum: 4 bytes]
     //
-    // v8 snapshot format (binary, multi-file):
-    // Directory at <db_path>/gi/snapshot.v8/ with numbered files.
+    // v9 snapshot format (binary, multi-file):
+    // Directory at <db_path>/gi/snapshot.v9/ with numbered files.
     // Each file contains a contiguous range of main arena buckets.
     // The last file also contains all extension slot data.
     // See saveBinarySnapshot() / loadBinarySnapshot() for details.
@@ -156,9 +150,9 @@ private:
 
     Status maybeSnapshot();
     std::string snapshotPath() const;       // v7 single file path
-    std::string snapshotDirV8() const;      // v8 directory path
+    std::string snapshotDirV9() const;      // v9 directory path
 
-    // v8 binary snapshot — write
+    // v9 binary snapshot — write
     Status saveBinarySnapshot(const std::string& dir) const;
 
     struct SnapshotFileDesc {
@@ -172,7 +166,7 @@ private:
     Status writeSnapshotFile(const std::string& dir,
                              const SnapshotFileDesc& fd) const;
 
-    // v8 binary snapshot — read
+    // v9 binary snapshot — read
     Status loadBinarySnapshot(const std::string& dir);
     Status loadSnapshotFile(const std::string& fpath,
                             uint32_t stride,

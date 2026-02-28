@@ -2,7 +2,7 @@
 
 A high-performance persistent key-value store optimized for SSD drives.
 
-Inspired by the [Pliops XDP paper](https://www.vldb.org/pvldb/vol14/p2932-dayan.pdf), kvlite implements an **index-plus-log** architecture in software, providing efficient point lookups with SSD-friendly sequential writes.
+kvlite implements an **index-plus-log** architecture in software, providing efficient point lookups with SSD-friendly sequential writes.
 
 ## Features
 
@@ -455,5 +455,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 Design inspired by:
-- [Pliops XDP (VLDB 2021)](https://www.vldb.org/pvldb/vol14/p2932-dayan.pdf)
 - LevelDB, RocksDB, and other LSM-tree storage engines

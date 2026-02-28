@@ -28,7 +28,6 @@ struct SegmentIndexEntry {
 static ReadOnlyDeltaHashTable::Config defaultDHTConfig() {
     ReadOnlyDeltaHashTable::Config config;
     config.bucket_bits = 16;
-    config.lslot_bits = 4;
     config.bucket_bytes = 256;
     return config;
 }

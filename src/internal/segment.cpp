@@ -261,16 +261,6 @@ Status Segment::get(const std::string& key, uint64_t upper_bound,
     return readEntry(offset, entry);
 }
 
-Status Segment::readTombstone(uint64_t offset, bool& tombstone) const {
-    // Tombstone is the LSB of the packed version (first 8 bytes).
-    // Only need 1 byte, but read 8 for alignment safety.
-    uint64_t packed_ver;
-    Status s = log_file_.readAt(offset, &packed_ver, 8);
-    if (!s.ok()) return s;
-    tombstone = (packed_ver & PackedVersion::kTombstoneMask) != 0;
-    return Status::OK();
-}
-
 bool Segment::contains(const std::string& key) const {
     if (state_ != State::kReadable) return false;
     return index_.contains(key);
@@ -288,31 +278,6 @@ size_t Segment::keyCount() const {
 
 size_t Segment::entryCount() const {
     return index_.entryCount();
-}
-
-Status Segment::readKeyByVersion(uint64_t packed_version, std::string& key) const {
-    size_t offset = 0;
-    while (offset < data_size_) {
-        uint8_t hdr[LogEntry::kHeaderSize];
-        Status s = log_file_.readAt(offset, hdr, LogEntry::kHeaderSize);
-        if (!s.ok()) return s;
-
-        uint64_t pv;
-        std::memcpy(&pv, hdr, 8);
-        uint16_t kl;
-        std::memcpy(&kl, hdr + 8, 2);
-        uint32_t vl;
-        std::memcpy(&vl, hdr + 10, 4);
-
-        if (pv == packed_version) {
-            key.resize(kl);
-            s = log_file_.readAt(offset + LogEntry::kHeaderSize,
-                                 key.data(), kl);
-            return s;
-        }
-        offset += LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
-    }
-    return Status::NotFound("Version not found in segment");
 }
 
 }  // namespace internal

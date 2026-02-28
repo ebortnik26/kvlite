@@ -42,10 +42,9 @@ void ReadOnlyDeltaHashTable::addEntry(uint64_t hash,
     assert(!sealed_);
 
     uint32_t bi = bucketIndex(hash);
-    uint32_t li = lslotIndex(hash);
-    uint64_t fp = fingerprint(hash);
+    uint64_t suffix = suffixFromHash(hash);
 
-    addToChain(bi, li, fp, packed_version, id,
+    addToChain(bi, suffix, packed_version, id,
         [this](Bucket& bucket) -> Bucket* {
             return createExtension(bucket);
         });
@@ -57,10 +56,9 @@ bool ReadOnlyDeltaHashTable::addEntryIsNew(uint64_t hash,
     assert(!sealed_);
 
     uint32_t bi = bucketIndex(hash);
-    uint32_t li = lslotIndex(hash);
-    uint64_t fp = fingerprint(hash);
+    uint64_t suffix = suffixFromHash(hash);
 
-    bool is_new = addToChain(bi, li, fp, packed_version, id,
+    bool is_new = addToChain(bi, suffix, packed_version, id,
         [this](Bucket& bucket) -> Bucket* {
             return createExtension(bucket);
         });

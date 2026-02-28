@@ -32,7 +32,7 @@ cd build && ctest
 | `kvlite_seg_test` | `test_segment.cpp` | Segment (LogFile + SegmentIndex pair) |
 | `kvlite_wb_test` | `test_write_buffer.cpp` | WriteBuffer + flush to Segment |
 | `kvlite_segment_index_test` | `test_segment_index.cpp` | SegmentIndex serialization/queries |
-| `kvlite_dht_test` | `test_delta_hash_table.cpp` | LSlotCodec, ReadOnlyDeltaHashTable, GlobalIndex |
+| `kvlite_dht_test` | `test_delta_hash_table.cpp` | DeltaHashTable (BucketCodec, ReadOnly/ReadWrite DHT, GlobalIndex) |
 | `kvlite_vm_test` | `test_version_manager.cpp` | VersionManager persistence/snapshots |
 | `kvlite_lf_test` | `test_log_file.cpp` | LogFile POSIX I/O |
 | `kvlite_bitstream_test` | `test_bit_stream.cpp` | BitStream encoding |
@@ -41,21 +41,22 @@ Unit test targets link only the sources they need (not the full library). The in
 
 ## Architecture
 
-kvlite is an **index-plus-log** key-value store inspired by the Pliops XDP paper. Point operations only (get/put/remove), no range queries. C++17, POSIX I/O.
+kvlite is an **index-plus-log** key-value store. Point operations only (get/put/remove), no range queries. C++17, POSIX I/O.
 
 ### Two-Level Indexing
 
 - **GlobalIndex** (`global_index.h`): Always in memory. Maps key → list of (packed_version, segment_id) pairs (latest first). Persisted via WAL + periodic snapshots.
 - **SegmentIndex** (`segment_index.h`): Per-file. Maps key → list of (offset, packed_version) pairs. Stored inside each Segment file. Cached in `SegmentIndexCache` (LRU).
 
-Both indexes use the **DeltaHashTable** family — compact hash tables with bit-packed slot encoding and overflow chain buckets:
+Both indexes use the **DeltaHashTable** family — compact hash tables with sorted suffix-array buckets and overflow chain buckets:
 
 ```
 DeltaHashTable                      (non-template base, .h + .cpp)
 ├── ReadOnlyDeltaHashTable          (write-once lifecycle, no locks)
 └── ReadWriteDeltaHashTable         (always-mutable, per-bucket spinlocks)
-LSlotCodec                          (.h + .cpp)
 ```
+
+Each bucket stores unique key suffixes (the hash bits not used for bucket selection) in sorted order, with per-key version/id arrays. Binary search replaces fingerprint matching. Full suffix comparison eliminates false positives — no I/O for disambiguation.
 
 ### Storage Layer
 
