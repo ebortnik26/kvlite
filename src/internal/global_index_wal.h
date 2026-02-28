@@ -118,6 +118,10 @@ public:
     // Also clears staging buffers.
     Status truncate(uint64_t cutoff_version);
 
+    // Close the active WAL file and start a new one.
+    // Used after recovery so replayed files are never appended to.
+    Status startNewFile();
+
     // Total WAL size on disk across all files.
     uint64_t size() const;
 

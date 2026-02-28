@@ -10,6 +10,7 @@
 #include "internal/crc32.h"
 #include "internal/global_index_wal.h"
 #include "internal/manifest.h"
+#include "internal/wal_stream.h"
 
 namespace kvlite {
 namespace internal {
@@ -83,6 +84,46 @@ Status GlobalIndex::open(const std::string& db_path, const Options& options) {
 
     is_open_ = true;
     return Status::OK();
+}
+
+Status GlobalIndex::recover() {
+    namespace fs = std::filesystem;
+
+    // Re-truncate WAL: delete files with max_version <= snapshot max_version.
+    // Idempotent — safe if the previous truncation partially completed.
+    Status s = wal_->truncate(max_version_);
+    if (!s.ok()) return s;
+
+    // Load snapshot (v9 binary or v7 fallback) if one exists.
+    std::error_code ec;
+    if ((fs::exists(snapshotDirV9(), ec) && fs::is_directory(snapshotDirV9(), ec)) ||
+        fs::exists(snapshotPath(), ec)) {
+        s = loadSnapshot(snapshotPath());
+        if (!s.ok()) return s;
+    }
+
+    // Replay all remaining WAL records, ordered by file (= by max_version).
+    auto stream = wal_->replayStream();
+    while (stream->valid()) {
+        const auto& rec = stream->record();
+        switch (rec.op) {
+            case WalOp::kPut:
+                applyPut(rec.hkey, rec.packed_version, rec.segment_id);
+                break;
+            case WalOp::kRelocate:
+                applyRelocate(rec.hkey, rec.packed_version,
+                              rec.segment_id, rec.new_segment_id);
+                break;
+            case WalOp::kEliminate:
+                applyEliminate(rec.hkey, rec.packed_version, rec.segment_id);
+                break;
+        }
+        s = stream->next();
+        if (!s.ok()) return s;
+    }
+
+    // Start a new WAL file so replayed files are never appended to.
+    return wal_->startNewFile();
 }
 
 Status GlobalIndex::close() {

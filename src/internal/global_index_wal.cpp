@@ -247,6 +247,36 @@ std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
     return stream::walReplay(walDir(), file_ids_);
 }
 
+Status GlobalIndexWAL::startNewFile() {
+    // Accumulate size of the file we're closing.
+    total_size_ += wal_.size();
+
+    // Persist the closing file's max_version to Manifest.
+    uint64_t closing_max = wal_.maxVersion();
+    Status s = manifest_->set(file_prefix_ + std::to_string(current_file_id_),
+                              std::to_string(closing_max));
+    if (!s.ok()) return s;
+
+    s = wal_.close();
+    if (!s.ok()) return s;
+
+    // Allocate a new file ID.
+    uint32_t new_id;
+    s = allocateFileId(new_id);
+    if (!s.ok()) return s;
+
+    // Register in Manifest and create.
+    s = manifest_->set(file_prefix_ + std::to_string(new_id), "");
+    if (!s.ok()) return s;
+
+    current_file_id_ = new_id;
+    file_ids_.push_back(new_id);
+    s = wal_.create(walFilePath(walDir(), new_id));
+    if (!s.ok()) return s;
+    wal_.updateMaxVersion(closing_max);
+    return Status::OK();
+}
+
 void GlobalIndexWAL::updateMaxVersion(uint64_t v) {
     wal_.updateMaxVersion(v);
 }
