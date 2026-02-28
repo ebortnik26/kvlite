@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include "internal/manifest.h"
 
@@ -39,6 +40,9 @@ Status VersionManager::recover() {
         current_version_.store(0, std::memory_order_relaxed);
         persisted_counter_ = 0;
     }
+    // No in-flight puts at startup — committed == current.
+    committed_version_.store(current_version_.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
     return Status::OK();
 }
 
@@ -78,6 +82,25 @@ uint64_t VersionManager::allocateVersion() {
 
 uint64_t VersionManager::latestVersion() const {
     return current_version_.load(std::memory_order_acquire);
+}
+
+void VersionManager::commitVersion(uint64_t ver) {
+    uint64_t expected = ver - 1;
+    while (!committed_version_.compare_exchange_weak(
+        expected, ver, std::memory_order_release, std::memory_order_relaxed)) {
+        expected = ver - 1;
+        std::this_thread::yield();
+    }
+}
+
+uint64_t VersionManager::committedVersion() const {
+    return committed_version_.load(std::memory_order_acquire);
+}
+
+void VersionManager::waitForCommitted(uint64_t ver) const {
+    while (committed_version_.load(std::memory_order_acquire) < ver) {
+        std::this_thread::yield();
+    }
 }
 
 uint64_t VersionManager::createSnapshot() {

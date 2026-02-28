@@ -25,7 +25,6 @@ DB::~DB() {
     }
 }
 
-
 Status DB::open(const std::string& path, const Options& options) {
     if (is_open_) {
         return Status::InvalidArgument("Database already open");
@@ -178,6 +177,7 @@ Status DB::put(const std::string& key, const std::string& value,
 
     uint64_t version = versions_->allocateVersion();
     write_buffer_->put(key, version, value, false);
+    versions_->commitVersion(version);
 
     if (options.sync ||
         write_buffer_->memoryUsage() >= options_.write_buffer_size) {
@@ -195,10 +195,14 @@ Status DB::get(const std::string& key, std::string& value,
 Status DB::get(const std::string& key, std::string& value,
                uint64_t& version, const ReadOptions& options) {
     // Pack the snapshot version as an upper bound: include tombstones at that version.
-    uint64_t upper_bound = options.snapshot
-        ? (options.snapshot->version() << internal::PackedVersion::kVersionShift)
-          | internal::PackedVersion::kTombstoneMask
-        : UINT64_MAX;
+    uint64_t upper_bound;
+    if (options.snapshot) {
+        versions_->waitForCommitted(options.snapshot->version());
+        upper_bound = (options.snapshot->version() << internal::PackedVersion::kVersionShift)
+                      | internal::PackedVersion::kTombstoneMask;
+    } else {
+        upper_bound = UINT64_MAX;
+    }
     return getByVersion(key, upper_bound, value, version, options);
 }
 
@@ -277,6 +281,7 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
 
     uint64_t version = versions_->allocateVersion();
     write_buffer_->put(key, version, "", true);
+    versions_->commitVersion(version);
 
     if (options.sync ||
         write_buffer_->memoryUsage() >= options_.write_buffer_size) {
@@ -287,10 +292,14 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
 
 Status DB::exists(const std::string& key, bool& exists,
                   const ReadOptions& options) {
-    uint64_t upper_bound = options.snapshot
-        ? (options.snapshot->version() << internal::PackedVersion::kVersionShift)
-          | internal::PackedVersion::kTombstoneMask
-        : UINT64_MAX;
+    uint64_t upper_bound;
+    if (options.snapshot) {
+        versions_->waitForCommitted(options.snapshot->version());
+        upper_bound = (options.snapshot->version() << internal::PackedVersion::kVersionShift)
+                      | internal::PackedVersion::kTombstoneMask;
+    } else {
+        upper_bound = UINT64_MAX;
+    }
 
     ResolveResult r;
     Status s = resolve(key, upper_bound, r);
@@ -327,22 +336,19 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
     }
 
     // All operations in batch get the same version.
-    // Hold batch_mutex_ so that a concurrent ReadBatch snapshot
-    // either sees all keys or none of them.
+    // committed_version_ fence ensures snapshots see all-or-nothing.
     // Two-phase bucket locking inside putBatch() guarantees atomicity
     // at the WriteBuffer level.
-    {
-        std::lock_guard<std::mutex> lock(batch_mutex_);
-        uint64_t version = versions_->allocateVersion();
+    uint64_t version = versions_->allocateVersion();
 
-        std::vector<internal::WriteBuffer::BatchOp> ops;
-        ops.reserve(batch.operations().size());
-        for (const auto& op : batch.operations()) {
-            ops.push_back({&op.key, &op.value,
-                           op.type == WriteBatch::OpType::kDelete});
-        }
-        write_buffer_->putBatch(ops, version);
+    std::vector<internal::WriteBuffer::BatchOp> ops;
+    ops.reserve(batch.operations().size());
+    for (const auto& op : batch.operations()) {
+        ops.push_back({&op.key, &op.value,
+                       op.type == WriteBatch::OpType::kDelete});
     }
+    write_buffer_->putBatch(ops, version);
+    versions_->commitVersion(version);
 
     if (options.sync ||
         write_buffer_->memoryUsage() >= options_.write_buffer_size) {
@@ -366,7 +372,6 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
     Snapshot owned_snap(0);
     bool owns_snapshot = false;
     if (!options.snapshot) {
-        std::lock_guard<std::mutex> lock(batch_mutex_);
         owned_snap = createSnapshot();
         owns_snapshot = true;
     }
@@ -424,27 +429,9 @@ Status DB::flush() {
     s = storage_->registerSegments({current_segment_id_});
     if (!s.ok()) return s;
 
-    auto resolver = [this](uint32_t seg_id, uint64_t packed_version) -> uint64_t {
-        const internal::Segment* s = storage_->getSegment(seg_id);
-        if (!s) return 0;
-        std::string key;
-        s->readKeyByVersion(packed_version, key);
-        return internal::dhtHashBytes(key.data(), key.size());
-    };
-
-    // Entries are ordered by (hash asc, packed_ver asc) — same hkey is adjacent.
-    // Use putChecked for the first occurrence of each hkey (collision-aware),
-    // plain put for subsequent versions of the same hkey.
-    uint64_t prev_hkey = 0;
     for (const auto& e : result.entries) {
-        if (e.hkey != prev_hkey) {
-            s = global_index_->putChecked(e.hkey, e.packed_ver,
-                                           current_segment_id_, resolver);
-        } else {
-            s = global_index_->put(e.hkey, e.packed_ver, current_segment_id_);
-        }
+        s = global_index_->put(e.hkey, e.packed_ver, current_segment_id_);
         if (!s.ok()) return s;
-        prev_hkey = e.hkey;
     }
 
     s = global_index_->commitWB();

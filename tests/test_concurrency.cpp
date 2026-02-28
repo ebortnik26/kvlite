@@ -590,6 +590,196 @@ TEST_F(ConcurrencyTest, WriteBatchAllOrNothingViaReadBatch) {
     EXPECT_FALSE(violation.load()) << "Partial batch visibility detected";
 }
 
+TEST_F(ConcurrencyTest, SnapshotDoesNotSeeUncommittedVersion) {
+    // Verify that a snapshot taken during concurrent puts never sees
+    // a version whose WB insertion hasn't completed yet.
+    //
+    // Strategy: N writer threads continuously put unique keys. A reader
+    // thread repeatedly creates a snapshot, reads every key that should
+    // exist at that snapshot version, and verifies the value is present
+    // (not missing due to a half-committed version).
+    const int kWriters = 4;
+    const int kOpsPerWriter = 500;
+    std::atomic<bool> writers_done{false};
+    std::atomic<bool> violation{false};
+
+    // Each writer writes keys "wT_I" with value "vT_I".
+    auto writer = [&](int tid) {
+        for (int i = 0; i < kOpsPerWriter && !violation; ++i) {
+            std::string key = "w" + std::to_string(tid) + "_" + std::to_string(i);
+            std::string val = "v" + std::to_string(tid) + "_" + std::to_string(i);
+            EXPECT_TRUE(db_.put(key, val).ok());
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kWriters; ++t) {
+        threads.emplace_back(writer, t);
+    }
+
+    // Reader: take snapshots and verify every key readable at that snapshot
+    // actually returns a value (not NotFound due to uncommitted version).
+    std::thread reader([&]() {
+        while (!writers_done && !violation) {
+            kvlite::Snapshot snap = db_.createSnapshot();
+            uint64_t snap_ver = snap.version();
+
+            // Read a few keys that *should* exist if their version <= snap_ver.
+            // We can't know exactly which keys exist, but any key returned by
+            // get-without-snapshot whose version <= snap_ver must also be
+            // returned by get-with-snapshot.
+            //
+            // Simpler check: every key we successfully read without a snapshot
+            // and whose version <= snap_ver must be readable with the snapshot.
+            for (int tid = 0; tid < kWriters; ++tid) {
+                for (int i = 0; i < 10; ++i) {
+                    std::string key = "w" + std::to_string(tid) + "_" + std::to_string(i);
+                    std::string val_current;
+                    uint64_t ver;
+                    auto s = db_.get(key, val_current, ver);
+                    if (!s.ok()) continue;  // not yet written
+
+                    if (ver <= snap_ver) {
+                        // Must be visible through the snapshot.
+                        std::string val_snap;
+                        auto s2 = db_.get(key, val_snap, snapOpts(snap));
+                        if (s2.isNotFound()) {
+                            violation = true;
+                            break;
+                        }
+                    }
+                }
+                if (violation) break;
+            }
+            db_.releaseSnapshot(snap);
+        }
+    });
+
+    for (auto& t : threads) {
+        t.join();
+    }
+    writers_done = true;
+    reader.join();
+
+    EXPECT_FALSE(violation.load())
+        << "Snapshot missed a committed version (uncommitted version leaked)";
+}
+
+TEST_F(ConcurrencyTest, SnapshotGetWaitsForInFlightPuts) {
+    // Verify that snapshot-based reads correctly wait for all versions
+    // up to the snapshot version to be committed.
+    //
+    // Writer threads do rapid puts. A reader takes a snapshot immediately
+    // after a put, then reads back through the snapshot. The snapshot
+    // version may include in-flight puts from other threads, but the
+    // get() must wait for them before returning.
+    const int kWriters = 4;
+    const int kOpsPerWriter = 500;
+    std::atomic<bool> done{false};
+    std::atomic<bool> violation{false};
+
+    auto writer = [&](int tid) {
+        for (int i = 0; i < kOpsPerWriter && !violation; ++i) {
+            std::string key = "snap_wait_" + std::to_string(tid) + "_" + std::to_string(i);
+            EXPECT_TRUE(db_.put(key, "val").ok());
+        }
+    };
+
+    // Reader: continuously create snapshots and verify keys are visible.
+    std::thread reader([&]() {
+        int checks = 0;
+        while (!done && !violation && checks < 2000) {
+            kvlite::Snapshot snap = db_.createSnapshot();
+            // Any key whose version <= snap.version() must be readable.
+            // We just wrote keys — try reading them through the snapshot.
+            // The snapshot version may be ahead of committed_version_,
+            // so get() must wait. If it doesn't wait, we'd get NotFound
+            // for a key that exists.
+            for (int tid = 0; tid < kWriters && !violation; ++tid) {
+                std::string key = "snap_wait_" + std::to_string(tid) + "_0";
+                std::string val;
+                uint64_t ver;
+                auto s = db_.get(key, val, ver);
+                if (!s.ok()) continue;
+
+                if (ver <= snap.version()) {
+                    auto s2 = db_.get(key, val, snapOpts(snap));
+                    if (s2.isNotFound()) {
+                        violation = true;
+                    }
+                }
+            }
+            db_.releaseSnapshot(snap);
+            ++checks;
+        }
+    });
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kWriters; ++t) {
+        threads.emplace_back(writer, t);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    done = true;
+    reader.join();
+
+    EXPECT_FALSE(violation.load())
+        << "Snapshot get returned NotFound for a committed key";
+}
+
+TEST_F(ConcurrencyTest, SnapshotExistsWaitsForInFlightPuts) {
+    // Same as above but using exists() instead of get().
+    const int kWriters = 4;
+    const int kOpsPerWriter = 500;
+    std::atomic<bool> done{false};
+    std::atomic<bool> violation{false};
+
+    auto writer = [&](int tid) {
+        for (int i = 0; i < kOpsPerWriter && !violation; ++i) {
+            std::string key = "exists_wait_" + std::to_string(tid) + "_" + std::to_string(i);
+            EXPECT_TRUE(db_.put(key, "val").ok());
+        }
+    };
+
+    std::thread reader([&]() {
+        int checks = 0;
+        while (!done && !violation && checks < 2000) {
+            kvlite::Snapshot snap = db_.createSnapshot();
+            for (int tid = 0; tid < kWriters && !violation; ++tid) {
+                std::string key = "exists_wait_" + std::to_string(tid) + "_0";
+                std::string val;
+                uint64_t ver;
+                auto s = db_.get(key, val, ver);
+                if (!s.ok()) continue;
+
+                if (ver <= snap.version()) {
+                    bool found = false;
+                    auto s2 = db_.exists(key, found, snapOpts(snap));
+                    if (s2.ok() && !found) {
+                        violation = true;
+                    }
+                }
+            }
+            db_.releaseSnapshot(snap);
+            ++checks;
+        }
+    });
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kWriters; ++t) {
+        threads.emplace_back(writer, t);
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    done = true;
+    reader.join();
+
+    EXPECT_FALSE(violation.load())
+        << "Snapshot exists() missed a committed key";
+}
+
 TEST_F(ConcurrencyTest, WriteBatchSameVersionUnderConcurrency) {
     // Multiple threads write batches concurrently.
     // After all threads finish, verify every batch's keys share one version.

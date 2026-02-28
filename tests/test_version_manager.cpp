@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "internal/version_manager.h"
@@ -54,9 +56,11 @@ TEST_F(VersionManagerTest, AllocateVersion) {
     ASSERT_TRUE(openVM().ok());
 
     EXPECT_EQ(vm_->latestVersion(), 0u);
-    EXPECT_EQ(vm_->allocateVersion(), 1u);
-    EXPECT_EQ(vm_->allocateVersion(), 2u);
-    EXPECT_EQ(vm_->allocateVersion(), 3u);
+
+    uint64_t v;
+    v = vm_->allocateVersion(); EXPECT_EQ(v, 1u); vm_->commitVersion(v);
+    v = vm_->allocateVersion(); EXPECT_EQ(v, 2u); vm_->commitVersion(v);
+    v = vm_->allocateVersion(); EXPECT_EQ(v, 3u); vm_->commitVersion(v);
     EXPECT_EQ(vm_->latestVersion(), 3u);
 
     closeVM();
@@ -69,7 +73,8 @@ TEST_F(VersionManagerTest, PersistAndRecover) {
     {
         ASSERT_TRUE(openVM(true, opts).ok());
         for (int i = 0; i < 10; ++i) {
-            vm_->allocateVersion();
+            uint64_t v = vm_->allocateVersion();
+            vm_->commitVersion(v);
         }
         closeVM();
     }
@@ -86,6 +91,7 @@ TEST_F(VersionManagerTest, PersistAndRecover) {
         // Next allocated version should be > 10.
         uint64_t next = vm2.allocateVersion();
         EXPECT_EQ(next, 11u);
+        vm2.commitVersion(next);
         ASSERT_TRUE(vm2.close().ok());
         m2.close();
     }
@@ -99,7 +105,9 @@ TEST_F(VersionManagerTest, BlockBoundaryPersistence) {
         ASSERT_TRUE(openVM(true, opts).ok());
 
         // Allocate version 1: exceeds persisted_counter_=0, should persist 4.
-        EXPECT_EQ(vm_->allocateVersion(), 1u);
+        uint64_t v = vm_->allocateVersion();
+        EXPECT_EQ(v, 1u);
+        vm_->commitVersion(v);
 
         // Check manifest: should contain "4".
         std::string val;
@@ -107,14 +115,16 @@ TEST_F(VersionManagerTest, BlockBoundaryPersistence) {
         EXPECT_EQ(val, "4");
 
         // Allocate versions 2, 3, 4: all <= 4, no new persist.
-        EXPECT_EQ(vm_->allocateVersion(), 2u);
-        EXPECT_EQ(vm_->allocateVersion(), 3u);
-        EXPECT_EQ(vm_->allocateVersion(), 4u);
+        v = vm_->allocateVersion(); EXPECT_EQ(v, 2u); vm_->commitVersion(v);
+        v = vm_->allocateVersion(); EXPECT_EQ(v, 3u); vm_->commitVersion(v);
+        v = vm_->allocateVersion(); EXPECT_EQ(v, 4u); vm_->commitVersion(v);
         ASSERT_TRUE(manifest_->get("next_version_id", val));
         EXPECT_EQ(val, "4");
 
         // Allocate version 5: exceeds 4, should persist 8.
-        EXPECT_EQ(vm_->allocateVersion(), 5u);
+        v = vm_->allocateVersion();
+        EXPECT_EQ(v, 5u);
+        vm_->commitVersion(v);
         ASSERT_TRUE(manifest_->get("next_version_id", val));
         EXPECT_EQ(val, "8");
 
@@ -132,7 +142,9 @@ TEST_F(VersionManagerTest, BlockBoundaryPersistence) {
 
         // Recovered from 8 (lost versions 6 and 7 — at most block_size-1 waste).
         EXPECT_EQ(vm2.latestVersion(), 8u);
-        EXPECT_EQ(vm2.allocateVersion(), 9u);
+        uint64_t v = vm2.allocateVersion();
+        EXPECT_EQ(v, 9u);
+        vm2.commitVersion(v);
 
         ASSERT_TRUE(vm2.close().ok());
         m2.close();
@@ -236,6 +248,54 @@ TEST_F(VersionManagerTest, SnapshotVersionsLatestEqualsSnapshot) {
     EXPECT_EQ(sv[0], s);  // 2
 
     vm_->releaseSnapshot(s);
+    closeVM();
+}
+
+TEST_F(VersionManagerTest, SnapshotUsesCurrentNotCommitted) {
+    ASSERT_TRUE(openVM().ok());
+
+    // Allocate v1 but don't commit it.
+    vm_->allocateVersion();  // v1
+
+    // Snapshot should see current_version_ (1), not committed_version_ (0).
+    uint64_t snap = vm_->createSnapshot();
+    EXPECT_EQ(snap, 1u);
+
+    vm_->releaseSnapshot(snap);
+    closeVM();
+}
+
+TEST_F(VersionManagerTest, WaitForCommittedReturnsImmediately) {
+    ASSERT_TRUE(openVM().ok());
+
+    uint64_t v;
+    v = vm_->allocateVersion(); vm_->commitVersion(v);  // v1
+    v = vm_->allocateVersion(); vm_->commitVersion(v);  // v2
+
+    // Should return immediately — committed_version_ is already 2.
+    vm_->waitForCommitted(2);
+    vm_->waitForCommitted(1);
+    vm_->waitForCommitted(0);
+
+    closeVM();
+}
+
+TEST_F(VersionManagerTest, WaitForCommittedBlocksUntilCommit) {
+    ASSERT_TRUE(openVM().ok());
+
+    uint64_t v1 = vm_->allocateVersion();  // v1, not committed
+    EXPECT_EQ(vm_->committedVersion(), 0u);
+
+    // Commit from another thread after a short delay.
+    std::thread committer([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        vm_->commitVersion(v1);
+    });
+
+    vm_->waitForCommitted(1);  // should block until committer runs
+    EXPECT_EQ(vm_->committedVersion(), 1u);
+
+    committer.join();
     closeVM();
 }
 

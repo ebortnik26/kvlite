@@ -57,6 +57,16 @@ public:
     // Get latest version (most recently allocated).
     uint64_t latestVersion() const;
 
+    // Mark version as committed (WB insertion complete).
+    // Must be called with consecutive versions; spins until predecessor commits.
+    void commitVersion(uint64_t ver);
+
+    // Get the highest version where all versions <= it are fully committed.
+    uint64_t committedVersion() const;
+
+    // Spin-wait until all versions <= ver are committed.
+    void waitForCommitted(uint64_t ver) const;
+
     // --- Snapshot Management ---
 
     // Create a snapshot at the current version.
@@ -94,6 +104,7 @@ private:
     bool is_open_ = false;
 
     std::atomic<uint64_t> current_version_{0};
+    std::atomic<uint64_t> committed_version_{0};
     uint64_t persisted_counter_{0};
 
     std::set<uint64_t> active_snapshots_;

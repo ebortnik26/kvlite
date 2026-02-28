@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
@@ -151,7 +150,7 @@ private:
     uint32_t current_segment_id_ = 0;
     bool is_open_ = false;
     bool clean_close_persisted_ = true;
-    std::mutex batch_mutex_;  // serializes batch write vs batch read snapshot
+
 };
 
 }  // namespace kvlite
