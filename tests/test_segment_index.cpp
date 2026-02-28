@@ -162,6 +162,10 @@ TEST(LSlotCodec, BitOffsetAndTotalBits) {
 
 // --- ReadOnlyDeltaHashTable Tests ---
 
+// Helper: hash a literal key for DHT calls.
+static uint64_t RH(const char* s) { return dhtHashBytes(s, std::strlen(s)); }
+static uint64_t RH(const std::string& s) { return dhtHashBytes(s.data(), s.size()); }
+
 static ReadOnlyDeltaHashTable::Config testConfig() {
     ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
@@ -173,11 +177,11 @@ static ReadOnlyDeltaHashTable::Config testConfig() {
 TEST(ReadOnlyDeltaHashTable, AddAndFindFirst) {
     ReadOnlyDeltaHashTable dht(testConfig());
 
-    dht.addEntry("hello", 100, 1);
+    dht.addEntry(RH("hello"), 100, 1);
 
     uint64_t pv;
     uint32_t id;
-    EXPECT_TRUE(dht.findFirst("hello", pv, id));
+    EXPECT_TRUE(dht.findFirst(RH("hello"), pv, id));
     EXPECT_EQ(pv, 100u);
     EXPECT_EQ(id, 1u);
     EXPECT_EQ(dht.size(), 1u);
@@ -187,21 +191,21 @@ TEST(ReadOnlyDeltaHashTable, FindNonExistent) {
     ReadOnlyDeltaHashTable dht(testConfig());
     uint64_t pv;
     uint32_t id;
-    EXPECT_FALSE(dht.findFirst("missing", pv, id));
+    EXPECT_FALSE(dht.findFirst(RH("missing"), pv, id));
 }
 
 TEST(ReadOnlyDeltaHashTable, AddMultipleEntries) {
     ReadOnlyDeltaHashTable dht(testConfig());
 
-    dht.addEntry("key1", 100, 1);
-    dht.addEntry("key1", 200, 2);
-    dht.addEntry("key1", 300, 3);
+    dht.addEntry(RH("key1"), 100, 1);
+    dht.addEntry(RH("key1"), 200, 2);
+    dht.addEntry(RH("key1"), 300, 3);
 
     EXPECT_EQ(dht.size(), 3u);
 
     std::vector<uint64_t> packed_versions;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key1", packed_versions, ids));
+    ASSERT_TRUE(dht.findAll(RH("key1"), packed_versions, ids));
     ASSERT_EQ(packed_versions.size(), 3u);
     EXPECT_EQ(packed_versions[0], 300u);
     EXPECT_EQ(packed_versions[1], 200u);
@@ -214,13 +218,13 @@ TEST(ReadOnlyDeltaHashTable, AddMultipleEntries) {
 TEST(ReadOnlyDeltaHashTable, FindFirstReturnsHighest) {
     ReadOnlyDeltaHashTable dht(testConfig());
 
-    dht.addEntry("key1", 100, 1);
-    dht.addEntry("key1", 300, 3);
-    dht.addEntry("key1", 200, 2);
+    dht.addEntry(RH("key1"), 100, 1);
+    dht.addEntry(RH("key1"), 300, 3);
+    dht.addEntry(RH("key1"), 200, 2);
 
     uint64_t pv;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key1", pv, id));
+    ASSERT_TRUE(dht.findFirst(RH("key1"), pv, id));
     EXPECT_EQ(pv, 300u);
     EXPECT_EQ(id, 3u);
 }
@@ -228,16 +232,16 @@ TEST(ReadOnlyDeltaHashTable, FindFirstReturnsHighest) {
 TEST(ReadOnlyDeltaHashTable, Contains) {
     ReadOnlyDeltaHashTable dht(testConfig());
 
-    EXPECT_FALSE(dht.contains("key1"));
-    dht.addEntry("key1", 100, 1);
-    EXPECT_TRUE(dht.contains("key1"));
+    EXPECT_FALSE(dht.contains(RH("key1")));
+    dht.addEntry(RH("key1"), 100, 1);
+    EXPECT_TRUE(dht.contains(RH("key1")));
 }
 
 TEST(ReadOnlyDeltaHashTable, Clear) {
     ReadOnlyDeltaHashTable dht(testConfig());
 
     for (int i = 0; i < 10; ++i) {
-        dht.addEntry("key" + std::to_string(i),
+        dht.addEntry(RH(("key" + std::to_string(i)).c_str()),
                      static_cast<uint64_t>(i * 100 + 1),
                      static_cast<uint32_t>(i + 1));
     }
@@ -247,16 +251,16 @@ TEST(ReadOnlyDeltaHashTable, Clear) {
     EXPECT_EQ(dht.size(), 0u);
 
     for (int i = 0; i < 10; ++i) {
-        EXPECT_FALSE(dht.contains("key" + std::to_string(i)));
+        EXPECT_FALSE(dht.contains(RH(("key" + std::to_string(i)).c_str())));
     }
 }
 
 TEST(ReadOnlyDeltaHashTable, ForEach) {
     ReadOnlyDeltaHashTable dht(testConfig());
 
-    dht.addEntry("a", 100, 1);
-    dht.addEntry("b", 200, 2);
-    dht.addEntry("c", 300, 3);
+    dht.addEntry(RH("a"), 100, 1);
+    dht.addEntry(RH("b"), 200, 2);
+    dht.addEntry(RH("c"), 300, 3);
 
     std::set<uint32_t> all_ids;
     dht.forEach([&](uint64_t, uint64_t, uint32_t id) {
@@ -272,9 +276,9 @@ TEST(ReadOnlyDeltaHashTable, ForEach) {
 TEST(ReadOnlyDeltaHashTable, ForEachGroup) {
     ReadOnlyDeltaHashTable dht(testConfig());
 
-    dht.addEntry("a", 100, 1);
-    dht.addEntry("a", 200, 2);
-    dht.addEntry("b", 300, 3);
+    dht.addEntry(RH("a"), 100, 1);
+    dht.addEntry(RH("a"), 200, 2);
+    dht.addEntry(RH("b"), 300, 3);
 
     size_t group_count = 0;
     dht.forEachGroup([&](uint64_t, const std::vector<uint64_t>& pvs,
@@ -301,7 +305,7 @@ TEST(ReadOnlyDeltaHashTable, ManyKeys) {
     const int N = 200;
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        dht.addEntry(key, static_cast<uint64_t>(i * 100 + 1),
+        dht.addEntry(RH(key), static_cast<uint64_t>(i * 100 + 1),
                      static_cast<uint32_t>(i + 1));
     }
 
@@ -311,7 +315,7 @@ TEST(ReadOnlyDeltaHashTable, ManyKeys) {
         std::string key = "key_" + std::to_string(i);
         uint64_t pv;
         uint32_t id;
-        ASSERT_TRUE(dht.findFirst(key, pv, id)) << "key not found: " << key;
+        ASSERT_TRUE(dht.findFirst(RH(key), pv, id)) << "key not found: " << key;
         EXPECT_EQ(pv, static_cast<uint64_t>(i * 100 + 1));
         EXPECT_EQ(id, static_cast<uint32_t>(i + 1));
     }
@@ -321,7 +325,7 @@ TEST(ReadOnlyDeltaHashTable, AddEntryByHash) {
     ReadOnlyDeltaHashTable dht(testConfig());
 
     uint64_t hash = 0xDEADBEEF12345678ULL;
-    dht.addEntryByHash(hash, 100, 1);
+    dht.addEntry(hash, 100, 1);
 
     size_t count = 0;
     dht.forEach([&](uint64_t, uint64_t pv, uint32_t id) {
@@ -676,12 +680,12 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t packed_version,
+        [&](uint64_t hkey, uint64_t packed_version,
             uint32_t old_id, uint32_t new_id) {
-            relocations.push_back({std::string(key), packed_version, old_id, new_id});
+            relocations.push_back({hkey, packed_version, old_id, new_id});
         },
-        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
-            eliminations.push_back({std::string(key), packed_version, old_id});
+        [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
+            eliminations.push_back({hkey, packed_version, old_id});
         },
         last_result_);
 
@@ -729,12 +733,12 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t packed_version,
+        [&](uint64_t hkey, uint64_t packed_version,
             uint32_t old_id, uint32_t new_id) {
-            relocations.push_back({std::string(key), packed_version, old_id, new_id});
+            relocations.push_back({hkey, packed_version, old_id, new_id});
         },
-        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
-            eliminations.push_back({std::string(key), packed_version, old_id});
+        [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
+            eliminations.push_back({hkey, packed_version, old_id});
         },
         last_result_);
 
@@ -743,12 +747,12 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
     ASSERT_EQ(eliminations.size(), 1u);
-    EXPECT_EQ(eliminations[0].key, "key1");
+    EXPECT_EQ(eliminations[0].hkey, dhtHashBytes("key1", 4));
     EXPECT_EQ(eliminations[0].packed_version, PackedVersion(1, false).data);
     EXPECT_EQ(eliminations[0].old_segment_id, 1u);
 
     ASSERT_EQ(relocations.size(), 1u);
-    EXPECT_EQ(relocations[0].key, "key1");
+    EXPECT_EQ(relocations[0].hkey, dhtHashBytes("key1", 4));
     EXPECT_EQ(relocations[0].packed_version, PackedVersion(2, false).data);
     EXPECT_EQ(relocations[0].old_segment_id, 2u);
 
@@ -776,8 +780,8 @@ TEST_F(GCMergeTest, MergePreservesOrder) {
     std::vector<uint64_t> snapshots = {2};
     std::vector<const Segment*> inputs = {&seg1, &seg2};
 
-    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
-    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
+    auto noop_relocate = [](uint64_t, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](uint64_t, uint64_t, uint32_t) {};
 
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
@@ -811,8 +815,8 @@ TEST_F(GCMergeTest, MergeSplitsOnSize) {
     std::vector<uint64_t> snapshots = {4};
     std::vector<const Segment*> inputs = {&seg};
 
-    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
-    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
+    auto noop_relocate = [](uint64_t, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](uint64_t, uint64_t, uint32_t) {};
 
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/450,
@@ -841,8 +845,8 @@ TEST_F(GCMergeTest, MergeEmpty) {
     std::vector<uint64_t> snapshots = {1};
     std::vector<const Segment*> inputs;
 
-    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
-    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
+    auto noop_relocate = [](uint64_t, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](uint64_t, uint64_t, uint32_t) {};
 
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
@@ -865,8 +869,8 @@ TEST_F(GCMergeTest, MergeSnapshotPins) {
     std::vector<uint64_t> snapshots = {1, 2};
     std::vector<const Segment*> inputs = {&seg1, &seg2};
 
-    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
-    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
+    auto noop_relocate = [](uint64_t, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](uint64_t, uint64_t, uint32_t) {};
 
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
@@ -913,12 +917,12 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t packed_version,
+        [&](uint64_t hkey, uint64_t packed_version,
             uint32_t old_id, uint32_t new_id) {
-            relocations.push_back({std::string(key), packed_version, old_id, new_id});
+            relocations.push_back({hkey, packed_version, old_id, new_id});
         },
-        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
-            eliminations.push_back({std::string(key), packed_version, old_id});
+        [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
+            eliminations.push_back({hkey, packed_version, old_id});
         },
         last_result_);
 
@@ -927,7 +931,7 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
     ASSERT_EQ(last_result_.outputs.size(), 1u);
 
     ASSERT_EQ(eliminations.size(), 1u);
-    EXPECT_EQ(eliminations[0].key, "key1");
+    EXPECT_EQ(eliminations[0].hkey, dhtHashBytes("key1", 4));
     EXPECT_EQ(eliminations[0].packed_version, PackedVersion(1, false).data);
     EXPECT_EQ(eliminations[0].old_segment_id, 1u);
 
@@ -956,8 +960,8 @@ TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
     std::vector<uint64_t> snapshots = {2};
     std::vector<const Segment*> inputs = {&seg1, &seg2};
 
-    auto noop_relocate = [](std::string_view, uint64_t, uint32_t, uint32_t) {};
-    auto noop_eliminate = [](std::string_view, uint64_t, uint32_t) {};
+    auto noop_relocate = [](uint64_t, uint64_t, uint32_t, uint32_t) {};
+    auto noop_eliminate = [](uint64_t, uint64_t, uint32_t) {};
 
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
@@ -983,11 +987,14 @@ TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
 
 // --- GC + GlobalIndex integration tests ---
 
+// Helper: hash a string literal for GI/DHT calls.
+static uint64_t H(const char* s) { return dhtHashBytes(s, std::strlen(s)); }
+
 TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
     // Put entries into GlobalIndex with specific segment_ids.
     auto& gi = createOpenGI();
-    gi.put("key1", PackedVersion(1, false).data, 1);
-    gi.put("key2", PackedVersion(2, false).data, 1);
+    gi.put(H("key1"), PackedVersion(1, false).data, 1);
+    gi.put(H("key2"), PackedVersion(2, false).data, 1);
 
     // Create segment with those entries.
     size_t idx = createSegment(1, {
@@ -1003,12 +1010,12 @@ TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t packed_version,
+        [&](uint64_t hkey, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
-            gi.relocate(std::string(key), packed_version, old_id, new_id);
+            gi.relocate(hkey, packed_version, old_id, new_id);
         },
-        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
-            gi.eliminate(std::string(key), packed_version, old_id);
+        [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
+            gi.eliminate(hkey, packed_version, old_id);
         },
         last_result_);
 
@@ -1019,9 +1026,9 @@ TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
     // Verify GlobalIndex entries now point to the new segment.
     uint64_t pv;
     uint32_t seg_id;
-    ASSERT_TRUE(gi.getLatest("key1", pv, seg_id).ok());
+    ASSERT_TRUE(gi.getLatest(H("key1"), pv, seg_id).ok());
     EXPECT_EQ(seg_id, new_seg_id);
-    ASSERT_TRUE(gi.getLatest("key2", pv, seg_id).ok());
+    ASSERT_TRUE(gi.getLatest(H("key2"), pv, seg_id).ok());
     EXPECT_EQ(seg_id, new_seg_id);
 
     EXPECT_EQ(gi.keyCount(), 2u);
@@ -1030,8 +1037,8 @@ TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
 
 TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
     auto& gi = createOpenGI();
-    gi.put("key1", PackedVersion(1, false).data, 1);
-    gi.put("key1", PackedVersion(2, false).data, 2);
+    gi.put(H("key1"), PackedVersion(1, false).data, 1);
+    gi.put(H("key1"), PackedVersion(2, false).data, 2);
 
     size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
@@ -1045,12 +1052,12 @@ TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t packed_version,
+        [&](uint64_t hkey, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
-            gi.relocate(std::string(key), packed_version, old_id, new_id);
+            gi.relocate(hkey, packed_version, old_id, new_id);
         },
-        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
-            gi.eliminate(std::string(key), packed_version, old_id);
+        [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
+            gi.eliminate(hkey, packed_version, old_id);
         },
         last_result_);
 
@@ -1063,7 +1070,7 @@ TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
 
     uint64_t pv;
     uint32_t seg_id;
-    ASSERT_TRUE(gi.getLatest("key1", pv, seg_id).ok());
+    ASSERT_TRUE(gi.getLatest(H("key1"), pv, seg_id).ok());
     EXPECT_EQ(pv, PackedVersion(2, false).data);
     EXPECT_EQ(seg_id, last_result_.outputs[0].getId());
 }
@@ -1073,8 +1080,8 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
     // Two versions of "key1" in same segment — both will be compacted,
     // but only the latest survives the single-snapshot classification.
     // To eliminate ALL versions, we need a tombstone as latest.
-    gi.put("key1", PackedVersion(1, false).data, 1);
-    gi.put("key1", PackedVersion(2, true).data, 1);  // tombstone
+    gi.put(H("key1"), PackedVersion(1, false).data, 1);
+    gi.put(H("key1"), PackedVersion(2, true).data, 1);  // tombstone
 
     size_t idx = createSegment(1, {
         {"key1", 1, "val1", false},
@@ -1092,12 +1099,12 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t packed_version,
+        [&](uint64_t hkey, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
-            gi.relocate(std::string(key), packed_version, old_id, new_id);
+            gi.relocate(hkey, packed_version, old_id, new_id);
         },
-        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
-            gi.eliminate(std::string(key), packed_version, old_id);
+        [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
+            gi.eliminate(hkey, packed_version, old_id);
         },
         last_result_);
 
@@ -1112,12 +1119,12 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
     // containing it is GC'ed in a future pass.
     EXPECT_EQ(gi.entryCount(), 1u);
     EXPECT_EQ(gi.keyCount(), 1u);
-    EXPECT_TRUE(gi.contains("key1"));
+    EXPECT_TRUE(gi.contains(H("key1")));
 
     // Verify the remaining entry is the tombstone at version 2.
     uint64_t pv;
     uint32_t seg_id;
-    ASSERT_TRUE(gi.getLatest("key1", pv, seg_id).ok());
+    ASSERT_TRUE(gi.getLatest(H("key1"), pv, seg_id).ok());
     EXPECT_EQ(pv, PackedVersion(2, true).data);
     EXPECT_EQ(seg_id, last_result_.outputs[0].getId());
 }
@@ -1127,7 +1134,7 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
     // in the output segment. A second GC pass eliminates it entirely.
     auto& gi = createOpenGI();
     uint32_t first_seg_id = 50;
-    gi.put("key1", PackedVersion(2, true).data, first_seg_id);  // tombstone only
+    gi.put(H("key1"), PackedVersion(2, true).data, first_seg_id);  // tombstone only
 
     // Create a segment containing just the tombstone.
     size_t idx = createSegment(first_seg_id, {
@@ -1137,7 +1144,7 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
 
     EXPECT_EQ(gi.keyCount(), 1u);
     EXPECT_EQ(gi.entryCount(), 1u);
-    EXPECT_TRUE(gi.contains("key1"));
+    EXPECT_TRUE(gi.contains(H("key1")));
 
     // Second GC pass: single snapshot at version 2.
     // The tombstone is the only entry — it's the latest for the snapshot,
@@ -1149,12 +1156,12 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
         [this]() { return allocateId(); },
-        [&](std::string_view key, uint64_t packed_version,
+        [&](uint64_t hkey, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
-            gi.relocate(std::string(key), packed_version, old_id, new_id);
+            gi.relocate(hkey, packed_version, old_id, new_id);
         },
-        [&](std::string_view key, uint64_t packed_version, uint32_t old_id) {
-            gi.eliminate(std::string(key), packed_version, old_id);
+        [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
+            gi.eliminate(hkey, packed_version, old_id);
         },
         last_result_);
 
@@ -1165,16 +1172,16 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
 
     // Key still exists — tombstone persists until no snapshot pins it.
     EXPECT_EQ(gi.keyCount(), 1u);
-    EXPECT_TRUE(gi.contains("key1"));
+    EXPECT_TRUE(gi.contains(H("key1")));
 
     // Now simulate: eliminate the tombstone directly (as would happen
     // when all snapshots are released and a GC eliminates it).
     uint64_t tomb_pv = PackedVersion(2, true).data;
     uint32_t new_seg_id = last_result_.outputs[0].getId();
-    gi.eliminate("key1", tomb_pv, new_seg_id);
+    gi.eliminate(H("key1"), tomb_pv, new_seg_id);
 
     // Now the key is fully gone from GlobalIndex.
     EXPECT_EQ(gi.keyCount(), 0u);
     EXPECT_EQ(gi.entryCount(), 0u);
-    EXPECT_FALSE(gi.contains("key1"));
+    EXPECT_FALSE(gi.contains(H("key1")));
 }

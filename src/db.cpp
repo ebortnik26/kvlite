@@ -5,6 +5,7 @@
 #include <memory>
 #include <vector>
 
+#include "internal/delta_hash_table.h"
 #include "internal/manifest.h"
 #include "internal/version_manager.h"
 #include "internal/global_index.h"
@@ -224,7 +225,8 @@ Status DB::resolve(const std::string& key, uint64_t upper_bound,
     // 2. Fall through to GlobalIndex -> Segment.
     uint64_t gi_packed_version;
     uint32_t gi_segment_id;
-    if (!global_index_->get(key, upper_bound, gi_packed_version, gi_segment_id)) {
+    uint64_t hkey = internal::dhtHashBytes(key.data(), key.size());
+    if (!global_index_->get(hkey, upper_bound, gi_packed_version, gi_segment_id)) {
         return Status::NotFound(key);
     }
 
@@ -422,26 +424,27 @@ Status DB::flush() {
     s = storage_->registerSegments({current_segment_id_});
     if (!s.ok()) return s;
 
-    auto resolver = [this](uint32_t seg_id, uint64_t packed_version) -> std::string {
+    auto resolver = [this](uint32_t seg_id, uint64_t packed_version) -> uint64_t {
         const internal::Segment* s = storage_->getSegment(seg_id);
-        if (!s) return "";
+        if (!s) return 0;
         std::string key;
         s->readKeyByVersion(packed_version, key);
-        return key;
+        return internal::dhtHashBytes(key.data(), key.size());
     };
 
-    // Entries are ordered by (hash asc, packed_ver asc) — same key is adjacent.
-    // Use putChecked for the first occurrence of each key (collision-aware),
-    // plain put for subsequent versions of the same key.
-    std::string_view prev_key;
+    // Entries are ordered by (hash asc, packed_ver asc) — same hkey is adjacent.
+    // Use putChecked for the first occurrence of each hkey (collision-aware),
+    // plain put for subsequent versions of the same hkey.
+    uint64_t prev_hkey = 0;
     for (const auto& e : result.entries) {
-        if (e.key != prev_key) {
-            s = global_index_->putChecked(e.key, e.packed_ver, current_segment_id_, resolver);
+        if (e.hkey != prev_hkey) {
+            s = global_index_->putChecked(e.hkey, e.packed_ver,
+                                           current_segment_id_, resolver);
         } else {
-            s = global_index_->put(e.key, e.packed_ver, current_segment_id_);
+            s = global_index_->put(e.hkey, e.packed_ver, current_segment_id_);
         }
         if (!s.ok()) return s;
-        prev_key = e.key;
+        prev_hkey = e.hkey;
     }
 
     s = global_index_->commitWB();

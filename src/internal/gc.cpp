@@ -313,7 +313,7 @@ Status GC::merge(
             entry.ext[kTagBase + GCTagSourceExt::kSegmentId]);
 
         if (action == EntryAction::kEliminate) {
-            on_eliminate(entry.key, entry.pv.data, old_seg_id);
+            on_eliminate(entry.hash, entry.pv.data, old_seg_id);
             result.entries_eliminated++;
             s = pipeline->next();
             if (!s.ok()) return s;
@@ -338,7 +338,7 @@ Status GC::merge(
         s = output.put(entry.key, entry.version(), entry.value, entry.tombstone());
         if (!s.ok()) return s;
 
-        on_relocate(entry.key, entry.pv.data, old_seg_id, output_id);
+        on_relocate(entry.hash, entry.pv.data, old_seg_id, output_id);
         result.entries_written++;
 
         s = pipeline->next();

@@ -114,10 +114,10 @@ Status GlobalIndexWAL::close() {
 void GlobalIndexWAL::serializeRecord(ProducerBuf& buf, WalOp op,
                                       uint8_t producer_id,
                                       uint64_t packed_version,
-                                      std::string_view key,
+                                      uint64_t hkey,
                                       const uint32_t* seg_ids,
                                       size_t seg_count) {
-    size_t rec_len = 1 + 1 + 8 + seg_count * 4 + 2 + key.size();
+    size_t rec_len = 1 + 1 + 8 + seg_count * 4 + 8;
     size_t off = buf.data.size();
     buf.data.resize(off + rec_len);
     uint8_t* p = buf.data.data() + off;
@@ -128,19 +128,17 @@ void GlobalIndexWAL::serializeRecord(ProducerBuf& buf, WalOp op,
     for (size_t i = 0; i < seg_count; ++i) {
         std::memcpy(p, &seg_ids[i], 4); p += 4;
     }
-    uint16_t key_len = static_cast<uint16_t>(key.size());
-    std::memcpy(p, &key_len, 2); p += 2;
-    std::memcpy(p, key.data(), key.size());
+    std::memcpy(p, &hkey, 8);
 
     ++buf.record_count;
 }
 
-Status GlobalIndexWAL::appendPut(std::string_view key, uint64_t packed_version,
+Status GlobalIndexWAL::appendPut(uint64_t hkey, uint64_t packed_version,
                                   uint32_t segment_id, uint8_t producer_id) {
     std::shared_lock lock(rw_mu_);
     if (!open_) return Status::IOError("WAL not open");
     serializeRecord(producers_[producer_id], WalOp::kPut, producer_id,
-                    packed_version, key, &segment_id, 1);
+                    packed_version, hkey, &segment_id, 1);
     ++entry_count_;
     if (producers_[producer_id].record_count >= options_.batch_size) {
         return flushProducer(producer_id);
@@ -148,14 +146,14 @@ Status GlobalIndexWAL::appendPut(std::string_view key, uint64_t packed_version,
     return Status::OK();
 }
 
-Status GlobalIndexWAL::appendRelocate(std::string_view key, uint64_t packed_version,
+Status GlobalIndexWAL::appendRelocate(uint64_t hkey, uint64_t packed_version,
                                        uint32_t old_segment_id, uint32_t new_segment_id,
                                        uint8_t producer_id) {
     std::shared_lock lock(rw_mu_);
     if (!open_) return Status::IOError("WAL not open");
     uint32_t segs[2] = {old_segment_id, new_segment_id};
     serializeRecord(producers_[producer_id], WalOp::kRelocate, producer_id,
-                    packed_version, key, segs, 2);
+                    packed_version, hkey, segs, 2);
     ++entry_count_;
     if (producers_[producer_id].record_count >= options_.batch_size) {
         return flushProducer(producer_id);
@@ -163,12 +161,12 @@ Status GlobalIndexWAL::appendRelocate(std::string_view key, uint64_t packed_vers
     return Status::OK();
 }
 
-Status GlobalIndexWAL::appendEliminate(std::string_view key, uint64_t packed_version,
+Status GlobalIndexWAL::appendEliminate(uint64_t hkey, uint64_t packed_version,
                                         uint32_t segment_id, uint8_t producer_id) {
     std::shared_lock lock(rw_mu_);
     if (!open_) return Status::IOError("WAL not open");
     serializeRecord(producers_[producer_id], WalOp::kEliminate, producer_id,
-                    packed_version, key, &segment_id, 1);
+                    packed_version, hkey, &segment_id, 1);
     ++entry_count_;
     if (producers_[producer_id].record_count >= options_.batch_size) {
         return flushProducer(producer_id);

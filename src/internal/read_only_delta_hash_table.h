@@ -2,7 +2,6 @@
 #define KVLITE_INTERNAL_READ_ONLY_DELTA_HASH_TABLE_H
 
 #include <cstdint>
-#include <string_view>
 
 #include "internal/delta_hash_table.h"
 
@@ -30,11 +29,10 @@ public:
 
     // --- Building phase (single-threaded, before seal) ---
 
-    void addEntry(std::string_view key, uint64_t packed_version, uint32_t id);
-    void addEntryByHash(uint64_t hash, uint64_t packed_version, uint32_t id);
+    void addEntry(uint64_t hash, uint64_t packed_version, uint32_t id);
 
     // Like addEntry, but returns true if the key's fingerprint group is new.
-    bool addEntryIsNew(std::string_view key, uint64_t packed_version, uint32_t id);
+    bool addEntryIsNew(uint64_t hash, uint64_t packed_version, uint32_t id);
 
     // Transition to read-only state. After this, writes are forbidden.
     void seal();

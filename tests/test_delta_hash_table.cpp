@@ -16,6 +16,26 @@
 
 using namespace kvlite::internal;
 
+static uint64_t H(const std::string& s) {
+    return dhtHashBytes(s.data(), s.size());
+}
+
+// Extract extension bits from a hash, matching DeltaHashTable internals.
+// For config with bucket_bits=b, lslot_bits=l: fingerprint_bits = (64-b-l)/2
+// Extension bits = (hash >> fingerprint_bits) & ((1 << extension_bits) - 1)
+static uint64_t extractExtBits(uint64_t hash, uint8_t bucket_bits, uint8_t lslot_bits) {
+    uint8_t available = 64 - bucket_bits - lslot_bits;
+    uint8_t fp_bits = available / 2;
+    uint8_t ext_bits = available - fp_bits;
+    return (hash >> fp_bits) & ((1ULL << ext_bits) - 1);
+}
+
+// For default GlobalIndex config (bucket_bits=20, lslot_bits=5).
+static uint64_t defaultExtBits(const std::string& s) {
+    uint64_t h = H(s);
+    return extractExtBits(h, 20, 5);
+}
+
 // --- Elias Gamma Round-Trip Tests ---
 
 TEST(EliasGamma, RoundTrip) {
@@ -103,20 +123,20 @@ protected:
 
 TEST_F(GlobalIndexDHT, PutAndGetLatest) {
 
-    // version=100 in seg 1, version=200 in seg 2, version=300 in seg 3
-    index->put("key1", 100, 1);
-    index->put("key1", 200, 2);
-    index->put("key1", 300, 3);
+    uint64_t hkey1 = H("key1");
+    index->put(hkey1, 100, 1);
+    index->put(hkey1, 200, 2);
+    index->put(hkey1, 300, 3);
 
     uint64_t ver;
     uint32_t seg;
-    EXPECT_TRUE(index->getLatest("key1", ver, seg).ok());
+    EXPECT_TRUE(index->getLatest(hkey1, ver, seg).ok());
     EXPECT_EQ(ver, 300u);
     EXPECT_EQ(seg, 3u);
 
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> vers;
-    ASSERT_TRUE(index->get("key1", seg_ids, vers));
+    ASSERT_TRUE(index->get(hkey1, seg_ids, vers));
     ASSERT_EQ(seg_ids.size(), 3u);
     EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
     EXPECT_EQ(vers[1], 200u);  EXPECT_EQ(seg_ids[1], 2u);
@@ -124,71 +144,73 @@ TEST_F(GlobalIndexDHT, PutAndGetLatest) {
 }
 
 TEST_F(GlobalIndexDHT, PutMultipleVersions) {
-    index->put("key1", 100, 1);
-    index->put("key1", 200, 2);
-    index->put("key1", 300, 3);
+    uint64_t hkey1 = H("key1");
+    index->put(hkey1, 100, 1);
+    index->put(hkey1, 200, 2);
+    index->put(hkey1, 300, 3);
 
     EXPECT_EQ(index->entryCount(), 3u);
     EXPECT_EQ(index->keyCount(), 1u);
 }
 
 TEST_F(GlobalIndexDHT, GetLatest) {
-    index->put("key1", 100, 1);
-    index->put("key1", 200, 2);
+    uint64_t hkey1 = H("key1");
+    index->put(hkey1, 100, 1);
+    index->put(hkey1, 200, 2);
 
     uint64_t ver;
     uint32_t seg;
-    EXPECT_TRUE(index->getLatest("key1", ver, seg).ok());
+    EXPECT_TRUE(index->getLatest(hkey1, ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 2u);
 
-    EXPECT_TRUE(index->getLatest("missing", ver, seg).isNotFound());
+    EXPECT_TRUE(index->getLatest(H("missing"), ver, seg).isNotFound());
 }
 
 TEST_F(GlobalIndexDHT, GetWithUpperBound) {
-    index->put("key1", 100, 1);
-    index->put("key1", 200, 2);
-    index->put("key1", 300, 3);
+    uint64_t hkey1 = H("key1");
+    index->put(hkey1, 100, 1);
+    index->put(hkey1, 200, 2);
+    index->put(hkey1, 300, 3);
 
     uint64_t ver;
     uint32_t seg;
-    // Upper bound 250 → should get version 200
-    EXPECT_TRUE(index->get("key1", 250, ver, seg));
+    EXPECT_TRUE(index->get(hkey1, 250, ver, seg));
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 2u);
 
-    // Upper bound 300 → should get version 300
-    EXPECT_TRUE(index->get("key1", 300, ver, seg));
+    EXPECT_TRUE(index->get(hkey1, 300, ver, seg));
     EXPECT_EQ(ver, 300u);
     EXPECT_EQ(seg, 3u);
 
-    // Upper bound 50 → nothing
-    EXPECT_FALSE(index->get("key1", 50, ver, seg));
+    EXPECT_FALSE(index->get(hkey1, 50, ver, seg));
 }
 
 TEST_F(GlobalIndexDHT, Contains) {
-    EXPECT_FALSE(index->contains("key1"));
-    index->put("key1", 100, 1);
-    EXPECT_TRUE(index->contains("key1"));
+    uint64_t hkey1 = H("key1");
+    EXPECT_FALSE(index->contains(hkey1));
+    index->put(hkey1, 100, 1);
+    EXPECT_TRUE(index->contains(hkey1));
 }
 
 TEST_F(GlobalIndexDHT, GetNonExistent) {
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> vers;
-    EXPECT_FALSE(index->get("missing", seg_ids, vers));
+    EXPECT_FALSE(index->get(H("missing"), seg_ids, vers));
 }
 
 TEST_F(GlobalIndexDHT, Snapshot) {
     std::string path = db_dir_ + "/test_snapshot.dat";
 
-    index->put("key1", 100, 1);
-    index->put("key1", 200, 2);
-    index->put("key2", 300, 3);
+    uint64_t hkey1 = H("key1");
+    uint64_t hkey2 = H("key2");
+    index->put(hkey1, 100, 1);
+    index->put(hkey1, 200, 2);
+    index->put(hkey2, 300, 3);
 
     Status s = index->saveSnapshot(path);
     ASSERT_TRUE(s.ok()) << s.toString();
 
-    // Load into a fresh index (no open needed for loadSnapshot — it only reads the DHT).
     GlobalIndex index2(manifest_);
     s = index2.loadSnapshot(path);
     ASSERT_TRUE(s.ok()) << s.toString();
@@ -198,11 +220,11 @@ TEST_F(GlobalIndexDHT, Snapshot) {
 
     uint64_t ver;
     uint32_t seg;
-    EXPECT_TRUE(index2.getLatest("key1", ver, seg).ok());
+    EXPECT_TRUE(index2.getLatest(hkey1, ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 2u);
 
-    EXPECT_TRUE(index2.getLatest("key2", ver, seg).ok());
+    EXPECT_TRUE(index2.getLatest(hkey2, ver, seg).ok());
     EXPECT_EQ(ver, 300u);
     EXPECT_EQ(seg, 3u);
 }
@@ -210,10 +232,12 @@ TEST_F(GlobalIndexDHT, Snapshot) {
 TEST_F(GlobalIndexDHT, SnapshotWithManyEntries) {
     std::string path = db_dir_ + "/test_snapshot_many.dat";
 
-    index->put("key1", 100, 1);
-    index->put("key1", 200, 2);
-    index->put("key1", 300, 3);
-    index->put("key2", 400, 4);
+    uint64_t hkey1 = H("key1");
+    uint64_t hkey2 = H("key2");
+    index->put(hkey1, 100, 1);
+    index->put(hkey1, 200, 2);
+    index->put(hkey1, 300, 3);
+    index->put(hkey2, 400, 4);
 
     Status s = index->saveSnapshot(path);
     ASSERT_TRUE(s.ok()) << s.toString();
@@ -227,7 +251,7 @@ TEST_F(GlobalIndexDHT, SnapshotWithManyEntries) {
 
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> vers;
-    ASSERT_TRUE(index2.get("key1", seg_ids, vers));
+    ASSERT_TRUE(index2.get(hkey1, seg_ids, vers));
     ASSERT_EQ(seg_ids.size(), 3u);
     EXPECT_EQ(vers[0], 300u);  EXPECT_EQ(seg_ids[0], 3u);
     EXPECT_EQ(vers[1], 200u);  EXPECT_EQ(seg_ids[1], 2u);
@@ -235,14 +259,15 @@ TEST_F(GlobalIndexDHT, SnapshotWithManyEntries) {
 
     uint64_t ver;
     uint32_t seg;
-    EXPECT_TRUE(index2.getLatest("key2", ver, seg).ok());
+    EXPECT_TRUE(index2.getLatest(hkey2, ver, seg).ok());
     EXPECT_EQ(ver, 400u);
     EXPECT_EQ(seg, 4u);
 }
 
 TEST_F(GlobalIndexDHT, Clear) {
     for (int i = 0; i < 50; ++i) {
-        index->put("key" + std::to_string(i), static_cast<uint64_t>(i * 10),
+        std::string key = "key" + std::to_string(i);
+        index->put(H(key), static_cast<uint64_t>(i * 10),
                   static_cast<uint32_t>(i));
     }
     EXPECT_EQ(index->keyCount(), 50u);
@@ -457,9 +482,10 @@ static ReadOnlyDeltaHashTable::Config smallBucketConfig() {
 // Write path: many entries for one key in small buckets forces overflow.
 TEST(ReadOnlyDHTOverflow, WritePathManyEntries) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     const int N = 200;
     for (int i = 1; i <= N; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), /*id=*/1);
+        dht.addEntry(hkey, static_cast<uint64_t>(i), /*id=*/1);
     }
     EXPECT_EQ(dht.size(), static_cast<size_t>(N));
 }
@@ -467,18 +493,18 @@ TEST(ReadOnlyDHTOverflow, WritePathManyEntries) {
 // Read-back after overflow: verify all entries survive the chain.
 TEST(ReadOnlyDHTOverflow, ReadBackAfterOverflow) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     const int N = 100;
     for (int i = 1; i <= N; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     std::vector<uint64_t> packed_versions;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key", packed_versions, ids));
+    ASSERT_TRUE(dht.findAll(hkey, packed_versions, ids));
     EXPECT_EQ(packed_versions.size(), static_cast<size_t>(N));
     EXPECT_EQ(ids.size(), static_cast<size_t>(N));
 
-    // Every id 1..N should appear
     std::set<uint32_t> id_set(ids.begin(), ids.end());
     for (int i = 1; i <= N; ++i) {
         EXPECT_EQ(id_set.count(static_cast<uint32_t>(i)), 1u)
@@ -489,17 +515,17 @@ TEST(ReadOnlyDHTOverflow, ReadBackAfterOverflow) {
 // Read-back with identical ids — zero deltas in id field.
 TEST(ReadOnlyDHTOverflow, ReadBackSameIdOverflow) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     const int N = 100;
     for (int i = 1; i <= N; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), /*id=*/42);
+        dht.addEntry(hkey, static_cast<uint64_t>(i), /*id=*/42);
     }
 
     std::vector<uint64_t> packed_versions;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key", packed_versions, ids));
+    ASSERT_TRUE(dht.findAll(hkey, packed_versions, ids));
     EXPECT_EQ(packed_versions.size(), static_cast<size_t>(N));
 
-    // All ids should be 42
     for (size_t i = 0; i < ids.size(); ++i) {
         EXPECT_EQ(ids[i], 42u);
     }
@@ -508,13 +534,14 @@ TEST(ReadOnlyDHTOverflow, ReadBackSameIdOverflow) {
 // findFirst after overflow should return the highest packed_version.
 TEST(ReadOnlyDHTOverflow, FindFirstAfterOverflow) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     for (int i = 1; i <= 100; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     uint64_t packed_version;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key", packed_version, id));
+    ASSERT_TRUE(dht.findFirst(hkey, packed_version, id));
     EXPECT_GT(packed_version, 0u);
 }
 
@@ -528,8 +555,9 @@ TEST(ReadOnlyDHTOverflow, MultipleKeysOverflowSameBucket) {
 
     for (int k = 0; k < 10; ++k) {
         std::string key = "k" + std::to_string(k);
+        uint64_t hkey = H(key);
         for (int i = 1; i <= 10; ++i) {
-            dht.addEntry(key, static_cast<uint64_t>(i),
+            dht.addEntry(hkey, static_cast<uint64_t>(i),
                          static_cast<uint32_t>(k));
         }
     }
@@ -540,7 +568,7 @@ TEST(ReadOnlyDHTOverflow, MultipleKeysOverflowSameBucket) {
         std::string key = "k" + std::to_string(k);
         std::vector<uint64_t> packed_versions;
         std::vector<uint32_t> ids;
-        ASSERT_TRUE(dht.findAll(key, packed_versions, ids))
+        ASSERT_TRUE(dht.findAll(H(key), packed_versions, ids))
             << "key not found: " << key;
         EXPECT_EQ(packed_versions.size(), 10u);
     }
@@ -549,9 +577,10 @@ TEST(ReadOnlyDHTOverflow, MultipleKeysOverflowSameBucket) {
 // forEach traverses all entries across overflow chains.
 TEST(ReadOnlyDHTOverflow, ForEachAcrossChain) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     const int N = 100;
     for (int i = 1; i <= N; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     std::set<uint32_t> seen_ids;
@@ -564,9 +593,10 @@ TEST(ReadOnlyDHTOverflow, ForEachAcrossChain) {
 // forEachGroup merges entries from overflow chains.
 TEST(ReadOnlyDHTOverflow, ForEachGroupMergesChain) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     const int N = 100;
     for (int i = 1; i <= N; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     size_t total_entries = 0;
@@ -583,8 +613,9 @@ TEST(ReadOnlyDHTOverflow, ForEachGroupMergesChain) {
 
 // Many versions of the same key, all in the same segment.
 TEST_F(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
+    uint64_t hkey = H("key");
     for (int i = 1; i <= 200; ++i) {
-        index->put("key", static_cast<uint64_t>(i), /*segment_id=*/1);
+        index->put(hkey, static_cast<uint64_t>(i), /*segment_id=*/1);
     }
 
     EXPECT_EQ(index->entryCount(), 200u);
@@ -592,33 +623,32 @@ TEST_F(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
 
     uint64_t ver;
     uint32_t seg;
-    ASSERT_TRUE(index->getLatest("key", ver, seg).ok());
+    ASSERT_TRUE(index->getLatest(hkey, ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 1u);
 
-    // Verify all versions are retrievable.
     std::vector<uint32_t> seg_ids;
     std::vector<uint64_t> vers;
-    ASSERT_TRUE(index->get("key", seg_ids, vers));
+    ASSERT_TRUE(index->get(hkey, seg_ids, vers));
     EXPECT_EQ(vers.size(), 200u);
-    EXPECT_EQ(vers[0], 200u);   // latest first
-    EXPECT_EQ(vers[199], 1u);   // earliest last
+    EXPECT_EQ(vers[0], 200u);
+    EXPECT_EQ(vers[199], 1u);
 }
 
 // Same key, different segments (unique segment_ids).
 TEST_F(GlobalIndexDHT, ManyVersionsDifferentSegments) {
+    uint64_t hkey = H("key");
     for (int i = 1; i <= 200; ++i) {
-        index->put("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        index->put(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     uint64_t ver;
     uint32_t seg;
-    ASSERT_TRUE(index->getLatest("key", ver, seg).ok());
+    ASSERT_TRUE(index->getLatest(hkey, ver, seg).ok());
     EXPECT_EQ(ver, 200u);
     EXPECT_EQ(seg, 200u);
 
-    // Verify upper-bound query works across the full range.
-    ASSERT_TRUE(index->get("key", 150, ver, seg));
+    ASSERT_TRUE(index->get(hkey, 150, ver, seg));
     EXPECT_EQ(ver, 150u);
     EXPECT_EQ(seg, 150u);
 }
@@ -628,7 +658,7 @@ TEST_F(GlobalIndexDHT, LargeScale) {
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        index->put(key, static_cast<uint64_t>(i * 10), static_cast<uint32_t>(i));
+        index->put(H(key), static_cast<uint64_t>(i * 10), static_cast<uint32_t>(i));
     }
 
     EXPECT_EQ(index->keyCount(), static_cast<size_t>(N));
@@ -637,7 +667,7 @@ TEST_F(GlobalIndexDHT, LargeScale) {
         std::string key = "key_" + std::to_string(i);
         uint64_t ver;
         uint32_t seg;
-        ASSERT_TRUE(index->getLatest(key, ver, seg).ok());
+        ASSERT_TRUE(index->getLatest(H(key), ver, seg).ok());
         EXPECT_EQ(ver, static_cast<uint64_t>(i * 10));
         EXPECT_EQ(seg, static_cast<uint32_t>(i));
     }
@@ -747,19 +777,20 @@ TEST(LSlotCodecTest, SkipLSlotLargePayload) {
 
 TEST(ReadOnlyDHT, AddEntryIsNewFirstAdd) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
-    EXPECT_TRUE(dht.addEntryIsNew("key1", 100, 1));
+    EXPECT_TRUE(dht.addEntryIsNew(H("key1"), 100, 1));
 }
 
 TEST(ReadOnlyDHT, AddEntryIsNewDuplicateKey) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
-    EXPECT_TRUE(dht.addEntryIsNew("key1", 100, 1));
-    EXPECT_FALSE(dht.addEntryIsNew("key1", 200, 2));
+    uint64_t hkey1 = H("key1");
+    EXPECT_TRUE(dht.addEntryIsNew(hkey1, 100, 1));
+    EXPECT_FALSE(dht.addEntryIsNew(hkey1, 200, 2));
 }
 
 TEST(ReadOnlyDHT, AddEntryIsNewDifferentKeys) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
-    EXPECT_TRUE(dht.addEntryIsNew("key1", 100, 1));
-    EXPECT_TRUE(dht.addEntryIsNew("key2", 200, 2));
+    EXPECT_TRUE(dht.addEntryIsNew(H("key1"), 100, 1));
+    EXPECT_TRUE(dht.addEntryIsNew(H("key2"), 200, 2));
 }
 
 TEST(ReadOnlyDHT, AddEntryIsNewAfterOverflow) {
@@ -769,11 +800,10 @@ TEST(ReadOnlyDHT, AddEntryIsNewAfterOverflow) {
     cfg.bucket_bytes = 64;
     ReadOnlyDeltaHashTable dht(cfg);
 
-    // First add is new
-    EXPECT_TRUE(dht.addEntryIsNew("key1", 1, 1));
-    // Add many entries to force overflow
+    uint64_t hkey1 = H("key1");
+    EXPECT_TRUE(dht.addEntryIsNew(hkey1, 1, 1));
     for (int i = 2; i <= 50; ++i) {
-        EXPECT_FALSE(dht.addEntryIsNew("key1", static_cast<uint64_t>(i),
+        EXPECT_FALSE(dht.addEntryIsNew(hkey1, static_cast<uint64_t>(i),
                                         static_cast<uint32_t>(i)));
     }
 }
@@ -782,8 +812,10 @@ TEST_F(GlobalIndexDHT, PutKeyCountWithAddEntryIsNew) {
     const int K = 50;
     const int V = 5;
     for (int k = 0; k < K; ++k) {
+        std::string key = "key" + std::to_string(k);
+        uint64_t hkey = H(key);
         for (int v = 0; v < V; ++v) {
-            index->put("key" + std::to_string(k),
+            index->put(hkey,
                       static_cast<uint64_t>(k * V + v),
                       static_cast<uint32_t>(k));
         }
@@ -798,26 +830,28 @@ TEST_F(GlobalIndexDHT, PutKeyCountWithAddEntryIsNew) {
 
 TEST(ReadOnlyDHTOverflow, FindFirstReturnsExactMax) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     for (int i = 1; i <= 100; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     uint64_t packed_version;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key", packed_version, id));
+    ASSERT_TRUE(dht.findFirst(hkey, packed_version, id));
     EXPECT_EQ(packed_version, 100u);
     EXPECT_EQ(id, 100u);
 }
 
 TEST(ReadOnlyDHTOverflow, FindFirstWithDescendingInsertOrder) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     for (int i = 100; i >= 1; --i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     uint64_t packed_version;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key", packed_version, id));
+    ASSERT_TRUE(dht.findFirst(hkey, packed_version, id));
     EXPECT_EQ(packed_version, 100u);
     EXPECT_EQ(id, 100u);
 }
@@ -826,16 +860,17 @@ TEST(ReadOnlyDHTOverflow, FindFirstSingleEntryPerBucket) {
     ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
     cfg.lslot_bits = 2;
-    cfg.bucket_bytes = 32;  // very tiny → forces frequent overflow
+    cfg.bucket_bytes = 32;
     ReadOnlyDeltaHashTable dht(cfg);
 
+    uint64_t hkey = H("key");
     for (int i = 1; i <= 20; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     uint64_t packed_version;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key", packed_version, id));
+    ASSERT_TRUE(dht.findFirst(hkey, packed_version, id));
     EXPECT_EQ(packed_version, 20u);
 }
 
@@ -845,17 +880,16 @@ TEST(ReadOnlyDHTOverflow, FindFirstSingleEntryPerBucket) {
 
 TEST(ReadOnlyDHTOverflow, FindAllDescOrderAcrossChain) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     for (int i = 1; i <= 100; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     std::vector<uint64_t> packed_versions;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key", packed_versions, ids));
+    ASSERT_TRUE(dht.findAll(hkey, packed_versions, ids));
     EXPECT_EQ(packed_versions.size(), 100u);
 
-    // Within each bucket's contribution, entries are sorted desc.
-    // Across buckets they may interleave but all values must be present.
     std::set<uint64_t> pv_set(packed_versions.begin(), packed_versions.end());
     for (int i = 1; i <= 100; ++i) {
         EXPECT_EQ(pv_set.count(static_cast<uint64_t>(i)), 1u)
@@ -865,14 +899,15 @@ TEST(ReadOnlyDHTOverflow, FindAllDescOrderAcrossChain) {
 
 TEST(ReadOnlyDHTOverflow, FindAllCompleteAcrossChain) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
+    uint64_t hkey = H("key");
     for (int i = 1; i <= 100; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i * 10),
+        dht.addEntry(hkey, static_cast<uint64_t>(i * 10),
                      static_cast<uint32_t>(i));
     }
 
     std::vector<uint64_t> packed_versions;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key", packed_versions, ids));
+    ASSERT_TRUE(dht.findAll(hkey, packed_versions, ids));
     ASSERT_EQ(ids.size(), 100u);
 
     std::set<uint32_t> id_set(ids.begin(), ids.end());
@@ -893,11 +928,11 @@ TEST(ReadOnlyDHTOverflow, ForEachGroupMergesCorrectly) {
     cfg.bucket_bytes = 64;
     ReadOnlyDeltaHashTable dht(cfg);
 
-    // 5 distinct keys, each with 20 entries to force overflow
     for (int k = 0; k < 5; ++k) {
         std::string key = "grp" + std::to_string(k);
+        uint64_t hkey = H(key);
         for (int i = 1; i <= 20; ++i) {
-            dht.addEntry(key, static_cast<uint64_t>(k * 100 + i),
+            dht.addEntry(hkey, static_cast<uint64_t>(k * 100 + i),
                          static_cast<uint32_t>(k * 100 + i));
         }
     }
@@ -927,13 +962,14 @@ TEST(ReadWriteDHT, ConcurrentAddAndFindFirst) {
     ReadWriteDeltaHashTable dht;
     const int threads = 4;
     const int per_thread = 1000;
+    uint64_t hkey = H("key");
 
     std::vector<std::thread> workers;
     for (int t = 0; t < threads; ++t) {
-        workers.emplace_back([&dht, t, per_thread]() {
+        workers.emplace_back([&dht, t, per_thread, hkey]() {
             for (int i = 0; i < per_thread; ++i) {
                 uint64_t pv = static_cast<uint64_t>(t * per_thread + i + 1);
-                dht.addEntry("key", pv, static_cast<uint32_t>(pv));
+                dht.addEntry(hkey, pv, static_cast<uint32_t>(pv));
             }
         });
     }
@@ -941,12 +977,12 @@ TEST(ReadWriteDHT, ConcurrentAddAndFindFirst) {
 
     uint64_t packed_version;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key", packed_version, id));
+    ASSERT_TRUE(dht.findFirst(hkey, packed_version, id));
     EXPECT_EQ(packed_version, static_cast<uint64_t>(threads * per_thread));
 
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key", pvs, ids));
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
     EXPECT_EQ(pvs.size(), static_cast<size_t>(threads * per_thread));
 }
 
@@ -959,8 +995,9 @@ TEST(ReadWriteDHT, ConcurrentAddDifferentKeys) {
     for (int t = 0; t < threads; ++t) {
         workers.emplace_back([&dht, t, per_thread]() {
             std::string key = "key" + std::to_string(t);
+            uint64_t hkey = H(key);
             for (int i = 0; i < per_thread; ++i) {
-                dht.addEntry(key, static_cast<uint64_t>(i + 1),
+                dht.addEntry(hkey, static_cast<uint64_t>(i + 1),
                              static_cast<uint32_t>(i + 1));
             }
         });
@@ -973,7 +1010,7 @@ TEST(ReadWriteDHT, ConcurrentAddDifferentKeys) {
         std::string key = "key" + std::to_string(t);
         std::vector<uint64_t> pvs;
         std::vector<uint32_t> ids;
-        ASSERT_TRUE(dht.findAll(key, pvs, ids));
+        ASSERT_TRUE(dht.findAll(H(key), pvs, ids));
         EXPECT_EQ(pvs.size(), static_cast<size_t>(per_thread));
     }
 }
@@ -992,8 +1029,9 @@ TEST(ReadWriteDHT, ConcurrentOverflowSameBucket) {
     for (int t = 0; t < threads; ++t) {
         workers.emplace_back([&dht, t, per_thread]() {
             std::string key = "overflow_key" + std::to_string(t);
+            uint64_t hkey = H(key);
             for (int i = 0; i < per_thread; ++i) {
-                dht.addEntry(key, static_cast<uint64_t>(t * per_thread + i + 1),
+                dht.addEntry(hkey, static_cast<uint64_t>(t * per_thread + i + 1),
                              static_cast<uint32_t>(t * per_thread + i + 1));
             }
         });
@@ -1004,7 +1042,7 @@ TEST(ReadWriteDHT, ConcurrentOverflowSameBucket) {
         std::string key = "overflow_key" + std::to_string(t);
         std::vector<uint64_t> pvs;
         std::vector<uint32_t> ids;
-        ASSERT_TRUE(dht.findAll(key, pvs, ids))
+        ASSERT_TRUE(dht.findAll(H(key), pvs, ids))
             << "key not found: " << key;
         EXPECT_EQ(pvs.size(), static_cast<size_t>(per_thread));
     }
@@ -1014,26 +1052,27 @@ TEST(ReadWriteDHT, ConcurrentAddAndContains) {
     ReadWriteDeltaHashTable dht;
     std::atomic<bool> done{false};
 
-    // Writer thread
     std::thread writer([&dht, &done]() {
         for (int i = 0; i < 5000; ++i) {
-            dht.addEntry("key" + std::to_string(i % 100),
+            std::string key = "key" + std::to_string(i % 100);
+            dht.addEntry(H(key),
                          static_cast<uint64_t>(i + 1),
                          static_cast<uint32_t>(i + 1));
         }
         done.store(true, std::memory_order_release);
     });
 
-    // Reader threads
     std::vector<std::thread> readers;
     for (int t = 0; t < 3; ++t) {
         readers.emplace_back([&dht, &done]() {
             while (!done.load(std::memory_order_acquire)) {
                 for (int k = 0; k < 100; ++k) {
-                    dht.contains("key" + std::to_string(k));
+                    std::string key = "key" + std::to_string(k);
+                    uint64_t hkey = H(key);
+                    dht.contains(hkey);
                     uint64_t pv;
                     uint32_t id;
-                    dht.findFirst("key" + std::to_string(k), pv, id);
+                    dht.findFirst(hkey, pv, id);
                 }
             }
         });
@@ -1041,31 +1080,30 @@ TEST(ReadWriteDHT, ConcurrentAddAndContains) {
 
     writer.join();
     for (auto& r : readers) r.join();
-    // If we get here without crash/ASAN error, the test passes.
 }
 
 TEST(ReadWriteDHT, FindFirstDuringConcurrentAdd) {
     ReadWriteDeltaHashTable dht;
     const int N = 10000;
     std::atomic<bool> done{false};
+    uint64_t hkey = H("key");
 
-    std::thread writer([&dht, &done, N]() {
+    std::thread writer([&dht, &done, N, hkey]() {
         for (int i = 1; i <= N; ++i) {
-            dht.addEntry("key", static_cast<uint64_t>(i),
+            dht.addEntry(hkey, static_cast<uint64_t>(i),
                          static_cast<uint32_t>(i));
         }
         done.store(true, std::memory_order_release);
     });
 
-    // Readers verify every returned packed_version is valid (1..N)
     std::atomic<bool> reader_ok{true};
     std::vector<std::thread> readers;
     for (int t = 0; t < 3; ++t) {
-        readers.emplace_back([&dht, &done, &reader_ok, N]() {
+        readers.emplace_back([&dht, &done, &reader_ok, N, hkey]() {
             while (!done.load(std::memory_order_acquire)) {
                 uint64_t pv;
                 uint32_t id;
-                if (dht.findFirst("key", pv, id)) {
+                if (dht.findFirst(hkey, pv, id)) {
                     if (pv < 1 || pv > static_cast<uint64_t>(N)) {
                         reader_ok.store(false, std::memory_order_relaxed);
                     }
@@ -1087,49 +1125,48 @@ TEST(ReadOnlyDHT, EmptyTableFindFirst) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
     uint64_t pv;
     uint32_t id;
-    EXPECT_FALSE(dht.findFirst("key", pv, id));
+    EXPECT_FALSE(dht.findFirst(H("key"), pv, id));
 }
 
 TEST(ReadOnlyDHT, EmptyTableFindAll) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    EXPECT_FALSE(dht.findAll("key", pvs, ids));
+    EXPECT_FALSE(dht.findAll(H("key"), pvs, ids));
     EXPECT_TRUE(pvs.empty());
     EXPECT_TRUE(ids.empty());
 }
 
 TEST(ReadOnlyDHT, SingleEntryFindFirst) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
-    dht.addEntry("key", 42, 7);
+    uint64_t hkey = H("key");
+    dht.addEntry(hkey, 42, 7);
     uint64_t pv;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key", pv, id));
+    ASSERT_TRUE(dht.findFirst(hkey, pv, id));
     EXPECT_EQ(pv, 42u);
     EXPECT_EQ(id, 7u);
 }
 
 TEST(ReadOnlyDHT, TwoEntriesSameFingerprint) {
-    // Use a config with very few buckets/lslots to maximize collision chance
     ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 1;
     cfg.lslot_bits = 1;
     cfg.bucket_bytes = 256;
     ReadOnlyDeltaHashTable dht(cfg);
 
-    // Find two keys that hash to the same bucket+lslot+fingerprint
-    // We add entries and verify they coexist via findAll
-    dht.addEntry("key_a", 100, 1);
-    dht.addEntry("key_a", 200, 2);
+    uint64_t hkey_a = H("key_a");
+    dht.addEntry(hkey_a, 100, 1);
+    dht.addEntry(hkey_a, 200, 2);
 
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key_a", pvs, ids));
+    ASSERT_TRUE(dht.findAll(hkey_a, pvs, ids));
     EXPECT_EQ(pvs.size(), 2u);
 
     uint64_t pv;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key_a", pv, id));
+    ASSERT_TRUE(dht.findFirst(hkey_a, pv, id));
     EXPECT_EQ(pv, 200u);
     EXPECT_EQ(id, 2u);
 }
@@ -1140,18 +1177,19 @@ TEST(ReadOnlyDHT, TwoEntriesSameFingerprint) {
 
 TEST(ReadWriteDHT, RemoveEntryBasic) {
     ReadWriteDeltaHashTable dht;
-    dht.addEntry("key", 100, 1);
-    dht.addEntry("key", 200, 2);
-    dht.addEntry("key", 300, 3);
+    uint64_t hkey = H("key");
+    dht.addEntry(hkey, 100, 1);
+    dht.addEntry(hkey, 200, 2);
+    dht.addEntry(hkey, 300, 3);
     EXPECT_EQ(dht.size(), 3u);
 
-    bool group_empty = dht.removeEntry("key", 200, 2);
+    bool group_empty = dht.removeEntry(hkey, 200, 2);
     EXPECT_FALSE(group_empty);
     EXPECT_EQ(dht.size(), 2u);
 
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key", pvs, ids));
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
     EXPECT_EQ(pvs.size(), 2u);
     std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
     EXPECT_EQ(pv_set.count(100u), 1u);
@@ -1161,16 +1199,17 @@ TEST(ReadWriteDHT, RemoveEntryBasic) {
 
 TEST(ReadWriteDHT, RemoveEntryLastInGroup) {
     ReadWriteDeltaHashTable dht;
-    dht.addEntry("key", 100, 1);
+    uint64_t hkey = H("key");
+    dht.addEntry(hkey, 100, 1);
     EXPECT_EQ(dht.size(), 1u);
 
-    bool group_empty = dht.removeEntry("key", 100, 1);
+    bool group_empty = dht.removeEntry(hkey, 100, 1);
     EXPECT_TRUE(group_empty);
     EXPECT_EQ(dht.size(), 0u);
 
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    EXPECT_FALSE(dht.findAll("key", pvs, ids));
+    EXPECT_FALSE(dht.findAll(hkey, pvs, ids));
 }
 
 TEST(ReadWriteDHT, RemoveEntryFromOverflowChain) {
@@ -1180,22 +1219,20 @@ TEST(ReadWriteDHT, RemoveEntryFromOverflowChain) {
     cfg.bucket_bytes = 128;
     ReadWriteDeltaHashTable dht(cfg);
 
-    // Add enough entries to force overflow.
+    uint64_t hkey = H("key");
     const int N = 100;
     for (int i = 1; i <= N; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
     EXPECT_EQ(dht.size(), static_cast<size_t>(N));
 
-    // Remove one entry.
-    bool group_empty = dht.removeEntry("key", 50, 50);
+    bool group_empty = dht.removeEntry(hkey, 50, 50);
     EXPECT_FALSE(group_empty);
     EXPECT_EQ(dht.size(), static_cast<size_t>(N - 1));
 
-    // Verify remaining entries.
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key", pvs, ids));
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
     EXPECT_EQ(pvs.size(), static_cast<size_t>(N - 1));
     std::set<uint32_t> id_set(ids.begin(), ids.end());
     EXPECT_EQ(id_set.count(50u), 0u);
@@ -1207,16 +1244,17 @@ TEST(ReadWriteDHT, RemoveEntryFromOverflowChain) {
 
 TEST(ReadWriteDHT, UpdateEntryIdBasic) {
     ReadWriteDeltaHashTable dht;
-    dht.addEntry("key", 100, 100);
+    uint64_t hkey = H("key");
+    dht.addEntry(hkey, 100, 100);
     EXPECT_EQ(dht.size(), 1u);
 
-    bool found = dht.updateEntryId("key", 100, 100, 200);
+    bool found = dht.updateEntryId(hkey, 100, 100, 200);
     EXPECT_TRUE(found);
     EXPECT_EQ(dht.size(), 1u);
 
     uint64_t pv;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key", pv, id));
+    ASSERT_TRUE(dht.findFirst(hkey, pv, id));
     EXPECT_EQ(pv, 100u);
     EXPECT_EQ(id, 200u);
 }
@@ -1228,20 +1266,19 @@ TEST(ReadWriteDHT, UpdateEntryIdOverflow) {
     cfg.bucket_bytes = 128;
     ReadWriteDeltaHashTable dht(cfg);
 
+    uint64_t hkey = H("key");
     const int N = 100;
     for (int i = 1; i <= N; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
-    // Update id=50 to a large value (may cause different delta encoding).
-    bool found = dht.updateEntryId("key", 50, 50, 999999);
+    bool found = dht.updateEntryId(hkey, 50, 50, 999999);
     EXPECT_TRUE(found);
     EXPECT_EQ(dht.size(), static_cast<size_t>(N));
 
-    // Verify the updated entry.
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll("key", pvs, ids));
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
     EXPECT_EQ(pvs.size(), static_cast<size_t>(N));
     bool found_updated = false;
     for (size_t i = 0; i < pvs.size(); ++i) {
@@ -1256,51 +1293,49 @@ TEST(ReadWriteDHT, UpdateEntryIdOverflow) {
 TEST(ReadWriteDHT, ConcurrentRemoveAndFind) {
     ReadWriteDeltaHashTable dht;
     const int N = 2000;
+    uint64_t hkey = H("key");
 
-    // Pre-populate.
     for (int i = 1; i <= N; ++i) {
-        dht.addEntry("key", static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
     std::atomic<bool> done{false};
 
-    // 2 writer threads removing entries.
     std::vector<std::thread> writers;
     for (int t = 0; t < 2; ++t) {
-        writers.emplace_back([&dht, &done, t, N]() {
+        writers.emplace_back([&dht, &done, t, N, hkey]() {
             for (int i = t + 1; i <= N; i += 2) {
-                dht.removeEntry("key", static_cast<uint64_t>(i),
+                dht.removeEntry(hkey, static_cast<uint64_t>(i),
                                 static_cast<uint32_t>(i));
             }
         });
     }
 
-    // 2 reader threads.
     std::vector<std::thread> readers;
     for (int t = 0; t < 2; ++t) {
-        readers.emplace_back([&dht, &done]() {
+        readers.emplace_back([&dht, &done, hkey]() {
             for (int i = 0; i < 1000; ++i) {
                 uint64_t pv;
                 uint32_t id;
-                dht.findFirst("key", pv, id);
+                dht.findFirst(hkey, pv, id);
             }
         });
     }
 
     for (auto& w : writers) w.join();
     for (auto& r : readers) r.join();
-    // If we get here without crash/ASAN error, the test passes.
     EXPECT_EQ(dht.size(), 0u);
 }
 
 TEST(ReadOnlyDHT, MaxPackedVersion) {
     ReadOnlyDeltaHashTable dht(smallBucketConfig());
-    uint64_t max_pv = UINT64_MAX - 1;  // near max (UINT64_MAX itself may cause issues with delta encoding)
-    dht.addEntry("key", max_pv, 42);
+    uint64_t hkey = H("key");
+    uint64_t max_pv = UINT64_MAX - 1;
+    dht.addEntry(hkey, max_pv, 42);
 
     uint64_t pv;
     uint32_t id;
-    ASSERT_TRUE(dht.findFirst("key", pv, id));
+    ASSERT_TRUE(dht.findFirst(hkey, pv, id));
     EXPECT_EQ(pv, max_pv);
     EXPECT_EQ(id, 42u);
 }
@@ -1379,22 +1414,20 @@ TEST(ReadWriteDHT, AddEntryCheckedSameKey) {
     ReadWriteDeltaHashTable dht;
 
     std::string key = "test_key";
-    auto resolver = [&](uint32_t /*seg_id*/, uint64_t /*pv*/) -> std::string {
-        return key;
+    uint64_t hkey = H(key);
+    auto resolver = [&](uint32_t /*seg_id*/, uint64_t /*pv*/) -> uint64_t {
+        return hkey;
     };
 
-    // First insert — should be new.
-    bool is_new = dht.addEntryChecked(key, 100, 1, resolver);
+    bool is_new = dht.addEntryChecked(hkey, 100, 1, resolver);
     EXPECT_TRUE(is_new);
 
-    // Second insert with same key — should NOT be new.
-    is_new = dht.addEntryChecked(key, 200, 2, resolver);
+    is_new = dht.addEntryChecked(hkey, 200, 2, resolver);
     EXPECT_FALSE(is_new);
 
-    // Both entries should be findable.
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll(key, pvs, ids));
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
     EXPECT_EQ(pvs.size(), 2u);
     EXPECT_EQ(ids.size(), 2u);
 }
@@ -1407,12 +1440,12 @@ public:
     bool testAddToChainChecked(uint32_t bi, uint32_t li, uint64_t fp,
                                uint64_t packed_version, uint32_t id,
                                const KeyResolver& resolver,
-                               uint64_t new_key_secondary_hash) {
+                               uint64_t new_key_ext_bits) {
         return addToChainChecked(bi, li, fp, packed_version, id,
             [this](Bucket& bucket) -> Bucket* {
                 return createExtension(bucket);
             },
-            resolver, new_key_secondary_hash);
+            resolver, new_key_ext_bits);
     }
 
     bool testFindAllByHash(uint32_t bi, uint32_t li, uint64_t fp,
@@ -1448,33 +1481,30 @@ TEST(ReadWriteDHT, AddEntryCheckedCollision) {
     TestableRWDHT dht(config);
 
     uint32_t bi = 0, li = 0;
-    uint64_t fp = 0x123;  // same base fingerprint for both "keys"
+    uint64_t fp = 0x123;
 
-    // Secondary hashes for the two different "keys" — must differ.
-    uint64_t sec1 = 0xAAAAAAAAAAAAAAAAULL;
-    uint64_t sec2 = 0x5555555555555555ULL;
+    // Use primary hashes for extension bits.
+    uint64_t hash1 = H("key_1");
+    uint64_t hash2 = H("key_2");
+    uint64_t ext1 = extractExtBits(hash1, config.bucket_bits, config.lslot_bits);
+    uint64_t ext2 = extractExtBits(hash2, config.bucket_bits, config.lslot_bits);
 
-    auto resolver = [](uint32_t seg_id, uint64_t /*pv*/) -> std::string {
-        // Return different "keys" based on segment_id.
-        if (seg_id == 1) return "key_alpha";
-        if (seg_id == 2) return "key_beta";
-        return "";
+    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> uint64_t {
+        if (seg_id == 1) return hash1;
+        if (seg_id == 2) return hash2;
+        return 0;
     };
 
-    // Insert first key.
-    bool is_new = dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec1);
+    bool is_new = dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext1);
     EXPECT_TRUE(is_new);
 
-    // Insert second key with same base fp — collision detected.
-    is_new = dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec2);
-    EXPECT_TRUE(is_new);  // new key!
+    is_new = dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext2);
+    EXPECT_TRUE(is_new);
 
-    // Both should be findable via base fingerprint.
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
     ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
     EXPECT_EQ(pvs.size(), 2u);
-    // Check we got both entries.
     std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
     EXPECT_TRUE(pv_set.count(100));
     EXPECT_TRUE(pv_set.count(200));
@@ -1490,19 +1520,25 @@ TEST(ReadWriteDHT, AddEntryCheckedTripleCollision) {
     uint32_t bi = 0, li = 0;
     uint64_t fp = 0x456;
 
-    // Three different secondary hashes.
-    uint64_t sec1 = 0x1111111111111111ULL;
-    uint64_t sec2 = 0x2222222222222222ULL;
-    uint64_t sec3 = 0x3333333333333333ULL;
+    uint64_t hash1 = H("key_1"), hash2 = H("key_2"), hash3 = H("key_3");
+    uint64_t ext1 = extractExtBits(hash1, config.bucket_bits, config.lslot_bits);
+    uint64_t ext2 = extractExtBits(hash2, config.bucket_bits, config.lslot_bits);
+    uint64_t ext3 = extractExtBits(hash3, config.bucket_bits, config.lslot_bits);
 
-    auto resolver = [](uint32_t seg_id, uint64_t /*pv*/) -> std::string {
-        return "key_" + std::to_string(seg_id);
+    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> uint64_t {
+        if (seg_id == 1) return hash1;
+        if (seg_id == 2) return hash2;
+        if (seg_id == 3) return hash3;
+        return 0;
     };
 
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec1));
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec2));
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, sec3));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext1));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext2));
+    // Third key may or may not be detected as new depending on whether its
+    // extension bits collide with an existing entry at the current extension width.
+    dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, ext3);
 
+    // All 3 entries must be findable regardless.
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
     ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
@@ -1515,8 +1551,6 @@ TEST(ReadWriteDHT, AddEntryCheckedTripleCollision) {
 }
 
 TEST(ReadWriteDHT, AddEntryCheckedSameKeyAfterCollision) {
-    // After a collision extends fingerprints, inserting the same key again
-    // should append to the existing extended entry rather than creating a new one.
     DeltaHashTable::Config config;
     config.bucket_bits = 4;
     config.lslot_bits = 2;
@@ -1526,39 +1560,33 @@ TEST(ReadWriteDHT, AddEntryCheckedSameKeyAfterCollision) {
     uint32_t bi = 0, li = 0;
     uint64_t fp = 0x789;
 
-    // Use actual secondary hashes computed from key strings, so the
-    // resolver and the caller agree on what the secondary hash should be.
     std::string key_x = "key_x";
     std::string key_y = "key_y";
-    uint64_t sec_x = dhtSecondaryHash(key_x.data(), key_x.size());
-    uint64_t sec_y = dhtSecondaryHash(key_y.data(), key_y.size());
-    ASSERT_NE(sec_x, sec_y) << "test requires different secondary hashes";
+    uint64_t hash_x = H(key_x);
+    uint64_t hash_y = H(key_y);
+    uint64_t ext_x = extractExtBits(hash_x, config.bucket_bits, config.lslot_bits);
+    uint64_t ext_y = extractExtBits(hash_y, config.bucket_bits, config.lslot_bits);
+    ASSERT_NE(ext_x, ext_y) << "test requires different extension bits";
 
-    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> std::string {
-        if (seg_id == 1 || seg_id == 3) return key_x;
-        if (seg_id == 2) return key_y;
-        return "";
+    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> uint64_t {
+        if (seg_id == 1 || seg_id == 3) return hash_x;
+        if (seg_id == 2) return hash_y;
+        return 0;
     };
 
-    // Insert key_x.
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_x));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_x));
 
-    // Insert key_y (collision).
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec_y));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext_y));
 
-    // Verify both are findable.
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
     ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
     EXPECT_EQ(pvs.size(), 2u);
 
-    // Insert key_x again (same secondary hash).
-    // The extended entry for key_x should match and this should NOT be new.
-    bool is_new = dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, sec_x);
+    bool is_new = dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, ext_x);
     EXPECT_FALSE(is_new) << "third insert of same key should not be new";
 
     ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    // Should have 3 entries total: 2 for key_x, 1 for key_y.
     EXPECT_EQ(pvs.size(), 3u);
 }
 
@@ -1576,32 +1604,29 @@ TEST(ReadWriteDHT, AppendOverflow) {
 
     std::string key_a = "key_alpha";
     std::string key_b = "key_beta";
-    uint64_t sec_a = dhtSecondaryHash(key_a.data(), key_a.size());
-    uint64_t sec_b = dhtSecondaryHash(key_b.data(), key_b.size());
-    ASSERT_NE(sec_a, sec_b);
+    uint64_t hash_a = H(key_a);
+    uint64_t hash_b = H(key_b);
+    uint64_t ext_a = extractExtBits(hash_a, config.bucket_bits, config.lslot_bits);
+    uint64_t ext_b = extractExtBits(hash_b, config.bucket_bits, config.lslot_bits);
+    ASSERT_NE(ext_a, ext_b);
 
-    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> std::string {
-        if (seg_id <= 50) return key_a;
-        return key_b;
+    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> uint64_t {
+        if (seg_id <= 50) return hash_a;
+        return hash_b;
     };
 
-    // Insert key_a.
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_a));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_a));
 
-    // Insert key_b (collision → extends fingerprints).
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 51, resolver, sec_b));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 51, resolver, ext_b));
 
-    // Append many versions to key_a to force bucket overflow.
     for (uint32_t i = 2; i <= 20; ++i) {
-        bool is_new = dht.testAddToChainChecked(bi, li, fp, 100 + i, i, resolver, sec_a);
+        bool is_new = dht.testAddToChainChecked(bi, li, fp, 100 + i, i, resolver, ext_a);
         EXPECT_FALSE(is_new) << "append #" << i << " should not be new";
     }
 
-    // All entries must be findable.
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
     ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    // 20 for key_a + 1 for key_b = 21
     EXPECT_EQ(pvs.size(), 21u);
 }
 
@@ -1616,8 +1641,7 @@ TEST(ReadWriteDHT, CollisionWithOverflow) {
     uint32_t bi = 0, li = 0;
     uint64_t fp = 0xA;
 
-    // Pre-fill the bucket with some non-colliding entries to make it tight.
-    auto no_resolver = [](uint32_t, uint64_t) -> std::string { return ""; };
+    auto no_resolver = [](uint32_t, uint64_t) -> uint64_t { return 0; };
     for (uint32_t i = 0; i < 3; ++i) {
         uint64_t other_fp = 0x1 + i;
         dht.testAddToChainChecked(bi, li, other_fp, 1000 + i, 100 + i,
@@ -1626,18 +1650,20 @@ TEST(ReadWriteDHT, CollisionWithOverflow) {
 
     std::string key_x = "collision_x";
     std::string key_y = "collision_y";
-    uint64_t sec_x = dhtSecondaryHash(key_x.data(), key_x.size());
-    uint64_t sec_y = dhtSecondaryHash(key_y.data(), key_y.size());
-    ASSERT_NE(sec_x, sec_y);
+    uint64_t hash_x = H(key_x);
+    uint64_t hash_y = H(key_y);
+    uint64_t ext_x = extractExtBits(hash_x, config.bucket_bits, config.lslot_bits);
+    uint64_t ext_y = extractExtBits(hash_y, config.bucket_bits, config.lslot_bits);
+    ASSERT_NE(ext_x, ext_y);
 
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
-        if (seg_id == 1) return key_x;
-        if (seg_id == 2) return key_y;
-        return "";
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
+        if (seg_id == 1) return hash_x;
+        if (seg_id == 2) return hash_y;
+        return 0;
     };
 
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 500, 1, resolver, sec_x));
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 600, 2, resolver, sec_y));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 500, 1, resolver, ext_x));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 600, 2, resolver, ext_y));
 
     // Both entries must survive in the extension chain.
     std::vector<uint64_t> pvs;
@@ -1664,23 +1690,24 @@ TEST(ReadWriteDHT, ManyCollisions) {
     uint64_t fp = 0x42;
     constexpr int N = 10;
 
-    std::vector<std::string> keys;
-    std::vector<uint64_t> sec_hashes;
+    std::vector<uint64_t> key_hashes;
+    std::vector<uint64_t> key_ext_bits;
     for (int i = 0; i < N; ++i) {
-        keys.push_back("mcoll_" + std::to_string(i));
-        sec_hashes.push_back(dhtSecondaryHash(keys.back().data(),
-                                               keys.back().size()));
+        std::string key = "mcoll_" + std::to_string(i);
+        uint64_t h = H(key);
+        key_hashes.push_back(h);
+        key_ext_bits.push_back(extractExtBits(h, config.bucket_bits, config.lslot_bits));
     }
 
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
-        return keys[seg_id];
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
+        return key_hashes[seg_id];
     };
 
     int new_count = 0;
     for (int i = 0; i < N; ++i) {
         bool is_new = dht.testAddToChainChecked(
             bi, li, fp, (i + 1) * 100, static_cast<uint32_t>(i),
-            resolver, sec_hashes[i]);
+            resolver, key_ext_bits[i]);
         if (is_new) new_count++;
     }
 
@@ -1715,32 +1742,31 @@ TEST(ReadWriteDHT, ExtraBitsGrowsMultipleTimes) {
     uint32_t bi = 0, li = 0;
     uint64_t fp = 0xDD;
 
-    // Find 3 keys where low 1 bit of secondary hash matches for at least 2,
-    // forcing extra_bits to grow to at least 2.
     std::string key_a = "extra_a";
     std::string key_b = "extra_b";
     std::string key_c = "extra_c";
-    uint64_t sec_a = dhtSecondaryHash(key_a.data(), key_a.size());
-    uint64_t sec_b = dhtSecondaryHash(key_b.data(), key_b.size());
-    uint64_t sec_c = dhtSecondaryHash(key_c.data(), key_c.size());
+    uint64_t hash_a = H(key_a);
+    uint64_t hash_b = H(key_b);
+    uint64_t hash_c = H(key_c);
+    uint64_t ext_a = extractExtBits(hash_a, config.bucket_bits, config.lslot_bits);
+    uint64_t ext_b = extractExtBits(hash_b, config.bucket_bits, config.lslot_bits);
+    uint64_t ext_c = extractExtBits(hash_c, config.bucket_bits, config.lslot_bits);
 
-    // Verify at least 2 share the same low bit (test precondition).
-    int matching_low = ((sec_a & 1) == (sec_b & 1)) +
-                       ((sec_a & 1) == (sec_c & 1)) +
-                       ((sec_b & 1) == (sec_c & 1));
-    // At least one pair must share low bit by pigeonhole.
+    int matching_low = ((ext_a & 1) == (ext_b & 1)) +
+                       ((ext_a & 1) == (ext_c & 1)) +
+                       ((ext_b & 1) == (ext_c & 1));
     ASSERT_GE(matching_low, 1);
 
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
-        if (seg_id == 1) return key_a;
-        if (seg_id == 2) return key_b;
-        if (seg_id == 3) return key_c;
-        return "";
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
+        if (seg_id == 1) return hash_a;
+        if (seg_id == 2) return hash_b;
+        if (seg_id == 3) return hash_c;
+        return 0;
     };
 
-    dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_a);
-    dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec_b);
-    dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, sec_c);
+    dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_a);
+    dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext_b);
+    dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, ext_c);
 
     // All 3 entries must be findable.
     std::vector<uint64_t> pvs;
@@ -1762,17 +1788,17 @@ TEST(ReadWriteDHT, AppendCreatesNewEntryInExtension) {
     uint64_t fp = 0xEE;
 
     std::string key = "overflow_key";
-    uint64_t sec = dhtSecondaryHash(key.data(), key.size());
+    uint64_t hash_key = H(key);
+    uint64_t ext = extractExtBits(hash_key, config.bucket_bits, config.lslot_bits);
 
-    auto resolver = [&](uint32_t, uint64_t) -> std::string { return key; };
+    auto resolver = [&](uint32_t, uint64_t) -> uint64_t { return hash_key; };
 
-    // First insert.
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext));
 
     // Append many versions to force multiple overflows to extension chain.
     for (uint32_t i = 2; i <= 15; ++i) {
         bool is_new = dht.testAddToChainChecked(bi, li, fp, 100 + i, i,
-                                                resolver, sec);
+                                                resolver, ext);
         EXPECT_FALSE(is_new) << "append #" << i;
     }
 
@@ -1797,18 +1823,20 @@ TEST(ReadWriteDHT, CollisionThenRemove) {
 
     std::string key_p = "key_persist";
     std::string key_r = "key_remove";
-    uint64_t sec_p = dhtSecondaryHash(key_p.data(), key_p.size());
-    uint64_t sec_r = dhtSecondaryHash(key_r.data(), key_r.size());
-    ASSERT_NE(sec_p, sec_r);
+    uint64_t hash_p = H(key_p);
+    uint64_t hash_r = H(key_r);
+    uint64_t ext_p = extractExtBits(hash_p, config.bucket_bits, config.lslot_bits);
+    uint64_t ext_r = extractExtBits(hash_r, config.bucket_bits, config.lslot_bits);
+    ASSERT_NE(ext_p, ext_r);
 
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
-        if (seg_id == 1) return key_p;
-        if (seg_id == 2) return key_r;
-        return "";
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
+        if (seg_id == 1) return hash_p;
+        if (seg_id == 2) return hash_r;
+        return 0;
     };
 
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_p));
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec_r));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_p));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext_r));
 
     // Remove key_r's entry.
     dht.removeEntry(fp, 200, 2, bi, li);
@@ -1836,18 +1864,20 @@ TEST(ReadWriteDHT, CollisionThenUpdate) {
 
     std::string key_u = "key_update";
     std::string key_o = "key_other";
-    uint64_t sec_u = dhtSecondaryHash(key_u.data(), key_u.size());
-    uint64_t sec_o = dhtSecondaryHash(key_o.data(), key_o.size());
-    ASSERT_NE(sec_u, sec_o);
+    uint64_t hash_u = H(key_u);
+    uint64_t hash_o = H(key_o);
+    uint64_t ext_u = extractExtBits(hash_u, config.bucket_bits, config.lslot_bits);
+    uint64_t ext_o = extractExtBits(hash_o, config.bucket_bits, config.lslot_bits);
+    ASSERT_NE(ext_u, ext_o);
 
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> std::string {
-        if (seg_id == 1 || seg_id == 99) return key_u;
-        if (seg_id == 2) return key_o;
-        return "";
+    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
+        if (seg_id == 1 || seg_id == 99) return hash_u;
+        if (seg_id == 2) return hash_o;
+        return 0;
     };
 
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, sec_u));
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, sec_o));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_u));
+    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext_o));
 
     // Update key_u's id from 1 to 99.
     bool updated = dht.updateEntry(fp, 100, 1, 99, bi, li);
@@ -1889,9 +1919,9 @@ TEST(MemoryLeak, ReadOnlyClearReleasesExtensions) {
     auto cfg = smallBucketConfig();
     TestableRODHT dht(cfg);
 
-    // Fill until extensions are created.
     for (int i = 1; i <= 500; ++i) {
-        dht.addEntry("key" + std::to_string(i % 5),
+        std::string key = "key" + std::to_string(i % 5);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
     ASSERT_GT(dht.extensionCount(), 0u);
@@ -1908,22 +1938,21 @@ TEST(MemoryLeak, ReadOnlyMoveTransfersOwnership) {
     auto cfg = smallBucketConfig();
     TestableRODHT src(cfg);
     for (int i = 1; i <= 300; ++i) {
-        src.addEntry("k" + std::to_string(i % 3),
+        std::string key = "k" + std::to_string(i % 3);
+        src.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
     size_t ext_before = src.extensionCount();
     size_t mem_before = src.memoryUsage();
     ASSERT_GT(ext_before, 0u);
 
-    // Move-construct destination.
     TestableRODHT dst(std::move(src));
     EXPECT_EQ(dst.extensionCount(), ext_before);
     EXPECT_EQ(dst.memoryUsage(), mem_before);
 
-    // Verify data survived the move.
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    EXPECT_TRUE(dst.findAll("k0", pvs, ids));
+    EXPECT_TRUE(dst.findAll(H("k0"), pvs, ids));
     EXPECT_FALSE(pvs.empty());
 }
 
@@ -1942,7 +1971,8 @@ TEST(MemoryLeak, ReadWriteClearReleasesExtensions) {
     TestableRWDHT dht(dcfg);
 
     for (int i = 1; i <= 500; ++i) {
-        dht.addEntry("key" + std::to_string(i % 5),
+        std::string key = "key" + std::to_string(i % 5);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
     ASSERT_GT(dht.extensionCount(), 0u);
@@ -1960,26 +1990,25 @@ TEST(MemoryLeak, RepeatedAddRemoveCyclesStableMemory) {
     cfg.bucket_bytes = 64;
     TestableRWDHT dht(cfg);
 
-    // Run multiple cycles of fill + drain.
     for (int cycle = 0; cycle < 5; ++cycle) {
-        // Fill: add entries that cause extensions.
         const int N = 200;
         for (int i = 1; i <= N; ++i) {
-            dht.addEntry("key" + std::to_string(i),
+            std::string key = "key" + std::to_string(i);
+            dht.addEntry(H(key),
                          static_cast<uint64_t>(i), static_cast<uint32_t>(i));
         }
         ASSERT_GT(dht.extensionCount(), 0u);
 
-        // Drain: remove all entries.
         for (int i = 1; i <= N; ++i) {
-            dht.removeEntry("key" + std::to_string(i),
+            std::string key = "key" + std::to_string(i);
+            dht.removeEntry(H(key),
                             static_cast<uint64_t>(i), static_cast<uint32_t>(i));
         }
     }
 
-    // After all cycles, verify no data remains and no entries are findable.
     for (int i = 1; i <= 200; ++i) {
-        EXPECT_FALSE(dht.contains("key" + std::to_string(i)));
+        std::string key = "key" + std::to_string(i);
+        EXPECT_FALSE(dht.contains(H(key)));
     }
     EXPECT_EQ(dht.size(), 0u);
 }
@@ -1997,21 +2026,22 @@ TEST(MemoryLeak, PruneEmptyExtensionOnRemove) {
     // meaning some extension buckets become entirely empty sooner.
     const int N = 100;
     for (int i = 1; i <= N; ++i) {
-        dht.addEntry("key" + std::to_string(i % 10),
+        std::string key = "key" + std::to_string(i % 10);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
     size_t ext_after_add = dht.extensionCount();
     ASSERT_GT(ext_after_add, 0u);
 
-    // Remove all entries.
     for (int i = 1; i <= N; ++i) {
-        dht.removeEntry("key" + std::to_string(i % 10),
+        std::string key = "key" + std::to_string(i % 10);
+        dht.removeEntry(H(key),
                         static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
-    // All data must be gone.
     for (int i = 0; i < 10; ++i) {
-        EXPECT_FALSE(dht.contains("key" + std::to_string(i)));
+        std::string key = "key" + std::to_string(i);
+        EXPECT_FALSE(dht.contains(H(key)));
     }
     EXPECT_EQ(dht.size(), 0u);
 }
@@ -2020,27 +2050,25 @@ TEST(MemoryLeak, ClearAfterOverflowThenReuseWorks) {
     auto cfg = smallBucketConfig();
     TestableRODHT dht(cfg);
 
-    // First round: fill with extensions.
     for (int i = 1; i <= 300; ++i) {
-        dht.addEntry("k" + std::to_string(i), static_cast<uint64_t>(i),
+        std::string key = "k" + std::to_string(i);
+        dht.addEntry(H(key), static_cast<uint64_t>(i),
                      static_cast<uint32_t>(i));
     }
     ASSERT_GT(dht.extensionCount(), 0u);
 
-    // Clear and reuse.
     dht.clear();
     ASSERT_EQ(dht.extensionCount(), 0u);
 
-    // Second round: same operations should work correctly.
     for (int i = 1; i <= 300; ++i) {
-        dht.addEntry("k" + std::to_string(i), static_cast<uint64_t>(i + 1000),
+        std::string key = "k" + std::to_string(i);
+        dht.addEntry(H(key), static_cast<uint64_t>(i + 1000),
                      static_cast<uint32_t>(i));
     }
 
-    // Verify all entries from second round are present.
     for (int i = 1; i <= 300; ++i) {
         std::string key = "k" + std::to_string(i);
-        ASSERT_TRUE(dht.contains(key)) << "missing after reuse: " << key;
+        ASSERT_TRUE(dht.contains(H(key))) << "missing after reuse: " << key;
     }
 }
 
@@ -2056,9 +2084,9 @@ TEST(BucketArena, SizeAndDataBytesTrackAllocations) {
     EXPECT_EQ(dht.arena().size(), 0u);
     EXPECT_EQ(dht.arena().dataBytes(), 0u);
 
-    // Force extensions by filling small buckets.
     for (int i = 1; i <= 300; ++i) {
-        dht.addEntry("k" + std::to_string(i),
+        std::string key = "k" + std::to_string(i);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
     uint32_t ext_count = dht.arena().size();
@@ -2074,10 +2102,9 @@ TEST(BucketArena, PointerStabilityAcrossChunks) {
     auto cfg = smallBucketConfig();
     TestableRODHT dht(cfg);
 
-    // Insert enough entries to create >64 extensions (multiple chunks).
-    // With 16 buckets and 128-byte buckets, many keys will force chains.
     for (int i = 1; i <= 2000; ++i) {
-        dht.addEntry("k" + std::to_string(i),
+        std::string key = "k" + std::to_string(i);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
     uint32_t ext_count = dht.arena().size();
@@ -2096,9 +2123,9 @@ TEST(BucketArena, PointerStabilityAcrossChunks) {
     std::set<const void*> unique_ptrs(ptrs.begin(), ptrs.end());
     EXPECT_EQ(unique_ptrs.size(), ptrs.size()) << "duplicate Bucket* pointers";
 
-    // All data must still be readable (pointers are stable).
     for (int i = 1; i <= 2000; ++i) {
-        ASSERT_TRUE(dht.contains("k" + std::to_string(i)))
+        std::string key = "k" + std::to_string(i);
+        ASSERT_TRUE(dht.contains(H(key)))
             << "missing key after multi-chunk allocation: k" << i;
     }
 }
@@ -2109,7 +2136,8 @@ TEST(BucketArena, ClearResetsAndReallocWorks) {
     TestableRODHT dht(cfg);
 
     for (int i = 1; i <= 500; ++i) {
-        dht.addEntry("k" + std::to_string(i),
+        std::string key = "k" + std::to_string(i);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
     uint32_t ext_before = dht.arena().size();
@@ -2119,15 +2147,16 @@ TEST(BucketArena, ClearResetsAndReallocWorks) {
     EXPECT_EQ(dht.arena().size(), 0u);
     EXPECT_EQ(dht.arena().dataBytes(), 0u);
 
-    // Reallocate — should work identically.
     for (int i = 1; i <= 500; ++i) {
-        dht.addEntry("k" + std::to_string(i),
+        std::string key = "k" + std::to_string(i);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i + 1000), static_cast<uint32_t>(i));
     }
     EXPECT_GT(dht.arena().size(), 0u);
 
     for (int i = 1; i <= 500; ++i) {
-        ASSERT_TRUE(dht.contains("k" + std::to_string(i)));
+        std::string key = "k" + std::to_string(i);
+        ASSERT_TRUE(dht.contains(H(key)));
     }
 }
 
@@ -2138,18 +2167,19 @@ TEST(BucketArena, RepeatedClearFillCycles) {
 
     for (int cycle = 0; cycle < 10; ++cycle) {
         for (int i = 1; i <= 200; ++i) {
-            dht.addEntry("k" + std::to_string(i),
+            std::string key = "k" + std::to_string(i);
+            dht.addEntry(H(key),
                          static_cast<uint64_t>(cycle * 1000 + i),
                          static_cast<uint32_t>(i));
         }
         ASSERT_GT(dht.arena().size(), 0u)
             << "no extensions on cycle " << cycle;
 
-        // Verify all data from this cycle.
         for (int i = 1; i <= 200; ++i) {
+            std::string key = "k" + std::to_string(i);
             uint64_t pv;
             uint32_t id;
-            ASSERT_TRUE(dht.findFirst("k" + std::to_string(i), pv, id))
+            ASSERT_TRUE(dht.findFirst(H(key), pv, id))
                 << "missing on cycle " << cycle << " key k" << i;
         }
 
@@ -2167,7 +2197,8 @@ TEST(BucketArena, MemoryUsageConsistency) {
     EXPECT_EQ(dht.memoryUsage(), base);
 
     for (int i = 1; i <= 500; ++i) {
-        dht.addEntry("k" + std::to_string(i),
+        std::string key = "k" + std::to_string(i);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
@@ -2187,25 +2218,24 @@ TEST(BucketArena, ReadWriteArenaTracking) {
 
     EXPECT_EQ(dht.arena().size(), 0u);
 
-    // Fill until extensions are created.
     for (int i = 1; i <= 500; ++i) {
-        dht.addEntry("key" + std::to_string(i % 5),
+        std::string key = "key" + std::to_string(i % 5);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
     uint32_t ext_after_fill = dht.arena().size();
     ASSERT_GT(ext_after_fill, 0u);
 
-    // Remove all entries.
     for (int i = 1; i <= 500; ++i) {
-        dht.removeEntry("key" + std::to_string(i % 5),
+        std::string key = "key" + std::to_string(i % 5);
+        dht.removeEntry(H(key),
                         static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
 
-    // Arena size doesn't shrink on individual removes (bump allocator),
-    // but data should be gone.
     EXPECT_EQ(dht.size(), 0u);
     for (int i = 0; i < 5; ++i) {
-        EXPECT_FALSE(dht.contains("key" + std::to_string(i)));
+        std::string key = "key" + std::to_string(i);
+        EXPECT_FALSE(dht.contains(H(key)));
     }
 
     // clear() resets the arena.
@@ -2223,19 +2253,19 @@ TEST(BucketArena, ChunkBoundaryTransition) {
     cfg.bucket_bytes = 32; // tiny
     TestableRODHT dht(cfg);
 
-    // Keep inserting until we cross the 64-extension chunk boundary.
     int i = 1;
     while (dht.arena().size() <= 64) {
-        dht.addEntry("k" + std::to_string(i),
+        std::string key = "k" + std::to_string(i);
+        dht.addEntry(H(key),
                      static_cast<uint64_t>(i), static_cast<uint32_t>(i));
         ++i;
     }
     ASSERT_GT(dht.arena().size(), 64u)
         << "need >64 extensions to test chunk boundary";
 
-    // All inserted data must still be readable.
     for (int j = 1; j < i; ++j) {
-        ASSERT_TRUE(dht.contains("k" + std::to_string(j)))
+        std::string key = "k" + std::to_string(j);
+        ASSERT_TRUE(dht.contains(H(key)))
             << "missing key k" << j << " after crossing chunk boundary";
     }
 }
@@ -2314,24 +2344,20 @@ protected:
 };
 
 TEST_F(BinarySnapshotTest, RoundTripBasic) {
-    // Populate with some entries.
     const int N = 1000;
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(key, i * 10 + 1, i + 1).ok());
+        ASSERT_TRUE(index_->put(H(key), i * 10 + 1, i + 1).ok());
     }
 
     ASSERT_EQ(index_->entryCount(), static_cast<size_t>(N));
     ASSERT_EQ(index_->keyCount(), static_cast<size_t>(N));
 
-    // Take binary snapshot.
     ASSERT_TRUE(index_->storeSnapshot(0).ok());
 
-    // Close the index.
     ASSERT_TRUE(index_->close().ok());
     manifest_.close();
 
-    // Re-open and load snapshot.
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
     GlobalIndex index2(manifest2);
@@ -2339,7 +2365,6 @@ TEST_F(BinarySnapshotTest, RoundTripBasic) {
     ASSERT_TRUE(index2.open(db_dir_, opts).ok());
     ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
 
-    // Verify all entries are present.
     EXPECT_EQ(index2.entryCount(), static_cast<size_t>(N));
     EXPECT_EQ(index2.keyCount(), static_cast<size_t>(N));
 
@@ -2347,7 +2372,7 @@ TEST_F(BinarySnapshotTest, RoundTripBasic) {
         std::string key = "key_" + std::to_string(i);
         uint64_t pv;
         uint32_t seg;
-        ASSERT_TRUE(index2.getLatest(key, pv, seg).ok()) << "missing key: " << key;
+        ASSERT_TRUE(index2.getLatest(H(key), pv, seg).ok()) << "missing key: " << key;
         EXPECT_EQ(pv, static_cast<uint64_t>(i * 10 + 1));
         EXPECT_EQ(seg, static_cast<uint32_t>(i + 1));
     }
@@ -2357,11 +2382,11 @@ TEST_F(BinarySnapshotTest, RoundTripBasic) {
 }
 
 TEST_F(BinarySnapshotTest, RoundTripMultiVersion) {
-    // Multiple versions per key.
     for (int i = 0; i < 100; ++i) {
         std::string key = "key_" + std::to_string(i);
+        uint64_t hkey = H(key);
         for (int v = 0; v < 5; ++v) {
-            ASSERT_TRUE(index_->put(key, v * 100 + i + 1, v * 10 + i).ok());
+            ASSERT_TRUE(index_->put(hkey, v * 100 + i + 1, v * 10 + i).ok());
         }
     }
 
@@ -2382,12 +2407,11 @@ TEST_F(BinarySnapshotTest, RoundTripMultiVersion) {
     EXPECT_EQ(index2.entryCount(), 500u);
     EXPECT_EQ(index2.keyCount(), 100u);
 
-    // Verify latest version for each key.
     for (int i = 0; i < 100; ++i) {
         std::string key = "key_" + std::to_string(i);
         uint64_t pv;
         uint32_t seg;
-        ASSERT_TRUE(index2.getLatest(key, pv, seg).ok());
+        ASSERT_TRUE(index2.getLatest(H(key), pv, seg).ok());
         EXPECT_EQ(pv, static_cast<uint64_t>(4 * 100 + i + 1));
     }
 
@@ -2396,15 +2420,12 @@ TEST_F(BinarySnapshotTest, RoundTripMultiVersion) {
 }
 
 TEST_F(BinarySnapshotTest, SnapshotWithExtensions) {
-    // Use enough entries with colliding hash prefixes to force extension buckets.
-    // With default config (bucket_bits=20, 1M buckets), we need enough entries
-    // to overflow some buckets. We'll add many entries per key to force overflow.
     const int N = 200;
     for (int i = 0; i < N; ++i) {
         std::string key = "extkey_" + std::to_string(i);
-        // Add many versions to increase bucket fill.
+        uint64_t hkey = H(key);
         for (int v = 0; v < 50; ++v) {
-            ASSERT_TRUE(index_->put(key, v * 1000 + i + 1, v).ok());
+            ASSERT_TRUE(index_->put(hkey, v * 1000 + i + 1, v).ok());
         }
     }
 
@@ -2426,12 +2447,11 @@ TEST_F(BinarySnapshotTest, SnapshotWithExtensions) {
     EXPECT_EQ(index2.entryCount(), entry_count);
     EXPECT_EQ(index2.keyCount(), key_count);
 
-    // Verify every entry can be looked up.
     for (int i = 0; i < N; ++i) {
         std::string key = "extkey_" + std::to_string(i);
         uint64_t pv;
         uint32_t seg;
-        ASSERT_TRUE(index2.getLatest(key, pv, seg).ok()) << "missing key: " << key;
+        ASSERT_TRUE(index2.getLatest(H(key), pv, seg).ok()) << "missing key: " << key;
     }
 
     index2.close();
@@ -2439,52 +2459,44 @@ TEST_F(BinarySnapshotTest, SnapshotWithExtensions) {
 }
 
 TEST_F(BinarySnapshotTest, SnapshotBlocksConcurrentPut) {
-    // Populate with some data.
     for (int i = 0; i < 100; ++i) {
-        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+        std::string key = "key_" + std::to_string(i);
+        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
 
-    // Verify that snapshot() blocks concurrent put().
-    // Strategy: start snapshot on main thread, try to put from another thread,
-    // verify the put completes only after snapshot.
     std::atomic<bool> snapshot_started{false};
     std::atomic<bool> snapshot_done{false};
     std::atomic<bool> put_started{false};
     std::atomic<bool> put_done{false};
 
-    // Writer thread: waits for snapshot to start, then tries to put.
+    uint64_t hblocked = H("blocked_key");
     std::thread writer([&]() {
         while (!snapshot_started.load(std::memory_order_acquire)) {
-            // spin-wait
         }
         put_started.store(true, std::memory_order_release);
-        // This put should block until snapshot completes.
-        index_->put("blocked_key", 999, 42);
+        index_->put(hblocked, 999, 42);
         put_done.store(true, std::memory_order_release);
     });
 
-    // Take snapshot (this will hold the exclusive lock).
     snapshot_started.store(true, std::memory_order_release);
     ASSERT_TRUE(index_->storeSnapshot(0).ok());
     snapshot_done.store(true, std::memory_order_release);
 
     writer.join();
 
-    // The put should have completed after snapshot.
     EXPECT_TRUE(put_done.load());
 
-    // Verify the blocked_key was eventually written.
     uint64_t pv;
     uint32_t seg;
-    EXPECT_TRUE(index_->getLatest("blocked_key", pv, seg).ok());
+    EXPECT_TRUE(index_->getLatest(hblocked, pv, seg).ok());
     EXPECT_EQ(pv, 999u);
     EXPECT_EQ(seg, 42u);
 }
 
 TEST_F(BinarySnapshotTest, AtomicSwapLeavesValidDir) {
-    // Verify that after snapshot(), the valid directory exists and tmp/old do not.
     for (int i = 0; i < 10; ++i) {
-        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+        std::string key = "key_" + std::to_string(i);
+        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
 
     ASSERT_TRUE(index_->storeSnapshot(0).ok());
@@ -2498,9 +2510,9 @@ TEST_F(BinarySnapshotTest, AtomicSwapLeavesValidDir) {
     EXPECT_FALSE(std::filesystem::exists(tmp_dir));
     EXPECT_FALSE(std::filesystem::exists(old_dir));
 
-    // Take a second snapshot and verify same invariant.
     for (int i = 10; i < 20; ++i) {
-        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+        std::string key = "key_" + std::to_string(i);
+        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
     ASSERT_TRUE(index_->storeSnapshot(0).ok());
 
@@ -2511,22 +2523,22 @@ TEST_F(BinarySnapshotTest, AtomicSwapLeavesValidDir) {
 
 TEST_F(BinarySnapshotTest, SnapshotResetsWALCounter) {
     for (int i = 0; i < 100; ++i) {
-        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+        std::string key = "key_" + std::to_string(i);
+        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
     EXPECT_EQ(index_->updatesSinceSnapshot(), 100u);
 
     ASSERT_TRUE(index_->storeSnapshot(0).ok());
     EXPECT_EQ(index_->updatesSinceSnapshot(), 0u);
 
-    // New puts after snapshot increment the counter.
-    ASSERT_TRUE(index_->put("new_key", 1, 1).ok());
+    ASSERT_TRUE(index_->put(H("new_key"), 1, 1).ok());
     EXPECT_EQ(index_->updatesSinceSnapshot(), 1u);
 }
 
 TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
-    // storeSnapshot creates v8 dir, loadSnapshot reads it.
     for (int i = 0; i < 50; ++i) {
-        ASSERT_TRUE(index_->put("key_" + std::to_string(i), i + 1, i).ok());
+        std::string key = "key_" + std::to_string(i);
+        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
 
     ASSERT_TRUE(index_->storeSnapshot(0).ok());
@@ -2551,7 +2563,7 @@ TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
         std::string key = "key_" + std::to_string(i);
         uint64_t pv;
         uint32_t seg;
-        ASSERT_TRUE(index2.getLatest(key, pv, seg).ok());
+        ASSERT_TRUE(index2.getLatest(H(key), pv, seg).ok());
     }
 
     index2.close();

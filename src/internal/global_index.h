@@ -69,30 +69,30 @@ public:
 
     using KeyResolver = DeltaHashTable::KeyResolver;
 
-    Status put(const std::string& key, uint64_t packed_version, uint32_t segment_id);
+    Status put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
 
     // Collision-aware put. Uses resolver to detect fingerprint collisions.
-    Status putChecked(const std::string& key, uint64_t packed_version,
+    Status putChecked(uint64_t hkey, uint64_t packed_version,
                       uint32_t segment_id, const KeyResolver& resolver);
 
-    bool get(const std::string& key,
+    bool get(uint64_t hkey,
              std::vector<uint32_t>& segment_ids,
              std::vector<uint64_t>& packed_versions) const;
 
-    bool get(const std::string& key, uint64_t upper_bound,
+    bool get(uint64_t hkey, uint64_t upper_bound,
              uint64_t& packed_version, uint32_t& segment_id) const;
 
-    Status getLatest(const std::string& key,
+    Status getLatest(uint64_t hkey,
                      uint64_t& packed_version, uint32_t& segment_id) const;
 
-    bool contains(const std::string& key) const;
+    bool contains(uint64_t hkey) const;
 
     // Update segment_id for an existing entry.
-    Status relocate(const std::string& key, uint64_t packed_version,
+    Status relocate(uint64_t hkey, uint64_t packed_version,
                     uint32_t old_segment_id, uint32_t new_segment_id);
 
     // Remove an entry. If the key's fingerprint group becomes empty, decrements key_count_.
-    Status eliminate(const std::string& key, uint64_t packed_version,
+    Status eliminate(uint64_t hkey, uint64_t packed_version,
                      uint32_t segment_id);
 
     // --- Iteration ---
@@ -148,10 +148,10 @@ public:
 private:
     // --- Core DHT mutations (no WAL, no snapshot counter) ---
     // Used by both the public API (which also writes to WAL) and WAL replay.
-    void applyPut(std::string_view key, uint64_t packed_version, uint32_t segment_id);
-    void applyRelocate(std::string_view key, uint64_t packed_version,
+    void applyPut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
+    void applyRelocate(uint64_t hkey, uint64_t packed_version,
                        uint32_t old_segment_id, uint32_t new_segment_id);
-    void applyEliminate(std::string_view key, uint64_t packed_version,
+    void applyEliminate(uint64_t hkey, uint64_t packed_version,
                         uint32_t segment_id);
 
     Status maybeSnapshot();

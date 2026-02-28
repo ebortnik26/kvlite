@@ -20,65 +20,53 @@ ReadWriteDeltaHashTable::~ReadWriteDeltaHashTable() = default;
 
 // --- Find (locked) ---
 
-bool ReadWriteDeltaHashTable::findAll(std::string_view key,
+bool ReadWriteDeltaHashTable::findAll(uint64_t hash,
                                        std::vector<uint64_t>& packed_versions,
                                        std::vector<uint32_t>& ids) const {
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
+    uint32_t bi = bucketIndex(hash);
+    uint32_t li = lslotIndex(hash);
+    uint64_t fp = fingerprint(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
     return findAllByHash(bi, li, fp, packed_versions, ids);
 }
 
-bool ReadWriteDeltaHashTable::findFirst(std::string_view key,
+bool ReadWriteDeltaHashTable::findFirst(uint64_t hash,
                                          uint64_t& packed_version,
                                          uint32_t& id) const {
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
+    uint32_t bi = bucketIndex(hash);
+    uint32_t li = lslotIndex(hash);
+    uint64_t fp = fingerprint(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
     return findFirstByHash(bi, li, fp, packed_version, id);
 }
 
-bool ReadWriteDeltaHashTable::contains(std::string_view key) const {
+bool ReadWriteDeltaHashTable::contains(uint64_t hash) const {
     uint64_t pv;
     uint32_t id;
-    return findFirst(key, pv, id);
+    return findFirst(hash, pv, id);
 }
 
 // --- Add ---
 
-void ReadWriteDeltaHashTable::addEntry(std::string_view key,
+void ReadWriteDeltaHashTable::addEntry(uint64_t hash,
                                         uint64_t packed_version, uint32_t id) {
-    uint64_t h = hashKey(key);
-    addImpl(bucketIndex(h), lslotIndex(h), fingerprint(h),
-            packed_version, id);
-}
-
-bool ReadWriteDeltaHashTable::addEntryIsNew(std::string_view key,
-                                              uint64_t packed_version, uint32_t id) {
-    uint64_t h = hashKey(key);
-    return addImpl(bucketIndex(h), lslotIndex(h), fingerprint(h),
-                   packed_version, id);
-}
-
-void ReadWriteDeltaHashTable::addEntryByHash(uint64_t hash,
-                                              uint64_t packed_version,
-                                              uint32_t id) {
     addImpl(bucketIndex(hash), lslotIndex(hash), fingerprint(hash),
             packed_version, id);
 }
 
-bool ReadWriteDeltaHashTable::removeEntry(std::string_view key,
+bool ReadWriteDeltaHashTable::addEntryIsNew(uint64_t hash,
+                                              uint64_t packed_version, uint32_t id) {
+    return addImpl(bucketIndex(hash), lslotIndex(hash), fingerprint(hash),
+                   packed_version, id);
+}
+
+bool ReadWriteDeltaHashTable::removeEntry(uint64_t hash,
                                            uint64_t packed_version, uint32_t id) {
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
+    uint32_t bi = bucketIndex(hash);
+    uint32_t li = lslotIndex(hash);
+    uint64_t fp = fingerprint(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
     bool group_empty = removeFromChain(bi, li, fp, packed_version, id);
@@ -86,13 +74,12 @@ bool ReadWriteDeltaHashTable::removeEntry(std::string_view key,
     return group_empty;
 }
 
-bool ReadWriteDeltaHashTable::updateEntryId(std::string_view key,
+bool ReadWriteDeltaHashTable::updateEntryId(uint64_t hash,
                                               uint64_t packed_version,
                                               uint32_t old_id, uint32_t new_id) {
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
+    uint32_t bi = bucketIndex(hash);
+    uint32_t li = lslotIndex(hash);
+    uint64_t fp = fingerprint(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
     return updateIdInChain(bi, li, fp, packed_version, old_id, new_id,
@@ -102,13 +89,12 @@ bool ReadWriteDeltaHashTable::updateEntryId(std::string_view key,
 }
 
 bool ReadWriteDeltaHashTable::addEntryChecked(
-    std::string_view key, uint64_t packed_version, uint32_t id,
+    uint64_t hash, uint64_t packed_version, uint32_t id,
     const DeltaHashTable::KeyResolver& resolver) {
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
-    uint64_t sec = secondaryHash(key);
+    uint32_t bi = bucketIndex(hash);
+    uint32_t li = lslotIndex(hash);
+    uint64_t fp = fingerprint(hash);
+    uint64_t ext_bits = extensionBits(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
 
@@ -116,7 +102,7 @@ bool ReadWriteDeltaHashTable::addEntryChecked(
         [this](Bucket& bucket) -> Bucket* {
             return createExtension(bucket);
         },
-        resolver, sec);
+        resolver, ext_bits);
     size_.fetch_add(1, std::memory_order_relaxed);
     return is_new;
 }

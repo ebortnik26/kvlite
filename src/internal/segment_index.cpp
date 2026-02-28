@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "internal/crc32.h"
+#include "internal/delta_hash_table.h"
 #include "internal/log_file.h"
 
 namespace kvlite {
@@ -39,7 +40,8 @@ SegmentIndex::SegmentIndex(SegmentIndex&&) noexcept = default;
 SegmentIndex& SegmentIndex::operator=(SegmentIndex&&) noexcept = default;
 
 void SegmentIndex::put(std::string_view key, uint32_t offset, uint64_t packed_version) {
-    if (dht_.addEntryIsNew(key, packed_version, offset)) {
+    uint64_t h = dhtHashBytes(key.data(), key.size());
+    if (dht_.addEntryIsNew(h, packed_version, offset)) {
         ++key_count_;
     }
 }
@@ -50,7 +52,8 @@ bool SegmentIndex::get(const std::string& key,
     // DHT stores (packed_version, id=offset)
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    if (!dht_.findAll(key, pvs, ids)) return false;
+    uint64_t h = dhtHashBytes(key.data(), key.size());
+    if (!dht_.findAll(h, pvs, ids)) return false;
     packed_versions = std::move(pvs);
     offsets = std::move(ids);
     return true;
@@ -78,14 +81,16 @@ bool SegmentIndex::getLatest(const std::string& key,
     // DHT stores (packed_version, id=offset)
     uint64_t pv;
     uint32_t id;
-    if (!dht_.findFirst(key, pv, id)) return false;
+    uint64_t h = dhtHashBytes(key.data(), key.size());
+    if (!dht_.findFirst(h, pv, id)) return false;
     packed_version = pv;
     offset = id;
     return true;
 }
 
 bool SegmentIndex::contains(const std::string& key) const {
-    return dht_.contains(key);
+    uint64_t h = dhtHashBytes(key.data(), key.size());
+    return dht_.contains(h);
 }
 
 Status SegmentIndex::writeTo(LogFile& file) {
@@ -159,7 +164,7 @@ Status SegmentIndex::readFrom(const LogFile& file, uint64_t offset) {
         buf.data() + sizeof(SegmentIndexHeader));
     for (uint32_t i = 0; i < header.entry_count; ++i) {
         // DHT stores (packed_version, id=offset)
-        dht_.addEntryByHash(entries[i].hash, entries[i].packed_version, entries[i].offset);
+        dht_.addEntry(entries[i].hash, entries[i].packed_version, entries[i].offset);
     }
     key_count_ = header.key_count;
 

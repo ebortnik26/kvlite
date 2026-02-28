@@ -150,27 +150,23 @@ size_t WALReplayStream::parseDomainRecord(const uint8_t* payload, size_t len,
     size_t remaining = len - 2;
 
     if (out.op == WalOp::kPut || out.op == WalOp::kEliminate) {
-        if (remaining < 14) return 0;
+        // [packed_version:8][segment_id:4][hkey:8] = 20 bytes
+        if (remaining < 20) return 0;
         std::memcpy(&out.packed_version, p, 8); p += 8;
         std::memcpy(&out.segment_id, p, 4);     p += 4;
-        uint16_t kl;
-        std::memcpy(&kl, p, 2);                 p += 2;
-        if (remaining - 14 < kl) return 0;
+        std::memcpy(&out.hkey, p, 8);
         out.new_segment_id = 0;
-        out.key.assign(reinterpret_cast<const char*>(p), kl);
-        return 2 + 14 + kl;  // op + producer_id + fixed fields + key
+        return 22;  // op(1) + producer_id(1) + 20
     }
 
     if (out.op == WalOp::kRelocate) {
-        if (remaining < 18) return 0;
+        // [packed_version:8][old_seg:4][new_seg:4][hkey:8] = 24 bytes
+        if (remaining < 24) return 0;
         std::memcpy(&out.packed_version, p, 8);   p += 8;
         std::memcpy(&out.segment_id, p, 4);       p += 4;
         std::memcpy(&out.new_segment_id, p, 4);   p += 4;
-        uint16_t kl;
-        std::memcpy(&kl, p, 2);                   p += 2;
-        if (remaining - 18 < kl) return 0;
-        out.key.assign(reinterpret_cast<const char*>(p), kl);
-        return 2 + 18 + kl;  // op + producer_id + fixed fields + key
+        std::memcpy(&out.hkey, p, 8);
+        return 26;  // op(1) + producer_id(1) + 24
     }
 
     return 0;  // unknown op
@@ -219,7 +215,7 @@ void WALReplayStream::updateCurrent() {
     current_.packed_version = r.packed_version;
     current_.segment_id = r.segment_id;
     current_.new_segment_id = r.new_segment_id;
-    current_.key = r.key;
+    current_.hkey = r.hkey;
 }
 
 // ---------------------------------------------------------------------------

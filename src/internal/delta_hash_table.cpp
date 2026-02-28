@@ -13,7 +13,8 @@ namespace internal {
 
 DeltaHashTable::DeltaHashTable(const Config& config)
     : config_(config),
-      fingerprint_bits_(64 - config.bucket_bits - config.lslot_bits),
+      fingerprint_bits_((64 - config.bucket_bits - config.lslot_bits) / 2),
+      extension_bits_(64 - config.bucket_bits - config.lslot_bits - fingerprint_bits_),
       lslot_codec_(fingerprint_bits_),
       ext_arena_(nullptr) {
     uint32_t num_buckets = 1u << config_.bucket_bits;
@@ -37,10 +38,6 @@ DeltaHashTable::DeltaHashTable(DeltaHashTable&&) noexcept = default;
 DeltaHashTable& DeltaHashTable::operator=(DeltaHashTable&&) noexcept = default;
 
 // --- Hash decomposition ---
-
-uint64_t DeltaHashTable::hashKey(std::string_view key) const {
-    return dhtHashBytes(key.data(), key.size());
-}
 
 uint32_t DeltaHashTable::bucketIndex(uint64_t hash) const {
     return static_cast<uint32_t>(hash >> (64 - config_.bucket_bits));
@@ -143,12 +140,6 @@ Bucket* DeltaHashTable::createExtension(Bucket& bucket) {
     return ext_bucket;
 }
 
-// --- Hash helpers ---
-
-uint64_t DeltaHashTable::secondaryHash(std::string_view key) const {
-    return dhtSecondaryHash(key.data(), key.size());
-}
-
 // Forward declaration — defined in the addToChainChecked helpers section below.
 static DeltaHashTable::LSlotContents buildCandidateSlot(
     const DeltaHashTable::LSlotContents& slot,
@@ -192,9 +183,9 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint32_t li, uint64_t fp,
 //
 // Collision resolution uses "variable-length fingerprints": when two keys
 // share the same base fingerprint (hash collision), we extend their
-// fingerprints with bits from a secondary hash to disambiguate them.
-// The extension width (fp_extra_bits) is the minimum number of secondary
-// hash bits needed to make all entries in the group pairwise unique.
+// fingerprints with extension bits from the same hash to disambiguate them.
+// The extension width (fp_extra_bits) is the minimum number of extension
+// bits needed to make all entries in the group pairwise unique.
 //
 // Helper call graph:
 //   addToChainChecked
@@ -249,11 +240,11 @@ static uint64_t extendAndInsert(
     std::vector<DeltaHashTable::LSlotContents>& all_slots, uint32_t li,
     const std::vector<size_t>& match_indices,
     const std::vector<uint64_t>& sec_hashes,
-    uint64_t fp, uint64_t new_key_secondary_hash,
+    uint64_t fp, uint64_t new_key_ext_bits,
     uint64_t packed_version, uint32_t id,
     uint8_t fingerprint_bits, uint8_t start_bits) {
 
-    uint8_t extra_bits = findMinExtraBits(sec_hashes, new_key_secondary_hash,
+    uint8_t extra_bits = findMinExtraBits(sec_hashes, new_key_ext_bits,
                                           start_bits);
     uint64_t ext_mask = (1ULL << extra_bits) - 1;
     auto& entries = all_slots[li].entries;
@@ -267,7 +258,7 @@ static uint64_t extendAndInsert(
 
     // Create and insert new entry.
     DeltaHashTable::TrieEntry new_entry;
-    new_entry.fingerprint = fp | ((new_key_secondary_hash & ext_mask) << fingerprint_bits);
+    new_entry.fingerprint = fp | ((new_key_ext_bits & ext_mask) << fingerprint_bits);
     new_entry.fp_extra_bits = extra_bits;
     new_entry.packed_versions.push_back(packed_version);
     new_entry.ids.push_back(id);
@@ -383,50 +374,55 @@ void DeltaHashTable::appendToEntry(
 
 // For entries with extended fingerprints, compare extension bits directly.
 // For entries with fp_extra_bits==0 (never extended), resolve the actual key
-// via the resolver and compare secondary hashes.
+// via the resolver (which returns the full primary hash) and extract extension
+// bits for comparison.
 // Returns the entry index if found, -1 otherwise.
 int DeltaHashTable::findSameKeyMatch(
     const std::vector<LSlotContents>& all_slots, uint32_t li,
     const std::vector<size_t>& match_indices,
     const KeyResolver& resolver,
-    uint64_t new_key_secondary_hash) const {
+    uint64_t new_key_ext_bits) const {
     auto& entries = all_slots[li].entries;
+    uint64_t full_ext_mask = (1ULL << extension_bits_) - 1;
     for (size_t ei : match_indices) {
         auto& existing = entries[ei];
         if (existing.fp_extra_bits > 0) {
             uint64_t ext_existing = existing.fingerprint >> fingerprint_bits_;
-            uint64_t ext_new = new_key_secondary_hash &
+            uint64_t ext_new = new_key_ext_bits &
                 ((1ULL << existing.fp_extra_bits) - 1);
             if (ext_existing == ext_new) return static_cast<int>(ei);
             continue;
         }
-        std::string key = resolver(existing.ids[0], existing.packed_versions[0]);
-        uint64_t sec = dhtSecondaryHash(key.data(), key.size());
-        if (sec == new_key_secondary_hash) return static_cast<int>(ei);
+        // Never-extended entry: resolve full hash, extract extension bits.
+        uint64_t resolved_hash = resolver(existing.ids[0], existing.packed_versions[0]);
+        uint64_t resolved_ext = (resolved_hash >> fingerprint_bits_) & full_ext_mask;
+        if (resolved_ext == new_key_ext_bits) return static_cast<int>(ei);
     }
     return -1;
 }
 
 // Handle a fingerprint collision: all matched entries belong to different keys.
-// Resolves each key to get its secondary hash, finds the minimum extension width
-// that disambiguates all keys, updates existing entries' fingerprints, creates
-// the new entry, and commits. On overflow, spills the new entry to extension.
+// Resolves each key's full hash, extracts extension bits, finds the minimum
+// extension width that disambiguates all keys, updates existing entries'
+// fingerprints, creates the new entry, and commits. On overflow, spills the
+// new entry to extension.
 void DeltaHashTable::resolveCollision(
     std::vector<LSlotContents>& all_slots,
     Bucket* bucket, uint32_t li, uint64_t fp,
     const std::vector<size_t>& match_indices,
     const KeyResolver& resolver,
-    uint64_t new_key_secondary_hash,
+    uint64_t new_key_ext_bits,
     uint64_t packed_version, uint32_t id,
     const std::function<Bucket*(Bucket&)>& createExtFn) {
 
     auto& entries = all_slots[li].entries;
+    uint64_t full_ext_mask = (1ULL << extension_bits_) - 1;
     std::vector<uint64_t> sec_hashes;
     uint8_t max_extra = 0;
     for (size_t mi : match_indices) {
-        std::string k = resolver(entries[mi].ids[0],
-                                 entries[mi].packed_versions[0]);
-        sec_hashes.push_back(dhtSecondaryHash(k.data(), k.size()));
+        uint64_t resolved_hash = resolver(entries[mi].ids[0],
+                                          entries[mi].packed_versions[0]);
+        sec_hashes.push_back((resolved_hash >> fingerprint_bits_) & full_ext_mask);
         if (entries[mi].fp_extra_bits > max_extra)
             max_extra = entries[mi].fp_extra_bits;
     }
@@ -434,7 +430,7 @@ void DeltaHashTable::resolveCollision(
 
     uint64_t new_fp = extendAndInsert(
         all_slots, li, match_indices, sec_hashes,
-        fp, new_key_secondary_hash, packed_version, id,
+        fp, new_key_ext_bits, packed_version, id,
         fingerprint_bits_, start_bits);
 
     if (totalBitsNeeded(all_slots) <= bucketDataBits()) {
@@ -476,7 +472,7 @@ bool DeltaHashTable::addToChainChecked(
     uint64_t packed_version, uint32_t id,
     const std::function<Bucket*(Bucket&)>& createExtFn,
     const KeyResolver& resolver,
-    uint64_t new_key_secondary_hash) {
+    uint64_t new_key_ext_bits) {
 
     uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
 
@@ -497,7 +493,7 @@ bool DeltaHashTable::addToChainChecked(
         }
 
         int same_key = findSameKeyMatch(all_slots, li, match_indices,
-                                            resolver, new_key_secondary_hash);
+                                            resolver, new_key_ext_bits);
         if (same_key >= 0) {
             appendToEntry(entries[same_key], all_slots, bucket, li,
                           packed_version, id, createExtFn);
@@ -505,7 +501,7 @@ bool DeltaHashTable::addToChainChecked(
         }
 
         resolveCollision(all_slots, bucket, li, fp, match_indices,
-                         resolver, new_key_secondary_hash,
+                         resolver, new_key_ext_bits,
                          packed_version, id, createExtFn);
         return true;
     }
@@ -723,25 +719,23 @@ bool DeltaHashTable::findFirstByHash(uint32_t bi, uint32_t li, uint64_t fp,
     return found;
 }
 
-bool DeltaHashTable::findAll(std::string_view key,
+bool DeltaHashTable::findAll(uint64_t hash,
                               std::vector<uint64_t>& packed_versions,
                               std::vector<uint32_t>& ids) const {
-    uint64_t h = hashKey(key);
-    return findAllByHash(bucketIndex(h), lslotIndex(h), fingerprint(h),
+    return findAllByHash(bucketIndex(hash), lslotIndex(hash), fingerprint(hash),
                          packed_versions, ids);
 }
 
-bool DeltaHashTable::findFirst(std::string_view key,
+bool DeltaHashTable::findFirst(uint64_t hash,
                                 uint64_t& packed_version, uint32_t& id) const {
-    uint64_t h = hashKey(key);
-    return findFirstByHash(bucketIndex(h), lslotIndex(h), fingerprint(h),
+    return findFirstByHash(bucketIndex(hash), lslotIndex(hash), fingerprint(hash),
                            packed_version, id);
 }
 
-bool DeltaHashTable::contains(std::string_view key) const {
+bool DeltaHashTable::contains(uint64_t hash) const {
     uint64_t pv;
     uint32_t id;
-    return findFirst(key, pv, id);
+    return findFirst(hash, pv, id);
 }
 
 void DeltaHashTable::forEach(
@@ -750,6 +744,7 @@ void DeltaHashTable::forEach(
     uint32_t num_buckets = 1u << config_.bucket_bits;
     uint32_t n_lslots = numLSlots();
     uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
+    uint8_t lslot_shift = fingerprint_bits_ + extension_bits_;
 
     for (uint32_t bi = 0; bi < num_buckets; ++bi) {
         const Bucket* b = &buckets_[bi];
@@ -761,7 +756,7 @@ void DeltaHashTable::forEach(
                 for (const auto& entry : contents.entries) {
                     uint64_t hash =
                         (static_cast<uint64_t>(bi) << (64 - config_.bucket_bits)) |
-                        (static_cast<uint64_t>(s) << fingerprint_bits_) |
+                        (static_cast<uint64_t>(s) << lslot_shift) |
                         (entry.fingerprint & base_mask);
                     for (size_t i = 0; i < entry.packed_versions.size(); ++i) {
                         fn(hash, entry.packed_versions[i], entry.ids[i]);
@@ -780,6 +775,7 @@ void DeltaHashTable::forEachGroup(
     uint32_t num_buckets = 1u << config_.bucket_bits;
     uint32_t n_lslots = numLSlots();
     uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
+    uint8_t lslot_shift = fingerprint_bits_ + extension_bits_;
 
     for (uint32_t bi = 0; bi < num_buckets; ++bi) {
         struct Group {
@@ -788,7 +784,7 @@ void DeltaHashTable::forEachGroup(
             std::vector<uint64_t> packed_versions;
             std::vector<uint32_t> ids;
         };
-        // O(1) lookup by (lslot << fp_bits) | base_fingerprint
+        // O(1) lookup by (lslot << lslot_shift) | base_fingerprint
         std::unordered_map<uint64_t, Group> group_map;
 
         const Bucket* b = &buckets_[bi];
@@ -799,7 +795,7 @@ void DeltaHashTable::forEachGroup(
                     lslot_codec_.decode(b->data, offset, &offset);
                 for (const auto& entry : contents.entries) {
                     uint64_t base_fp = entry.fingerprint & base_mask;
-                    uint64_t map_key = (static_cast<uint64_t>(s) << fingerprint_bits_)
+                    uint64_t map_key = (static_cast<uint64_t>(s) << lslot_shift)
                                        | base_fp;
                     auto it = group_map.find(map_key);
                     if (it != group_map.end()) {
@@ -825,7 +821,7 @@ void DeltaHashTable::forEachGroup(
         for (const auto& [map_key, g] : group_map) {
             uint64_t hash =
                 (static_cast<uint64_t>(bi) << (64 - config_.bucket_bits)) |
-                (static_cast<uint64_t>(g.lslot) << fingerprint_bits_) |
+                (static_cast<uint64_t>(g.lslot) << lslot_shift) |
                 g.fp;  // g.fp is already the base fingerprint
             fn(hash, g.packed_versions, g.ids);
         }
@@ -867,6 +863,14 @@ const DeltaHashTable::Config& DeltaHashTable::config() const {
 
 uint8_t DeltaHashTable::fingerprintBits() const {
     return fingerprint_bits_;
+}
+
+uint8_t DeltaHashTable::extensionBitsWidth() const {
+    return extension_bits_;
+}
+
+uint64_t DeltaHashTable::extensionBits(uint64_t hash) const {
+    return (hash >> fingerprint_bits_) & ((1ULL << extension_bits_) - 1);
 }
 
 void DeltaHashTable::loadArenaData(const uint8_t* data, size_t len) {

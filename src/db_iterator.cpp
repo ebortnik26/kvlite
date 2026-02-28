@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "internal/delta_hash_table.h"
 #include "internal/entry_stream.h"
 #include "internal/global_index.h"
 #include "internal/log_entry.h"
@@ -122,7 +123,8 @@ private:
             // GI stores packed versions; compare packed forms.
             uint64_t gi_packed_version;
             uint32_t gi_segment_id;
-            if (!db_->global_index_->get(scan_key_, packed_bound,
+            uint64_t scan_hkey = internal::dhtHashBytes(scan_key_.data(), scan_key_.size());
+            if (!db_->global_index_->get(scan_hkey, packed_bound,
                                          gi_packed_version, gi_segment_id)) {
                 continue;
             }

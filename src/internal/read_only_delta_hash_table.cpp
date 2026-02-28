@@ -37,41 +37,8 @@ ReadOnlyDeltaHashTable& ReadOnlyDeltaHashTable::operator=(ReadOnlyDeltaHashTable
     return *this;
 }
 
-void ReadOnlyDeltaHashTable::addEntry(std::string_view key,
+void ReadOnlyDeltaHashTable::addEntry(uint64_t hash,
                                        uint64_t packed_version, uint32_t id) {
-    assert(!sealed_);
-
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
-
-    addToChain(bi, li, fp, packed_version, id,
-        [this](Bucket& bucket) -> Bucket* {
-            return createExtension(bucket);
-        });
-    ++size_;
-}
-
-bool ReadOnlyDeltaHashTable::addEntryIsNew(std::string_view key,
-                                            uint64_t packed_version, uint32_t id) {
-    assert(!sealed_);
-
-    uint64_t h = hashKey(key);
-    uint32_t bi = bucketIndex(h);
-    uint32_t li = lslotIndex(h);
-    uint64_t fp = fingerprint(h);
-
-    bool is_new = addToChain(bi, li, fp, packed_version, id,
-        [this](Bucket& bucket) -> Bucket* {
-            return createExtension(bucket);
-        });
-    ++size_;
-    return is_new;
-}
-
-void ReadOnlyDeltaHashTable::addEntryByHash(uint64_t hash,
-                                             uint64_t packed_version, uint32_t id) {
     assert(!sealed_);
 
     uint32_t bi = bucketIndex(hash);
@@ -83,6 +50,22 @@ void ReadOnlyDeltaHashTable::addEntryByHash(uint64_t hash,
             return createExtension(bucket);
         });
     ++size_;
+}
+
+bool ReadOnlyDeltaHashTable::addEntryIsNew(uint64_t hash,
+                                            uint64_t packed_version, uint32_t id) {
+    assert(!sealed_);
+
+    uint32_t bi = bucketIndex(hash);
+    uint32_t li = lslotIndex(hash);
+    uint64_t fp = fingerprint(hash);
+
+    bool is_new = addToChain(bi, li, fp, packed_version, id,
+        [this](Bucket& bucket) -> Bucket* {
+            return createExtension(bucket);
+        });
+    ++size_;
+    return is_new;
 }
 
 void ReadOnlyDeltaHashTable::seal() {

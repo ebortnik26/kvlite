@@ -72,7 +72,7 @@ public:
 
     void clear();
 
-    struct FlushedEntry { std::string key; uint64_t packed_ver; };
+    struct FlushedEntry { uint64_t hkey; uint64_t packed_ver; };
 
     struct FlushResult {
         Status status;

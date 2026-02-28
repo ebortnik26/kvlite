@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "internal/global_index_wal.h"
@@ -22,7 +21,7 @@ struct WALRecord {
     uint64_t packed_version;
     uint32_t segment_id;     // for put/eliminate: the segment; for relocate: old_seg
     uint32_t new_segment_id; // for relocate only (0 otherwise)
-    std::string_view key;    // points into owned storage
+    uint64_t hkey;           // primary hash of the key
 };
 
 // Abstract pull-based iterator over WAL replay records.
@@ -71,7 +70,7 @@ private:
         uint64_t packed_version;
         uint32_t segment_id;
         uint32_t new_segment_id;
-        std::string key;
+        uint64_t hkey;
     };
 
     // Read one raw WAL record: body_len + body + CRC check.

@@ -530,7 +530,7 @@ WriteBuffer::FlushResult WriteBuffer::flush(Segment& out) {
         for (const auto& e : bucket_entries) {
             s = out.put(e.key, e.pv.version(), e.value, e.pv.tombstone());
             if (!s.ok()) return {s, {}};
-            flushed.push_back({e.key, e.packed_ver});
+            flushed.push_back({e.hash, e.packed_ver});
         }
     }
 

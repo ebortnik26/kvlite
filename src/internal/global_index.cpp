@@ -103,43 +103,44 @@ bool GlobalIndex::isOpen() const {
 
 // --- Index Operations ---
 
-Status GlobalIndex::put(const std::string& key, uint64_t packed_version, uint32_t segment_id) {
+Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
     std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
-    Status s = wal_->appendPut(key, packed_version, segment_id, WalProducer::kWB);
+    Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
-    applyPut(key, packed_version, segment_id);
+    applyPut(hkey, packed_version, segment_id);
     updates_since_snapshot_++;
     return Status::OK();
 }
 
-Status GlobalIndex::putChecked(const std::string& key, uint64_t packed_version,
-                               uint32_t segment_id, const KeyResolver& resolver) {
+Status GlobalIndex::putChecked(uint64_t hkey, uint64_t packed_version,
+                               uint32_t segment_id,
+                               const KeyResolver& resolver) {
     std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
-    Status s = wal_->appendPut(key, packed_version, segment_id, WalProducer::kWB);
+    Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
-    if (dht_.addEntryChecked(key, packed_version, segment_id, resolver)) {
+    if (dht_.addEntryChecked(hkey, packed_version, segment_id, resolver)) {
         ++key_count_;
     }
     updates_since_snapshot_++;
     return Status::OK();
 }
 
-bool GlobalIndex::get(const std::string& key,
+bool GlobalIndex::get(uint64_t hkey,
                   std::vector<uint32_t>& segment_ids,
                   std::vector<uint64_t>& packed_versions) const {
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    if (!dht_.findAll(key, pvs, ids)) return false;
+    if (!dht_.findAll(hkey, pvs, ids)) return false;
     packed_versions = std::move(pvs);
     segment_ids = std::move(ids);
     return true;
 }
 
-bool GlobalIndex::get(const std::string& key, uint64_t upper_bound,
+bool GlobalIndex::get(uint64_t hkey, uint64_t upper_bound,
                   uint64_t& packed_version, uint32_t& segment_id) const {
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    if (!dht_.findAll(key, pvs, ids)) return false;
+    if (!dht_.findAll(hkey, pvs, ids)) return false;
     // Entries are sorted by packed_version descending; find the first <= upper_bound.
     for (size_t i = 0; i < pvs.size(); ++i) {
         if (pvs[i] <= upper_bound) {
@@ -151,38 +152,38 @@ bool GlobalIndex::get(const std::string& key, uint64_t upper_bound,
     return false;
 }
 
-Status GlobalIndex::getLatest(const std::string& key,
+Status GlobalIndex::getLatest(uint64_t hkey,
                         uint64_t& packed_version, uint32_t& segment_id) const {
     uint64_t pv;
     uint32_t id;
-    if (!dht_.findFirst(key, pv, id)) {
-        return Status::NotFound(key);
+    if (!dht_.findFirst(hkey, pv, id)) {
+        return Status::NotFound("key");
     }
     packed_version = pv;
     segment_id = id;
     return Status::OK();
 }
 
-bool GlobalIndex::contains(const std::string& key) const {
-    return dht_.contains(key);
+bool GlobalIndex::contains(uint64_t hkey) const {
+    return dht_.contains(hkey);
 }
 
-Status GlobalIndex::relocate(const std::string& key, uint64_t packed_version,
+Status GlobalIndex::relocate(uint64_t hkey, uint64_t packed_version,
                               uint32_t old_segment_id, uint32_t new_segment_id) {
     std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
-    Status s = wal_->appendRelocate(key, packed_version, old_segment_id, new_segment_id, WalProducer::kGC);
+    Status s = wal_->appendRelocate(hkey, packed_version, old_segment_id, new_segment_id, WalProducer::kGC);
     if (!s.ok()) return s;
-    applyRelocate(key, packed_version, old_segment_id, new_segment_id);
+    applyRelocate(hkey, packed_version, old_segment_id, new_segment_id);
     updates_since_snapshot_++;
     return Status::OK();
 }
 
-Status GlobalIndex::eliminate(const std::string& key, uint64_t packed_version,
+Status GlobalIndex::eliminate(uint64_t hkey, uint64_t packed_version,
                                uint32_t segment_id) {
     std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
-    Status s = wal_->appendEliminate(key, packed_version, segment_id, WalProducer::kGC);
+    Status s = wal_->appendEliminate(hkey, packed_version, segment_id, WalProducer::kGC);
     if (!s.ok()) return s;
-    applyEliminate(key, packed_version, segment_id);
+    applyEliminate(hkey, packed_version, segment_id);
     updates_since_snapshot_++;
     return Status::OK();
 }
@@ -618,7 +619,7 @@ Status GlobalIndex::loadV7Snapshot(const std::string& path) {
         if (!reader.readVal(hash) || !reader.readVal(packed_ver) || !reader.readVal(seg)) {
             return Status::Corruption("Failed to read entry");
         }
-        dht_.addEntryByHash(hash, packed_ver, seg);
+        dht_.addEntry(hash, packed_ver, seg);
     }
 
     key_count_ = static_cast<size_t>(key_count);
@@ -647,21 +648,21 @@ Status GlobalIndex::loadSnapshot(const std::string& path) {
 
 // --- Private ---
 
-void GlobalIndex::applyPut(std::string_view key, uint64_t packed_version,
+void GlobalIndex::applyPut(uint64_t hkey, uint64_t packed_version,
                            uint32_t segment_id) {
-    if (dht_.addEntryIsNew(key, packed_version, segment_id)) {
+    if (dht_.addEntryIsNew(hkey, packed_version, segment_id)) {
         ++key_count_;
     }
 }
 
-void GlobalIndex::applyRelocate(std::string_view key, uint64_t packed_version,
+void GlobalIndex::applyRelocate(uint64_t hkey, uint64_t packed_version,
                                 uint32_t old_segment_id, uint32_t new_segment_id) {
-    dht_.updateEntryId(key, packed_version, old_segment_id, new_segment_id);
+    dht_.updateEntryId(hkey, packed_version, old_segment_id, new_segment_id);
 }
 
-void GlobalIndex::applyEliminate(std::string_view key, uint64_t packed_version,
+void GlobalIndex::applyEliminate(uint64_t hkey, uint64_t packed_version,
                                  uint32_t segment_id) {
-    if (dht_.removeEntry(key, packed_version, segment_id)) {
+    if (dht_.removeEntry(hkey, packed_version, segment_id)) {
         --key_count_;
     }
 }

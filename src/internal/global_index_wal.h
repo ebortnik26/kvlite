@@ -6,7 +6,6 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "kvlite/status.h"
@@ -49,13 +48,13 @@ namespace WalProducer {
 // Each WAL data record contains a batch of concatenated domain records:
 //   [record_1][record_2]...[record_N]
 //
-// Domain record formats:
+// Domain record formats (fixed-size, hash-based):
 //
-// kPut / kEliminate (16 + key_len bytes):
-//   [op:1][producer_id:1][packed_version:8][segment_id:4][key_len:2][key:var]
+// kPut / kEliminate (22 bytes):
+//   [op:1][producer_id:1][packed_version:8][segment_id:4][hkey:8]
 //
-// kRelocate (20 + key_len bytes):
-//   [op:1][producer_id:1][packed_version:8][old_segment_id:4][new_segment_id:4][key_len:2][key:var]
+// kRelocate (26 bytes):
+//   [op:1][producer_id:1][packed_version:8][old_segment_id:4][new_segment_id:4][hkey:8]
 //
 // Thread-safety: All public methods are thread-safe. A shared_mutex serves
 // as a lifecycle lock: append/commit take a shared lock (concurrent producers),
@@ -90,14 +89,14 @@ public:
     // When the staging buffer reaches batch_size records, auto-commits.
     // Returns an error only if auto-commit fails.
 
-    Status appendPut(std::string_view key, uint64_t packed_version,
+    Status appendPut(uint64_t hkey, uint64_t packed_version,
                      uint32_t segment_id, uint8_t producer_id);
 
-    Status appendRelocate(std::string_view key, uint64_t packed_version,
+    Status appendRelocate(uint64_t hkey, uint64_t packed_version,
                           uint32_t old_segment_id, uint32_t new_segment_id,
                           uint8_t producer_id);
 
-    Status appendEliminate(std::string_view key, uint64_t packed_version,
+    Status appendEliminate(uint64_t hkey, uint64_t packed_version,
                            uint32_t segment_id, uint8_t producer_id);
 
     // Flush a producer's staged records to disk and sync.
@@ -138,7 +137,7 @@ private:
 
     // Serialize a domain record into a producer's staging buffer.
     static void serializeRecord(ProducerBuf& buf, WalOp op, uint8_t producer_id,
-                                uint64_t packed_version, std::string_view key,
+                                uint64_t packed_version, uint64_t hkey,
                                 const uint32_t* seg_ids, size_t seg_count);
 
     // Flush a producer's staging buffer under the WAL mutex.

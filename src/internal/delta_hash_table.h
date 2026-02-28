@@ -4,8 +4,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <string>
-#include <string_view>
 #include <vector>
 
 #include "internal/bucket_arena.h"
@@ -30,21 +28,6 @@ inline uint64_t dhtHashBytes(const void* data, size_t len) {
     return hash;
 }
 
-// Secondary hash for fingerprint extension (collision disambiguation).
-// Uses a different FNV offset basis to be independent of the primary hash.
-inline uint64_t dhtSecondaryHash(const void* data, size_t len) {
-    uint64_t hash = 6364136223846793005ULL;
-    const uint8_t* bytes = static_cast<const uint8_t*>(data);
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= bytes[i];
-        hash *= 1099511628211ULL;
-    }
-    hash ^= hash >> 33;
-    hash *= 0xff51afd7ed558ccdULL;
-    hash ^= hash >> 33;
-    return hash;
-}
-
 // Base class for Delta Hash Tables.
 //
 // Provides all bucket management, hash decomposition, extension chain
@@ -59,9 +42,9 @@ public:
     using TrieEntry = LSlotCodec::TrieEntry;
     using LSlotContents = LSlotCodec::LSlotContents;
 
-    // Resolves the actual key for a given (segment_id, packed_version) pair.
-    // Used during collision detection to compare keys.
-    using KeyResolver = std::function<std::string(uint32_t segment_id, uint64_t packed_version)>;
+    // Resolves the full primary hash for a given (segment_id, packed_version) pair.
+    // Used during collision detection to extract extension bits for disambiguation.
+    using KeyResolver = std::function<uint64_t(uint32_t segment_id, uint64_t packed_version)>;
 
     struct Config {
         uint8_t bucket_bits = 20;
@@ -71,14 +54,14 @@ public:
 
     // --- Public read API (no locking) ---
 
-    bool findAll(std::string_view key,
+    bool findAll(uint64_t hash,
                  std::vector<uint64_t>& packed_versions,
                  std::vector<uint32_t>& ids) const;
 
-    bool findFirst(std::string_view key,
+    bool findFirst(uint64_t hash,
                    uint64_t& packed_version, uint32_t& id) const;
 
-    bool contains(std::string_view key) const;
+    bool contains(uint64_t hash) const;
 
     void forEach(const std::function<void(uint64_t hash,
                                           uint64_t packed_version,
@@ -98,6 +81,10 @@ public:
     uint32_t bucketStride() const;
     const Config& config() const;
     uint8_t fingerprintBits() const;
+    uint8_t extensionBitsWidth() const;
+
+    // Extract extension bits from a full hash.
+    uint64_t extensionBits(uint64_t hash) const;
 
 protected:
     static constexpr uint32_t kBucketPadding = 8;
@@ -112,7 +99,6 @@ protected:
 
     // --- Hash decomposition ---
 
-    uint64_t hashKey(std::string_view key) const;
     uint32_t bucketIndex(uint64_t hash) const;
     uint32_t lslotIndex(uint64_t hash) const;
     uint64_t fingerprint(uint64_t hash) const;
@@ -147,9 +133,6 @@ protected:
     bool findFirstByHash(uint32_t bi, uint32_t li, uint64_t fp,
                          uint64_t& packed_version, uint32_t& id) const;
 
-    // --- Hash helpers ---
-    uint64_t secondaryHash(std::string_view key) const;
-
     // --- Protected write helpers ---
     // Adds an entry to the chain at (bi, li) for fingerprint fp.
     // createExtFn is called (with bucket lock held by caller if needed)
@@ -160,13 +143,13 @@ protected:
                     const std::function<Bucket*(Bucket&)>& createExtFn);
 
     // Like addToChain, but detects fingerprint collisions by resolving existing keys.
-    // When a collision is detected, extends fingerprints with secondary hash bits.
-    // Returns true if the key is new (no prior entry for this key).
+    // When a collision is detected, extends fingerprints with extension bits from
+    // the same hash function. Returns true if the key is new (no prior entry).
     bool addToChainChecked(uint32_t bi, uint32_t li, uint64_t fp,
                            uint64_t packed_version, uint32_t id,
                            const std::function<Bucket*(Bucket&)>& createExtFn,
                            const KeyResolver& resolver,
-                           uint64_t new_key_secondary_hash);
+                           uint64_t new_key_ext_bits);
 
     // Remove entry matching (fp, packed_version, id) from chain at (bi, li).
     // Returns true if the fingerprint group is now empty (all entries removed).
@@ -188,7 +171,8 @@ protected:
     // --- Members ---
 
     Config config_;
-    uint8_t fingerprint_bits_;
+    uint8_t fingerprint_bits_;   // base fingerprint width (lower bits of hash)
+    uint8_t extension_bits_;     // extension width (bits between lslot and fingerprint)
     LSlotCodec lslot_codec_;
     std::unique_ptr<uint8_t[]> arena_;
     std::vector<Bucket> buckets_;
@@ -226,7 +210,7 @@ private:
         const std::vector<LSlotContents>& all_slots, uint32_t li,
         const std::vector<size_t>& match_indices,
         const KeyResolver& resolver,
-        uint64_t new_key_secondary_hash) const;
+        uint64_t new_key_ext_bits) const;
 
     // Resolve a collision by extending fingerprints and committing.
     void resolveCollision(
@@ -234,7 +218,7 @@ private:
         Bucket* bucket, uint32_t li, uint64_t fp,
         const std::vector<size_t>& match_indices,
         const KeyResolver& resolver,
-        uint64_t new_key_secondary_hash,
+        uint64_t new_key_ext_bits,
         uint64_t packed_version, uint32_t id,
         const std::function<Bucket*(Bucket&)>& createExtFn);
 };

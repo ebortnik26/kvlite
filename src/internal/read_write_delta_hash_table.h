@@ -5,8 +5,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <string>
-#include <string_view>
 #include <vector>
 
 #include "internal/delta_hash_table.h"
@@ -33,33 +31,32 @@ public:
     ReadWriteDeltaHashTable(ReadWriteDeltaHashTable&&) = delete;
     ReadWriteDeltaHashTable& operator=(ReadWriteDeltaHashTable&&) = delete;
 
-    void addEntry(std::string_view key, uint64_t packed_version, uint32_t id);
-    void addEntryByHash(uint64_t hash, uint64_t packed_version, uint32_t id);
+    void addEntry(uint64_t hash, uint64_t packed_version, uint32_t id);
 
     // Like addEntry, but returns true if the key's fingerprint group is new.
-    bool addEntryIsNew(std::string_view key, uint64_t packed_version, uint32_t id);
+    bool addEntryIsNew(uint64_t hash, uint64_t packed_version, uint32_t id);
 
     // Thread-safe collision-aware insertion.
     // Returns true if the key is new (fingerprint group newly created).
-    bool addEntryChecked(std::string_view key, uint64_t packed_version, uint32_t id,
+    bool addEntryChecked(uint64_t hash, uint64_t packed_version, uint32_t id,
                          const DeltaHashTable::KeyResolver& resolver);
 
-    // Remove entry (packed_version, id) for key. Returns true if fp group is now empty.
-    bool removeEntry(std::string_view key, uint64_t packed_version, uint32_t id);
+    // Remove entry (packed_version, id) for hash. Returns true if fp group is now empty.
+    bool removeEntry(uint64_t hash, uint64_t packed_version, uint32_t id);
 
-    // Update id for entry (packed_version, old_id) for key. Returns true if found.
-    bool updateEntryId(std::string_view key, uint64_t packed_version,
+    // Update id for entry (packed_version, old_id) for hash. Returns true if found.
+    bool updateEntryId(uint64_t hash, uint64_t packed_version,
                        uint32_t old_id, uint32_t new_id);
 
     // Locked read methods (hide base class unlocked versions)
-    bool findAll(std::string_view key,
+    bool findAll(uint64_t hash,
                  std::vector<uint64_t>& packed_versions,
                  std::vector<uint32_t>& ids) const;
 
-    bool findFirst(std::string_view key,
+    bool findFirst(uint64_t hash,
                    uint64_t& packed_version, uint32_t& id) const;
 
-    bool contains(std::string_view key) const;
+    bool contains(uint64_t hash) const;
 
     size_t size() const;
     size_t memoryUsage() const;
