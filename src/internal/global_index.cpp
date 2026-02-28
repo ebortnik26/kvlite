@@ -75,6 +75,12 @@ Status GlobalIndex::open(const std::string& db_path, const Options& options) {
     Status s = wal_->open(db_path, manifest_, wal_opts);
     if (!s.ok()) return s;
 
+    // Load persisted max_version from last snapshot (if any).
+    std::string mv_str;
+    if (manifest_.get("gi.snapshot.max_version", mv_str) && !mv_str.empty()) {
+        max_version_ = std::stoull(mv_str);
+    }
+
     is_open_ = true;
     return Status::OK();
 }
@@ -196,8 +202,10 @@ void GlobalIndex::clear() {
 
 // --- WAL commit ---
 
-Status GlobalIndex::commitWB() {
+Status GlobalIndex::commitWB(uint64_t max_version) {
     std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
+    if (max_version > max_version_) max_version_ = max_version;
+    wal_->updateMaxVersion(max_version);
     return wal_->commit(WalProducer::kWB);
 }
 
@@ -245,7 +253,11 @@ Status GlobalIndex::storeSnapshot(uint64_t snapshot_version) {
     }
     fs::remove_all(old_dir, ec);  // best-effort cleanup
 
-    s = wal_->truncate();
+    // Persist the GlobalIndex max_version for recovery.
+    ts = manifest_.set("gi.snapshot.max_version", std::to_string(max_version_));
+    if (!ts.ok()) return ts;
+
+    s = wal_->truncate(max_version_);
     if (!s.ok()) return s;
     updates_since_snapshot_ = 0;
     return Status::OK();

@@ -17,7 +17,10 @@ WAL::~WAL() {
 
 WAL::WAL(WAL&& other) noexcept
     : log_file_(std::move(other.log_file_)),
-      batch_buf_(std::move(other.batch_buf_)) {}
+      batch_buf_(std::move(other.batch_buf_)),
+      max_version_(other.max_version_) {
+    other.max_version_ = 0;
+}
 
 WAL& WAL::operator=(WAL&& other) noexcept {
     if (this != &other) {
@@ -26,6 +29,8 @@ WAL& WAL::operator=(WAL&& other) noexcept {
         }
         log_file_ = std::move(other.log_file_);
         batch_buf_ = std::move(other.batch_buf_);
+        max_version_ = other.max_version_;
+        other.max_version_ = 0;
     }
     return *this;
 }
@@ -34,6 +39,7 @@ Status WAL::create(const std::string& path) {
     Status s = log_file_.create(path);
     if (!s.ok()) return s;
     batch_buf_.clear();
+    max_version_ = 0;
     return Status::OK();
 }
 
@@ -73,18 +79,19 @@ void WAL::put(const void* data, size_t len) {
 }
 
 Status WAL::commit(bool do_sync) {
-    // Commit record: [body_len:4][type:1][txn_crc32:4]
-    // txn_crc32 covers all bytes from batch start through the commit type byte.
-    uint32_t body_len = 1 + 4; // type + crc = 5
+    // Commit record: [body_len:4][type:1][max_version:8][txn_crc32:4]
+    // txn_crc32 covers all bytes from batch start through max_version (inclusive).
+    uint32_t body_len = 1 + 8 + 4; // type + max_version + crc = 13
 
-    // Append body_len + type (covered by CRC).
+    // Append body_len + type + max_version (all covered by CRC).
     size_t commit_offset = batch_buf_.size();
-    batch_buf_.resize(commit_offset + 4 + 1);
+    batch_buf_.resize(commit_offset + 4 + 1 + 8);
     uint8_t* p = batch_buf_.data() + commit_offset;
     std::memcpy(p, &body_len, 4);
     p[4] = kTypeCommit;
+    std::memcpy(p + 5, &max_version_, 8);
 
-    // CRC covers entire batch_buf_ so far (all data records + commit header).
+    // CRC covers entire batch_buf_ so far (all data records + commit header + max_version).
     uint32_t checksum = crc32(batch_buf_.data(), batch_buf_.size());
 
     // Append CRC (not covered by itself).
@@ -141,15 +148,19 @@ Status WAL::replay(const ReplayCallback& cb, uint64_t& valid_end) const {
             const char* payload_ptr = reinterpret_cast<const char*>(buf.data() + pos + 5);
             pending.emplace_back(payload_ptr, payload_len);
         } else if (type == kTypeCommit) {
-            if (body_len != 5) {
+            // Backward-compatible: body_len==5 is old format (no max_version),
+            // body_len==13 is new format with max_version.
+            if (body_len != 5 && body_len != 13) {
                 break; // malformed commit record
             }
 
-            // txn_crc32 covers bytes [txn_start .. pos+5) — all data records
-            // plus the commit's body_len(4) and type(1).
+            // CRC-covered region ends just before the 4-byte CRC.
+            // Old: [body_len:4][type:1] then [crc:4]  → covered = pos+5
+            // New: [body_len:4][type:1][max_ver:8] then [crc:4] → covered = pos+13
+            size_t covered_end = pos + 4 + body_len - 4; // exclude the CRC itself
             uint32_t expected_crc;
-            std::memcpy(&expected_crc, buf.data() + pos + 5, 4);
-            uint32_t actual_crc = crc32(buf.data() + txn_start, pos + 5 - txn_start);
+            std::memcpy(&expected_crc, buf.data() + covered_end, 4);
+            uint32_t actual_crc = crc32(buf.data() + txn_start, covered_end - txn_start);
             if (expected_crc != actual_crc) {
                 break; // corruption
             }
@@ -185,11 +196,20 @@ Status WAL::replayAndTruncate(const ReplayCallback& cb) {
 
 Status WAL::truncate() {
     batch_buf_.clear();
+    max_version_ = 0;
     return log_file_.truncateTo(0);
 }
 
 Status WAL::sync() {
     return log_file_.sync();
+}
+
+void WAL::updateMaxVersion(uint64_t v) {
+    if (v > max_version_) max_version_ = v;
+}
+
+uint64_t WAL::maxVersion() const {
+    return max_version_;
 }
 
 } // namespace internal

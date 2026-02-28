@@ -107,8 +107,16 @@ public:
     // Return a pull-based stream over all WAL records, ordered by file then position.
     std::unique_ptr<WALStream> replayStream() const;
 
-    // Truncate WAL (resets counters).
+    // Update the running max version for the active WAL file.
+    void updateMaxVersion(uint64_t v);
+
+    // Truncate WAL (resets staging buffers only, no file deletion).
     Status truncate();
+
+    // Version-based truncation: delete obsolete WAL files whose max_version
+    // is <= cutoff_version. The active file is never deleted.
+    // Also clears staging buffers.
+    Status truncate(uint64_t cutoff_version);
 
     // Total WAL size on disk across all files.
     uint64_t size() const;

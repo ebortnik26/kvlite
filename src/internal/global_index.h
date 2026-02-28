@@ -100,7 +100,7 @@ public:
 
     // --- WAL commit (hides producer IDs from callers) ---
 
-    Status commitWB();
+    Status commitWB(uint64_t max_version);
     Status commitGC();
 
     // --- Binary snapshot ---
@@ -193,6 +193,7 @@ private:
     bool is_open_ = false;
     std::unique_ptr<GlobalIndexWAL> wal_;
     uint64_t updates_since_snapshot_ = 0;
+    uint64_t max_version_ = 0;
 };
 
 } // namespace internal

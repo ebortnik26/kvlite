@@ -77,6 +77,7 @@ public:
     struct FlushResult {
         Status status;
         std::vector<FlushedEntry> entries;
+        uint64_t max_version = 0;  // max logical version across all flushed entries
     };
 
     // Flush all entries to a Segment that is already in Writing state.

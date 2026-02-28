@@ -434,7 +434,7 @@ Status DB::flush() {
         if (!s.ok()) return s;
     }
 
-    s = global_index_->commitWB();
+    s = global_index_->commitWB(result.max_version);
     if (!s.ok()) return s;
 
     current_segment_id_ = storage_->allocateSegmentId();

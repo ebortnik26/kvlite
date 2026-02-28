@@ -105,6 +105,10 @@ Status GlobalIndexWAL::close() {
             }
         }
     }
+    // Persist the active file's max_version to Manifest.
+    manifest_->set(file_prefix_ + std::to_string(current_file_id_),
+                   std::to_string(wal_.maxVersion()));
+
     wal_.abort();
     return wal_.close();
 }
@@ -207,7 +211,13 @@ Status GlobalIndexWAL::rollover() {
     // Accumulate size of the file we're closing.
     total_size_ += wal_.size();
 
-    Status s = wal_.close();
+    // Persist the closing file's max_version to Manifest.
+    uint64_t closing_max = wal_.maxVersion();
+    Status s = manifest_->set(file_prefix_ + std::to_string(current_file_id_),
+                              std::to_string(closing_max));
+    if (!s.ok()) return s;
+
+    s = wal_.close();
     if (!s.ok()) return s;
 
     // Allocate a new file ID.
@@ -219,10 +229,13 @@ Status GlobalIndexWAL::rollover() {
     s = manifest_->set(file_prefix_ + std::to_string(new_id), "");
     if (!s.ok()) return s;
 
-    // Create the new file.
+    // Create the new file and inherit the running max_version.
     current_file_id_ = new_id;
     file_ids_.push_back(new_id);
-    return wal_.create(walFilePath(walDir(), new_id));
+    s = wal_.create(walFilePath(walDir(), new_id));
+    if (!s.ok()) return s;
+    wal_.updateMaxVersion(closing_max);
+    return Status::OK();
 }
 
 Status GlobalIndexWAL::allocateFileId(uint32_t& file_id) {
@@ -234,6 +247,10 @@ std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
     return stream::walReplay(walDir(), file_ids_);
 }
 
+void GlobalIndexWAL::updateMaxVersion(uint64_t v) {
+    wal_.updateMaxVersion(v);
+}
+
 Status GlobalIndexWAL::truncate() {
     total_size_ = 0;
     for (auto& p : producers_) {
@@ -241,6 +258,57 @@ Status GlobalIndexWAL::truncate() {
         p.record_count = 0;
     }
     wal_.abort();
+    return Status::OK();
+}
+
+Status GlobalIndexWAL::truncate(uint64_t cutoff_version) {
+    // Clear staging buffers.
+    for (auto& p : producers_) {
+        p.data.clear();
+        p.record_count = 0;
+    }
+    wal_.abort();
+
+    // Delete obsolete WAL files (all except the active file)
+    // whose max_version <= cutoff_version.
+    std::string dir = walDir();
+    std::vector<uint32_t> kept;
+    for (uint32_t fid : file_ids_) {
+        if (fid == current_file_id_) {
+            kept.push_back(fid);
+            continue;
+        }
+
+        // Read max_version from Manifest.
+        std::string key = file_prefix_ + std::to_string(fid);
+        std::string val;
+        uint64_t file_max = 0;
+        if (manifest_->get(key, val) && !val.empty()) {
+            file_max = std::stoull(val);
+        }
+
+        if (file_max <= cutoff_version) {
+            // Delete file from disk.
+            std::string path = walFilePath(dir, fid);
+            std::remove(path.c_str());
+            // Remove from Manifest.
+            manifest_->remove(key);
+        } else {
+            kept.push_back(fid);
+        }
+    }
+    file_ids_ = std::move(kept);
+    total_size_ = 0;
+
+    // Recompute total_size_ from remaining closed files.
+    for (uint32_t fid : file_ids_) {
+        if (fid == current_file_id_) continue;
+        struct stat st;
+        if (::stat(walFilePath(dir, fid).c_str(), &st) == 0) {
+            total_size_ += static_cast<uint64_t>(st.st_size);
+        }
+    }
+
     return Status::OK();
 }
 

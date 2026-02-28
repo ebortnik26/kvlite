@@ -609,3 +609,110 @@ TEST_F(WALStreamTest, ConcurrentWriteAndClose) {
     wal2.close();
     manifest2.close();
 }
+
+// --- Version-based truncation tests ---
+
+TEST_F(WALStreamTest, VersionBasedTruncation) {
+    // Create a WAL with multiple files (small max_file_size to force rollover).
+    Manifest manifest;
+    ASSERT_TRUE(manifest.create(dir_.string()).ok());
+
+    GlobalIndexWAL wal;
+    GlobalIndexWAL::Options opts;
+    opts.max_file_size = 128;  // tiny — forces rollover after every few commits
+    opts.batch_size = 1;       // commit after every record
+    ASSERT_TRUE(wal.open(dir_.string(), manifest, opts).ok());
+
+    // Write entries with increasing max_version across files.
+    for (int i = 0; i < 20; ++i) {
+        std::string key = "k" + std::to_string(i);
+        wal.updateMaxVersion(static_cast<uint64_t>(i + 1));
+        ASSERT_TRUE(wal.appendPut(H(key), static_cast<uint64_t>(i + 1),
+                                  static_cast<uint32_t>(i + 1),
+                                  WalProducer::kWB).ok());
+    }
+    ASSERT_TRUE(wal.commit(WalProducer::kWB).ok());
+
+    uint32_t file_count_before = wal.fileCount();
+    ASSERT_GT(file_count_before, 1u) << "Need multiple files for this test";
+
+    // Truncate with a cutoff that should remove some but not all files.
+    // Set cutoff to version 10 — files with max_version <= 10 should be deleted.
+    ASSERT_TRUE(wal.truncate(10).ok());
+
+    uint32_t file_count_after = wal.fileCount();
+    EXPECT_LT(file_count_after, file_count_before);
+    EXPECT_GE(file_count_after, 1u); // active file always kept
+
+    ASSERT_TRUE(wal.close().ok());
+    manifest.close();
+}
+
+TEST_F(WALStreamTest, VersionBasedTruncationPreservesActiveFile) {
+    // Even if cutoff_version covers everything, the active file survives.
+    Manifest manifest;
+    ASSERT_TRUE(manifest.create(dir_.string()).ok());
+
+    GlobalIndexWAL wal;
+    GlobalIndexWAL::Options opts;
+    opts.max_file_size = 128;
+    opts.batch_size = 1;
+    ASSERT_TRUE(wal.open(dir_.string(), manifest, opts).ok());
+
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "k" + std::to_string(i);
+        wal.updateMaxVersion(static_cast<uint64_t>(i + 1));
+        ASSERT_TRUE(wal.appendPut(H(key), static_cast<uint64_t>(i + 1),
+                                  static_cast<uint32_t>(i + 1),
+                                  WalProducer::kWB).ok());
+    }
+    ASSERT_TRUE(wal.commit(WalProducer::kWB).ok());
+
+    // Truncate with a very high cutoff — should delete all except active.
+    ASSERT_TRUE(wal.truncate(1000).ok());
+    EXPECT_GE(wal.fileCount(), 1u);
+
+    ASSERT_TRUE(wal.close().ok());
+    manifest.close();
+}
+
+TEST_F(WALStreamTest, MaxVersionPersistsAcrossRollover) {
+    // Verify that max_version is inherited by new files after rollover.
+    Manifest manifest;
+    ASSERT_TRUE(manifest.create(dir_.string()).ok());
+
+    GlobalIndexWAL wal;
+    GlobalIndexWAL::Options opts;
+    opts.max_file_size = 128;
+    opts.batch_size = 1;
+    ASSERT_TRUE(wal.open(dir_.string(), manifest, opts).ok());
+
+    // Set a high max_version early.
+    wal.updateMaxVersion(500);
+
+    for (int i = 0; i < 20; ++i) {
+        std::string key = "k" + std::to_string(i);
+        ASSERT_TRUE(wal.appendPut(H(key), static_cast<uint64_t>(i + 1),
+                                  static_cast<uint32_t>(i + 1),
+                                  WalProducer::kWB).ok());
+    }
+    ASSERT_TRUE(wal.commit(WalProducer::kWB).ok());
+
+    ASSERT_GT(wal.fileCount(), 1u) << "Need rollover for this test";
+
+    // Check that max_version is stored in Manifest for closed files.
+    std::string val;
+    bool found = false;
+    for (uint32_t i = 0; i < wal.fileCount() - 1; ++i) {
+        std::string key = "gi.wal.file." + std::to_string(i);
+        if (manifest.get(key, val) && !val.empty()) {
+            uint64_t file_max = std::stoull(val);
+            EXPECT_GE(file_max, 500u);
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found) << "At least one closed file should have max_version in Manifest";
+
+    ASSERT_TRUE(wal.close().ok());
+    manifest.close();
+}

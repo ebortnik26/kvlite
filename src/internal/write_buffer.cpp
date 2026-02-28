@@ -496,6 +496,7 @@ WriteBuffer::FlushResult WriteBuffer::flush(Segment& out) {
 
     std::vector<FlushedEntry> flushed;
     flushed.reserve(size_.load(std::memory_order_relaxed));
+    uint64_t max_ver = 0;
 
     // Process one bucket at a time. Iterating buckets 0..N gives hash-prefix
     // order; we only need to sort within each bucket by (hash, version).
@@ -529,15 +530,17 @@ WriteBuffer::FlushResult WriteBuffer::flush(Segment& out) {
 
         for (const auto& e : bucket_entries) {
             s = out.put(e.key, e.pv.version(), e.value, e.pv.tombstone());
-            if (!s.ok()) return {s, {}};
+            if (!s.ok()) return {s, {}, 0};
             flushed.push_back({e.hash, e.packed_ver});
+            uint64_t v = e.pv.version();
+            if (v > max_ver) max_ver = v;
         }
     }
 
     s = out.seal();
-    if (!s.ok()) return {s, {}};
+    if (!s.ok()) return {s, {}, 0};
 
-    return {Status::OK(), std::move(flushed)};
+    return {Status::OK(), std::move(flushed), max_ver};
 }
 
 } // namespace internal

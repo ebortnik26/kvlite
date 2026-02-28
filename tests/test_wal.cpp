@@ -63,8 +63,8 @@ TEST_F(WALTest, PutAndCommitSingle) {
     wal.put(data, 3);
     ASSERT_TRUE(wal.commit().ok());
 
-    // File should have: data record (4+1+3=8) + commit record (4+5=9) = 17 bytes
-    EXPECT_EQ(wal.size(), 17u);
+    // File should have: data record (4+1+3=8) + commit record (4+13=17) = 25 bytes
+    EXPECT_EQ(wal.size(), 25u);
     ASSERT_TRUE(wal.close().ok());
 }
 
@@ -78,8 +78,8 @@ TEST_F(WALTest, PutMultipleAndCommit) {
     wal.put(d2, 2);
     ASSERT_TRUE(wal.commit().ok());
 
-    // d1: 4+1+1=6, d2: 4+1+2=7, commit: 4+5=9, total=22
-    EXPECT_EQ(wal.size(), 22u);
+    // d1: 4+1+1=6, d2: 4+1+2=7, commit: 4+13=17, total=30
+    EXPECT_EQ(wal.size(), 30u);
     ASSERT_TRUE(wal.close().ok());
 }
 
@@ -109,7 +109,7 @@ TEST_F(WALTest, EmptyCommit) {
 
     // Commit with no data records — just a commit record
     ASSERT_TRUE(wal.commit().ok());
-    EXPECT_EQ(wal.size(), 9u); // just the commit record (4+5)
+    EXPECT_EQ(wal.size(), 17u); // just the commit record (4+13)
 
     ASSERT_TRUE(wal.close().ok());
 }
@@ -402,15 +402,15 @@ TEST_F(WALTest, CorruptedCRC) {
     ASSERT_TRUE(wal.close().ok());
 
     // Corrupt a byte in the second batch's data record.
-    // Batch 1: data(4+1+1=6) + commit(4+5=9) = 15 bytes [0..14].
-    // Batch 2: starts at offset 15. Flip a payload byte.
+    // Batch 1: data(4+1+1=6) + commit(4+13=17) = 23 bytes [0..22].
+    // Batch 2: starts at offset 23. Flip a payload byte.
     {
         kvlite::internal::LogFile lf;
         ASSERT_TRUE(lf.open(path_).ok());
         uint64_t offset;
         std::vector<uint8_t> buf(lf.size());
         ASSERT_TRUE(lf.readAt(0, buf.data(), buf.size()).ok());
-        buf[20] ^= 0xFF; // flip byte in second batch's data record payload
+        buf[28] ^= 0xFF; // flip byte in second batch's data record payload
         ASSERT_TRUE(lf.truncateTo(0).ok());
         ASSERT_TRUE(lf.append(buf.data(), buf.size(), offset).ok());
         ASSERT_TRUE(lf.close().ok());
@@ -484,6 +484,58 @@ TEST_F(WALTest, MultipleCommitsReplay) {
 
     ASSERT_TRUE(s.ok());
     EXPECT_EQ(batch_count, 5);
+    ASSERT_TRUE(wal2.close().ok());
+}
+
+TEST_F(WALTest, MaxVersionTracking) {
+    WAL wal;
+    ASSERT_TRUE(wal.create(path_).ok());
+    EXPECT_EQ(wal.maxVersion(), 0u);
+
+    wal.updateMaxVersion(10);
+    EXPECT_EQ(wal.maxVersion(), 10u);
+
+    wal.updateMaxVersion(5); // should not decrease
+    EXPECT_EQ(wal.maxVersion(), 10u);
+
+    wal.updateMaxVersion(42);
+    EXPECT_EQ(wal.maxVersion(), 42u);
+
+    // Commit and verify max_version persists through replay
+    uint8_t d[] = {1};
+    wal.put(d, 1);
+    ASSERT_TRUE(wal.commit().ok());
+    ASSERT_TRUE(wal.close().ok());
+
+    // After truncate, max_version resets
+    WAL wal2;
+    ASSERT_TRUE(wal2.create(path_).ok());
+    wal2.updateMaxVersion(100);
+    ASSERT_TRUE(wal2.truncate().ok());
+    EXPECT_EQ(wal2.maxVersion(), 0u);
+    ASSERT_TRUE(wal2.close().ok());
+}
+
+TEST_F(WALTest, MaxVersionPreservedAcrossMoveConstruct) {
+    WAL wal1;
+    ASSERT_TRUE(wal1.create(path_).ok());
+    wal1.updateMaxVersion(99);
+
+    WAL wal2(std::move(wal1));
+    EXPECT_EQ(wal2.maxVersion(), 99u);
+    EXPECT_EQ(wal1.maxVersion(), 0u);
+    ASSERT_TRUE(wal2.close().ok());
+}
+
+TEST_F(WALTest, MaxVersionPreservedAcrossMoveAssign) {
+    WAL wal1;
+    ASSERT_TRUE(wal1.create(path_).ok());
+    wal1.updateMaxVersion(77);
+
+    WAL wal2;
+    wal2 = std::move(wal1);
+    EXPECT_EQ(wal2.maxVersion(), 77u);
+    EXPECT_EQ(wal1.maxVersion(), 0u);
     ASSERT_TRUE(wal2.close().ok());
 }
 

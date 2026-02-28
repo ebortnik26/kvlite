@@ -7,8 +7,11 @@
 
 #include "internal/crc32.h"
 
-// Commit record body: [type:1][txn_crc32:4]
-static constexpr size_t kCommitBodyLen = 5;
+// Commit record body lengths:
+// Old format: [type:1][txn_crc32:4] = 5
+// New format: [type:1][max_version:8][txn_crc32:4] = 13
+static constexpr size_t kCommitBodyLenOld = 5;
+static constexpr size_t kCommitBodyLenNew = 13;
 
 namespace kvlite {
 namespace internal {
@@ -209,16 +212,17 @@ bool WALReplayStream::readNextBatch() {
                 remaining -= consumed;
             }
         } else if (type == kTypeCommit) {
-            if (body_len != kCommitBodyLen) break;
+            if (body_len != kCommitBodyLenOld && body_len != kCommitBodyLenNew) break;
 
-            // Accumulate CRC over commit's [body_len:4][type:1].
+            // CRC covers [body_len:4][type:1] and, for new format, [max_version:8].
+            // The CRC itself (last 4 bytes of payload) is excluded.
+            size_t crc_covered = body_len - 4; // bytes in body covered by CRC (type + optional max_version)
             running_crc = updateCrc32(running_crc, &body_len, 4);
-            uint8_t commit_type = kTypeCommit;
-            running_crc = updateCrc32(running_crc, &commit_type, 1);
+            running_crc = updateCrc32(running_crc, body_.data(), crc_covered);
 
-            // Verify against stored txn_crc32 (payload is the 4-byte CRC).
+            // The txn_crc32 is the last 4 bytes of the payload.
             uint32_t stored_crc;
-            std::memcpy(&stored_crc, payload, 4);
+            std::memcpy(&stored_crc, payload + payload_len - 4, 4);
             if (finalizeCrc32(running_crc) != stored_crc) break;
 
             if (!pending.empty()) {

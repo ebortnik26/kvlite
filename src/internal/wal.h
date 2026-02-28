@@ -18,10 +18,10 @@ namespace internal {
 // On-disk record format:
 //
 // Data record:   [body_len:4][type:1 = 0x01][payload:var]
-// Commit record: [body_len:4][type:1 = 0x02][txn_crc32:4]
+// Commit record: [body_len:4][type:1 = 0x02][max_version:8][txn_crc32:4]
 //
 // body_len = 1 + payload_len        (data record)
-//          = 1 + 4 = 5              (commit record)
+//          = 1 + 8 + 4 = 13         (commit record)
 //
 // txn_crc32 covers all bytes from the first data record's body_len
 // through the commit record's type byte (inclusive). One CRC per
@@ -84,12 +84,19 @@ public:
     // Sync data to disk.
     Status sync();
 
+    // Update the running max version (used in commit records).
+    void updateMaxVersion(uint64_t v);
+
+    // Return the current max version.
+    uint64_t maxVersion() const;
+
 private:
     static constexpr uint8_t kTypeData = 0x01;
     static constexpr uint8_t kTypeCommit = 0x02;
 
     LogFile log_file_;
     std::vector<uint8_t> batch_buf_;
+    uint64_t max_version_ = 0;
 };
 
 } // namespace internal
