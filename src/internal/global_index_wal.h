@@ -113,9 +113,6 @@ public:
     // Total WAL size on disk across all files.
     uint64_t size() const;
 
-    // Get number of data entries written (excludes commit records)
-    uint64_t entryCount() const { return entry_count_; }
-
     // Number of WAL files tracked by the Manifest.
     uint32_t fileCount() const { return static_cast<uint32_t>(file_ids_.size()); }
 
@@ -169,7 +166,6 @@ private:
 
     std::mutex mu_;  // serializes WAL file writes
     WAL wal_;
-    uint64_t entry_count_ = 0;
 
     // Per-producer staging buffers (indexed by producer_id).
     // Protected by rw_mu_ (shared for owning producer, exclusive for close).

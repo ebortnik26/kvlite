@@ -7,6 +7,9 @@
 
 #include "internal/crc32.h"
 
+// Commit record body: [type:1][txn_crc32:4]
+static constexpr size_t kCommitBodyLen = 5;
+
 namespace kvlite {
 namespace internal {
 
@@ -125,18 +128,14 @@ bool WALReplayStream::readRawRecord(uint8_t& type,
                                      size_t& payload_len) {
     uint32_t body_len;
     if (!reader_.readExact(&body_len, 4)) return false;
-    if (body_len < 5) return false;  // minimum: type(1) + crc32(4)
+    if (body_len < 1) return false;  // minimum: type(1)
 
     body_.resize(body_len);
     if (!reader_.readExact(body_.data(), body_len)) return false;
 
-    uint32_t stored_crc;
-    std::memcpy(&stored_crc, body_.data() + body_len - 4, 4);
-    if (crc32(body_.data(), body_len - 4) != stored_crc) return false;
-
     type = body_[0];
     payload = body_.data() + 1;
-    payload_len = body_len - 5;  // exclude type(1) and crc32(4)
+    payload_len = body_len - 1;  // exclude type(1)
     return true;
 }
 
@@ -178,31 +177,57 @@ bool WALReplayStream::readNextBatch() {
     //
     // Each WAL data record may contain multiple concatenated domain records
     // (a bulk write from one producer). Parse all of them from the payload.
+    //
+    // CRC is per-transaction: the commit record carries a txn_crc32 that
+    // covers all bytes from the first data record's body_len through the
+    // commit's type byte. We accumulate a running CRC over raw bytes
+    // (body_len + body) as we read each record, and verify at commit.
     std::vector<OwnedRecord> pending;
+    uint32_t running_crc = 0xFFFFFFFFu;
 
     uint8_t type;
     const uint8_t* payload;
     size_t payload_len;
 
     while (readRawRecord(type, payload, payload_len)) {
+        // body_len that was read by readRawRecord (reconstruct).
+        uint32_t body_len = static_cast<uint32_t>(1 + payload_len);
+
         if (type == kTypeData) {
-            // Parse all concatenated domain records from this payload.
+            // Accumulate CRC over [body_len:4][type:1][payload:var].
+            running_crc = updateCrc32(running_crc, &body_len, 4);
+            running_crc = updateCrc32(running_crc, body_.data(), body_.size());
+
             const uint8_t* p = payload;
             size_t remaining = payload_len;
             while (remaining > 0) {
                 OwnedRecord rec;
                 size_t consumed = parseDomainRecord(p, remaining, rec);
-                if (consumed == 0) break;  // malformed — skip rest
+                if (consumed == 0) break;
                 pending.push_back(std::move(rec));
                 p += consumed;
                 remaining -= consumed;
             }
         } else if (type == kTypeCommit) {
+            if (body_len != kCommitBodyLen) break;
+
+            // Accumulate CRC over commit's [body_len:4][type:1].
+            running_crc = updateCrc32(running_crc, &body_len, 4);
+            uint8_t commit_type = kTypeCommit;
+            running_crc = updateCrc32(running_crc, &commit_type, 1);
+
+            // Verify against stored txn_crc32 (payload is the 4-byte CRC).
+            uint32_t stored_crc;
+            std::memcpy(&stored_crc, payload, 4);
+            if (finalizeCrc32(running_crc) != stored_crc) break;
+
             if (!pending.empty()) {
                 batch_ = std::move(pending);
                 return true;
             }
-            // Empty transaction — keep reading.
+            // Empty transaction — reset and keep reading.
+            pending.clear();
+            running_crc = 0xFFFFFFFFu;
         }
     }
     return false;  // EOF or corruption — discard incomplete transaction

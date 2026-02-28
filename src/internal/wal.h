@@ -17,13 +17,15 @@ namespace internal {
 //
 // On-disk record format:
 //
-// Data record:   [body_len:4][type:1 = 0x01][payload:var][crc32:4]
-// Commit record: [body_len:4][type:1 = 0x02][crc32:4]
+// Data record:   [body_len:4][type:1 = 0x01][payload:var]
+// Commit record: [body_len:4][type:1 = 0x02][txn_crc32:4]
 //
-// body_len = 1 + payload_len + 4  (data record)
-//          = 1 + 4 = 5             (commit record)
+// body_len = 1 + payload_len        (data record)
+//          = 1 + 4 = 5              (commit record)
 //
-// crc32 covers: type byte + payload (everything between body_len and crc32)
+// txn_crc32 covers all bytes from the first data record's body_len
+// through the commit record's type byte (inclusive). One CRC per
+// transaction instead of per record.
 //
 // Single implicit transaction: put() buffers data records in memory (no I/O).
 // commit() appends all buffered records + a commit record to disk atomically,

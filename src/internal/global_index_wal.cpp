@@ -139,7 +139,7 @@ Status GlobalIndexWAL::appendPut(uint64_t hkey, uint64_t packed_version,
     if (!open_) return Status::IOError("WAL not open");
     serializeRecord(producers_[producer_id], WalOp::kPut, producer_id,
                     packed_version, hkey, &segment_id, 1);
-    ++entry_count_;
+
     if (producers_[producer_id].record_count >= options_.batch_size) {
         return flushProducer(producer_id);
     }
@@ -154,7 +154,7 @@ Status GlobalIndexWAL::appendRelocate(uint64_t hkey, uint64_t packed_version,
     uint32_t segs[2] = {old_segment_id, new_segment_id};
     serializeRecord(producers_[producer_id], WalOp::kRelocate, producer_id,
                     packed_version, hkey, segs, 2);
-    ++entry_count_;
+
     if (producers_[producer_id].record_count >= options_.batch_size) {
         return flushProducer(producer_id);
     }
@@ -167,7 +167,7 @@ Status GlobalIndexWAL::appendEliminate(uint64_t hkey, uint64_t packed_version,
     if (!open_) return Status::IOError("WAL not open");
     serializeRecord(producers_[producer_id], WalOp::kEliminate, producer_id,
                     packed_version, hkey, &segment_id, 1);
-    ++entry_count_;
+
     if (producers_[producer_id].record_count >= options_.batch_size) {
         return flushProducer(producer_id);
     }
@@ -235,7 +235,6 @@ std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
 }
 
 Status GlobalIndexWAL::truncate() {
-    entry_count_ = 0;
     total_size_ = 0;
     for (auto& p : producers_) {
         p.data.clear();

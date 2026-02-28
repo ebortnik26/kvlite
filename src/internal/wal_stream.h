@@ -73,9 +73,10 @@ private:
         uint64_t hkey;
     };
 
-    // Read one raw WAL record: body_len + body + CRC check.
+    // Read one raw WAL record: body_len + body.
     // Returns type byte via out param, payload points into body_.
-    // Returns false on EOF or CRC error.
+    // No per-record CRC check — CRC is verified per transaction.
+    // Returns false on EOF or read error.
     bool readRawRecord(uint8_t& type, const uint8_t*& payload, size_t& payload_len);
 
     // Parse one domain record from a payload buffer.

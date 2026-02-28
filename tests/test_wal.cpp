@@ -63,8 +63,8 @@ TEST_F(WALTest, PutAndCommitSingle) {
     wal.put(data, 3);
     ASSERT_TRUE(wal.commit().ok());
 
-    // File should have: data record (4+1+3+4=12) + commit record (4+5=9) = 21 bytes
-    EXPECT_EQ(wal.size(), 21u);
+    // File should have: data record (4+1+3=8) + commit record (4+5=9) = 17 bytes
+    EXPECT_EQ(wal.size(), 17u);
     ASSERT_TRUE(wal.close().ok());
 }
 
@@ -78,8 +78,8 @@ TEST_F(WALTest, PutMultipleAndCommit) {
     wal.put(d2, 2);
     ASSERT_TRUE(wal.commit().ok());
 
-    // d1: 4+1+1+4=10, d2: 4+1+2+4=11, commit: 4+5=9, total=30
-    EXPECT_EQ(wal.size(), 30u);
+    // d1: 4+1+1=6, d2: 4+1+2=7, commit: 4+5=9, total=22
+    EXPECT_EQ(wal.size(), 22u);
     ASSERT_TRUE(wal.close().ok());
 }
 
@@ -401,15 +401,16 @@ TEST_F(WALTest, CorruptedCRC) {
     ASSERT_TRUE(wal.commit().ok());
     ASSERT_TRUE(wal.close().ok());
 
-    // Corrupt a byte in the middle of the second batch
+    // Corrupt a byte in the second batch's data record.
+    // Batch 1: data(4+1+1=6) + commit(4+5=9) = 15 bytes [0..14].
+    // Batch 2: starts at offset 15. Flip a payload byte.
     {
         kvlite::internal::LogFile lf;
         ASSERT_TRUE(lf.open(path_).ok());
-        // First batch is 10 + 17 = 27 bytes. Corrupt byte 28 (start of second batch data).
         uint64_t offset;
         std::vector<uint8_t> buf(lf.size());
         ASSERT_TRUE(lf.readAt(0, buf.data(), buf.size()).ok());
-        buf[31] ^= 0xFF; // flip bits in second batch
+        buf[20] ^= 0xFF; // flip byte in second batch's data record payload
         ASSERT_TRUE(lf.truncateTo(0).ok());
         ASSERT_TRUE(lf.append(buf.data(), buf.size(), offset).ok());
         ASSERT_TRUE(lf.close().ok());

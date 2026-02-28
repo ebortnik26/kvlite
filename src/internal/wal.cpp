@@ -58,50 +58,41 @@ uint64_t WAL::size() const {
 }
 
 void WAL::put(const void* data, size_t len) {
-    // Data record: [body_len:4][type:1][payload:var][crc32:4]
-    // body_len = 1 (type) + len (payload) + 4 (crc)
-    uint32_t body_len = static_cast<uint32_t>(1 + len + 4);
+    // Data record: [body_len:4][type:1][payload:var]
+    uint32_t body_len = static_cast<uint32_t>(1 + len);
 
-    size_t offset = batch_buf_.size();
-    size_t total = 4 + body_len; // body_len field + body
-    batch_buf_.resize(offset + total);
-    uint8_t* p = batch_buf_.data() + offset;
-
-    // body_len
-    std::memcpy(p, &body_len, 4);
-    p += 4;
-
-    // type
-    *p = kTypeData;
-
-    // payload
-    std::memcpy(p + 1, data, len);
-
-    // crc32 covers type + payload
-    uint32_t checksum = crc32(p, 1 + len);
-    std::memcpy(p + 1 + len, &checksum, 4);
-}
-
-Status WAL::commit(bool do_sync) {
-    // Commit record: [body_len:4][type:1][crc32:4]
-    uint32_t body_len = 1 + 4; // type + crc = 5
     size_t offset = batch_buf_.size();
     size_t total = 4 + body_len;
     batch_buf_.resize(offset + total);
     uint8_t* p = batch_buf_.data() + offset;
 
-    // body_len
     std::memcpy(p, &body_len, 4);
     p += 4;
+    *p = kTypeData;
+    std::memcpy(p + 1, data, len);
+}
 
-    // type
-    *p = kTypeCommit;
+Status WAL::commit(bool do_sync) {
+    // Commit record: [body_len:4][type:1][txn_crc32:4]
+    // txn_crc32 covers all bytes from batch start through the commit type byte.
+    uint32_t body_len = 1 + 4; // type + crc = 5
 
-    // crc32 covers type byte
-    uint32_t checksum = crc32(p, 1);
-    std::memcpy(p + 1, &checksum, 4);
+    // Append body_len + type (covered by CRC).
+    size_t commit_offset = batch_buf_.size();
+    batch_buf_.resize(commit_offset + 4 + 1);
+    uint8_t* p = batch_buf_.data() + commit_offset;
+    std::memcpy(p, &body_len, 4);
+    p[4] = kTypeCommit;
 
-    // Write entire batch to disk
+    // CRC covers entire batch_buf_ so far (all data records + commit header).
+    uint32_t checksum = crc32(batch_buf_.data(), batch_buf_.size());
+
+    // Append CRC (not covered by itself).
+    size_t crc_offset = batch_buf_.size();
+    batch_buf_.resize(crc_offset + 4);
+    std::memcpy(batch_buf_.data() + crc_offset, &checksum, 4);
+
+    // Write entire batch to disk.
     uint64_t write_offset;
     Status s = log_file_.append(batch_buf_.data(), batch_buf_.size(), write_offset);
     batch_buf_.clear();
@@ -131,39 +122,36 @@ Status WAL::replay(const ReplayCallback& cb, uint64_t& valid_end) const {
     if (!s.ok()) return s;
 
     uint64_t pos = 0;
+    uint64_t txn_start = 0;
     std::vector<std::string_view> pending;
 
     while (pos + 5 <= file_size) { // minimum: body_len(4) + type(1)
-        // Read body_len
         uint32_t body_len;
         std::memcpy(&body_len, buf.data() + pos, 4);
 
-        // Sanity check: body_len must be at least 5 (type + crc) and
-        // the full record must fit in the file
-        if (body_len < 5 || pos + 4 + body_len > file_size) {
+        if (body_len < 1 || pos + 4 + body_len > file_size) {
             break; // truncated record
         }
 
-        uint8_t* body = buf.data() + pos + 4;
-        uint8_t type = body[0];
-
-        // CRC covers everything in the body except the trailing 4 bytes (the CRC itself)
-        uint32_t expected_crc;
-        std::memcpy(&expected_crc, body + body_len - 4, 4);
-        uint32_t actual_crc = crc32(body, body_len - 4);
-
-        if (expected_crc != actual_crc) {
-            break; // corruption
-        }
+        uint8_t type = buf[pos + 4];
 
         if (type == kTypeData) {
-            // payload is between type and crc: body[1 .. body_len-4)
-            size_t payload_len = body_len - 1 - 4; // subtract type and crc
-            const char* payload_ptr = reinterpret_cast<const char*>(body + 1);
+            // payload is body[1..body_len): no per-record CRC
+            size_t payload_len = body_len - 1;
+            const char* payload_ptr = reinterpret_cast<const char*>(buf.data() + pos + 5);
             pending.emplace_back(payload_ptr, payload_len);
         } else if (type == kTypeCommit) {
             if (body_len != 5) {
                 break; // malformed commit record
+            }
+
+            // txn_crc32 covers bytes [txn_start .. pos+5) — all data records
+            // plus the commit's body_len(4) and type(1).
+            uint32_t expected_crc;
+            std::memcpy(&expected_crc, buf.data() + pos + 5, 4);
+            uint32_t actual_crc = crc32(buf.data() + txn_start, pos + 5 - txn_start);
+            if (expected_crc != actual_crc) {
+                break; // corruption
             }
 
             s = cb(pending);
@@ -171,6 +159,7 @@ Status WAL::replay(const ReplayCallback& cb, uint64_t& valid_end) const {
 
             pending.clear();
             valid_end = pos + 4 + body_len;
+            txn_start = valid_end;
         } else {
             break; // unknown record type
         }
