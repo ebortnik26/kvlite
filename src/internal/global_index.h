@@ -62,7 +62,6 @@ public:
     // --- Lifecycle ---
 
     Status open(const std::string& db_path, const Options& options);
-    Status recover();
     Status close();
     bool isOpen() const;
 
@@ -149,6 +148,7 @@ private:
     void applyEliminate(uint64_t hkey, uint64_t packed_version,
                         uint32_t segment_id);
 
+    Status recover();
     Status maybeSnapshot();
     std::string snapshotPath() const;       // v7 single file path
     std::string snapshotDirV9() const;      // v9 directory path

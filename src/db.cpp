@@ -83,17 +83,6 @@ Status DB::open(const std::string& path, const Options& options) {
         return s;
     }
 
-    s = global_index_->recover();
-    if (!s.ok()) {
-        global_index_->close();
-        global_index_.reset();
-        versions_->close();
-        versions_.reset();
-        manifest_->close();
-        manifest_.reset();
-        return s;
-    }
-
     // Initialize storage manager
     storage_ = std::make_unique<internal::SegmentStorageManager>(*manifest_);
 

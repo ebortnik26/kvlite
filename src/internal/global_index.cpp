@@ -82,6 +82,12 @@ Status GlobalIndex::open(const std::string& db_path, const Options& options) {
         max_version_ = std::stoull(mv_str);
     }
 
+    s = recover();
+    if (!s.ok()) {
+        wal_->close();
+        return s;
+    }
+
     is_open_ = true;
     return Status::OK();
 }
