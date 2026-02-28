@@ -24,52 +24,51 @@ bool ReadWriteDeltaHashTable::findAll(uint64_t hash,
                                        std::vector<uint64_t>& packed_versions,
                                        std::vector<uint32_t>& ids) const {
     uint32_t bi = bucketIndex(hash);
-    uint32_t li = lslotIndex(hash);
-    uint64_t fp = fingerprint(hash);
+    uint64_t suffix = suffixFromHash(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
-    return findAllByHash(bi, li, fp, packed_versions, ids);
+    return findAllByHash(bi, suffix, packed_versions, ids);
 }
 
 bool ReadWriteDeltaHashTable::findFirst(uint64_t hash,
                                          uint64_t& packed_version,
                                          uint32_t& id) const {
     uint32_t bi = bucketIndex(hash);
-    uint32_t li = lslotIndex(hash);
-    uint64_t fp = fingerprint(hash);
+    uint64_t suffix = suffixFromHash(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
-    return findFirstByHash(bi, li, fp, packed_version, id);
+    return findFirstByHash(bi, suffix, packed_version, id);
 }
 
 bool ReadWriteDeltaHashTable::contains(uint64_t hash) const {
-    uint64_t pv;
-    uint32_t id;
-    return findFirst(hash, pv, id);
+    uint32_t bi = bucketIndex(hash);
+    uint64_t suffix = suffixFromHash(hash);
+
+    SpinlockGuard guard(bucket_locks_[bi]);
+    return containsByHash(bi, suffix);
 }
 
 // --- Add ---
 
 void ReadWriteDeltaHashTable::addEntry(uint64_t hash,
                                         uint64_t packed_version, uint32_t id) {
-    addImpl(bucketIndex(hash), lslotIndex(hash), fingerprint(hash),
+    addImpl(bucketIndex(hash), suffixFromHash(hash),
             packed_version, id);
 }
 
 bool ReadWriteDeltaHashTable::addEntryIsNew(uint64_t hash,
                                               uint64_t packed_version, uint32_t id) {
-    return addImpl(bucketIndex(hash), lslotIndex(hash), fingerprint(hash),
+    return addImpl(bucketIndex(hash), suffixFromHash(hash),
                    packed_version, id);
 }
 
 bool ReadWriteDeltaHashTable::removeEntry(uint64_t hash,
                                            uint64_t packed_version, uint32_t id) {
     uint32_t bi = bucketIndex(hash);
-    uint32_t li = lslotIndex(hash);
-    uint64_t fp = fingerprint(hash);
+    uint64_t suffix = suffixFromHash(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
-    bool group_empty = removeFromChain(bi, li, fp, packed_version, id);
+    bool group_empty = removeFromChain(bi, suffix, packed_version, id);
     size_.fetch_sub(1, std::memory_order_relaxed);
     return group_empty;
 }
@@ -78,40 +77,20 @@ bool ReadWriteDeltaHashTable::updateEntryId(uint64_t hash,
                                               uint64_t packed_version,
                                               uint32_t old_id, uint32_t new_id) {
     uint32_t bi = bucketIndex(hash);
-    uint32_t li = lslotIndex(hash);
-    uint64_t fp = fingerprint(hash);
+    uint64_t suffix = suffixFromHash(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
-    return updateIdInChain(bi, li, fp, packed_version, old_id, new_id,
+    return updateIdInChain(bi, suffix, packed_version, old_id, new_id,
         [this](Bucket& bucket) -> Bucket* {
             return createExtension(bucket);
         });
 }
 
-bool ReadWriteDeltaHashTable::addEntryChecked(
-    uint64_t hash, uint64_t packed_version, uint32_t id,
-    const DeltaHashTable::KeyResolver& resolver) {
-    uint32_t bi = bucketIndex(hash);
-    uint32_t li = lslotIndex(hash);
-    uint64_t fp = fingerprint(hash);
-    uint64_t ext_bits = extensionBits(hash);
-
-    SpinlockGuard guard(bucket_locks_[bi]);
-
-    bool is_new = addToChainChecked(bi, li, fp, packed_version, id,
-        [this](Bucket& bucket) -> Bucket* {
-            return createExtension(bucket);
-        },
-        resolver, ext_bits);
-    size_.fetch_add(1, std::memory_order_relaxed);
-    return is_new;
-}
-
-bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint32_t li, uint64_t fp,
+bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint64_t suffix,
                                        uint64_t packed_version, uint32_t id) {
     SpinlockGuard guard(bucket_locks_[bi]);
 
-    bool is_new = addToChain(bi, li, fp, packed_version, id,
+    bool is_new = addToChain(bi, suffix, packed_version, id,
         [this](Bucket& bucket) -> Bucket* {
             return createExtension(bucket);
         });

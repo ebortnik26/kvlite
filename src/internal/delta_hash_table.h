@@ -6,8 +6,8 @@
 #include <memory>
 #include <vector>
 
+#include "internal/bit_stream.h"
 #include "internal/bucket_arena.h"
-#include "internal/lslot_codec.h"
 
 namespace kvlite {
 namespace internal {
@@ -28,28 +28,33 @@ inline uint64_t dhtHashBytes(const void* data, size_t len) {
     return hash;
 }
 
-// Base class for Delta Hash Tables.
+// Base class for Delta Hash Tables using sorted suffix arrays per bucket.
 //
-// Provides all bucket management, hash decomposition, extension chain
-// handling, and generic chain-traversal helpers. Derived classes add
-// lifecycle-specific public APIs and optional locking.
+// Each bucket stores unique key suffixes (the hash bits not used for bucket
+// selection) in sorted order, with per-key version/id arrays. Binary search
+// replaces fingerprint matching. Full suffix comparison replaces collision
+// resolution — no false positives, no I/O for disambiguation.
 //
-// Payload per fingerprint group: parallel arrays of
+// Payload per key suffix: parallel arrays of
 //   packed_version (uint64_t) — opaque 64-bit value
 //   id            (uint32_t) — opaque 32-bit value (file-offset or segment-id)
 class DeltaHashTable {
 public:
-    using TrieEntry = LSlotCodec::TrieEntry;
-    using LSlotContents = LSlotCodec::LSlotContents;
-
-    // Resolves the full primary hash for a given (segment_id, packed_version) pair.
-    // Used during collision detection to extract extension bits for disambiguation.
-    using KeyResolver = std::function<uint64_t(uint32_t segment_id, uint64_t packed_version)>;
-
     struct Config {
         uint8_t bucket_bits = 20;
-        uint8_t lslot_bits = 5;
         uint32_t bucket_bytes = 512;
+    };
+
+    // Per-key entry within a decoded bucket.
+    struct KeyEntry {
+        uint64_t suffix;
+        std::vector<uint64_t> packed_versions;  // sorted desc
+        std::vector<uint32_t> ids;              // parallel with packed_versions
+    };
+
+    // Decoded contents of an entire bucket.
+    struct BucketContents {
+        std::vector<KeyEntry> keys;  // sorted by suffix ascending
     };
 
     // --- Public read API (no locking) ---
@@ -80,11 +85,7 @@ public:
     uint32_t numBuckets() const;
     uint32_t bucketStride() const;
     const Config& config() const;
-    uint8_t fingerprintBits() const;
-    uint8_t extensionBitsWidth() const;
-
-    // Extract extension bits from a full hash.
-    uint64_t extensionBits(uint64_t hash) const;
+    uint8_t suffixBits() const;
 
 protected:
     static constexpr uint32_t kBucketPadding = 8;
@@ -100,23 +101,18 @@ protected:
     // --- Hash decomposition ---
 
     uint32_t bucketIndex(uint64_t hash) const;
-    uint32_t lslotIndex(uint64_t hash) const;
-    uint64_t fingerprint(uint64_t hash) const;
+    uint64_t suffixFromHash(uint64_t hash) const;
 
     // --- Bucket data ---
 
     uint64_t getExtensionPtr(const Bucket& bucket) const;
     void setExtensionPtr(Bucket& bucket, uint64_t ptr) const;
     size_t bucketDataBits() const;
-    uint32_t numLSlots() const;
 
     // --- Decode / Encode ---
 
-    LSlotContents decodeLSlot(const Bucket& bucket, uint32_t lslot_idx) const;
-    std::vector<LSlotContents> decodeAllLSlots(const Bucket& bucket) const;
-    void reencodeAllLSlots(Bucket& bucket,
-                           const std::vector<LSlotContents>& all_slots);
-    size_t totalBitsNeeded(const std::vector<LSlotContents>& all_slots) const;
+    BucketContents decodeBucket(const Bucket& bucket) const;
+    size_t encodeBucket(Bucket& bucket, const BucketContents& contents) const;
 
     // --- Extension chain ---
 
@@ -124,42 +120,67 @@ protected:
     Bucket* nextBucketMut(Bucket& bucket);
     Bucket* createExtension(Bucket& bucket);
 
+    // --- Targeted scan helpers ---
+
+    // Decode only the suffix array from a bucket. Returns suffixes and the
+    // bit position where per-key version data begins.
+    struct SuffixScanResult {
+        std::vector<uint64_t> suffixes;
+        size_t versions_start_bit;
+    };
+    SuffixScanResult decodeSuffixes(const Bucket& bucket) const;
+
+    // Skip one key's version/id data in the bitstream (advances reader past it).
+    static void skipKeyData(BitReader& reader);
+
+    // Decode one key's version/id data from current reader position.
+    static KeyEntry decodeKeyData(BitReader& reader, uint64_t suffix);
+
+    // Check if a suffix exists in the chain at bucket bi (suffix-only scan).
+    bool containsByHash(uint32_t bi, uint64_t suffix) const;
+
+    // --- Incremental bit budget helpers ---
+
+    // Returns the bit count the current bucket contents use.
+    size_t decodeBucketUsedBits(const Bucket& bucket) const;
+
+    // Extra bits for appending one version to an existing key.
+    static size_t bitsForAppendVersion(uint64_t prev_pv, uint64_t new_pv,
+                                       uint32_t prev_id, uint32_t new_id);
+
+    // Extra bits for inserting a new single-version key entry.
+    static size_t bitsForNewEntry(uint64_t suffix, uint64_t prev_suffix,
+                                  uint64_t next_suffix, bool has_prev,
+                                  bool has_next, uint8_t suffix_bits,
+                                  uint64_t packed_version, uint32_t id);
+
     // --- Protected read helpers (pre-hashed) ---
 
-    bool findAllByHash(uint32_t bi, uint32_t li, uint64_t fp,
+    bool findAllByHash(uint32_t bi, uint64_t suffix,
                        std::vector<uint64_t>& packed_versions,
                        std::vector<uint32_t>& ids) const;
 
-    bool findFirstByHash(uint32_t bi, uint32_t li, uint64_t fp,
+    bool findFirstByHash(uint32_t bi, uint64_t suffix,
                          uint64_t& packed_version, uint32_t& id) const;
 
     // --- Protected write helpers ---
-    // Adds an entry to the chain at (bi, li) for fingerprint fp.
-    // createExtFn is called (with bucket lock held by caller if needed)
-    // when the current bucket overflows.
-    // Returns true if the fingerprint group was newly created (key is new).
-    bool addToChain(uint32_t bi, uint32_t li, uint64_t fp,
+
+    // Adds an entry to the chain at bucket bi for the given suffix.
+    // createExtFn is called when the current bucket overflows.
+    // Returns true if the suffix was newly created (key is new).
+    bool addToChain(uint32_t bi, uint64_t suffix,
                     uint64_t packed_version, uint32_t id,
                     const std::function<Bucket*(Bucket&)>& createExtFn);
 
-    // Like addToChain, but detects fingerprint collisions by resolving existing keys.
-    // When a collision is detected, extends fingerprints with extension bits from
-    // the same hash function. Returns true if the key is new (no prior entry).
-    bool addToChainChecked(uint32_t bi, uint32_t li, uint64_t fp,
-                           uint64_t packed_version, uint32_t id,
-                           const std::function<Bucket*(Bucket&)>& createExtFn,
-                           const KeyResolver& resolver,
-                           uint64_t new_key_ext_bits);
-
-    // Remove entry matching (fp, packed_version, id) from chain at (bi, li).
-    // Returns true if the fingerprint group is now empty (all entries removed).
-    bool removeFromChain(uint32_t bi, uint32_t li, uint64_t fp,
+    // Remove entry matching (suffix, packed_version, id) from chain at bi.
+    // Returns true if the suffix group is now empty (all entries removed).
+    bool removeFromChain(uint32_t bi, uint64_t suffix,
                          uint64_t packed_version, uint32_t id);
 
-    // Update id for entry matching (fp, packed_version, old_id) to new_id.
+    // Update id for entry matching (suffix, packed_version, old_id) to new_id.
     // createExtFn called if re-encoding overflows the current bucket.
     // Returns true if the entry was found and updated.
-    bool updateIdInChain(uint32_t bi, uint32_t li, uint64_t fp,
+    bool updateIdInChain(uint32_t bi, uint64_t suffix,
                          uint64_t packed_version, uint32_t old_id, uint32_t new_id,
                          const std::function<Bucket*(Bucket&)>& createExtFn);
 
@@ -171,56 +192,15 @@ protected:
     // --- Members ---
 
     Config config_;
-    uint8_t fingerprint_bits_;   // base fingerprint width (lower bits of hash)
-    uint8_t extension_bits_;     // extension width (bits between lslot and fingerprint)
-    LSlotCodec lslot_codec_;
+    uint8_t suffix_bits_;   // 64 - bucket_bits
     std::unique_ptr<uint8_t[]> arena_;
     std::vector<Bucket> buckets_;
     BucketArena* ext_arena_;    // non-owning; set by derived class
 
 private:
     void initBucket(Bucket& bucket);
-
-    // Prune an empty tail extension from a bucket's chain.
     void pruneEmptyExtension(Bucket* bucket);
-
-    // Check whether any entry with matching base fp exists in the chain.
-    bool isGroupEmpty(uint32_t bi, uint32_t li, uint64_t fp) const;
-
-    // Remove one TrieEntry (by base fp match) from bucket's lslot,
-    // reencode bucket, write entry to extension.
-    void spillEntryToExtension(
-        Bucket* bucket, uint32_t li, uint64_t base_mask, uint64_t fp,
-        const std::function<Bucket*(Bucket&)>& createExtFn);
-
-    // Try committing a candidate lslot to a bucket. Returns true if it fits.
-    bool tryCommitSlot(Bucket* bucket, uint32_t li,
-                       std::vector<LSlotContents>& all_slots,
-                       LSlotContents&& candidate);
-
-    // Append (packed_version, id) to an existing TrieEntry, handling overflow.
-    void appendToEntry(TrieEntry& entry,
-                       std::vector<LSlotContents>& all_slots,
-                       Bucket* bucket, uint32_t li,
-                       uint64_t packed_version, uint32_t id,
-                       const std::function<Bucket*(Bucket&)>& createExtFn);
-
-    // Find which matched entry is the same key. Returns index or -1.
-    int findSameKeyMatch(
-        const std::vector<LSlotContents>& all_slots, uint32_t li,
-        const std::vector<size_t>& match_indices,
-        const KeyResolver& resolver,
-        uint64_t new_key_ext_bits) const;
-
-    // Resolve a collision by extending fingerprints and committing.
-    void resolveCollision(
-        std::vector<LSlotContents>& all_slots,
-        Bucket* bucket, uint32_t li, uint64_t fp,
-        const std::vector<size_t>& match_indices,
-        const KeyResolver& resolver,
-        uint64_t new_key_ext_bits,
-        uint64_t packed_version, uint32_t id,
-        const std::function<Bucket*(Bucket&)>& createExtFn);
+    bool isSuffixEmpty(uint32_t bi, uint64_t suffix) const;
 };
 
 }  // namespace internal

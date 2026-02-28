@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <unordered_map>
 
 #include "internal/bit_stream.h"
 
@@ -13,9 +12,7 @@ namespace internal {
 
 DeltaHashTable::DeltaHashTable(const Config& config)
     : config_(config),
-      fingerprint_bits_((64 - config.bucket_bits - config.lslot_bits) / 2),
-      extension_bits_(64 - config.bucket_bits - config.lslot_bits - fingerprint_bits_),
-      lslot_codec_(fingerprint_bits_),
+      suffix_bits_(64 - config.bucket_bits),
       ext_arena_(nullptr) {
     uint32_t num_buckets = 1u << config_.bucket_bits;
     uint32_t stride = bucketStride();
@@ -27,7 +24,6 @@ DeltaHashTable::DeltaHashTable(const Config& config)
     for (uint32_t i = 0; i < num_buckets; ++i) {
         buckets_[i].data = arena_.get() + static_cast<size_t>(i) * stride;
     }
-    // Init buckets directly — ext_arena_ is not set yet (derived class owns it).
     for (auto& bucket : buckets_) {
         initBucket(bucket);
     }
@@ -43,14 +39,8 @@ uint32_t DeltaHashTable::bucketIndex(uint64_t hash) const {
     return static_cast<uint32_t>(hash >> (64 - config_.bucket_bits));
 }
 
-uint32_t DeltaHashTable::lslotIndex(uint64_t hash) const {
-    return static_cast<uint32_t>(
-        (hash >> (64 - config_.bucket_bits - config_.lslot_bits))
-        & ((1u << config_.lslot_bits) - 1));
-}
-
-uint64_t DeltaHashTable::fingerprint(uint64_t hash) const {
-    return hash & ((1ULL << fingerprint_bits_) - 1);
+uint64_t DeltaHashTable::suffixFromHash(uint64_t hash) const {
+    return hash & ((suffix_bits_ == 64) ? ~0ULL : ((1ULL << suffix_bits_) - 1));
 }
 
 // --- Bucket data ---
@@ -73,56 +63,338 @@ size_t DeltaHashTable::bucketDataBits() const {
     return (config_.bucket_bytes - 8) * 8;
 }
 
-uint32_t DeltaHashTable::numLSlots() const {
-    return 1u << config_.lslot_bits;
-}
-
 // --- Decode / Encode ---
+//
+// Bucket format (sorted suffix array):
+//   Header: N_k (uint16_t) — number of unique keys
+//   Suffix array: N_k suffixes, sorted ascending
+//     First suffix: raw suffix_bits bits
+//     Remaining: delta-encoded (Elias gamma of delta+1)
+//   Per-key entries (N_k of them):
+//     N_v (Elias gamma of count)
+//     packed_versions[N_v]: first raw 64-bit, rest delta-encoded (desc, gamma of delta+1)
+//     ids[N_v]: first raw 32-bit, rest zigzag-varint delta-encoded (gamma of zigzag(delta)+1)
 
-DeltaHashTable::LSlotContents DeltaHashTable::decodeLSlot(
-    const Bucket& bucket, uint32_t lslot_idx) const {
-    size_t bit_off = lslot_codec_.bitOffset(bucket.data, lslot_idx);
-    return lslot_codec_.decode(bucket.data, bit_off);
+static uint32_t zigzagEncode(int32_t v) {
+    return static_cast<uint32_t>((v << 1) ^ (v >> 31));
 }
 
-std::vector<DeltaHashTable::LSlotContents> DeltaHashTable::decodeAllLSlots(
-    const Bucket& bucket) const {
-    uint32_t n = numLSlots();
-    std::vector<LSlotContents> slots(n);
-    size_t offset = 0;
-    for (uint32_t s = 0; s < n; ++s) {
-        slots[s] = lslot_codec_.decode(bucket.data, offset, &offset);
+static int32_t zigzagDecode(uint32_t v) {
+    return static_cast<int32_t>((v >> 1) ^ -(v & 1));
+}
+
+DeltaHashTable::BucketContents DeltaHashTable::decodeBucket(const Bucket& bucket) const {
+    BucketContents contents;
+
+    // Read N_k from first 16 bits.
+    uint16_t num_keys = 0;
+    std::memcpy(&num_keys, bucket.data, sizeof(uint16_t));
+    if (num_keys == 0) return contents;
+
+    BitReader reader(bucket.data, 16);
+
+    contents.keys.resize(num_keys);
+
+    // Decode suffixes (sorted ascending, delta-encoded).
+    contents.keys[0].suffix = reader.read(suffix_bits_);
+    for (uint16_t i = 1; i < num_keys; ++i) {
+        uint64_t delta = reader.readEliasGamma64() - 1;
+        contents.keys[i].suffix = contents.keys[i - 1].suffix + delta;
     }
-    return slots;
+
+    // Decode per-key entries.
+    for (uint16_t i = 0; i < num_keys; ++i) {
+        auto& key = contents.keys[i];
+        uint32_t nv = reader.readEliasGamma();
+        key.packed_versions.resize(nv);
+        key.ids.resize(nv);
+
+        if (nv > 0) {
+            // Packed versions: raw first, gamma(delta+1) for rest (desc order).
+            key.packed_versions[0] = reader.read(64);
+            for (uint32_t v = 1; v < nv; ++v) {
+                uint64_t delta = reader.readEliasGamma64() - 1;
+                key.packed_versions[v] = key.packed_versions[v - 1] - delta;
+            }
+            // IDs: raw first, gamma(zigzag(delta)+1) for rest.
+            key.ids[0] = static_cast<uint32_t>(reader.read(32));
+            for (uint32_t v = 1; v < nv; ++v) {
+                uint32_t zz = reader.readEliasGamma() - 1;
+                int32_t delta = zigzagDecode(zz);
+                key.ids[v] = static_cast<uint32_t>(static_cast<int32_t>(key.ids[v - 1]) + delta);
+            }
+        }
+    }
+
+    return contents;
 }
 
-void DeltaHashTable::reencodeAllLSlots(
-    Bucket& bucket, const std::vector<LSlotContents>& all_slots) {
-    size_t data_bytes = config_.bucket_bytes - 8;
+// Returns the number of bits written (excluding the 16-bit header).
+size_t DeltaHashTable::encodeBucket(Bucket& bucket, const BucketContents& contents) const {
     uint64_t ext_ptr = getExtensionPtr(bucket);
+    size_t data_bytes = config_.bucket_bytes - 8;
     std::memset(bucket.data, 0, data_bytes);
     setExtensionPtr(bucket, ext_ptr);
 
-    size_t write_offset = 0;
-    for (uint32_t s = 0; s < all_slots.size(); ++s) {
-        write_offset = lslot_codec_.encode(bucket.data, write_offset,
-                                           all_slots[s]);
+    uint16_t num_keys = static_cast<uint16_t>(contents.keys.size());
+    std::memcpy(bucket.data, &num_keys, sizeof(uint16_t));
+    if (num_keys == 0) return 16;
+
+    BitWriter writer(bucket.data, 16);
+
+    // Encode suffixes (sorted ascending, delta-encoded).
+    writer.write(contents.keys[0].suffix, suffix_bits_);
+    for (uint16_t i = 1; i < num_keys; ++i) {
+        uint64_t delta = contents.keys[i].suffix - contents.keys[i - 1].suffix;
+        writer.writeEliasGamma64(delta + 1);
+    }
+
+    // Encode per-key entries.
+    for (uint16_t i = 0; i < num_keys; ++i) {
+        const auto& key = contents.keys[i];
+        uint32_t nv = static_cast<uint32_t>(key.packed_versions.size());
+        writer.writeEliasGamma(nv);
+
+        if (nv > 0) {
+            // Packed versions: raw first, gamma(delta+1) for rest (desc order).
+            writer.write(key.packed_versions[0], 64);
+            for (uint32_t v = 1; v < nv; ++v) {
+                uint64_t delta = key.packed_versions[v - 1] - key.packed_versions[v];
+                writer.writeEliasGamma64(delta + 1);
+            }
+            // IDs: raw first, gamma(zigzag(delta)+1) for rest.
+            writer.write(key.ids[0], 32);
+            for (uint32_t v = 1; v < nv; ++v) {
+                int32_t delta = static_cast<int32_t>(key.ids[v]) -
+                                static_cast<int32_t>(key.ids[v - 1]);
+                writer.writeEliasGamma(zigzagEncode(delta) + 1);
+            }
+        }
+    }
+
+    return writer.position();
+}
+
+// Compute the bits needed to encode a BucketContents.
+static uint8_t eliasGammaBits(uint32_t n) {
+    uint8_t k = 31 - __builtin_clz(n);
+    return 2 * k + 1;
+}
+
+static uint8_t eliasGammaBits64(uint64_t n) {
+    uint8_t k = 63 - __builtin_clzll(n);
+    return 2 * k + 1;
+}
+
+static size_t contentsBitsNeeded(const DeltaHashTable::BucketContents& contents,
+                                  uint8_t suffix_bits) {
+    if (contents.keys.empty()) return 16;  // just the header
+
+    size_t bits = 16;  // uint16_t header
+
+    // First suffix raw, rest delta-encoded.
+    bits += suffix_bits;
+    for (size_t i = 1; i < contents.keys.size(); ++i) {
+        uint64_t delta = contents.keys[i].suffix - contents.keys[i - 1].suffix;
+        bits += eliasGammaBits64(delta + 1);
+    }
+
+    // Per-key entries.
+    for (const auto& key : contents.keys) {
+        uint32_t nv = static_cast<uint32_t>(key.packed_versions.size());
+        bits += eliasGammaBits(nv);
+        if (nv > 0) {
+            bits += 64;  // first packed_version
+            for (uint32_t v = 1; v < nv; ++v) {
+                uint64_t delta = key.packed_versions[v - 1] - key.packed_versions[v];
+                bits += eliasGammaBits64(delta + 1);
+            }
+            bits += 32;  // first id
+            for (uint32_t v = 1; v < nv; ++v) {
+                int32_t delta = static_cast<int32_t>(key.ids[v]) -
+                                static_cast<int32_t>(key.ids[v - 1]);
+                bits += eliasGammaBits(zigzagEncode(delta) + 1);
+            }
+        }
+    }
+
+    return bits;
+}
+
+// --- Targeted scan helpers ---
+
+DeltaHashTable::SuffixScanResult DeltaHashTable::decodeSuffixes(const Bucket& bucket) const {
+    SuffixScanResult result;
+
+    uint16_t num_keys = 0;
+    std::memcpy(&num_keys, bucket.data, sizeof(uint16_t));
+    if (num_keys == 0) {
+        result.versions_start_bit = 16;
+        return result;
+    }
+
+    BitReader reader(bucket.data, 16);
+    result.suffixes.resize(num_keys);
+
+    result.suffixes[0] = reader.read(suffix_bits_);
+    for (uint16_t i = 1; i < num_keys; ++i) {
+        uint64_t delta = reader.readEliasGamma64() - 1;
+        result.suffixes[i] = result.suffixes[i - 1] + delta;
+    }
+
+    result.versions_start_bit = reader.position();
+    return result;
+}
+
+void DeltaHashTable::skipKeyData(BitReader& reader) {
+    uint32_t nv = reader.readEliasGamma();
+    if (nv > 0) {
+        // Skip first packed_version (64 bits).
+        reader.read(64);
+        // Skip remaining packed_versions (gamma-coded deltas).
+        for (uint32_t v = 1; v < nv; ++v) {
+            reader.readEliasGamma64();
+        }
+        // Skip first id (32 bits).
+        reader.read(32);
+        // Skip remaining ids (gamma-coded zigzag deltas).
+        for (uint32_t v = 1; v < nv; ++v) {
+            reader.readEliasGamma();
+        }
     }
 }
 
-size_t DeltaHashTable::totalBitsNeeded(
-    const std::vector<LSlotContents>& all_slots) const {
-    size_t bits = 0;
-    for (const auto& slot : all_slots) {
-        bits += LSlotCodec::bitsNeeded(slot, fingerprint_bits_);
+DeltaHashTable::KeyEntry DeltaHashTable::decodeKeyData(BitReader& reader, uint64_t suffix) {
+    KeyEntry key;
+    key.suffix = suffix;
+    uint32_t nv = reader.readEliasGamma();
+    key.packed_versions.resize(nv);
+    key.ids.resize(nv);
+
+    if (nv > 0) {
+        key.packed_versions[0] = reader.read(64);
+        for (uint32_t v = 1; v < nv; ++v) {
+            uint64_t delta = reader.readEliasGamma64() - 1;
+            key.packed_versions[v] = key.packed_versions[v - 1] - delta;
+        }
+        key.ids[0] = static_cast<uint32_t>(reader.read(32));
+        for (uint32_t v = 1; v < nv; ++v) {
+            uint32_t zz = reader.readEliasGamma() - 1;
+            int32_t delta = zigzagDecode(zz);
+            key.ids[v] = static_cast<uint32_t>(static_cast<int32_t>(key.ids[v - 1]) + delta);
+        }
     }
+
+    return key;
+}
+
+bool DeltaHashTable::containsByHash(uint32_t bi, uint64_t suffix) const {
+    const Bucket* bucket = &buckets_[bi];
+    while (bucket) {
+        auto scan = decodeSuffixes(*bucket);
+        if (std::binary_search(scan.suffixes.begin(), scan.suffixes.end(), suffix)) {
+            return true;
+        }
+        bucket = nextBucket(*bucket);
+    }
+    return false;
+}
+
+// --- Incremental bit budget helpers ---
+
+size_t DeltaHashTable::decodeBucketUsedBits(const Bucket& bucket) const {
+    uint16_t num_keys = 0;
+    std::memcpy(&num_keys, bucket.data, sizeof(uint16_t));
+    if (num_keys == 0) return 16;
+
+    BitReader reader(bucket.data, 16);
+
+    // Skip suffixes.
+    reader.read(suffix_bits_);
+    for (uint16_t i = 1; i < num_keys; ++i) {
+        reader.readEliasGamma64();
+    }
+
+    // Skip per-key entries.
+    for (uint16_t i = 0; i < num_keys; ++i) {
+        skipKeyData(reader);
+    }
+
+    return reader.position();
+}
+
+size_t DeltaHashTable::bitsForAppendVersion(uint64_t prev_pv, uint64_t new_pv,
+                                             uint32_t prev_id, uint32_t new_id) {
+    // The version count gamma code grows. We compute the difference in gamma bits
+    // for count vs count+1, but since we don't know count, we must account for it.
+    // Actually, the caller deals with the count gamma change separately.
+    // Here we just compute the bits for the new delta-encoded version + id.
+
+    // New packed_version delta (desc order: prev_pv > new_pv for append at end,
+    // but insertion position varies). For simplicity, compute based on the
+    // deltas that will actually be encoded.
+
+    // Version delta: gamma(prev_pv - new_pv + 1) if appended after prev_pv.
+    // But if inserted in middle, both neighbor deltas change. For typical
+    // append (latest version), this is the common case.
+    size_t bits = 0;
+    uint64_t pv_delta = (prev_pv > new_pv) ? (prev_pv - new_pv) : (new_pv - prev_pv);
+    bits += eliasGammaBits64(pv_delta + 1);
+
+    int32_t id_delta = static_cast<int32_t>(new_id) - static_cast<int32_t>(prev_id);
+    bits += eliasGammaBits(zigzagEncode(id_delta) + 1);
+
+    return bits;
+}
+
+size_t DeltaHashTable::bitsForNewEntry(uint64_t suffix, uint64_t prev_suffix,
+                                        uint64_t next_suffix, bool has_prev,
+                                        bool has_next, uint8_t suffix_bits,
+                                        uint64_t packed_version, uint32_t id) {
+    size_t bits = 0;
+
+    // Suffix delta chain change.
+    if (!has_prev) {
+        // First key: raw suffix_bits.
+        bits += suffix_bits;
+        if (has_next) {
+            // Remove the raw next suffix encoding, add delta from new→next.
+            // Net: remove suffix_bits (the old raw next), add gamma(delta+1).
+            uint64_t delta_new_next = next_suffix - suffix;
+            // We're replacing the old raw encoding of next_suffix.
+            // Old cost for next_suffix was suffix_bits (it was the first key).
+            // New cost: suffix (raw) + gamma(next-suffix delta).
+            // So extra = gamma(delta+1) - suffix_bits + suffix_bits = gamma(delta+1).
+            // Wait, let's think again. Before insertion:
+            //   next_suffix was first, encoded as raw suffix_bits.
+            // After insertion:
+            //   suffix (new first) as raw suffix_bits, then next_suffix as gamma(next-suffix+1).
+            // Net change: +suffix_bits + gamma(delta+1) - suffix_bits = +gamma(delta+1).
+            bits += eliasGammaBits64(delta_new_next + 1);
+        }
+    } else if (!has_next) {
+        // Last key: add delta from prev→new.
+        uint64_t delta_prev_new = suffix - prev_suffix;
+        bits += eliasGammaBits64(delta_prev_new + 1);
+    } else {
+        // Middle: remove delta(prev→next), add delta(prev→new) + delta(new→next).
+        uint64_t old_delta = next_suffix - prev_suffix;
+        uint64_t delta_prev_new = suffix - prev_suffix;
+        uint64_t delta_new_next = next_suffix - suffix;
+        bits += eliasGammaBits64(delta_prev_new + 1);
+        bits += eliasGammaBits64(delta_new_next + 1);
+        bits -= eliasGammaBits64(old_delta + 1);
+    }
+
+    // Entry data: gamma(1) + 64-bit packed_version + 32-bit id.
+    bits += 1 + 64 + 32;  // eliasGammaBits(1) == 1
+
     return bits;
 }
 
 // --- Extension chain ---
 
-const Bucket* DeltaHashTable::nextBucket(
-    const Bucket& bucket) const {
+const Bucket* DeltaHashTable::nextBucket(const Bucket& bucket) const {
     uint64_t ext = getExtensionPtr(bucket);
     return ext ? ext_arena_->get(static_cast<uint32_t>(ext)) : nullptr;
 }
@@ -140,521 +412,234 @@ Bucket* DeltaHashTable::createExtension(Bucket& bucket) {
     return ext_bucket;
 }
 
-// Forward declaration — defined in the addToChainChecked helpers section below.
-static DeltaHashTable::LSlotContents buildCandidateSlot(
-    const DeltaHashTable::LSlotContents& slot,
-    uint64_t full_fp, uint8_t fp_extra_bits,
-    uint64_t packed_version, uint32_t id);
-
 // --- addToChain ---
 
-bool DeltaHashTable::addToChain(uint32_t bi, uint32_t li, uint64_t fp,
+bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
                                  uint64_t packed_version, uint32_t id,
                                  const std::function<Bucket*(Bucket&)>& createExtFn) {
-    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
     Bucket* bucket = &buckets_[bi];
     bool is_new = true;
 
     while (true) {
-        auto all_slots = decodeAllLSlots(*bucket);
+        // First, do a targeted suffix scan to check fit incrementally.
+        auto scan = decodeSuffixes(*bucket);
+        auto sit = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
+        size_t suffix_idx = sit - scan.suffixes.begin();
+        bool suffix_found = (sit != scan.suffixes.end() && *sit == suffix);
 
-        if (is_new) {
-            for (const auto& entry : all_slots[li].entries) {
-                if ((entry.fingerprint & base_mask) == fp) {
-                    is_new = false;
-                    break;
-                }
+        if (suffix_found) {
+            // Suffix exists in this bucket — need to append version.
+            // Decode only the target key to check the new version fits.
+            BitReader reader(bucket->data, scan.versions_start_bit);
+            for (size_t k = 0; k < suffix_idx; ++k) {
+                skipKeyData(reader);
             }
-        }
+            auto key = decodeKeyData(reader, suffix);
 
-        auto candidate = buildCandidateSlot(all_slots[li], fp, 0,
-                                            packed_version, id);
-        if (tryCommitSlot(bucket, li, all_slots, std::move(candidate))) {
-            return is_new;
-        }
+            is_new = false;
+            uint32_t old_nv = static_cast<uint32_t>(key.packed_versions.size());
 
-        Bucket* ext = nextBucketMut(*bucket);
-        if (!ext) ext = createExtFn(*bucket);
-        bucket = ext;
-    }
-}
+            // Find insertion position for the new version (desc order).
+            auto pos = std::lower_bound(key.packed_versions.begin(),
+                                        key.packed_versions.end(),
+                                        packed_version,
+                                        std::greater<uint64_t>());
+            size_t vidx = pos - key.packed_versions.begin();
 
-// --- addToChainChecked helpers ---
-//
-// Collision resolution uses "variable-length fingerprints": when two keys
-// share the same base fingerprint (hash collision), we extend their
-// fingerprints with extension bits from the same hash to disambiguate them.
-// The extension width (fp_extra_bits) is the minimum number of extension
-// bits needed to make all entries in the group pairwise unique.
-//
-// Helper call graph:
-//   addToChainChecked
-//   ├── findSameKeyMatch       — check if new key matches any existing entry
-//   ├── appendToEntry          — add version to existing key's entry
-//   │   ├── buildCandidateSlot — build modified slot offline (no mutation)
-//   │   └── tryCommitSlot      — check fit and reencode if OK
-//   └── resolveCollision       — extend fingerprints for all colliding keys
-//       ├── findMinExtraBits   — find min bits to disambiguate all keys
-//       └── extendAndInsert    — apply extension and add new entry
+            // Compute incremental bit cost.
+            size_t current_bits = decodeBucketUsedBits(*bucket);
+            size_t extra_bits = 0;
 
-// Find minimum extra_bits such that new_sec and all entries in sec_hashes
-// produce unique values when masked to extra_bits width. Tries widths
-// starting at start_bits, incrementing until all N+1 values are distinct.
-static uint8_t findMinExtraBits(
-    const std::vector<uint64_t>& sec_hashes,
-    uint64_t new_sec,
-    uint8_t start_bits = 1) {
-    uint8_t extra_bits = start_bits;
-    while (extra_bits < 64) {
-        uint64_t ext_mask = (1ULL << extra_bits) - 1;
-        uint64_t new_ext = new_sec & ext_mask;
-        bool all_unique = true;
-        for (uint64_t sh : sec_hashes) {
-            if ((sh & ext_mask) == new_ext) {
-                all_unique = false;
-                break;
+            // The version count gamma code changes: gamma(old_nv) → gamma(old_nv+1).
+            extra_bits += eliasGammaBits(old_nv + 1);
+            extra_bits -= eliasGammaBits(old_nv);
+
+            // New version/id encoding depends on insertion position.
+            if (old_nv == 0) {
+                // Was empty (shouldn't happen for found suffix, but handle it).
+                extra_bits += 64 + 32;
+            } else if (vidx == 0) {
+                // Insert at front (new highest version).
+                uint64_t old_first_pv = key.packed_versions[0];
+                uint32_t old_first_id = key.ids[0];
+                // New first is raw 64+32, old first becomes delta-encoded.
+                // Remove old raw cost, add new raw + delta for old first.
+                // Net: old was raw(64+32). New: raw(64+32) for new + delta for old.
+                uint64_t pv_delta = packed_version - old_first_pv;
+                int32_t id_delta = static_cast<int32_t>(old_first_id) - static_cast<int32_t>(id);
+                extra_bits += eliasGammaBits64(pv_delta + 1);
+                extra_bits += eliasGammaBits(zigzagEncode(id_delta) + 1);
+            } else if (vidx == old_nv) {
+                // Append at end.
+                uint64_t prev_pv = key.packed_versions[old_nv - 1];
+                uint32_t prev_id = key.ids[old_nv - 1];
+                extra_bits += bitsForAppendVersion(prev_pv, packed_version, prev_id, id);
+            } else {
+                // Insert in middle between vidx-1 and vidx.
+                uint64_t prev_pv = key.packed_versions[vidx - 1];
+                uint64_t next_pv = key.packed_versions[vidx];
+                uint32_t prev_id = key.ids[vidx - 1];
+                uint32_t next_id = key.ids[vidx];
+                // Remove old delta(prev→next), add delta(prev→new) + delta(new→next).
+                uint64_t old_pv_delta = prev_pv - next_pv;
+                uint64_t delta_prev_new = prev_pv - packed_version;
+                uint64_t delta_new_next = packed_version - next_pv;
+                extra_bits += eliasGammaBits64(delta_prev_new + 1);
+                extra_bits += eliasGammaBits64(delta_new_next + 1);
+                extra_bits -= eliasGammaBits64(old_pv_delta + 1);
+
+                int32_t old_id_delta = static_cast<int32_t>(next_id) - static_cast<int32_t>(prev_id);
+                int32_t id_delta_prev_new = static_cast<int32_t>(id) - static_cast<int32_t>(prev_id);
+                int32_t id_delta_new_next = static_cast<int32_t>(next_id) - static_cast<int32_t>(id);
+                extra_bits += eliasGammaBits(zigzagEncode(id_delta_prev_new) + 1);
+                extra_bits += eliasGammaBits(zigzagEncode(id_delta_new_next) + 1);
+                extra_bits -= eliasGammaBits(zigzagEncode(old_id_delta) + 1);
             }
-        }
-        if (all_unique) {
-            bool existing_unique = true;
-            for (size_t a = 0; a < sec_hashes.size() && existing_unique; ++a) {
-                for (size_t b = a + 1; b < sec_hashes.size(); ++b) {
-                    if ((sec_hashes[a] & ext_mask) ==
-                        (sec_hashes[b] & ext_mask)) {
-                        existing_unique = false;
+
+            if (current_bits + extra_bits <= bucketDataBits()) {
+                // Fits — do full decode/modify/encode for this bucket only.
+                auto contents = decodeBucket(*bucket);
+                auto cit = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
+                    [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
+                auto vpos = std::lower_bound(cit->packed_versions.begin(),
+                                             cit->packed_versions.end(),
+                                             packed_version,
+                                             std::greater<uint64_t>());
+                size_t vi = vpos - cit->packed_versions.begin();
+                cit->packed_versions.insert(vpos, packed_version);
+                cit->ids.insert(cit->ids.begin() + vi, id);
+                encodeBucket(*bucket, contents);
+                return is_new;
+            }
+
+            // Doesn't fit — move to extension (bucket data is pristine).
+            Bucket* ext = nextBucketMut(*bucket);
+            if (!ext) ext = createExtFn(*bucket);
+            bucket = ext;
+        } else {
+            // Suffix not found in this bucket — check remaining extensions for is_new.
+            if (is_new) {
+                const Bucket* check = nextBucket(*bucket);
+                while (check) {
+                    auto check_scan = decodeSuffixes(*check);
+                    if (std::binary_search(check_scan.suffixes.begin(),
+                                           check_scan.suffixes.end(), suffix)) {
+                        is_new = false;
                         break;
                     }
+                    check = nextBucket(*check);
                 }
             }
-            if (existing_unique) return extra_bits;
-        }
-        extra_bits++;
-    }
-    return extra_bits;
-}
 
-// Extend all matched entries' fingerprints with secondary hash bits and insert
-// the new entry. Modifies all_slots in place. Returns the full (extended)
-// fingerprint assigned to the new entry. Caller checks fit and handles overflow.
-static uint64_t extendAndInsert(
-    std::vector<DeltaHashTable::LSlotContents>& all_slots, uint32_t li,
-    const std::vector<size_t>& match_indices,
-    const std::vector<uint64_t>& sec_hashes,
-    uint64_t fp, uint64_t new_key_ext_bits,
-    uint64_t packed_version, uint32_t id,
-    uint8_t fingerprint_bits, uint8_t start_bits) {
+            // Compute incremental bit cost for new entry.
+            size_t current_bits = decodeBucketUsedBits(*bucket);
+            bool has_prev = (suffix_idx > 0);
+            bool has_next = (suffix_idx < scan.suffixes.size());
+            uint64_t prev_suffix = has_prev ? scan.suffixes[suffix_idx - 1] : 0;
+            uint64_t next_suffix = has_next ? scan.suffixes[suffix_idx] : 0;
 
-    uint8_t extra_bits = findMinExtraBits(sec_hashes, new_key_ext_bits,
-                                          start_bits);
-    uint64_t ext_mask = (1ULL << extra_bits) - 1;
-    auto& entries = all_slots[li].entries;
-
-    // Update existing entries with extended fingerprints.
-    for (size_t i = 0; i < match_indices.size(); ++i) {
-        entries[match_indices[i]].fp_extra_bits = extra_bits;
-        entries[match_indices[i]].fingerprint =
-            fp | ((sec_hashes[i] & ext_mask) << fingerprint_bits);
-    }
-
-    // Create and insert new entry.
-    DeltaHashTable::TrieEntry new_entry;
-    new_entry.fingerprint = fp | ((new_key_ext_bits & ext_mask) << fingerprint_bits);
-    new_entry.fp_extra_bits = extra_bits;
-    new_entry.packed_versions.push_back(packed_version);
-    new_entry.ids.push_back(id);
-    uint64_t new_fp = new_entry.fingerprint;
-    entries.push_back(std::move(new_entry));
-
-    std::sort(entries.begin(), entries.end(),
-              [](const DeltaHashTable::TrieEntry& a,
-                 const DeltaHashTable::TrieEntry& b) {
-                  return a.fingerprint < b.fingerprint;
-              });
-
-    return new_fp;
-}
-
-// Build a candidate lslot offline (pure function — no bucket mutation).
-// Returns a copy of the slot with (packed_version, id) inserted into the
-// entry matching full_fp, or with a new TrieEntry if no match exists.
-static DeltaHashTable::LSlotContents buildCandidateSlot(
-    const DeltaHashTable::LSlotContents& slot,
-    uint64_t full_fp, uint8_t fp_extra_bits,
-    uint64_t packed_version, uint32_t id) {
-    DeltaHashTable::LSlotContents candidate = slot;
-    bool found = false;
-    for (auto& e : candidate.entries) {
-        if (e.fingerprint == full_fp) {
-            auto it = std::lower_bound(e.packed_versions.begin(),
-                                       e.packed_versions.end(),
-                                       packed_version,
-                                       std::greater<uint64_t>());
-            size_t pos = it - e.packed_versions.begin();
-            e.packed_versions.insert(it, packed_version);
-            e.ids.insert(e.ids.begin() + pos, id);
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        DeltaHashTable::TrieEntry new_entry;
-        new_entry.fingerprint = full_fp;
-        new_entry.fp_extra_bits = fp_extra_bits;
-        new_entry.packed_versions.push_back(packed_version);
-        new_entry.ids.push_back(id);
-        candidate.entries.push_back(std::move(new_entry));
-        std::sort(candidate.entries.begin(), candidate.entries.end(),
-                  [](const DeltaHashTable::TrieEntry& a,
-                     const DeltaHashTable::TrieEntry& b) {
-                      return a.fingerprint < b.fingerprint;
-                  });
-    }
-    return candidate;
-}
-
-// Try replacing the lslot in a bucket with a candidate. Computes the total
-// bit cost with the candidate substituted in; if it fits in bucket data area,
-// commits (reencodes) and returns true. Otherwise returns false with no mutation.
-bool DeltaHashTable::tryCommitSlot(
-    Bucket* bucket, uint32_t li,
-    std::vector<LSlotContents>& all_slots,
-    LSlotContents&& candidate) {
-    size_t old_bits = LSlotCodec::bitsNeeded(all_slots[li], fingerprint_bits_);
-    size_t new_bits = LSlotCodec::bitsNeeded(candidate, fingerprint_bits_);
-    size_t total = totalBitsNeeded(all_slots) - old_bits + new_bits;
-    if (total <= bucketDataBits()) {
-        all_slots[li] = std::move(candidate);
-        reencodeAllLSlots(*bucket, all_slots);
-        return true;
-    }
-    return false;
-}
-
-// Append a new (packed_version, id) to an existing key's TrieEntry.
-// Builds a candidate offline, attempts to commit to the current bucket.
-// On overflow, walks the extension chain to find a bucket with space.
-void DeltaHashTable::appendToEntry(
-    TrieEntry& entry,
-    std::vector<LSlotContents>& all_slots,
-    Bucket* bucket, uint32_t li,
-    uint64_t packed_version, uint32_t id,
-    const std::function<Bucket*(Bucket&)>& createExtFn) {
-
-    auto candidate = buildCandidateSlot(all_slots[li], entry.fingerprint,
-                                        entry.fp_extra_bits,
-                                        packed_version, id);
-    if (tryCommitSlot(bucket, li, all_slots, std::move(candidate))) {
-        return;
-    }
-
-    // Doesn't fit — add the version to extension chain.
-    uint64_t full_fp = entry.fingerprint;
-    uint8_t extra_bits = entry.fp_extra_bits;
-    Bucket* target = nextBucketMut(*bucket);
-    if (!target) {
-        target = createExtFn(*bucket);
-    }
-    while (true) {
-        auto ext_slots = decodeAllLSlots(*target);
-        auto ext_candidate = buildCandidateSlot(ext_slots[li], full_fp,
-                                                extra_bits,
+            size_t extra_bits = bitsForNewEntry(suffix, prev_suffix, next_suffix,
+                                                has_prev, has_next, suffix_bits_,
                                                 packed_version, id);
-        if (tryCommitSlot(target, li, ext_slots, std::move(ext_candidate))) {
-            return;
-        }
-        Bucket* next = nextBucketMut(*target);
-        if (!next) {
-            next = createExtFn(*target);
-        }
-        target = next;
-    }
-}
 
-// --- addToChainChecked ---
-
-// For entries with extended fingerprints, compare extension bits directly.
-// For entries with fp_extra_bits==0 (never extended), resolve the actual key
-// via the resolver (which returns the full primary hash) and extract extension
-// bits for comparison.
-// Returns the entry index if found, -1 otherwise.
-int DeltaHashTable::findSameKeyMatch(
-    const std::vector<LSlotContents>& all_slots, uint32_t li,
-    const std::vector<size_t>& match_indices,
-    const KeyResolver& resolver,
-    uint64_t new_key_ext_bits) const {
-    auto& entries = all_slots[li].entries;
-    uint64_t full_ext_mask = (1ULL << extension_bits_) - 1;
-    for (size_t ei : match_indices) {
-        auto& existing = entries[ei];
-        if (existing.fp_extra_bits > 0) {
-            uint64_t ext_existing = existing.fingerprint >> fingerprint_bits_;
-            uint64_t ext_new = new_key_ext_bits &
-                ((1ULL << existing.fp_extra_bits) - 1);
-            if (ext_existing == ext_new) return static_cast<int>(ei);
-            continue;
-        }
-        // Never-extended entry: resolve full hash, extract extension bits.
-        uint64_t resolved_hash = resolver(existing.ids[0], existing.packed_versions[0]);
-        uint64_t resolved_ext = (resolved_hash >> fingerprint_bits_) & full_ext_mask;
-        if (resolved_ext == new_key_ext_bits) return static_cast<int>(ei);
-    }
-    return -1;
-}
-
-// Handle a fingerprint collision: all matched entries belong to different keys.
-// Resolves each key's full hash, extracts extension bits, finds the minimum
-// extension width that disambiguates all keys, updates existing entries'
-// fingerprints, creates the new entry, and commits. On overflow, spills the
-// new entry to extension.
-void DeltaHashTable::resolveCollision(
-    std::vector<LSlotContents>& all_slots,
-    Bucket* bucket, uint32_t li, uint64_t fp,
-    const std::vector<size_t>& match_indices,
-    const KeyResolver& resolver,
-    uint64_t new_key_ext_bits,
-    uint64_t packed_version, uint32_t id,
-    const std::function<Bucket*(Bucket&)>& createExtFn) {
-
-    auto& entries = all_slots[li].entries;
-    uint64_t full_ext_mask = (1ULL << extension_bits_) - 1;
-    std::vector<uint64_t> sec_hashes;
-    uint8_t max_extra = 0;
-    for (size_t mi : match_indices) {
-        uint64_t resolved_hash = resolver(entries[mi].ids[0],
-                                          entries[mi].packed_versions[0]);
-        sec_hashes.push_back((resolved_hash >> fingerprint_bits_) & full_ext_mask);
-        if (entries[mi].fp_extra_bits > max_extra)
-            max_extra = entries[mi].fp_extra_bits;
-    }
-    uint8_t start_bits = max_extra > 0 ? max_extra : 1;
-
-    uint64_t new_fp = extendAndInsert(
-        all_slots, li, match_indices, sec_hashes,
-        fp, new_key_ext_bits, packed_version, id,
-        fingerprint_bits_, start_bits);
-
-    if (totalBitsNeeded(all_slots) <= bucketDataBits()) {
-        reencodeAllLSlots(*bucket, all_slots);
-        return;
-    }
-
-    // Remove the new entry before reencoding, then spill it to extension.
-    auto& ents = all_slots[li].entries;
-    TrieEntry spilled;
-    for (auto eit = ents.begin(); eit != ents.end(); ++eit) {
-        if (eit->fingerprint == new_fp) {
-            spilled = std::move(*eit);
-            ents.erase(eit);
-            break;
-        }
-    }
-    reencodeAllLSlots(*bucket, all_slots);
-
-    Bucket* ext = nextBucketMut(*bucket);
-    if (!ext) ext = createExtFn(*bucket);
-    auto ext_slots = decodeAllLSlots(*ext);
-    ext_slots[li].entries.push_back(std::move(spilled));
-    std::sort(ext_slots[li].entries.begin(), ext_slots[li].entries.end(),
-              [](const TrieEntry& a, const TrieEntry& b) {
-                  return a.fingerprint < b.fingerprint;
-              });
-    reencodeAllLSlots(*ext, ext_slots);
-}
-
-// Collision-aware insertion. Walks the bucket chain looking for entries with
-// matching base fingerprint. Three outcomes per bucket:
-//   1. No matches → walk to next bucket.
-//   2. Same key found → append version (appendToEntry).
-//   3. All matches are different keys → collision (resolveCollision).
-// If no bucket has matches, falls through to addToChain (new key, no collision).
-bool DeltaHashTable::addToChainChecked(
-    uint32_t bi, uint32_t li, uint64_t fp,
-    uint64_t packed_version, uint32_t id,
-    const std::function<Bucket*(Bucket&)>& createExtFn,
-    const KeyResolver& resolver,
-    uint64_t new_key_ext_bits) {
-
-    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
-
-    Bucket* bucket = &buckets_[bi];
-    while (bucket) {
-        auto all_slots = decodeAllLSlots(*bucket);
-        auto& entries = all_slots[li].entries;
-
-        std::vector<size_t> match_indices;
-        for (size_t ei = 0; ei < entries.size(); ++ei) {
-            if ((entries[ei].fingerprint & base_mask) == fp)
-                match_indices.push_back(ei);
-        }
-
-        if (match_indices.empty()) {
-            bucket = nextBucketMut(*bucket);
-            continue;
-        }
-
-        int same_key = findSameKeyMatch(all_slots, li, match_indices,
-                                            resolver, new_key_ext_bits);
-        if (same_key >= 0) {
-            appendToEntry(entries[same_key], all_slots, bucket, li,
-                          packed_version, id, createExtFn);
-            return false;
-        }
-
-        resolveCollision(all_slots, bucket, li, fp, match_indices,
-                         resolver, new_key_ext_bits,
-                         packed_version, id, createExtFn);
-        return true;
-    }
-
-    return addToChain(bi, li, fp, packed_version, id, createExtFn);
-}
-
-// --- Chain-walk helpers (static) ---
-
-// Remove (packed_version, id) from the first entry whose base fingerprint
-// matches fp. Erases the TrieEntry if it becomes empty.
-// Returns true if the pair was found and removed.
-static bool removeVersionFromSlot(
-    DeltaHashTable::LSlotContents& slot,
-    uint64_t base_mask, uint64_t fp,
-    uint64_t packed_version, uint32_t id) {
-    auto& entries = slot.entries;
-    for (auto it = entries.begin(); it != entries.end(); ++it) {
-        if ((it->fingerprint & base_mask) != fp) continue;
-        for (size_t j = 0; j < it->packed_versions.size(); ++j) {
-            if (it->packed_versions[j] == packed_version && it->ids[j] == id) {
-                it->packed_versions.erase(it->packed_versions.begin() + j);
-                it->ids.erase(it->ids.begin() + j);
-                if (it->packed_versions.empty()) {
-                    entries.erase(it);
-                }
-                return true;
+            if (current_bits + extra_bits <= bucketDataBits()) {
+                // Fits — do full decode/modify/encode.
+                auto contents = decodeBucket(*bucket);
+                auto cit = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
+                    [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
+                KeyEntry new_entry;
+                new_entry.suffix = suffix;
+                new_entry.packed_versions.push_back(packed_version);
+                new_entry.ids.push_back(id);
+                contents.keys.insert(cit, std::move(new_entry));
+                encodeBucket(*bucket, contents);
+                return is_new;
             }
-        }
-        return false;  // right entry, pair not found
-    }
-    return false;
-}
 
-// Find (packed_version, old_id) in the first entry whose base fingerprint
-// matches fp and replace old_id with new_id.
-// Returns true if the pair was found and updated.
-static bool updateIdInSlot(
-    DeltaHashTable::LSlotContents& slot,
-    uint64_t base_mask, uint64_t fp,
-    uint64_t packed_version, uint32_t old_id, uint32_t new_id) {
-    for (auto& entry : slot.entries) {
-        if ((entry.fingerprint & base_mask) != fp) continue;
-        for (size_t j = 0; j < entry.packed_versions.size(); ++j) {
-            if (entry.packed_versions[j] == packed_version &&
-                entry.ids[j] == old_id) {
-                entry.ids[j] = new_id;
-                return true;
-            }
-        }
-        return false;  // right entry, pair not found
-    }
-    return false;
-}
-
-// --- Chain-walk member helpers ---
-
-void DeltaHashTable::pruneEmptyExtension(Bucket* bucket) {
-    Bucket* ext = nextBucketMut(*bucket);
-    if (!ext) return;
-    auto ext_slots = decodeAllLSlots(*ext);
-    bool ext_empty = true;
-    for (const auto& slot : ext_slots) {
-        if (!slot.entries.empty()) { ext_empty = false; break; }
-    }
-    if (ext_empty && !nextBucket(*ext)) {
-        setExtensionPtr(*bucket, 0);
-    }
-}
-
-bool DeltaHashTable::isGroupEmpty(uint32_t bi, uint32_t li, uint64_t fp) const {
-    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
-    const Bucket* b = &buckets_[bi];
-    while (b) {
-        LSlotContents contents = decodeLSlot(*b, li);
-        for (const auto& entry : contents.entries) {
-            if ((entry.fingerprint & base_mask) == fp) return false;
-        }
-        b = nextBucket(*b);
-    }
-    return true;
-}
-
-void DeltaHashTable::spillEntryToExtension(
-    Bucket* bucket, uint32_t li, uint64_t base_mask, uint64_t fp,
-    const std::function<Bucket*(Bucket&)>& createExtFn) {
-    auto all_slots = decodeAllLSlots(*bucket);
-    auto& entries = all_slots[li].entries;
-    TrieEntry spilled;
-    for (auto it = entries.begin(); it != entries.end(); ++it) {
-        if ((it->fingerprint & base_mask) == fp) {
-            spilled = std::move(*it);
-            entries.erase(it);
-            break;
+            // Doesn't fit — move to extension (bucket data is pristine).
+            Bucket* ext = nextBucketMut(*bucket);
+            if (!ext) ext = createExtFn(*bucket);
+            bucket = ext;
         }
     }
-    reencodeAllLSlots(*bucket, all_slots);
-
-    Bucket* ext = nextBucketMut(*bucket);
-    if (!ext) ext = createExtFn(*bucket);
-    auto ext_slots = decodeAllLSlots(*ext);
-    ext_slots[li].entries.push_back(std::move(spilled));
-    std::sort(ext_slots[li].entries.begin(), ext_slots[li].entries.end(),
-              [](const TrieEntry& a, const TrieEntry& b) {
-                  return a.fingerprint < b.fingerprint;
-              });
-    reencodeAllLSlots(*ext, ext_slots);
 }
 
 // --- removeFromChain ---
 
-bool DeltaHashTable::removeFromChain(uint32_t bi, uint32_t li, uint64_t fp,
+bool DeltaHashTable::removeFromChain(uint32_t bi, uint64_t suffix,
                                       uint64_t packed_version, uint32_t id) {
-    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
     Bucket* bucket = &buckets_[bi];
 
     while (bucket) {
-        auto all_slots = decodeAllLSlots(*bucket);
-        if (removeVersionFromSlot(all_slots[li], base_mask, fp,
-                                  packed_version, id)) {
-            reencodeAllLSlots(*bucket, all_slots);
+        auto contents = decodeBucket(*bucket);
+
+        auto it = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
+            [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
+
+        if (it != contents.keys.end() && it->suffix == suffix) {
+            for (size_t j = 0; j < it->packed_versions.size(); ++j) {
+                if (it->packed_versions[j] == packed_version && it->ids[j] == id) {
+                    it->packed_versions.erase(it->packed_versions.begin() + j);
+                    it->ids.erase(it->ids.begin() + j);
+                    if (it->packed_versions.empty()) {
+                        contents.keys.erase(it);
+                    }
+                    encodeBucket(*bucket, contents);
+                    pruneEmptyExtension(bucket);
+                    // Check if suffix is fully gone from the chain.
+                    return isSuffixEmpty(bi, suffix);
+                }
+            }
         }
-        pruneEmptyExtension(bucket);
+
         bucket = nextBucketMut(*bucket);
     }
 
-    return isGroupEmpty(bi, li, fp);
+    return isSuffixEmpty(bi, suffix);
 }
 
 // --- updateIdInChain ---
 
-bool DeltaHashTable::updateIdInChain(uint32_t bi, uint32_t li, uint64_t fp,
+bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
                                       uint64_t packed_version, uint32_t old_id,
                                       uint32_t new_id,
                                       const std::function<Bucket*(Bucket&)>& createExtFn) {
-    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
     Bucket* bucket = &buckets_[bi];
 
     while (bucket) {
-        auto all_slots = decodeAllLSlots(*bucket);
-        if (!updateIdInSlot(all_slots[li], base_mask, fp,
-                            packed_version, old_id, new_id)) {
-            bucket = nextBucketMut(*bucket);
-            continue;
+        auto contents = decodeBucket(*bucket);
+
+        auto it = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
+            [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
+
+        if (it != contents.keys.end() && it->suffix == suffix) {
+            for (size_t j = 0; j < it->packed_versions.size(); ++j) {
+                if (it->packed_versions[j] == packed_version && it->ids[j] == old_id) {
+                    it->ids[j] = new_id;
+                    size_t bits = contentsBitsNeeded(contents, suffix_bits_);
+                    if (bits <= bucketDataBits()) {
+                        encodeBucket(*bucket, contents);
+                        return true;
+                    }
+                    // Doesn't fit after update — spill this key entry to extension.
+                    KeyEntry spilled = std::move(*it);
+                    contents.keys.erase(it);
+                    encodeBucket(*bucket, contents);
+
+                    Bucket* ext = nextBucketMut(*bucket);
+                    if (!ext) ext = createExtFn(*bucket);
+                    auto ext_contents = decodeBucket(*ext);
+                    auto ext_it = std::lower_bound(ext_contents.keys.begin(),
+                        ext_contents.keys.end(), spilled.suffix,
+                        [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
+                    ext_contents.keys.insert(ext_it, std::move(spilled));
+                    encodeBucket(*ext, ext_contents);
+                    return true;
+                }
+            }
         }
 
-        if (totalBitsNeeded(all_slots) <= bucketDataBits()) {
-            reencodeAllLSlots(*bucket, all_slots);
-            return true;
-        }
-
-        spillEntryToExtension(bucket, li, base_mask, fp, createExtFn);
-        return true;
+        bucket = nextBucketMut(*bucket);
     }
 
     return false;
@@ -662,53 +647,60 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint32_t li, uint64_t fp,
 
 // --- Public read API ---
 
-bool DeltaHashTable::findAllByHash(uint32_t bi, uint32_t li, uint64_t fp,
+bool DeltaHashTable::findAllByHash(uint32_t bi, uint64_t suffix,
                                     std::vector<uint64_t>& packed_versions,
                                     std::vector<uint32_t>& ids) const {
     packed_versions.clear();
     ids.clear();
 
-    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
-
     const Bucket* bucket = &buckets_[bi];
     while (bucket) {
-        LSlotContents contents = decodeLSlot(*bucket, li);
-        for (const auto& entry : contents.entries) {
-            if ((entry.fingerprint & base_mask) == fp) {
-                packed_versions.insert(packed_versions.end(),
-                                       entry.packed_versions.begin(),
-                                       entry.packed_versions.end());
-                ids.insert(ids.end(), entry.ids.begin(), entry.ids.end());
+        auto scan = decodeSuffixes(*bucket);
+        auto it = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
+        if (it != scan.suffixes.end() && *it == suffix) {
+            size_t idx = it - scan.suffixes.begin();
+            // Position reader at versions_start_bit and skip preceding keys.
+            BitReader reader(bucket->data, scan.versions_start_bit);
+            for (size_t k = 0; k < idx; ++k) {
+                skipKeyData(reader);
             }
+            auto key = decodeKeyData(reader, suffix);
+            packed_versions.insert(packed_versions.end(),
+                                   key.packed_versions.begin(),
+                                   key.packed_versions.end());
+            ids.insert(ids.end(), key.ids.begin(), key.ids.end());
         }
         bucket = nextBucket(*bucket);
     }
     return !packed_versions.empty();
 }
 
-bool DeltaHashTable::findFirstByHash(uint32_t bi, uint32_t li, uint64_t fp,
+bool DeltaHashTable::findFirstByHash(uint32_t bi, uint64_t suffix,
                                       uint64_t& packed_version, uint32_t& id) const {
     bool found = false;
     uint64_t best_pv = 0;
     uint32_t best_id = 0;
 
-    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
-
     const Bucket* bucket = &buckets_[bi];
     while (bucket) {
-        LSlotContents contents = decodeLSlot(*bucket, li);
-
-        for (const auto& entry : contents.entries) {
-            if ((entry.fingerprint & base_mask) == fp && !entry.packed_versions.empty()) {
-                uint64_t pv = entry.packed_versions[0];
+        auto scan = decodeSuffixes(*bucket);
+        auto it = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
+        if (it != scan.suffixes.end() && *it == suffix) {
+            size_t idx = it - scan.suffixes.begin();
+            BitReader reader(bucket->data, scan.versions_start_bit);
+            for (size_t k = 0; k < idx; ++k) {
+                skipKeyData(reader);
+            }
+            auto key = decodeKeyData(reader, suffix);
+            if (!key.packed_versions.empty()) {
+                uint64_t pv = key.packed_versions[0];
                 if (!found || pv > best_pv) {
                     best_pv = pv;
-                    best_id = entry.ids[0];
+                    best_id = key.ids[0];
                     found = true;
                 }
             }
         }
-
         bucket = nextBucket(*bucket);
     }
 
@@ -722,45 +714,34 @@ bool DeltaHashTable::findFirstByHash(uint32_t bi, uint32_t li, uint64_t fp,
 bool DeltaHashTable::findAll(uint64_t hash,
                               std::vector<uint64_t>& packed_versions,
                               std::vector<uint32_t>& ids) const {
-    return findAllByHash(bucketIndex(hash), lslotIndex(hash), fingerprint(hash),
+    return findAllByHash(bucketIndex(hash), suffixFromHash(hash),
                          packed_versions, ids);
 }
 
 bool DeltaHashTable::findFirst(uint64_t hash,
                                 uint64_t& packed_version, uint32_t& id) const {
-    return findFirstByHash(bucketIndex(hash), lslotIndex(hash), fingerprint(hash),
+    return findFirstByHash(bucketIndex(hash), suffixFromHash(hash),
                            packed_version, id);
 }
 
 bool DeltaHashTable::contains(uint64_t hash) const {
-    uint64_t pv;
-    uint32_t id;
-    return findFirst(hash, pv, id);
+    return containsByHash(bucketIndex(hash), suffixFromHash(hash));
 }
 
 void DeltaHashTable::forEach(
     const std::function<void(uint64_t hash, uint64_t packed_version,
                              uint32_t id)>& fn) const {
     uint32_t num_buckets = 1u << config_.bucket_bits;
-    uint32_t n_lslots = numLSlots();
-    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
-    uint8_t lslot_shift = fingerprint_bits_ + extension_bits_;
 
     for (uint32_t bi = 0; bi < num_buckets; ++bi) {
         const Bucket* b = &buckets_[bi];
         while (b) {
-            size_t offset = 0;
-            for (uint32_t s = 0; s < n_lslots; ++s) {
-                LSlotContents contents =
-                    lslot_codec_.decode(b->data, offset, &offset);
-                for (const auto& entry : contents.entries) {
-                    uint64_t hash =
-                        (static_cast<uint64_t>(bi) << (64 - config_.bucket_bits)) |
-                        (static_cast<uint64_t>(s) << lslot_shift) |
-                        (entry.fingerprint & base_mask);
-                    for (size_t i = 0; i < entry.packed_versions.size(); ++i) {
-                        fn(hash, entry.packed_versions[i], entry.ids[i]);
-                    }
+            auto contents = decodeBucket(*b);
+            for (const auto& key : contents.keys) {
+                uint64_t hash =
+                    (static_cast<uint64_t>(bi) << (64 - config_.bucket_bits)) | key.suffix;
+                for (size_t i = 0; i < key.packed_versions.size(); ++i) {
+                    fn(hash, key.packed_versions[i], key.ids[i]);
                 }
             }
             b = nextBucket(*b);
@@ -773,56 +754,34 @@ void DeltaHashTable::forEachGroup(
                              const std::vector<uint64_t>& packed_versions,
                              const std::vector<uint32_t>& ids)>& fn) const {
     uint32_t num_buckets = 1u << config_.bucket_bits;
-    uint32_t n_lslots = numLSlots();
-    uint64_t base_mask = (1ULL << fingerprint_bits_) - 1;
-    uint8_t lslot_shift = fingerprint_bits_ + extension_bits_;
 
     for (uint32_t bi = 0; bi < num_buckets; ++bi) {
-        struct Group {
-            uint32_t lslot;
-            uint64_t fp;
-            std::vector<uint64_t> packed_versions;
-            std::vector<uint32_t> ids;
-        };
-        // O(1) lookup by (lslot << lslot_shift) | base_fingerprint
-        std::unordered_map<uint64_t, Group> group_map;
+        // Merge across extension chain by suffix using sorted vector + binary search.
+        std::vector<KeyEntry> groups;
 
         const Bucket* b = &buckets_[bi];
         while (b) {
-            size_t offset = 0;
-            for (uint32_t s = 0; s < n_lslots; ++s) {
-                LSlotContents contents =
-                    lslot_codec_.decode(b->data, offset, &offset);
-                for (const auto& entry : contents.entries) {
-                    uint64_t base_fp = entry.fingerprint & base_mask;
-                    uint64_t map_key = (static_cast<uint64_t>(s) << lslot_shift)
-                                       | base_fp;
-                    auto it = group_map.find(map_key);
-                    if (it != group_map.end()) {
-                        it->second.packed_versions.insert(
-                            it->second.packed_versions.end(),
-                            entry.packed_versions.begin(),
-                            entry.packed_versions.end());
-                        it->second.ids.insert(
-                            it->second.ids.end(),
-                            entry.ids.begin(),
-                            entry.ids.end());
-                    } else {
-                        group_map.emplace(map_key,
-                            Group{s, base_fp,
-                                  entry.packed_versions,
-                                  entry.ids});
-                    }
+            auto contents = decodeBucket(*b);
+            for (auto& key : contents.keys) {
+                auto it = std::lower_bound(groups.begin(), groups.end(),
+                    key.suffix, [](const KeyEntry& e, uint64_t s) { return e.suffix < s; });
+                if (it != groups.end() && it->suffix == key.suffix) {
+                    it->packed_versions.insert(it->packed_versions.end(),
+                                               key.packed_versions.begin(),
+                                               key.packed_versions.end());
+                    it->ids.insert(it->ids.end(),
+                                   key.ids.begin(),
+                                   key.ids.end());
+                } else {
+                    groups.insert(it, std::move(key));
                 }
             }
             b = nextBucket(*b);
         }
 
-        for (const auto& [map_key, g] : group_map) {
+        for (const auto& g : groups) {
             uint64_t hash =
-                (static_cast<uint64_t>(bi) << (64 - config_.bucket_bits)) |
-                (static_cast<uint64_t>(g.lslot) << lslot_shift) |
-                g.fp;  // g.fp is already the base fingerprint
+                (static_cast<uint64_t>(bi) << (64 - config_.bucket_bits)) | g.suffix;
             fn(hash, g.packed_versions, g.ids);
         }
     }
@@ -861,16 +820,8 @@ const DeltaHashTable::Config& DeltaHashTable::config() const {
     return config_;
 }
 
-uint8_t DeltaHashTable::fingerprintBits() const {
-    return fingerprint_bits_;
-}
-
-uint8_t DeltaHashTable::extensionBitsWidth() const {
-    return extension_bits_;
-}
-
-uint64_t DeltaHashTable::extensionBits(uint64_t hash) const {
-    return (hash >> fingerprint_bits_) & ((1ULL << extension_bits_) - 1);
+uint8_t DeltaHashTable::suffixBits() const {
+    return suffix_bits_;
 }
 
 void DeltaHashTable::loadArenaData(const uint8_t* data, size_t len) {
@@ -882,11 +833,20 @@ void DeltaHashTable::initBucket(Bucket& bucket) {
     uint64_t ext_ptr = getExtensionPtr(bucket);
     std::memset(bucket.data, 0, data_bytes);
     setExtensionPtr(bucket, ext_ptr);
+    // Header: N_k = 0 (uint16_t). Already zero from memset.
+}
 
-    BitWriter writer(bucket.data, 0);
-    for (uint32_t s = 0; s < numLSlots(); ++s) {
-        writer.writeUnary(0);
+void DeltaHashTable::pruneEmptyExtension(Bucket* bucket) {
+    Bucket* ext = nextBucketMut(*bucket);
+    if (!ext) return;
+    auto contents = decodeBucket(*ext);
+    if (contents.keys.empty() && !nextBucket(*ext)) {
+        setExtensionPtr(*bucket, 0);
     }
+}
+
+bool DeltaHashTable::isSuffixEmpty(uint32_t bi, uint64_t suffix) const {
+    return !containsByHash(bi, suffix);
 }
 
 }  // namespace internal

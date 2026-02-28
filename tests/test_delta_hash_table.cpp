@@ -9,7 +9,6 @@
 
 #include "internal/bit_stream.h"
 #include "internal/global_index.h"
-#include "internal/lslot_codec.h"
 #include "internal/manifest.h"
 #include "internal/read_only_delta_hash_table.h"
 #include "internal/read_write_delta_hash_table.h"
@@ -18,75 +17,6 @@ using namespace kvlite::internal;
 
 static uint64_t H(const std::string& s) {
     return dhtHashBytes(s.data(), s.size());
-}
-
-// Extract extension bits from a hash, matching DeltaHashTable internals.
-// For config with bucket_bits=b, lslot_bits=l: fingerprint_bits = (64-b-l)/2
-// Extension bits = (hash >> fingerprint_bits) & ((1 << extension_bits) - 1)
-static uint64_t extractExtBits(uint64_t hash, uint8_t bucket_bits, uint8_t lslot_bits) {
-    uint8_t available = 64 - bucket_bits - lslot_bits;
-    uint8_t fp_bits = available / 2;
-    uint8_t ext_bits = available - fp_bits;
-    return (hash >> fp_bits) & ((1ULL << ext_bits) - 1);
-}
-
-// For default GlobalIndex config (bucket_bits=20, lslot_bits=5).
-static uint64_t defaultExtBits(const std::string& s) {
-    uint64_t h = H(s);
-    return extractExtBits(h, 20, 5);
-}
-
-// --- Elias Gamma Round-Trip Tests ---
-
-TEST(EliasGamma, RoundTrip) {
-    // Test a range of values including edge cases.
-    std::vector<uint32_t> test_values = {
-        1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 100, 255, 256,
-        1000, 10000, 65535, 65536, 100000, 1000000, 0x7FFFFFFFu
-    };
-
-    // Buffer with padding for BitReader/BitWriter (needs 8 bytes beyond data).
-    uint8_t buf[256] = {};
-
-    // Write all values.
-    BitWriter writer(buf, 0);
-    for (uint32_t v : test_values) {
-        writer.writeEliasGamma(v);
-    }
-
-    // Read them back.
-    BitReader reader(buf, 0);
-    for (uint32_t expected : test_values) {
-        uint32_t got = reader.readEliasGamma();
-        EXPECT_EQ(got, expected) << "mismatch for value " << expected;
-    }
-
-    // Positions should match.
-    EXPECT_EQ(reader.position(), writer.position());
-}
-
-// --- 64-bit Elias Gamma Round-Trip Tests ---
-
-TEST(EliasGamma, RoundTrip64) {
-    std::vector<uint64_t> test_values = {
-        1, 2, 3, 100, 0xFFFFFFFFULL, 0x100000000ULL,
-        0xDEADBEEFCAFEULL, 0x7FFFFFFFFFFFFFFFULL
-    };
-
-    uint8_t buf[512] = {};
-
-    BitWriter writer(buf, 0);
-    for (uint64_t v : test_values) {
-        writer.writeEliasGamma64(v);
-    }
-
-    BitReader reader(buf, 0);
-    for (uint64_t expected : test_values) {
-        uint64_t got = reader.readEliasGamma64();
-        EXPECT_EQ(got, expected) << "mismatch for value " << expected;
-    }
-
-    EXPECT_EQ(reader.position(), writer.position());
 }
 
 // --- GlobalIndex via DHT Tests ---
@@ -278,195 +208,6 @@ TEST_F(GlobalIndexDHT, Clear) {
 }
 
 // ============================================================
-// Codec-level tests: LSlotCodec zero-delta safety
-// ============================================================
-
-// Zero packed_version deltas: entries with identical packed_versions.
-// Before the fix, this would crash in writeEliasGamma(0).
-TEST(LSlotCodecTest, ZeroPackedVersionDeltaRoundTrip) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
-    LSlotCodec::TrieEntry entry;
-    entry.fingerprint = 0x42;
-    entry.packed_versions = {100, 100, 100};  // zero deltas
-    entry.ids             = {3, 2, 1};        // unique, delta=1
-    contents.entries.push_back(entry);
-
-    uint8_t buf[256] = {};
-    size_t end = codec.encode(buf, 0, contents);
-    EXPECT_GT(end, 0u);
-
-    size_t decoded_end;
-    auto decoded = codec.decode(buf, 0, &decoded_end);
-    EXPECT_EQ(decoded_end, end);
-    ASSERT_EQ(decoded.entries.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].packed_versions, entry.packed_versions);
-    EXPECT_EQ(decoded.entries[0].ids, entry.ids);
-}
-
-// Identical ids (e.g. same segment_id): raw encoding handles this.
-TEST(LSlotCodecTest, IdenticalIdsRoundTrip) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
-    LSlotCodec::TrieEntry entry;
-    entry.fingerprint = 0x42;
-    entry.packed_versions = {30, 20, 10};  // unique, delta=10
-    entry.ids             = {5, 5, 5};     // all same
-    contents.entries.push_back(entry);
-
-    uint8_t buf[256] = {};
-    size_t end = codec.encode(buf, 0, contents);
-
-    size_t decoded_end;
-    auto decoded = codec.decode(buf, 0, &decoded_end);
-    EXPECT_EQ(decoded_end, end);
-    ASSERT_EQ(decoded.entries.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].packed_versions, entry.packed_versions);
-    EXPECT_EQ(decoded.entries[0].ids, entry.ids);
-}
-
-// Packed_versions in DESCENDING order.
-TEST(LSlotCodecTest, DescendingPackedVersionsRoundTrip) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
-    LSlotCodec::TrieEntry entry;
-    entry.fingerprint = 0x1;
-    entry.packed_versions = {300, 200, 100};  // desc
-    entry.ids             = {3, 2, 1};        // desc (correlated)
-    contents.entries.push_back(entry);
-
-    uint8_t buf[256] = {};
-    codec.encode(buf, 0, contents);
-
-    auto decoded = codec.decode(buf, 0, nullptr);
-    ASSERT_EQ(decoded.entries.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].packed_versions, entry.packed_versions);
-    EXPECT_EQ(decoded.entries[0].ids, entry.ids);
-}
-
-// Consecutive packed_versions [N, N-1, ..., 1]: all deltas are 1.
-TEST(LSlotCodecTest, ConsecutivePackedVersionsRoundTrip) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
-    LSlotCodec::TrieEntry entry;
-    entry.fingerprint = 0x1;
-    const int N = 50;
-    for (int i = N; i >= 1; --i) {
-        entry.packed_versions.push_back(static_cast<uint64_t>(i * 100));  // desc
-        entry.ids.push_back(static_cast<uint32_t>(i));                     // desc
-    }
-    contents.entries.push_back(entry);
-
-    std::vector<uint8_t> buf(4096, 0);
-    size_t end = codec.encode(buf.data(), 0, contents);
-    EXPECT_GT(end, 0u);
-
-    auto decoded = codec.decode(buf.data(), 0, nullptr);
-    ASSERT_EQ(decoded.entries.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].packed_versions, entry.packed_versions);
-    EXPECT_EQ(decoded.entries[0].ids, entry.ids);
-}
-
-// BitsNeeded must not crash on zero deltas.
-TEST(LSlotCodecTest, BitsNeededZeroDeltas) {
-    LSlotCodec::LSlotContents contents;
-    LSlotCodec::TrieEntry entry;
-    entry.fingerprint = 0x1;
-    entry.packed_versions = {10, 10};
-    entry.ids             = {5, 5};
-    contents.entries.push_back(entry);
-
-    size_t bits = LSlotCodec::bitsNeeded(contents, 39);
-    EXPECT_GT(bits, 0u);  // must not crash
-}
-
-// Mixed: packed_versions with zero deltas, ids non-increasing.
-TEST(LSlotCodecTest, MixedDeltasRoundTrip) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
-    LSlotCodec::TrieEntry entry;
-    entry.fingerprint = 0xABC;
-    entry.packed_versions = {100, 100, 90, 90, 80};  // deltas: 0, 10, 0, 10
-    entry.ids             = {5, 4, 4, 2, 1};         // non-increasing
-    contents.entries.push_back(entry);
-
-    uint8_t buf[256] = {};
-    codec.encode(buf, 0, contents);
-
-    auto decoded = codec.decode(buf, 0, nullptr);
-    ASSERT_EQ(decoded.entries.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].packed_versions, entry.packed_versions);
-    EXPECT_EQ(decoded.entries[0].ids, entry.ids);
-}
-
-// Many entries per fingerprint — stress-test the encoding.
-TEST(LSlotCodecTest, ManyEntriesRoundTrip) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
-    LSlotCodec::TrieEntry entry;
-    entry.fingerprint = 0x1;
-    const int N = 500;
-    for (int i = N; i >= 1; --i) {
-        entry.packed_versions.push_back(static_cast<uint64_t>(i));
-        entry.ids.push_back(static_cast<uint32_t>(i));  // descending
-    }
-    contents.entries.push_back(entry);
-
-    std::vector<uint8_t> buf(65536, 0);
-    size_t end = codec.encode(buf.data(), 0, contents);
-    EXPECT_GT(end, 0u);
-
-    auto decoded = codec.decode(buf.data(), 0, nullptr);
-    ASSERT_EQ(decoded.entries.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].packed_versions, entry.packed_versions);
-    EXPECT_EQ(decoded.entries[0].ids, entry.ids);
-}
-
-// Multiple fingerprint groups in one lslot, each with zero deltas.
-TEST(LSlotCodecTest, MultipleGroupsZeroDeltas) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
-
-    for (uint64_t fp = 1; fp <= 3; ++fp) {
-        LSlotCodec::TrieEntry entry;
-        entry.fingerprint = fp;
-        entry.packed_versions = {50, 50, 50};
-        entry.ids             = {10, 10, 10};
-        contents.entries.push_back(entry);
-    }
-
-    std::vector<uint8_t> buf(4096, 0);
-    codec.encode(buf.data(), 0, contents);
-
-    auto decoded = codec.decode(buf.data(), 0, nullptr);
-    ASSERT_EQ(decoded.entries.size(), 3u);
-    for (int i = 0; i < 3; ++i) {
-        EXPECT_EQ(decoded.entries[i].packed_versions, contents.entries[i].packed_versions);
-        EXPECT_EQ(decoded.entries[i].ids, contents.entries[i].ids);
-    }
-}
-
-// 64-bit packed_version: verify large values survive encode/decode.
-TEST(LSlotCodecTest, LargePackedVersionRoundTrip) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
-    LSlotCodec::TrieEntry entry;
-    entry.fingerprint = 0x1;
-    entry.packed_versions = {0xDEADBEEFCAFE0003ULL, 0xDEADBEEFCAFE0002ULL, 0xDEADBEEFCAFE0001ULL};
-    entry.ids = {3, 2, 1};
-    contents.entries.push_back(entry);
-
-    std::vector<uint8_t> buf(4096, 0);
-    size_t end = codec.encode(buf.data(), 0, contents);
-    EXPECT_GT(end, 0u);
-
-    auto decoded = codec.decode(buf.data(), 0, nullptr);
-    ASSERT_EQ(decoded.entries.size(), 1u);
-    EXPECT_EQ(decoded.entries[0].packed_versions, entry.packed_versions);
-    EXPECT_EQ(decoded.entries[0].ids, entry.ids);
-}
-
-// ============================================================
 // DHT-level tests: bucket overflow with small buckets
 // ============================================================
 
@@ -474,7 +215,6 @@ TEST(LSlotCodecTest, LargePackedVersionRoundTrip) {
 static ReadOnlyDeltaHashTable::Config smallBucketConfig() {
     ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;      // 16 buckets
-    cfg.lslot_bits = 2;       // 4 lslots
     cfg.bucket_bytes = 128;   // tiny buckets → fast overflow
     return cfg;
 }
@@ -549,7 +289,6 @@ TEST(ReadOnlyDHTOverflow, FindFirstAfterOverflow) {
 TEST(ReadOnlyDHTOverflow, MultipleKeysOverflowSameBucket) {
     ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 1;      // 2 buckets
-    cfg.lslot_bits = 1;       // 2 lslots
     cfg.bucket_bytes = 64;    // very small
     ReadOnlyDeltaHashTable dht(cfg);
 
@@ -674,104 +413,6 @@ TEST_F(GlobalIndexDHT, LargeScale) {
 }
 
 // ============================================================
-// skipLSlot correctness tests
-// ============================================================
-
-TEST(LSlotCodecTest, SkipLSlotMatchesDecode) {
-    LSlotCodec codec(39);
-    const int N = 5;
-    std::vector<LSlotCodec::LSlotContents> slots(N);
-
-    // Slot 0: empty
-    // Slot 1: 1 group, 1 entry
-    {
-        LSlotCodec::TrieEntry e;
-        e.fingerprint = 0x1;
-        e.packed_versions = {100};
-        e.ids = {1};
-        slots[1].entries.push_back(e);
-    }
-    // Slot 2: 3 groups, mixed entry counts
-    for (uint64_t fp = 1; fp <= 3; ++fp) {
-        LSlotCodec::TrieEntry e;
-        e.fingerprint = fp;
-        for (uint64_t v = fp * 10; v >= fp * 10 - fp + 1; --v) {
-            e.packed_versions.push_back(v);
-            e.ids.push_back(static_cast<uint32_t>(v));
-        }
-        slots[2].entries.push_back(e);
-    }
-    // Slot 3: 1 group, 5 entries
-    {
-        LSlotCodec::TrieEntry e;
-        e.fingerprint = 0xABC;
-        for (int i = 50; i >= 46; --i) {
-            e.packed_versions.push_back(static_cast<uint64_t>(i));
-            e.ids.push_back(static_cast<uint32_t>(i));
-        }
-        slots[3].entries.push_back(e);
-    }
-    // Slot 4: empty
-
-    std::vector<uint8_t> buf(4096, 0);
-    size_t write_offset = 0;
-    for (int s = 0; s < N; ++s) {
-        write_offset = codec.encode(buf.data(), write_offset, slots[s]);
-    }
-
-    // Verify skipLSlot matches decode for each lslot index
-    for (int target = 0; target <= N; ++target) {
-        size_t skip_offset = 0;
-        for (int s = 0; s < target; ++s) {
-            skip_offset = codec.skipLSlot(buf.data(), skip_offset);
-        }
-        size_t decode_offset = codec.bitOffset(buf.data(), target);
-        EXPECT_EQ(skip_offset, decode_offset) << "mismatch at lslot " << target;
-    }
-}
-
-TEST(LSlotCodecTest, SkipEmptyLSlots) {
-    LSlotCodec codec(39);
-    const int N = 8;
-    std::vector<uint8_t> buf(4096, 0);
-    size_t write_offset = 0;
-    LSlotCodec::LSlotContents empty;
-    for (int s = 0; s < N; ++s) {
-        write_offset = codec.encode(buf.data(), write_offset, empty);
-    }
-
-    size_t offset = 0;
-    for (int s = 0; s < N; ++s) {
-        size_t expected = codec.bitOffset(buf.data(), s);
-        EXPECT_EQ(offset, expected) << "mismatch at empty lslot " << s;
-        offset = codec.skipLSlot(buf.data(), offset);
-    }
-}
-
-TEST(LSlotCodecTest, SkipLSlotLargePayload) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
-    LSlotCodec::TrieEntry entry;
-    entry.fingerprint = 0x1;
-    for (int i = 100; i >= 1; --i) {
-        entry.packed_versions.push_back(static_cast<uint64_t>(i * 1000));
-        entry.ids.push_back(static_cast<uint32_t>(i));
-    }
-    contents.entries.push_back(entry);
-
-    std::vector<uint8_t> buf(65536, 0);
-    size_t end = codec.encode(buf.data(), 0, contents);
-
-    // skipLSlot should return the same end offset as decode
-    size_t skip_end = codec.skipLSlot(buf.data(), 0);
-    EXPECT_EQ(skip_end, end);
-
-    size_t decode_end;
-    codec.decode(buf.data(), 0, &decode_end);
-    EXPECT_EQ(skip_end, decode_end);
-}
-
-// ============================================================
 // addEntryIsNew correctness tests
 // ============================================================
 
@@ -796,7 +437,6 @@ TEST(ReadOnlyDHT, AddEntryIsNewDifferentKeys) {
 TEST(ReadOnlyDHT, AddEntryIsNewAfterOverflow) {
     ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 1;
-    cfg.lslot_bits = 1;
     cfg.bucket_bytes = 64;
     ReadOnlyDeltaHashTable dht(cfg);
 
@@ -859,7 +499,6 @@ TEST(ReadOnlyDHTOverflow, FindFirstWithDescendingInsertOrder) {
 TEST(ReadOnlyDHTOverflow, FindFirstSingleEntryPerBucket) {
     ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
-    cfg.lslot_bits = 2;
     cfg.bucket_bytes = 32;
     ReadOnlyDeltaHashTable dht(cfg);
 
@@ -924,7 +563,6 @@ TEST(ReadOnlyDHTOverflow, FindAllCompleteAcrossChain) {
 TEST(ReadOnlyDHTOverflow, ForEachGroupMergesCorrectly) {
     ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 1;
-    cfg.lslot_bits = 1;
     cfg.bucket_bytes = 64;
     ReadOnlyDeltaHashTable dht(cfg);
 
@@ -1018,7 +656,6 @@ TEST(ReadWriteDHT, ConcurrentAddDifferentKeys) {
 TEST(ReadWriteDHT, ConcurrentOverflowSameBucket) {
     ReadWriteDeltaHashTable::Config cfg;
     cfg.bucket_bits = 1;
-    cfg.lslot_bits = 1;
     cfg.bucket_bytes = 64;
     ReadWriteDeltaHashTable dht(cfg);
 
@@ -1148,10 +785,9 @@ TEST(ReadOnlyDHT, SingleEntryFindFirst) {
     EXPECT_EQ(id, 7u);
 }
 
-TEST(ReadOnlyDHT, TwoEntriesSameFingerprint) {
+TEST(ReadOnlyDHT, TwoEntriesSameSuffix) {
     ReadOnlyDeltaHashTable::Config cfg;
     cfg.bucket_bits = 1;
-    cfg.lslot_bits = 1;
     cfg.bucket_bytes = 256;
     ReadOnlyDeltaHashTable dht(cfg);
 
@@ -1215,7 +851,6 @@ TEST(ReadWriteDHT, RemoveEntryLastInGroup) {
 TEST(ReadWriteDHT, RemoveEntryFromOverflowChain) {
     ReadWriteDeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
-    cfg.lslot_bits = 2;
     cfg.bucket_bytes = 128;
     ReadWriteDeltaHashTable dht(cfg);
 
@@ -1262,7 +897,6 @@ TEST(ReadWriteDHT, UpdateEntryIdBasic) {
 TEST(ReadWriteDHT, UpdateEntryIdOverflow) {
     ReadWriteDeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
-    cfg.lslot_bits = 2;
     cfg.bucket_bytes = 128;
     ReadWriteDeltaHashTable dht(cfg);
 
@@ -1340,562 +974,194 @@ TEST(ReadOnlyDHT, MaxPackedVersion) {
     EXPECT_EQ(id, 42u);
 }
 
-// --- Variable-Width Fingerprint Tests ---
+// ============================================================
+// BucketCodec round-trip tests
+// ============================================================
 
-TEST(LSlotCodecTest, VariableWidthFingerprintRoundtrip) {
-    LSlotCodec codec(39);
-    LSlotCodec::LSlotContents contents;
+// Helper: expose protected decodeBucket/encodeBucket for testing.
+class TestableDHT : public ReadOnlyDeltaHashTable {
+public:
+    using ReadOnlyDeltaHashTable::ReadOnlyDeltaHashTable;
+    using DeltaHashTable::BucketContents;
+    using DeltaHashTable::KeyEntry;
 
-    // Entry with no extra bits (common case).
-    LSlotCodec::TrieEntry e0;
-    e0.fingerprint = 0x1234567;
-    e0.fp_extra_bits = 0;
-    e0.packed_versions = {100};
-    e0.ids = {1};
-    contents.entries.push_back(e0);
+    BucketContents testDecodeBucket(uint32_t bi) const {
+        return decodeBucket(buckets_[bi]);
+    }
+    size_t testEncodeBucket(uint32_t bi, const BucketContents& contents) {
+        return encodeBucket(const_cast<Bucket&>(buckets_[bi]), contents);
+    }
+    uint8_t testSuffixBits() const { return suffix_bits_; }
+};
 
-    // Entry with 3 extra bits.
-    LSlotCodec::TrieEntry e1;
-    e1.fingerprint = 0x1234567 | (5ULL << 39);  // 3 extra bits = 5 (0b101)
-    e1.fp_extra_bits = 3;
-    e1.packed_versions = {200};
-    e1.ids = {2};
-    contents.entries.push_back(e1);
+TEST(BucketCodec, EmptyBucketRoundTrip) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 64;
+    TestableDHT dht(cfg);
 
-    // Entry with 7 extra bits.
-    LSlotCodec::TrieEntry e2;
-    e2.fingerprint = 0x7654321 | (0x5AULL << 39);  // 7 extra bits
-    e2.fp_extra_bits = 7;
-    e2.packed_versions = {300, 250};
-    e2.ids = {4, 3};  // sorted desc, parallel with packed_versions
-    contents.entries.push_back(e2);
+    auto contents = dht.testDecodeBucket(0);
+    EXPECT_TRUE(contents.keys.empty());
 
-    // Sort by fingerprint for encoding.
-    std::sort(contents.entries.begin(), contents.entries.end(),
-              [](const LSlotCodec::TrieEntry& a, const LSlotCodec::TrieEntry& b) {
-                  return a.fingerprint < b.fingerprint;
-              });
+    size_t bits = dht.testEncodeBucket(0, contents);
+    EXPECT_EQ(bits, 16u);  // just the uint16_t N_k header
 
-    uint8_t buf[512] = {};
-    size_t end_offset = codec.encode(buf, 0, contents);
-    EXPECT_GT(end_offset, 0u);
+    auto rt = dht.testDecodeBucket(0);
+    EXPECT_TRUE(rt.keys.empty());
+}
 
-    // Verify bitsNeeded matches encode output.
-    size_t expected_bits = LSlotCodec::bitsNeeded(contents, 39);
-    EXPECT_EQ(expected_bits, end_offset)
-        << "bitsNeeded and encode disagree on total bits";
+TEST(BucketCodec, SingleKeyRoundTrip) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 128;
+    TestableDHT dht(cfg);
 
-    // Decode and verify round-trip.
-    size_t decode_end;
-    auto decoded = codec.decode(buf, 0, &decode_end);
-    EXPECT_EQ(decode_end, end_offset)
-        << "decode and encode disagree on total bits";
-    ASSERT_EQ(decoded.entries.size(), 3u);
+    // Write a single key with one version/id pair.
+    DeltaHashTable::BucketContents contents;
+    DeltaHashTable::KeyEntry ke;
+    ke.suffix = 0x12345;
+    ke.packed_versions = {1000};
+    ke.ids = {42};
+    contents.keys.push_back(ke);
 
-    for (size_t i = 0; i < 3; ++i) {
-        EXPECT_EQ(decoded.entries[i].fingerprint,
-                  contents.entries[i].fingerprint)
-            << "fingerprint mismatch at entry " << i;
-        EXPECT_EQ(decoded.entries[i].fp_extra_bits,
-                  contents.entries[i].fp_extra_bits)
-            << "fp_extra_bits mismatch at entry " << i;
-        EXPECT_EQ(decoded.entries[i].packed_versions,
-                  contents.entries[i].packed_versions)
-            << "packed_versions mismatch at entry " << i;
-        EXPECT_EQ(decoded.entries[i].ids,
-                  contents.entries[i].ids)
-            << "ids mismatch at entry " << i;
+    dht.testEncodeBucket(0, contents);
+
+    auto rt = dht.testDecodeBucket(0);
+    ASSERT_EQ(rt.keys.size(), 1u);
+    EXPECT_EQ(rt.keys[0].suffix, 0x12345u);
+    ASSERT_EQ(rt.keys[0].packed_versions.size(), 1u);
+    EXPECT_EQ(rt.keys[0].packed_versions[0], 1000u);
+    ASSERT_EQ(rt.keys[0].ids.size(), 1u);
+    EXPECT_EQ(rt.keys[0].ids[0], 42u);
+}
+
+TEST(BucketCodec, MultipleKeysRoundTrip) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 256;
+    TestableDHT dht(cfg);
+
+    DeltaHashTable::BucketContents contents;
+
+    // Three keys with different suffixes, sorted ascending.
+    DeltaHashTable::KeyEntry k1, k2, k3;
+    k1.suffix = 100; k1.packed_versions = {500}; k1.ids = {1};
+    k2.suffix = 200; k2.packed_versions = {600, 400}; k2.ids = {2, 3};
+    k3.suffix = 300; k3.packed_versions = {700}; k3.ids = {4};
+
+    contents.keys = {k1, k2, k3};
+    dht.testEncodeBucket(0, contents);
+
+    auto rt = dht.testDecodeBucket(0);
+    ASSERT_EQ(rt.keys.size(), 3u);
+
+    EXPECT_EQ(rt.keys[0].suffix, 100u);
+    EXPECT_EQ(rt.keys[1].suffix, 200u);
+    EXPECT_EQ(rt.keys[2].suffix, 300u);
+
+    ASSERT_EQ(rt.keys[1].packed_versions.size(), 2u);
+    EXPECT_EQ(rt.keys[1].packed_versions[0], 600u);
+    EXPECT_EQ(rt.keys[1].packed_versions[1], 400u);
+    ASSERT_EQ(rt.keys[1].ids.size(), 2u);
+    EXPECT_EQ(rt.keys[1].ids[0], 2u);
+    EXPECT_EQ(rt.keys[1].ids[1], 3u);
+}
+
+TEST(BucketCodec, ManyVersionsRoundTrip) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 512;
+    TestableDHT dht(cfg);
+
+    DeltaHashTable::BucketContents contents;
+    DeltaHashTable::KeyEntry ke;
+    ke.suffix = 0xABCDE;
+
+    // 20 versions descending, with various ids.
+    for (int i = 20; i >= 1; --i) {
+        ke.packed_versions.push_back(static_cast<uint64_t>(i) * 100);
+        ke.ids.push_back(static_cast<uint32_t>(i));
+    }
+    contents.keys.push_back(ke);
+    dht.testEncodeBucket(0, contents);
+
+    auto rt = dht.testDecodeBucket(0);
+    ASSERT_EQ(rt.keys.size(), 1u);
+    ASSERT_EQ(rt.keys[0].packed_versions.size(), 20u);
+    ASSERT_EQ(rt.keys[0].ids.size(), 20u);
+
+    for (int i = 0; i < 20; ++i) {
+        EXPECT_EQ(rt.keys[0].packed_versions[i], static_cast<uint64_t>(20 - i) * 100);
+        EXPECT_EQ(rt.keys[0].ids[i], static_cast<uint32_t>(20 - i));
     }
 }
 
-// --- Collision-Aware Insertion Tests ---
+TEST(BucketCodec, ZigzagDeltaRoundTrip) {
+    // Test that ids with non-monotonic deltas round-trip correctly.
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 256;
+    TestableDHT dht(cfg);
 
-TEST(ReadWriteDHT, AddEntryCheckedSameKey) {
-    ReadWriteDeltaHashTable dht;
+    DeltaHashTable::BucketContents contents;
+    DeltaHashTable::KeyEntry ke;
+    ke.suffix = 0x42;
+    ke.packed_versions = {1000, 900, 800};
+    ke.ids = {50, 10, 100};  // non-monotonic: 50, then -40, then +90
+    contents.keys.push_back(ke);
 
-    std::string key = "test_key";
-    uint64_t hkey = H(key);
-    auto resolver = [&](uint32_t /*seg_id*/, uint64_t /*pv*/) -> uint64_t {
-        return hkey;
-    };
+    dht.testEncodeBucket(0, contents);
+    auto rt = dht.testDecodeBucket(0);
 
-    bool is_new = dht.addEntryChecked(hkey, 100, 1, resolver);
-    EXPECT_TRUE(is_new);
-
-    is_new = dht.addEntryChecked(hkey, 200, 2, resolver);
-    EXPECT_FALSE(is_new);
-
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
-    EXPECT_EQ(pvs.size(), 2u);
-    EXPECT_EQ(ids.size(), 2u);
+    ASSERT_EQ(rt.keys.size(), 1u);
+    ASSERT_EQ(rt.keys[0].ids.size(), 3u);
+    EXPECT_EQ(rt.keys[0].ids[0], 50u);
+    EXPECT_EQ(rt.keys[0].ids[1], 10u);
+    EXPECT_EQ(rt.keys[0].ids[2], 100u);
 }
 
-// Test helper: exposes protected DeltaHashTable methods for collision testing.
+TEST(BucketCodec, LargePackedVersionRoundTrip) {
+    // Test with very large packed_version values (near UINT64_MAX).
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 256;
+    TestableDHT dht(cfg);
+
+    DeltaHashTable::BucketContents contents;
+    DeltaHashTable::KeyEntry ke;
+    ke.suffix = 0xFF;
+    ke.packed_versions = {UINT64_MAX - 1, UINT64_MAX - 100};
+    ke.ids = {999, 1};
+    contents.keys.push_back(ke);
+
+    dht.testEncodeBucket(0, contents);
+    auto rt = dht.testDecodeBucket(0);
+
+    ASSERT_EQ(rt.keys.size(), 1u);
+    EXPECT_EQ(rt.keys[0].packed_versions[0], UINT64_MAX - 1);
+    EXPECT_EQ(rt.keys[0].packed_versions[1], UINT64_MAX - 100);
+    EXPECT_EQ(rt.keys[0].ids[0], 999u);
+    EXPECT_EQ(rt.keys[0].ids[1], 1u);
+}
+
+// TestableRWDHT for memory leak tests — exposes extension count/arena.
 class TestableRWDHT : public ReadWriteDeltaHashTable {
 public:
     using ReadWriteDeltaHashTable::ReadWriteDeltaHashTable;
 
-    bool testAddToChainChecked(uint32_t bi, uint32_t li, uint64_t fp,
-                               uint64_t packed_version, uint32_t id,
-                               const KeyResolver& resolver,
-                               uint64_t new_key_ext_bits) {
-        return addToChainChecked(bi, li, fp, packed_version, id,
-            [this](Bucket& bucket) -> Bucket* {
-                return createExtension(bucket);
-            },
-            resolver, new_key_ext_bits);
-    }
-
-    bool testFindAllByHash(uint32_t bi, uint32_t li, uint64_t fp,
-                           std::vector<uint64_t>& pvs, std::vector<uint32_t>& ids) const {
-        return findAllByHash(bi, li, fp, pvs, ids);
-    }
-
-    using ReadWriteDeltaHashTable::removeEntry;
-    void removeEntry(uint64_t fp, uint64_t packed_version, uint32_t id,
-                     uint32_t bi, uint32_t li) {
-        removeFromChain(bi, li, fp, packed_version, id);
-    }
-
-    bool updateEntry(uint64_t fp, uint64_t packed_version,
-                     uint32_t old_id, uint32_t new_id,
-                     uint32_t bi, uint32_t li) {
-        return updateIdInChain(bi, li, fp, packed_version, old_id, new_id,
-            [this](Bucket& bucket) -> Bucket* {
-                return createExtension(bucket);
-            });
-    }
-
-    uint8_t fpBits() const { return fingerprint_bits_; }
     size_t extensionCount() const { return ext_arena_->size(); }
     const BucketArena& arena() const { return *ext_arena_; }
 };
 
-TEST(ReadWriteDHT, AddEntryCheckedCollision) {
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 512;
-    TestableRWDHT dht(config);
 
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0x123;
 
-    // Use primary hashes for extension bits.
-    uint64_t hash1 = H("key_1");
-    uint64_t hash2 = H("key_2");
-    uint64_t ext1 = extractExtBits(hash1, config.bucket_bits, config.lslot_bits);
-    uint64_t ext2 = extractExtBits(hash2, config.bucket_bits, config.lslot_bits);
 
-    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> uint64_t {
-        if (seg_id == 1) return hash1;
-        if (seg_id == 2) return hash2;
-        return 0;
-    };
 
-    bool is_new = dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext1);
-    EXPECT_TRUE(is_new);
 
-    is_new = dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext2);
-    EXPECT_TRUE(is_new);
 
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 2u);
-    std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
-    EXPECT_TRUE(pv_set.count(100));
-    EXPECT_TRUE(pv_set.count(200));
-}
 
-TEST(ReadWriteDHT, AddEntryCheckedTripleCollision) {
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 512;
-    TestableRWDHT dht(config);
 
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0x456;
 
-    uint64_t hash1 = H("key_1"), hash2 = H("key_2"), hash3 = H("key_3");
-    uint64_t ext1 = extractExtBits(hash1, config.bucket_bits, config.lslot_bits);
-    uint64_t ext2 = extractExtBits(hash2, config.bucket_bits, config.lslot_bits);
-    uint64_t ext3 = extractExtBits(hash3, config.bucket_bits, config.lslot_bits);
-
-    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> uint64_t {
-        if (seg_id == 1) return hash1;
-        if (seg_id == 2) return hash2;
-        if (seg_id == 3) return hash3;
-        return 0;
-    };
-
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext1));
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext2));
-    // Third key may or may not be detected as new depending on whether its
-    // extension bits collide with an existing entry at the current extension width.
-    dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, ext3);
-
-    // All 3 entries must be findable regardless.
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 3u);
-
-    std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
-    EXPECT_TRUE(pv_set.count(100));
-    EXPECT_TRUE(pv_set.count(200));
-    EXPECT_TRUE(pv_set.count(300));
-}
-
-TEST(ReadWriteDHT, AddEntryCheckedSameKeyAfterCollision) {
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 512;
-    TestableRWDHT dht(config);
-
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0x789;
-
-    std::string key_x = "key_x";
-    std::string key_y = "key_y";
-    uint64_t hash_x = H(key_x);
-    uint64_t hash_y = H(key_y);
-    uint64_t ext_x = extractExtBits(hash_x, config.bucket_bits, config.lslot_bits);
-    uint64_t ext_y = extractExtBits(hash_y, config.bucket_bits, config.lslot_bits);
-    ASSERT_NE(ext_x, ext_y) << "test requires different extension bits";
-
-    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> uint64_t {
-        if (seg_id == 1 || seg_id == 3) return hash_x;
-        if (seg_id == 2) return hash_y;
-        return 0;
-    };
-
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_x));
-
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext_y));
-
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 2u);
-
-    bool is_new = dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, ext_x);
-    EXPECT_FALSE(is_new) << "third insert of same key should not be new";
-
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 3u);
-}
-
-TEST(ReadWriteDHT, AppendOverflow) {
-    // Verify that appending a version to an existing extended entry correctly
-    // handles bucket overflow by spilling to the extension chain.
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 64;  // tiny bucket to force overflow
-    TestableRWDHT dht(config);
-
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0x7;
-
-    std::string key_a = "key_alpha";
-    std::string key_b = "key_beta";
-    uint64_t hash_a = H(key_a);
-    uint64_t hash_b = H(key_b);
-    uint64_t ext_a = extractExtBits(hash_a, config.bucket_bits, config.lslot_bits);
-    uint64_t ext_b = extractExtBits(hash_b, config.bucket_bits, config.lslot_bits);
-    ASSERT_NE(ext_a, ext_b);
-
-    auto resolver = [&](uint32_t seg_id, uint64_t /*pv*/) -> uint64_t {
-        if (seg_id <= 50) return hash_a;
-        return hash_b;
-    };
-
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_a));
-
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 51, resolver, ext_b));
-
-    for (uint32_t i = 2; i <= 20; ++i) {
-        bool is_new = dht.testAddToChainChecked(bi, li, fp, 100 + i, i, resolver, ext_a);
-        EXPECT_FALSE(is_new) << "append #" << i << " should not be new";
-    }
-
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 21u);
-}
-
-TEST(ReadWriteDHT, CollisionWithOverflow) {
-    // Two colliding keys that together exceed bucket capacity after extension.
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 64;  // tiny
-    TestableRWDHT dht(config);
-
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0xA;
-
-    auto no_resolver = [](uint32_t, uint64_t) -> uint64_t { return 0; };
-    for (uint32_t i = 0; i < 3; ++i) {
-        uint64_t other_fp = 0x1 + i;
-        dht.testAddToChainChecked(bi, li, other_fp, 1000 + i, 100 + i,
-                                  no_resolver, i);
-    }
-
-    std::string key_x = "collision_x";
-    std::string key_y = "collision_y";
-    uint64_t hash_x = H(key_x);
-    uint64_t hash_y = H(key_y);
-    uint64_t ext_x = extractExtBits(hash_x, config.bucket_bits, config.lslot_bits);
-    uint64_t ext_y = extractExtBits(hash_y, config.bucket_bits, config.lslot_bits);
-    ASSERT_NE(ext_x, ext_y);
-
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
-        if (seg_id == 1) return hash_x;
-        if (seg_id == 2) return hash_y;
-        return 0;
-    };
-
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 500, 1, resolver, ext_x));
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 600, 2, resolver, ext_y));
-
-    // Both entries must survive in the extension chain.
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 2u);
-    std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
-    EXPECT_TRUE(pv_set.count(500));
-    EXPECT_TRUE(pv_set.count(600));
-}
-
-TEST(ReadWriteDHT, ManyCollisions) {
-    // 10 keys all sharing the same base fingerprint.
-    // The collision resolution creates extended fingerprints. When a new key's
-    // extended bits match an existing entry, findMinExtraBits grows the extension
-    // to re-disambiguate. Test inserts all 10 and verifies all entries survive.
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 512;
-    TestableRWDHT dht(config);
-
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0x42;
-    constexpr int N = 10;
-
-    std::vector<uint64_t> key_hashes;
-    std::vector<uint64_t> key_ext_bits;
-    for (int i = 0; i < N; ++i) {
-        std::string key = "mcoll_" + std::to_string(i);
-        uint64_t h = H(key);
-        key_hashes.push_back(h);
-        key_ext_bits.push_back(extractExtBits(h, config.bucket_bits, config.lslot_bits));
-    }
-
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
-        return key_hashes[seg_id];
-    };
-
-    int new_count = 0;
-    for (int i = 0; i < N; ++i) {
-        bool is_new = dht.testAddToChainChecked(
-            bi, li, fp, (i + 1) * 100, static_cast<uint32_t>(i),
-            resolver, key_ext_bits[i]);
-        if (is_new) new_count++;
-    }
-
-    // At minimum, the first 2 keys must be detected as new (first insert +
-    // first collision). Subsequent keys may or may not be detected as new
-    // depending on extension bit collisions.
-    EXPECT_GE(new_count, 2);
-
-    // All 10 entries must be findable via the base fingerprint.
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), static_cast<size_t>(N));
-
-    std::set<uint64_t> pv_set(pvs.begin(), pvs.end());
-    for (int i = 0; i < N; ++i) {
-        EXPECT_TRUE(pv_set.count((i + 1) * 100))
-            << "missing version for key " << i;
-    }
-}
-
-TEST(ReadWriteDHT, ExtraBitsGrowsMultipleTimes) {
-    // Exercise findMinExtraBits needing to grow extra_bits multiple times.
-    // Insert 3 keys whose secondary hashes share low bits, forcing
-    // the extension width to grow beyond 1.
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 512;
-    TestableRWDHT dht(config);
-
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0xDD;
-
-    std::string key_a = "extra_a";
-    std::string key_b = "extra_b";
-    std::string key_c = "extra_c";
-    uint64_t hash_a = H(key_a);
-    uint64_t hash_b = H(key_b);
-    uint64_t hash_c = H(key_c);
-    uint64_t ext_a = extractExtBits(hash_a, config.bucket_bits, config.lslot_bits);
-    uint64_t ext_b = extractExtBits(hash_b, config.bucket_bits, config.lslot_bits);
-    uint64_t ext_c = extractExtBits(hash_c, config.bucket_bits, config.lslot_bits);
-
-    int matching_low = ((ext_a & 1) == (ext_b & 1)) +
-                       ((ext_a & 1) == (ext_c & 1)) +
-                       ((ext_b & 1) == (ext_c & 1));
-    ASSERT_GE(matching_low, 1);
-
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
-        if (seg_id == 1) return hash_a;
-        if (seg_id == 2) return hash_b;
-        if (seg_id == 3) return hash_c;
-        return 0;
-    };
-
-    dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_a);
-    dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext_b);
-    dht.testAddToChainChecked(bi, li, fp, 300, 3, resolver, ext_c);
-
-    // All 3 entries must be findable.
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 3u);
-}
-
-TEST(ReadWriteDHT, AppendCreatesNewEntryInExtension) {
-    // Exercise buildCandidateSlot creating a new TrieEntry (not appending
-    // to an existing one) when the version overflows to the extension.
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 64;  // tiny to force overflow
-    TestableRWDHT dht(config);
-
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0xEE;
-
-    std::string key = "overflow_key";
-    uint64_t hash_key = H(key);
-    uint64_t ext = extractExtBits(hash_key, config.bucket_bits, config.lslot_bits);
-
-    auto resolver = [&](uint32_t, uint64_t) -> uint64_t { return hash_key; };
-
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext));
-
-    // Append many versions to force multiple overflows to extension chain.
-    for (uint32_t i = 2; i <= 15; ++i) {
-        bool is_new = dht.testAddToChainChecked(bi, li, fp, 100 + i, i,
-                                                resolver, ext);
-        EXPECT_FALSE(is_new) << "append #" << i;
-    }
-
-    // All 15 versions must be findable.
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 15u);
-}
-
-TEST(ReadWriteDHT, CollisionThenRemove) {
-    // After collision extends fingerprints, remove one key's entry.
-    // The other key's entry must remain findable with its extended fingerprint.
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 512;
-    TestableRWDHT dht(config);
-
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0xBB;
-
-    std::string key_p = "key_persist";
-    std::string key_r = "key_remove";
-    uint64_t hash_p = H(key_p);
-    uint64_t hash_r = H(key_r);
-    uint64_t ext_p = extractExtBits(hash_p, config.bucket_bits, config.lslot_bits);
-    uint64_t ext_r = extractExtBits(hash_r, config.bucket_bits, config.lslot_bits);
-    ASSERT_NE(ext_p, ext_r);
-
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
-        if (seg_id == 1) return hash_p;
-        if (seg_id == 2) return hash_r;
-        return 0;
-    };
-
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_p));
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext_r));
-
-    // Remove key_r's entry.
-    dht.removeEntry(fp, 200, 2, bi, li);
-
-    // key_p must still be findable.
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 1u);
-    EXPECT_EQ(pvs[0], 100u);
-    EXPECT_EQ(ids[0], 1u);
-}
-
-TEST(ReadWriteDHT, CollisionThenUpdate) {
-    // After collision extends fingerprints, update one entry's id.
-    // The update must succeed and the extended fingerprint must be preserved.
-    DeltaHashTable::Config config;
-    config.bucket_bits = 4;
-    config.lslot_bits = 2;
-    config.bucket_bytes = 512;
-    TestableRWDHT dht(config);
-
-    uint32_t bi = 0, li = 0;
-    uint64_t fp = 0xCC;
-
-    std::string key_u = "key_update";
-    std::string key_o = "key_other";
-    uint64_t hash_u = H(key_u);
-    uint64_t hash_o = H(key_o);
-    uint64_t ext_u = extractExtBits(hash_u, config.bucket_bits, config.lslot_bits);
-    uint64_t ext_o = extractExtBits(hash_o, config.bucket_bits, config.lslot_bits);
-    ASSERT_NE(ext_u, ext_o);
-
-    auto resolver = [&](uint32_t seg_id, uint64_t) -> uint64_t {
-        if (seg_id == 1 || seg_id == 99) return hash_u;
-        if (seg_id == 2) return hash_o;
-        return 0;
-    };
-
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 100, 1, resolver, ext_u));
-    EXPECT_TRUE(dht.testAddToChainChecked(bi, li, fp, 200, 2, resolver, ext_o));
-
-    // Update key_u's id from 1 to 99.
-    bool updated = dht.updateEntry(fp, 100, 1, 99, bi, li);
-    EXPECT_TRUE(updated);
-
-    // Both must still be findable.
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    ASSERT_TRUE(dht.testFindAllByHash(bi, li, fp, pvs, ids));
-    EXPECT_EQ(pvs.size(), 2u);
-
-    std::map<uint64_t, uint32_t> pv_to_id;
-    for (size_t i = 0; i < pvs.size(); ++i) {
-        pv_to_id[pvs[i]] = ids[i];
-    }
-    EXPECT_EQ(pv_to_id[100], 99u);   // updated
-    EXPECT_EQ(pv_to_id[200], 2u);    // unchanged
-}
 
 // ============================================================
 // Memory leak tests
@@ -1959,14 +1225,12 @@ TEST(MemoryLeak, ReadOnlyMoveTransfersOwnership) {
 TEST(MemoryLeak, ReadWriteClearReleasesExtensions) {
     ReadWriteDeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
-    cfg.lslot_bits = 2;
     cfg.bucket_bytes = 32;
 
     // Use TestableRWDHT to inspect extension count, but note it can't be
     // moved (deleted move ctor), so we test clear() only.
     DeltaHashTable::Config dcfg;
     dcfg.bucket_bits = cfg.bucket_bits;
-    dcfg.lslot_bits = cfg.lslot_bits;
     dcfg.bucket_bytes = cfg.bucket_bytes;
     TestableRWDHT dht(dcfg);
 
@@ -1986,7 +1250,6 @@ TEST(MemoryLeak, ReadWriteClearReleasesExtensions) {
 TEST(MemoryLeak, RepeatedAddRemoveCyclesStableMemory) {
     DeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
-    cfg.lslot_bits = 2;
     cfg.bucket_bytes = 64;
     TestableRWDHT dht(cfg);
 
@@ -2016,13 +1279,12 @@ TEST(MemoryLeak, RepeatedAddRemoveCyclesStableMemory) {
 TEST(MemoryLeak, PruneEmptyExtensionOnRemove) {
     DeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
-    cfg.lslot_bits = 2;
     cfg.bucket_bytes = 32;  // very small → forces extensions quickly
     TestableRWDHT dht(cfg);
 
     // Add enough entries across multiple keys so different extension chain
     // tails become empty during removal (pruneEmptyExtension unlinks empty
-    // tail extensions). Using multiple keys spreads entries across lslots,
+    // tail extensions). Using multiple keys spreads entries across buckets,
     // meaning some extension buckets become entirely empty sooner.
     const int N = 100;
     for (int i = 1; i <= N; ++i) {
@@ -2212,7 +1474,6 @@ TEST(BucketArena, MemoryUsageConsistency) {
 TEST(BucketArena, ReadWriteArenaTracking) {
     DeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
-    cfg.lslot_bits = 2;
     cfg.bucket_bytes = 32;
     TestableRWDHT dht(cfg);
 
@@ -2249,7 +1510,6 @@ TEST(BucketArena, ChunkBoundaryTransition) {
     // Use a very small bucket to force many extensions quickly.
     DeltaHashTable::Config cfg;
     cfg.bucket_bits = 2;   // 4 buckets
-    cfg.lslot_bits = 1;    // 2 lslots
     cfg.bucket_bytes = 32; // tiny
     TestableRODHT dht(cfg);
 
@@ -2316,13 +1576,13 @@ TEST(BucketArena, ConcurrentAllocate) {
 }
 
 // ============================================================
-// Binary snapshot (v8) tests
+// Binary snapshot (v9) tests
 // ============================================================
 
 class BinarySnapshotTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        db_dir_ = ::testing::TempDir() + "/gi_snap_v8_" +
+        db_dir_ = ::testing::TempDir() + "/gi_snap_v9_" +
                   std::to_string(reinterpret_cast<uintptr_t>(this));
         std::filesystem::create_directories(db_dir_);
         ASSERT_TRUE(manifest_.create(db_dir_).ok());
@@ -2501,7 +1761,7 @@ TEST_F(BinarySnapshotTest, AtomicSwapLeavesValidDir) {
 
     ASSERT_TRUE(index_->storeSnapshot(0).ok());
 
-    std::string valid_dir = db_dir_ + "/gi/snapshot.v8";
+    std::string valid_dir = db_dir_ + "/gi/snapshot.v9";
     std::string tmp_dir = valid_dir + ".tmp";
     std::string old_dir = valid_dir + ".old";
 
@@ -2544,10 +1804,10 @@ TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
     ASSERT_TRUE(index_->storeSnapshot(0).ok());
     ASSERT_TRUE(index_->close().ok());
 
-    std::string valid_dir = db_dir_ + "/gi/snapshot.v8";
+    std::string valid_dir = db_dir_ + "/gi/snapshot.v9";
     EXPECT_TRUE(std::filesystem::exists(valid_dir));
 
-    // Re-open and verify data is loaded from v8 snapshot.
+    // Re-open and verify data is loaded from v9 snapshot.
     manifest_.close();
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
@@ -2589,4 +1849,757 @@ TEST_F(BinarySnapshotTest, EmptyIndexSnapshot) {
 
     index2.close();
     manifest2.close();
+}
+
+// ============================================================
+// Testable DHT for optimization tests — exposes protected helpers.
+// ============================================================
+
+class OptTestDHT : public ReadOnlyDeltaHashTable {
+public:
+    using ReadOnlyDeltaHashTable::ReadOnlyDeltaHashTable;
+    using DeltaHashTable::BucketContents;
+    using DeltaHashTable::KeyEntry;
+    using DeltaHashTable::SuffixScanResult;
+
+    SuffixScanResult testDecodeSuffixes(uint32_t bi) const {
+        return decodeSuffixes(buckets_[bi]);
+    }
+    BucketContents testDecodeBucket(uint32_t bi) const {
+        return decodeBucket(buckets_[bi]);
+    }
+    size_t testEncodeBucket(uint32_t bi, const BucketContents& contents) {
+        return encodeBucket(const_cast<Bucket&>(buckets_[bi]), contents);
+    }
+    size_t testDecodeBucketUsedBits(uint32_t bi) const {
+        return decodeBucketUsedBits(buckets_[bi]);
+    }
+    uint8_t testSuffixBits() const { return suffix_bits_; }
+    uint32_t testBucketIndex(uint64_t hash) const { return bucketIndex(hash); }
+    uint64_t testSuffixFromHash(uint64_t hash) const { return suffixFromHash(hash); }
+    const Bucket& testBucket(uint32_t bi) const { return buckets_[bi]; }
+
+    // Expose static protected helpers.
+    static void testSkipKeyData(BitReader& reader) { skipKeyData(reader); }
+    static KeyEntry testDecodeKeyData(BitReader& reader, uint64_t suffix) {
+        return decodeKeyData(reader, suffix);
+    }
+    static size_t testBitsForAppendVersion(uint64_t prev_pv, uint64_t new_pv,
+                                           uint32_t prev_id, uint32_t new_id) {
+        return bitsForAppendVersion(prev_pv, new_pv, prev_id, new_id);
+    }
+    static size_t testBitsForNewEntry(uint64_t suffix, uint64_t prev_suffix,
+                                      uint64_t next_suffix, bool has_prev,
+                                      bool has_next, uint8_t suffix_bits,
+                                      uint64_t packed_version, uint32_t id) {
+        return bitsForNewEntry(suffix, prev_suffix, next_suffix, has_prev,
+                               has_next, suffix_bits, packed_version, id);
+    }
+};
+
+class OptTestRWDHT : public ReadWriteDeltaHashTable {
+public:
+    using ReadWriteDeltaHashTable::ReadWriteDeltaHashTable;
+    using DeltaHashTable::SuffixScanResult;
+
+    SuffixScanResult testDecodeSuffixes(uint32_t bi) const {
+        return decodeSuffixes(buckets_[bi]);
+    }
+    size_t testDecodeBucketUsedBits(uint32_t bi) const {
+        return decodeBucketUsedBits(buckets_[bi]);
+    }
+    uint32_t testBucketIndex(uint64_t hash) const { return bucketIndex(hash); }
+    uint64_t testSuffixFromHash(uint64_t hash) const { return suffixFromHash(hash); }
+    bool testContainsByHash(uint32_t bi, uint64_t suffix) const {
+        return containsByHash(bi, suffix);
+    }
+};
+
+// ============================================================
+// Suite: DHTTargetedScan (improvement 1)
+// ============================================================
+
+TEST(DHTTargetedScan, DecodeSuffixesEmpty) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 128;
+    OptTestDHT dht(cfg);
+
+    auto result = dht.testDecodeSuffixes(0);
+    EXPECT_TRUE(result.suffixes.empty());
+    EXPECT_EQ(result.versions_start_bit, 16u);
+}
+
+TEST(DHTTargetedScan, DecodeSuffixesSingle) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 128;
+    OptTestDHT dht(cfg);
+
+    // Insert a single key.
+    uint64_t hash = (0ULL << 60) | 0x12345ULL;  // bucket 0, suffix 0x12345
+    dht.addEntry(hash, 1000, 42);
+
+    auto result = dht.testDecodeSuffixes(0);
+    ASSERT_EQ(result.suffixes.size(), 1u);
+    EXPECT_EQ(result.suffixes[0], 0x12345u);
+    // versions_start_bit should be > 16 (16-bit header + suffix bits).
+    EXPECT_GT(result.versions_start_bit, 16u);
+}
+
+TEST(DHTTargetedScan, DecodeSuffixesMultiple) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 256;
+    OptTestDHT dht(cfg);
+
+    // Manually encode three keys in bucket 0.
+    DeltaHashTable::BucketContents contents;
+    DeltaHashTable::KeyEntry k1, k2, k3;
+    k1.suffix = 100; k1.packed_versions = {500}; k1.ids = {1};
+    k2.suffix = 200; k2.packed_versions = {600}; k2.ids = {2};
+    k3.suffix = 300; k3.packed_versions = {700}; k3.ids = {3};
+    contents.keys = {k1, k2, k3};
+    dht.testEncodeBucket(0, contents);
+
+    auto result = dht.testDecodeSuffixes(0);
+    ASSERT_EQ(result.suffixes.size(), 3u);
+    EXPECT_EQ(result.suffixes[0], 100u);
+    EXPECT_EQ(result.suffixes[1], 200u);
+    EXPECT_EQ(result.suffixes[2], 300u);
+}
+
+TEST(DHTTargetedScan, SkipKeyDataRoundTrip) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 256;
+    OptTestDHT dht(cfg);
+
+    // Encode three keys with different version counts.
+    DeltaHashTable::BucketContents contents;
+    DeltaHashTable::KeyEntry k1, k2, k3;
+    k1.suffix = 100; k1.packed_versions = {500, 400}; k1.ids = {1, 2};
+    k2.suffix = 200; k2.packed_versions = {800, 700, 600}; k2.ids = {10, 20, 30};
+    k3.suffix = 300; k3.packed_versions = {900}; k3.ids = {99};
+    contents.keys = {k1, k2, k3};
+    dht.testEncodeBucket(0, contents);
+
+    auto scan = dht.testDecodeSuffixes(0);
+    BitReader reader(dht.testBucket(0).data, scan.versions_start_bit);
+
+    // Skip first 2 keys.
+    OptTestDHT::testSkipKeyData(reader);
+    OptTestDHT::testSkipKeyData(reader);
+
+    // Decode 3rd key.
+    auto key3 = OptTestDHT::testDecodeKeyData(reader, 300);
+    ASSERT_EQ(key3.packed_versions.size(), 1u);
+    EXPECT_EQ(key3.packed_versions[0], 900u);
+    EXPECT_EQ(key3.ids[0], 99u);
+}
+
+TEST(DHTTargetedScan, FindFirstTargetedMatchesFull) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 512;
+    OptTestDHT dht(cfg);
+
+    // Insert 50 keys into the same bucket.
+    std::vector<uint64_t> hashes;
+    for (int i = 0; i < 50; ++i) {
+        // Use bucket 0: high 4 bits = 0.
+        uint64_t hash = static_cast<uint64_t>(i * 7 + 1);  // suffix only
+        dht.addEntry(hash, 1000 + i, 100 + i);
+        hashes.push_back(hash);
+    }
+
+    // Verify findFirst returns correct results for each.
+    for (int i = 0; i < 50; ++i) {
+        uint64_t pv;
+        uint32_t id;
+        ASSERT_TRUE(dht.findFirst(hashes[i], pv, id))
+            << "Key " << i << " not found";
+        EXPECT_EQ(pv, static_cast<uint64_t>(1000 + i));
+        EXPECT_EQ(id, static_cast<uint32_t>(100 + i));
+    }
+}
+
+TEST(DHTTargetedScan, FindAllTargetedMatchesFull) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 512;
+    OptTestDHT dht(cfg);
+
+    // Insert one key with 5 versions.
+    uint64_t hash = 42;
+    for (int v = 0; v < 5; ++v) {
+        dht.addEntry(hash, 500 - v * 10, 100 + v);
+    }
+
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(hash, pvs, ids));
+    ASSERT_EQ(pvs.size(), 5u);
+    // Versions should be sorted descending.
+    EXPECT_EQ(pvs[0], 500u);
+    EXPECT_EQ(pvs[4], 460u);
+    EXPECT_EQ(ids[0], 100u);
+    EXPECT_EQ(ids[4], 104u);
+}
+
+// ============================================================
+// Suite: DHTOverflowOpt (improvement 2)
+// ============================================================
+
+TEST(DHTOverflowOpt, AddToChainOverflowPreserves) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 1;  // 2 buckets
+    cfg.bucket_bytes = 64; // tiny
+    OptTestDHT dht(cfg);
+
+    // Fill bucket 0 near capacity.
+    std::vector<uint64_t> hashes;
+    for (int i = 0; i < 20; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 3 + 1);  // bucket 0
+        dht.addEntry(hash, 1000 + i, i);
+        hashes.push_back(hash);
+    }
+
+    // Verify all entries are findable (some will be in extensions).
+    for (int i = 0; i < 20; ++i) {
+        uint64_t pv;
+        uint32_t id;
+        ASSERT_TRUE(dht.findFirst(hashes[i], pv, id))
+            << "Key " << i << " not found after overflow";
+        EXPECT_EQ(pv, static_cast<uint64_t>(1000 + i));
+        EXPECT_EQ(id, static_cast<uint32_t>(i));
+    }
+}
+
+TEST(DHTOverflowOpt, AddToChainMultipleLevelOverflow) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 1;
+    cfg.bucket_bytes = 32; // very tiny — triggers multiple extension levels
+    OptTestDHT dht(cfg);
+
+    // Insert enough keys to overflow through 3+ extension levels.
+    std::vector<uint64_t> hashes;
+    for (int i = 0; i < 30; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 5 + 1);  // bucket 0
+        dht.addEntry(hash, 2000 + i, i);
+        hashes.push_back(hash);
+    }
+
+    for (int i = 0; i < 30; ++i) {
+        uint64_t pv;
+        uint32_t id;
+        ASSERT_TRUE(dht.findFirst(hashes[i], pv, id))
+            << "Key " << i << " not found after multi-level overflow";
+        EXPECT_EQ(pv, static_cast<uint64_t>(2000 + i));
+    }
+}
+
+TEST(DHTOverflowOpt, AddToChainOverflowIsNew) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 1;
+    cfg.bucket_bytes = 32;
+    OptTestDHT dht(cfg);
+
+    // Fill bucket 0 until overflow happens.
+    for (int i = 0; i < 5; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 3 + 1);
+        bool is_new = dht.addEntryIsNew(hash, 1000 + i, i);
+        EXPECT_TRUE(is_new) << "Key " << i << " should be new";
+    }
+
+    // Add another unique key that will overflow to extension.
+    uint64_t overflow_hash = 999;  // bucket 0 (high bit 0)
+    bool is_new = dht.addEntryIsNew(overflow_hash, 5000, 50);
+    EXPECT_TRUE(is_new) << "Overflow key should be new";
+}
+
+TEST(DHTOverflowOpt, AddToChainAppendOverflowIsNotNew) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 1;
+    cfg.bucket_bytes = 32;
+    OptTestDHT dht(cfg);
+
+    // Insert some keys to fill bucket.
+    uint64_t target_hash = 1;  // bucket 0
+    dht.addEntry(target_hash, 1000, 1);
+
+    for (int i = 1; i < 5; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 3 + 1);
+        dht.addEntry(hash, 2000 + i, 10 + i);
+    }
+
+    // Now add another version of the same key — should overflow but is_new = false.
+    bool is_new = dht.addEntryIsNew(target_hash, 900, 2);
+    EXPECT_FALSE(is_new) << "Existing key with new version should not be new";
+}
+
+// ============================================================
+// Suite: DHTForEachGroupOpt (improvement 3)
+// ============================================================
+
+TEST(DHTForEachGroupOpt, ForEachGroupSorted) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 1;
+    cfg.bucket_bytes = 64;
+    OptTestDHT dht(cfg);
+
+    // Add key with versions across primary + extension.
+    uint64_t hash = 1;
+    for (int v = 0; v < 8; ++v) {
+        dht.addEntry(hash, 1000 - v * 10, v);
+    }
+
+    int group_count = 0;
+    dht.forEachGroup([&](uint64_t h, const std::vector<uint64_t>& pvs,
+                         const std::vector<uint32_t>& ids) {
+        if (h == hash) {
+            group_count++;
+            // All 8 versions should be merged into one group.
+            EXPECT_EQ(pvs.size(), 8u);
+        }
+    });
+    EXPECT_EQ(group_count, 1);
+}
+
+TEST(DHTForEachGroupOpt, ForEachGroupManyKeys) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 64;  // small — forces extensions
+    OptTestDHT dht(cfg);
+
+    // Insert 100 distinct keys.
+    std::set<uint64_t> inserted_hashes;
+    for (int i = 0; i < 100; ++i) {
+        uint64_t hash = H("forEachGroupKey_" + std::to_string(i));
+        dht.addEntry(hash, 5000 + i, i);
+        inserted_hashes.insert(hash);
+    }
+
+    std::set<uint64_t> seen_hashes;
+    dht.forEachGroup([&](uint64_t h, const std::vector<uint64_t>& pvs,
+                         const std::vector<uint32_t>& ids) {
+        seen_hashes.insert(h);
+        EXPECT_EQ(pvs.size(), ids.size());
+    });
+    EXPECT_EQ(seen_hashes.size(), 100u);
+    EXPECT_EQ(seen_hashes, inserted_hashes);
+}
+
+TEST(DHTForEachGroupOpt, ForEachGroupNoExtensions) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 512;  // large — no overflow
+    OptTestDHT dht(cfg);
+
+    // Insert 3 keys in same bucket.
+    DeltaHashTable::BucketContents contents;
+    DeltaHashTable::KeyEntry k1, k2, k3;
+    k1.suffix = 10; k1.packed_versions = {100}; k1.ids = {1};
+    k2.suffix = 20; k2.packed_versions = {200}; k2.ids = {2};
+    k3.suffix = 30; k3.packed_versions = {300}; k3.ids = {3};
+    contents.keys = {k1, k2, k3};
+    dht.testEncodeBucket(0, contents);
+
+    int group_count = 0;
+    dht.forEachGroup([&](uint64_t h, const std::vector<uint64_t>& pvs,
+                         const std::vector<uint32_t>& ids) {
+        group_count++;
+        EXPECT_EQ(pvs.size(), 1u);
+    });
+    EXPECT_EQ(group_count, 3);
+}
+
+TEST(DHTForEachGroupOpt, ForEachGroupDuplicateSuffix) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 1;
+    cfg.bucket_bytes = 32;  // very small — forces extensions
+    OptTestDHT dht(cfg);
+
+    // Insert same key with multiple versions — will spread across extensions.
+    uint64_t hash = 1;
+    for (int v = 0; v < 10; ++v) {
+        dht.addEntry(hash, 5000 - v * 100, v);
+    }
+
+    int group_count = 0;
+    size_t total_versions = 0;
+    dht.forEachGroup([&](uint64_t h, const std::vector<uint64_t>& pvs,
+                         const std::vector<uint32_t>& ids) {
+        if (h == hash) {
+            group_count++;
+            total_versions = pvs.size();
+        }
+    });
+    EXPECT_EQ(group_count, 1) << "Duplicate suffix should merge into one group";
+    EXPECT_EQ(total_versions, 10u);
+}
+
+// ============================================================
+// Suite: DHTContainsOpt (improvement 4)
+// ============================================================
+
+TEST(DHTContainsOpt, ContainsEmpty) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 128;
+    OptTestDHT dht(cfg);
+
+    EXPECT_FALSE(dht.contains(12345));
+    EXPECT_FALSE(dht.contains(0));
+    EXPECT_FALSE(dht.contains(~0ULL));
+}
+
+TEST(DHTContainsOpt, ContainsSingleKey) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 128;
+    OptTestDHT dht(cfg);
+
+    uint64_t hash = H("the_only_key");
+    dht.addEntry(hash, 100, 1);
+
+    EXPECT_TRUE(dht.contains(hash));
+    EXPECT_FALSE(dht.contains(hash + 1));
+    EXPECT_FALSE(dht.contains(hash ^ (1ULL << 63)));
+}
+
+TEST(DHTContainsOpt, ContainsAfterOverflow) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 1;
+    cfg.bucket_bytes = 32;
+    OptTestDHT dht(cfg);
+
+    // Fill until overflow, then check contains for a key in extension.
+    std::vector<uint64_t> hashes;
+    for (int i = 0; i < 15; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 3 + 1);
+        dht.addEntry(hash, 1000 + i, i);
+        hashes.push_back(hash);
+    }
+
+    for (auto h : hashes) {
+        EXPECT_TRUE(dht.contains(h)) << "contains failed for hash " << h;
+    }
+}
+
+TEST(DHTContainsOpt, ContainsManyKeys) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 8;
+    cfg.bucket_bytes = 256;
+    OptTestRWDHT dht(cfg);
+
+    std::vector<uint64_t> existing;
+    for (int i = 0; i < 200; ++i) {
+        uint64_t hash = H("contains_key_" + std::to_string(i));
+        dht.addEntry(hash, 1000 + i, i);
+        existing.push_back(hash);
+    }
+
+    for (auto h : existing) {
+        EXPECT_TRUE(dht.contains(h));
+    }
+    for (int i = 200; i < 400; ++i) {
+        uint64_t hash = H("contains_key_" + std::to_string(i));
+        EXPECT_FALSE(dht.contains(hash));
+    }
+}
+
+TEST(DHTContainsOpt, ConcurrentContainsDuringWrites) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 8;
+    cfg.bucket_bytes = 256;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> written{0};
+
+    // 4 writer threads.
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([&, t]() {
+            for (int i = 0; i < 100; ++i) {
+                uint64_t hash = H("concurrent_key_" + std::to_string(t * 100 + i));
+                dht.addEntry(hash, 1000 + i, i);
+                written.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    // 4 reader threads calling contains.
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&, t]() {
+            while (!stop.load(std::memory_order_relaxed)) {
+                // Just exercise contains without crashing.
+                uint64_t hash = H("concurrent_key_" + std::to_string(t * 50));
+                dht.contains(hash);
+            }
+        });
+    }
+
+    for (auto& w : writers) w.join();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& r : readers) r.join();
+
+    EXPECT_EQ(written.load(), 400);
+    // All written keys should be findable.
+    for (int t = 0; t < 4; ++t) {
+        for (int i = 0; i < 100; ++i) {
+            uint64_t hash = H("concurrent_key_" + std::to_string(t * 100 + i));
+            EXPECT_TRUE(dht.contains(hash));
+        }
+    }
+}
+
+// ============================================================
+// Suite: DHTIncrementalBits (improvement 5)
+// ============================================================
+
+TEST(DHTIncrementalBits, BitsForAppendSmallDelta) {
+    // Small version delta → small gamma.
+    size_t bits = OptTestDHT::testBitsForAppendVersion(1000, 999, 10, 11);
+    // pv delta = 1 → gamma(2) = 3 bits; id delta = 1 → zigzag(1)=2 → gamma(3) = 3 bits.
+    EXPECT_EQ(bits, 3u + 3u);
+}
+
+TEST(DHTIncrementalBits, BitsForAppendLargeDelta) {
+    // Large version delta → large gamma.
+    size_t bits = OptTestDHT::testBitsForAppendVersion(1000000, 1, 10, 10);
+    // pv delta = 999999 → gamma(1000000) = many bits.
+    // id delta = 0 → zigzag(0) = 0 → gamma(1) = 1 bit.
+    EXPECT_GT(bits, 20u);  // 999999 needs ~40 bits in gamma
+}
+
+TEST(DHTIncrementalBits, BitsForNewEntryFirst) {
+    // First key in bucket → raw suffix_bits.
+    size_t bits = OptTestDHT::testBitsForNewEntry(
+        100, 0, 0, false, false, 60, 1000, 42);
+    // suffix_bits (60) + gamma(1) (1) + 64 + 32 = 157.
+    EXPECT_EQ(bits, 60u + 1u + 64u + 32u);
+}
+
+TEST(DHTIncrementalBits, BitsForNewEntryMiddle) {
+    // Between two keys → removes one delta, adds two.
+    size_t bits = OptTestDHT::testBitsForNewEntry(
+        200, 100, 300, true, true, 60, 1000, 42);
+    // Removes gamma(300-100+1)=gamma(201), adds gamma(200-100+1)+gamma(300-200+1)
+    // = gamma(101) + gamma(101) - gamma(201) + 97 (entry data).
+    EXPECT_GT(bits, 97u);  // at minimum the entry data
+}
+
+TEST(DHTIncrementalBits, BitsForNewEntryLast) {
+    // After all keys → adds one delta.
+    size_t bits = OptTestDHT::testBitsForNewEntry(
+        300, 200, 0, true, false, 60, 1000, 42);
+    // gamma(300-200+1) = gamma(101) ≈ 13 bits, + 97 entry data.
+    EXPECT_GT(bits, 97u);
+}
+
+TEST(DHTIncrementalBits, IncrementalMatchesFull) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 512;
+    OptTestDHT dht(cfg);
+
+    // Insert 20 keys and verify incremental bit computation matches full decode.
+    for (int i = 0; i < 20; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 7 + 1);
+        dht.addEntry(hash, 1000 + i, i);
+
+        // Get the bucket index.
+        uint32_t bi = dht.testBucketIndex(hash);
+        // Decode full bucket to compute contentsBitsNeeded.
+        auto contents = dht.testDecodeBucket(bi);
+        // Re-encode to get exact bit count.
+        size_t encode_bits = dht.testEncodeBucket(bi, contents);
+        // Compare with decodeBucketUsedBits.
+        size_t used_bits = dht.testDecodeBucketUsedBits(bi);
+        EXPECT_EQ(encode_bits, used_bits)
+            << "Mismatch at key " << i << " for bucket " << bi;
+    }
+}
+
+TEST(DHTIncrementalBits, AddToChainUsesIncrementalBits) {
+    // End-to-end: add entries, verify they're stored correctly.
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 128;
+    OptTestDHT dht(cfg);
+
+    // Add 15 unique keys.
+    for (int i = 0; i < 15; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 11 + 1);
+        dht.addEntry(hash, 3000 + i, 50 + i);
+    }
+
+    // Add multiple versions to some keys.
+    for (int i = 0; i < 5; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 11 + 1);
+        dht.addEntry(hash, 2000 + i, 60 + i);
+    }
+
+    // Verify all entries are retrievable.
+    for (int i = 0; i < 15; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 11 + 1);
+        uint64_t pv;
+        uint32_t id;
+        ASSERT_TRUE(dht.findFirst(hash, pv, id));
+        EXPECT_EQ(pv, static_cast<uint64_t>(3000 + i));
+    }
+
+    // Verify multi-version keys have all versions.
+    for (int i = 0; i < 5; ++i) {
+        uint64_t hash = static_cast<uint64_t>(i * 11 + 1);
+        std::vector<uint64_t> pvs;
+        std::vector<uint32_t> ids;
+        ASSERT_TRUE(dht.findAll(hash, pvs, ids));
+        EXPECT_EQ(pvs.size(), 2u);
+    }
+}
+
+// ============================================================
+// Suite: DHTChaos (concurrency stress)
+// ============================================================
+
+TEST(DHTChaos, ConcurrentContainsAndAdds) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 8;
+    cfg.bucket_bytes = 256;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    std::atomic<bool> stop{false};
+
+    // 4 writer threads adding keys.
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([&, t]() {
+            for (int i = 0; i < 200; ++i) {
+                uint64_t hash = H("chaos_key_" + std::to_string(t * 1000 + i));
+                dht.addEntry(hash, 1000 + i, i);
+            }
+        });
+    }
+
+    // 4 reader threads calling contains on random keys.
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&, t]() {
+            int checks = 0;
+            while (!stop.load(std::memory_order_relaxed) && checks < 10000) {
+                uint64_t hash = H("chaos_key_" + std::to_string((t * 37 + checks) % 800));
+                dht.contains(hash);
+                checks++;
+            }
+        });
+    }
+
+    for (auto& w : writers) w.join();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& r : readers) r.join();
+
+    // All 800 written keys should be findable.
+    for (int t = 0; t < 4; ++t) {
+        for (int i = 0; i < 200; ++i) {
+            uint64_t hash = H("chaos_key_" + std::to_string(t * 1000 + i));
+            EXPECT_TRUE(dht.contains(hash));
+        }
+    }
+}
+
+TEST(DHTChaos, ConcurrentFindFirstDuringOverflow) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 64;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    std::atomic<bool> stop{false};
+
+    // Pre-populate some data.
+    for (int i = 0; i < 20; ++i) {
+        uint64_t hash = H("overflow_key_" + std::to_string(i));
+        dht.addEntry(hash, 1000 + i, i);
+    }
+
+    // 4 writer threads causing overflow on same buckets.
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([&, t]() {
+            for (int i = 0; i < 50; ++i) {
+                uint64_t hash = H("overflow_key_" + std::to_string(t * 50 + i + 20));
+                dht.addEntry(hash, 2000 + t * 50 + i, t * 50 + i);
+            }
+        });
+    }
+
+    // 4 reader threads doing findFirst.
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&, t]() {
+            while (!stop.load(std::memory_order_relaxed)) {
+                uint64_t hash = H("overflow_key_" + std::to_string(t % 20));
+                uint64_t pv;
+                uint32_t id;
+                dht.findFirst(hash, pv, id);
+            }
+        });
+    }
+
+    for (auto& w : writers) w.join();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& r : readers) r.join();
+
+    // Pre-populated keys should still be findable.
+    for (int i = 0; i < 20; ++i) {
+        uint64_t hash = H("overflow_key_" + std::to_string(i));
+        EXPECT_TRUE(dht.contains(hash));
+    }
+}
+
+TEST(DHTChaos, ConcurrentForEachGroupDuringWrites) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 8;
+    cfg.bucket_bytes = 256;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    // Pre-populate.
+    for (int i = 0; i < 50; ++i) {
+        uint64_t hash = H("fegroup_key_" + std::to_string(i));
+        dht.addEntry(hash, 1000 + i, i);
+    }
+
+    std::atomic<bool> stop{false};
+
+    // 4 writer threads.
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([&, t]() {
+            for (int i = 0; i < 100; ++i) {
+                uint64_t hash = H("fegroup_key_" + std::to_string(t * 100 + i + 50));
+                dht.addEntry(hash, 2000 + i, i);
+            }
+        });
+    }
+
+    // Background forEachGroup — just exercise it without crashing.
+    std::thread reader([&]() {
+        int iters = 0;
+        while (!stop.load(std::memory_order_relaxed) && iters < 5) {
+            int count = 0;
+            dht.forEachGroup([&](uint64_t, const std::vector<uint64_t>&,
+                                  const std::vector<uint32_t>&) {
+                count++;
+            });
+            EXPECT_GT(count, 0);
+            iters++;
+        }
+    });
+
+    for (auto& w : writers) w.join();
+    stop.store(true, std::memory_order_relaxed);
+    reader.join();
 }
