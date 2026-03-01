@@ -1,7 +1,6 @@
 #ifndef KVLITE_INTERNAL_GLOBAL_INDEX_H
 #define KVLITE_INTERNAL_GLOBAL_INDEX_H
 
-#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -43,9 +42,6 @@ class Manifest;
 class GlobalIndex {
 public:
     struct Options {
-        // Number of updates before auto-savepoint (0 = disabled)
-        uint64_t savepoint_interval = 1ULL << 24;
-
         // Sync WAL to disk on every write (slower but more durable)
         bool sync_writes = false;
 
@@ -128,7 +124,7 @@ public:
     // persists max_version to Manifest, truncates WAL.
     Status storeSavepoint(uint64_t snapshot_version);
 
-    // Create a savepoint if WAL changes exceed savepoint_interval.
+    // Create a savepoint if the WAL has accumulated any changes.
     Status maybeSavepoint();
 
     // --- Statistics ---
@@ -139,9 +135,6 @@ public:
 
     // Fraction of key groups with more than one version (0.0–1.0).
     double estimateDeadRatio() const;
-
-    // Number of mutations (put/relocate/eliminate) since the last savepoint.
-    uint64_t changesSinceSavepoint() const;
 
 private:
     // --- Core DHT mutations (no WAL, no savepoint counter) ---
@@ -182,7 +175,6 @@ private:
     // --- Data ---
     ReadWriteDeltaHashTable dht_;
     size_t key_count_ = 0;
-    std::atomic<uint64_t> changes_since_savepoint_{0};
 
     // --- Concurrency ---
     // Savepoint mutex: shared for writes (put/relocate/eliminate/commit),

@@ -39,12 +39,8 @@ struct Options {
 
     // --- GlobalIndex Options ---
 
-    // Number of WAL mutations before a savepoint is triggered.
-    // WAL is truncated after successful savepoint.
-    // Default: 10 million
-    uint64_t global_index_savepoint_interval = 1ULL << 24;
-
-    // Seconds between savepoint daemon wake-ups (0 = disable daemon)
+    // Seconds between savepoint daemon wake-ups (0 = disable daemon).
+    // The daemon creates a savepoint whenever the WAL has accumulated changes.
     // Default: 10
     uint32_t savepoint_interval_sec = 10;
 

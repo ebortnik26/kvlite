@@ -168,7 +168,6 @@ protected:
 TEST_F(SavepointDaemonTest, PeriodicSavepointTruncatesWAL) {
     kvlite::Options opts;
     opts.create_if_missing = true;
-    opts.global_index_savepoint_interval = 10;  // low threshold
     opts.savepoint_interval_sec = 1;            // fast wake-up
     opts.gc_interval_sec = 0;                   // disable GC daemon
     ASSERT_TRUE(db_.open(test_dir_.string(), opts).ok());
@@ -198,7 +197,6 @@ TEST_F(SavepointDaemonTest, PeriodicSavepointTruncatesWAL) {
 TEST_F(SavepointDaemonTest, DisabledByZeroInterval) {
     kvlite::Options opts;
     opts.create_if_missing = true;
-    opts.global_index_savepoint_interval = 1;   // would always trigger
     opts.savepoint_interval_sec = 0;            // disabled
     opts.gc_interval_sec = 0;
     ASSERT_TRUE(db_.open(test_dir_.string(), opts).ok());

@@ -71,7 +71,6 @@ Status DB::open(const std::string& path, const Options& options) {
     // Initialize GlobalIndex
     global_index_ = std::make_unique<internal::GlobalIndex>(*manifest_);
     internal::GlobalIndex::Options global_index_opts;
-    global_index_opts.savepoint_interval = options.global_index_savepoint_interval;
     global_index_opts.sync_writes = options.sync_writes;
 
     s = global_index_->open(path, global_index_opts);

@@ -365,8 +365,6 @@ Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
     s = wal_->truncate(max_version_);
     if (!s.ok()) return s;
 
-    changes_since_savepoint_.store(0, std::memory_order_relaxed);
-
     // Start a fresh WAL file so replayed records from the old active
     // file don't duplicate the savepoint data on next recovery.
     return wal_->startNewFile();
@@ -689,13 +687,11 @@ void GlobalIndex::applyPut(uint64_t hkey, uint64_t packed_version,
     if (dht_.addEntryIsNew(hkey, packed_version, segment_id)) {
         ++key_count_;
     }
-    changes_since_savepoint_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void GlobalIndex::applyRelocate(uint64_t hkey, uint64_t packed_version,
                                 uint32_t old_segment_id, uint32_t new_segment_id) {
     dht_.updateEntryId(hkey, packed_version, old_segment_id, new_segment_id);
-    changes_since_savepoint_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void GlobalIndex::applyEliminate(uint64_t hkey, uint64_t packed_version,
@@ -703,16 +699,10 @@ void GlobalIndex::applyEliminate(uint64_t hkey, uint64_t packed_version,
     if (dht_.removeEntry(hkey, packed_version, segment_id)) {
         --key_count_;
     }
-    changes_since_savepoint_.fetch_add(1, std::memory_order_relaxed);
-}
-
-uint64_t GlobalIndex::changesSinceSavepoint() const {
-    return changes_since_savepoint_.load(std::memory_order_relaxed);
 }
 
 Status GlobalIndex::maybeSavepoint() {
-    if (changes_since_savepoint_.load(std::memory_order_relaxed)
-            < options_.savepoint_interval) {
+    if (wal_->size() == 0) {
         return Status::OK();
     }
     return storeSavepoint(max_version_);
