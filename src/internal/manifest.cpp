@@ -56,6 +56,19 @@ Status Manifest::create(const std::string& db_path) {
         return s;
     }
 
+    if (::fdatasync(fd_) != 0) {
+        ::close(fd_);
+        fd_ = -1;
+        return Status::IOError("Failed to fdatasync MANIFEST after header write");
+    }
+
+    s = fsyncDir(db_path_);
+    if (!s.ok()) {
+        ::close(fd_);
+        fd_ = -1;
+        return s;
+    }
+
     is_open_ = true;
     return Status::OK();
 }
@@ -237,13 +250,18 @@ Status Manifest::compactUnlocked() {
         return Status::IOError("Failed to rename MANIFEST.tmp -> MANIFEST");
     }
 
-    // Reopen the new file.
-    ::close(fd_);
-    fd_ = ::open(path.c_str(), O_RDWR, 0644);
-    if (fd_ < 0) {
+    // Ensure directory entry is durable.
+    Status dir_s = fsyncDir(db_path_);
+    if (!dir_s.ok()) return dir_s;
+
+    // Reopen the new file. Hold old fd until new one is confirmed.
+    int new_fd = ::open(path.c_str(), O_RDWR, 0644);
+    if (new_fd < 0) {
         is_open_ = false;
         return Status::IOError("Failed to reopen MANIFEST after compaction");
     }
+    ::close(fd_);
+    fd_ = new_fd;
 
     // Seek to end for future appends.
     ::lseek(fd_, 0, SEEK_END);
@@ -398,8 +416,17 @@ Status Manifest::appendRecord(const std::string& key,
     roff += payload_size;
     std::memcpy(record.data() + roff, &checksum, 4);
 
+    off_t pre_write_pos = ::lseek(fd_, 0, SEEK_CUR);
+    if (pre_write_pos < 0) {
+        return Status::IOError("Failed to get MANIFEST position before write");
+    }
+
     ssize_t written = ::write(fd_, record.data(), total);
     if (written != static_cast<ssize_t>(total)) {
+        // Short write: truncate back to pre-write position to avoid partial garbage.
+        int trunc_rc = ::ftruncate(fd_, pre_write_pos);
+        (void)trunc_rc;
+        ::lseek(fd_, pre_write_pos, SEEK_SET);
         return Status::IOError("Failed to append MANIFEST record");
     }
 
@@ -407,6 +434,22 @@ Status Manifest::appendRecord(const std::string& key,
         return Status::IOError("Failed to fdatasync MANIFEST");
     }
 
+    return Status::OK();
+}
+
+Status Manifest::fsyncDir(const std::string& dir_path) {
+    int dir_fd = ::open(dir_path.c_str(), O_RDONLY);
+    if (dir_fd < 0) {
+        return Status::IOError("Failed to open directory for fsync: " + dir_path +
+                               " (" + std::strerror(errno) + ")");
+    }
+    if (::fsync(dir_fd) != 0) {
+        int saved_errno = errno;
+        ::close(dir_fd);
+        return Status::IOError("Failed to fsync directory: " + dir_path +
+                               " (" + std::strerror(saved_errno) + ")");
+    }
+    ::close(dir_fd);
     return Status::OK();
 }
 

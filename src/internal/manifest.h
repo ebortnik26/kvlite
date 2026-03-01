@@ -86,6 +86,7 @@ private:
     Status validateHeader(int fd);
     Status appendRecord(const std::string& key, const std::string& value);
 
+    Status fsyncDir(const std::string& dir_path);
     std::string manifestPath() const;
     std::string manifestTmpPath() const;
 
