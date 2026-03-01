@@ -42,7 +42,7 @@ Status Manifest::create(const std::string& db_path) {
     ::mkdir(db_path.c_str(), 0755);
 
     std::string path = manifestPath();
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DSYNC, 0644);
     if (fd < 0) {
         return Status::IOError("Failed to create MANIFEST: " + path +
                                " (" + std::strerror(errno) + ")");
@@ -54,12 +54,6 @@ Status Manifest::create(const std::string& db_path) {
         ::close(fd_);
         fd_ = -1;
         return s;
-    }
-
-    if (::fdatasync(fd_) != 0) {
-        ::close(fd_);
-        fd_ = -1;
-        return Status::IOError("Failed to fdatasync MANIFEST after header write");
     }
 
     s = fsyncDir(db_path_);
@@ -82,7 +76,7 @@ Status Manifest::open(const std::string& db_path) {
     db_path_ = db_path;
 
     std::string path = manifestPath();
-    int fd = ::open(path.c_str(), O_RDWR, 0644);
+    int fd = ::open(path.c_str(), O_RDWR | O_DSYNC, 0644);
     if (fd < 0) {
         if (errno == ENOENT) {
             return Status::NotFound("MANIFEST not found: " + path);
@@ -255,7 +249,7 @@ Status Manifest::compactUnlocked() {
     if (!dir_s.ok()) return dir_s;
 
     // Reopen the new file. Hold old fd until new one is confirmed.
-    int new_fd = ::open(path.c_str(), O_RDWR, 0644);
+    int new_fd = ::open(path.c_str(), O_RDWR | O_DSYNC, 0644);
     if (new_fd < 0) {
         is_open_ = false;
         return Status::IOError("Failed to reopen MANIFEST after compaction");
@@ -287,8 +281,9 @@ Status Manifest::recover() {
         ssize_t n = ::pread(fd_, &record_len, 4, pos);
         if (n != 4) break;
 
-        // Sanity check: record_len must cover at least header + crc.
-        if (record_len < kRecordHeaderSize + kRecordChecksumSize) break;
+        // Sanity check: record_len must be within valid bounds.
+        if (record_len < kRecordHeaderSize + kRecordChecksumSize ||
+            record_len > kMaxRecordLen) break;
 
         // Check that the full record fits in the file.
         if (pos + kRecordLenSize + record_len > static_cast<uint64_t>(file_size)) break;
@@ -390,6 +385,11 @@ Status Manifest::appendRecord(const std::string& key,
     uint16_t key_len = static_cast<uint16_t>(key.size());
     uint32_t value_len = static_cast<uint32_t>(value.size());
 
+    uint32_t record_len = kRecordHeaderSize + key_len + value_len + kRecordChecksumSize;
+    if (record_len > kMaxRecordLen) {
+        return Status::InvalidArgument("Manifest record too large");
+    }
+
     // Build payload: type + key_len + value_len + key + value
     size_t payload_size = kRecordHeaderSize + key_len + value_len;
     std::vector<char> payload(payload_size);
@@ -404,7 +404,6 @@ Status Manifest::appendRecord(const std::string& key,
     std::memcpy(payload.data() + off, value.data(), value_len);
 
     uint32_t checksum = crc32(payload.data(), payload_size);
-    uint32_t record_len = static_cast<uint32_t>(payload_size + kRecordChecksumSize);
 
     // Write: record_len + payload + crc32
     size_t total = kRecordLenSize + payload_size + kRecordChecksumSize;
@@ -421,17 +420,14 @@ Status Manifest::appendRecord(const std::string& key,
         return Status::IOError("Failed to get MANIFEST position before write");
     }
 
+    // O_DSYNC: write returns success only after data is durable on disk.
     ssize_t written = ::write(fd_, record.data(), total);
     if (written != static_cast<ssize_t>(total)) {
-        // Short write: truncate back to pre-write position to avoid partial garbage.
+        // Short/failed write: truncate back to pre-write position.
         int trunc_rc = ::ftruncate(fd_, pre_write_pos);
         (void)trunc_rc;
         ::lseek(fd_, pre_write_pos, SEEK_SET);
         return Status::IOError("Failed to append MANIFEST record");
-    }
-
-    if (::fdatasync(fd_) != 0) {
-        return Status::IOError("Failed to fdatasync MANIFEST");
     }
 
     return Status::OK();

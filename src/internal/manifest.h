@@ -31,7 +31,7 @@ const char* manifestKeyStr(ManifestKey key);
 // new file, and switches to it atomically.
 //
 // open() calls compact() after recovery. DB::close() calls compact() before
-// close(). Every set() is followed by fdatasync.
+// close(). The file is opened with O_DSYNC so every write is durable on return.
 //
 // File layout:
 //   [magic:4 = "MNFT"] [format_version:4 = 1]     -- header (8 bytes)
@@ -102,6 +102,7 @@ private:
     static constexpr size_t kRecordHeaderSize = 7;   // type(1) + key_len(2) + value_len(4)
     static constexpr size_t kRecordChecksumSize = 4;
     static constexpr size_t kRecordLenSize = 4;
+    static constexpr size_t kMaxRecordLen = 256;
 };
 
 }  // namespace internal
