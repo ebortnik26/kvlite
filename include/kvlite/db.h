@@ -150,6 +150,10 @@ private:
     Status mergeSegments(const std::vector<uint32_t>& input_ids);
     double estimateDeadRatio() const;
 
+    void startSavepointLoop();
+    void stopSavepointLoop();
+    void savepointLoop();
+
     std::string db_path_;
     Options options_;
     std::unique_ptr<internal::Manifest> manifest_;
@@ -165,6 +169,11 @@ private:
     std::mutex gc_mu_;
     std::condition_variable gc_cv_;
     bool gc_stop_ = false;
+
+    std::thread sp_thread_;
+    std::mutex sp_mu_;
+    std::condition_variable sp_cv_;
+    bool sp_stop_ = false;
 
 };
 

@@ -102,8 +102,15 @@ public:
                           uint32_t old_segment_id, uint32_t new_segment_id,
                           uint8_t producer_id);
 
+    Status stageRelocate(uint64_t hkey, uint64_t packed_version,
+                         uint32_t old_segment_id, uint32_t new_segment_id,
+                         uint8_t producer_id);
+
     Status appendEliminate(uint64_t hkey, uint64_t packed_version,
                            uint32_t segment_id, uint8_t producer_id);
+
+    Status stageEliminate(uint64_t hkey, uint64_t packed_version,
+                          uint32_t segment_id, uint8_t producer_id);
 
     // Flush a producer's staged records to disk and sync.
     // Acquires the WAL mutex, writes the batch as a single WAL record,

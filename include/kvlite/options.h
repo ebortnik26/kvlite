@@ -39,10 +39,14 @@ struct Options {
 
     // --- GlobalIndex Options ---
 
-    // Number of updates before persisting GlobalIndex savepoint.
+    // Number of WAL mutations before a savepoint is triggered.
     // WAL is truncated after successful savepoint.
     // Default: 10 million
     uint64_t global_index_savepoint_interval = 1ULL << 24;
+
+    // Seconds between savepoint daemon wake-ups (0 = disable daemon)
+    // Default: 10
+    uint32_t savepoint_interval_sec = 10;
 
     // --- SegmentIndex Cache Options ---
 

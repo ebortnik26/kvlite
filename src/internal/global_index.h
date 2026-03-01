@@ -1,6 +1,7 @@
 #ifndef KVLITE_INTERNAL_GLOBAL_INDEX_H
 #define KVLITE_INTERNAL_GLOBAL_INDEX_H
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -127,6 +128,9 @@ public:
     // persists max_version to Manifest, truncates WAL.
     Status storeSavepoint(uint64_t snapshot_version);
 
+    // Create a savepoint if WAL changes exceed savepoint_interval.
+    Status maybeSavepoint();
+
     // --- Statistics ---
 
     size_t keyCount() const;
@@ -135,6 +139,9 @@ public:
 
     // Fraction of key groups with more than one version (0.0–1.0).
     double estimateDeadRatio() const;
+
+    // Number of mutations (put/relocate/eliminate) since the last savepoint.
+    uint64_t changesSinceSavepoint() const;
 
 private:
     // --- Core DHT mutations (no WAL, no savepoint counter) ---
@@ -146,7 +153,6 @@ private:
                         uint32_t segment_id);
 
     Status recover();
-    Status maybeSavepoint();
     std::string savepointDir() const;
 
     // Savepoint format (binary, multi-file):
@@ -176,6 +182,7 @@ private:
     // --- Data ---
     ReadWriteDeltaHashTable dht_;
     size_t key_count_ = 0;
+    std::atomic<uint64_t> changes_since_savepoint_{0};
 
     // --- Concurrency ---
     // Savepoint mutex: shared for writes (put/relocate/eliminate/commit),

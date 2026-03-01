@@ -106,6 +106,7 @@ Status DB::open(const std::string& path, const Options& options) {
     is_open_ = true;
 
     startGCLoop();
+    startSavepointLoop();
     return Status::OK();
 }
 
@@ -123,6 +124,7 @@ Status DB::close() {
     write_buffer_.reset();
 
     stopGCLoop();
+    stopSavepointLoop();
 
     is_open_ = false;
 
@@ -611,6 +613,38 @@ Status DB::runGC() {
         storage_->removeSegment(id);
     }
     return Status::OK();
+}
+
+// --- Savepoint Daemon ---
+
+void DB::startSavepointLoop() {
+    if (options_.savepoint_interval_sec > 0) {
+        sp_stop_ = false;
+        sp_thread_ = std::thread(&DB::savepointLoop, this);
+    }
+}
+
+void DB::stopSavepointLoop() {
+    {
+        std::lock_guard<std::mutex> lock(sp_mu_);
+        sp_stop_ = true;
+    }
+    sp_cv_.notify_one();
+    if (sp_thread_.joinable()) sp_thread_.join();
+}
+
+void DB::savepointLoop() {
+    std::unique_lock<std::mutex> lock(sp_mu_);
+    while (!sp_stop_) {
+        sp_cv_.wait_for(lock, std::chrono::seconds(options_.savepoint_interval_sec),
+                        [this] { return sp_stop_; });
+        if (sp_stop_) break;
+        lock.unlock();
+
+        global_index_->maybeSavepoint();
+
+        lock.lock();
+    }
 }
 
 }  // namespace kvlite
