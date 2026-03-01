@@ -48,7 +48,7 @@ public:
         // Sync WAL to disk on every write (slower but more durable)
         bool sync_writes = false;
 
-        // Number of threads for parallel binary savepoint writes
+        // Number of threads for parallel savepoint writes
         uint32_t savepoint_threads = 4;
     };
 
@@ -105,8 +105,8 @@ public:
 
     // --- Savepoint ---
 
-    // Takes exclusive lock on savepoint_mu_, writes binary v9 savepoint to
-    // disk, persists max_version to Manifest, truncates WAL, resets counter.
+    // Takes exclusive lock on savepoint_mu_, writes savepoint to disk,
+    // persists max_version to Manifest, truncates WAL.
     Status storeSavepoint(uint64_t snapshot_version);
 
     // --- Statistics ---
@@ -114,29 +114,6 @@ public:
     size_t keyCount() const;
     size_t entryCount() const;
     size_t memoryUsage() const;
-    uint64_t updatesSinceSavepoint() const;
-
-    // --- Persistence (low-level) ---
-
-    Status saveSavepoint(const std::string& path) const;
-    Status loadSavepoint(const std::string& path);
-
-    // v7 savepoint file format (hash-based, single file):
-    // [magic: 4 bytes]["L1IX"]
-    // [format_version: 4 bytes][7]
-    // [num_entries: 8 bytes]
-    // [key_count: 8 bytes]
-    // Per entry (via forEach):
-    //   [hash: 8 bytes]
-    //   [packed_version: 8 bytes]
-    //   [segment_id: 4 bytes]
-    // [checksum: 4 bytes]
-    //
-    // v9 savepoint format (binary, multi-file):
-    // Directory at <db_path>/gi/snapshot.v9/ with numbered files.
-    // Each file contains a contiguous range of main arena buckets.
-    // The last file also contains all extension slot data.
-    // See saveBinarySavepoint() / loadBinarySavepoint() for details.
 
 private:
     // --- Core DHT mutations (no WAL, no savepoint counter) ---
@@ -149,11 +126,12 @@ private:
 
     Status recover();
     Status maybeSavepoint();
-    std::string savepointPath() const;       // v7 single file path
-    std::string savepointDirV9() const;      // v9 directory path
+    std::string savepointDir() const;
 
-    // v9 binary savepoint — write
-    Status saveBinarySavepoint(const std::string& dir) const;
+    // Savepoint format (binary, multi-file):
+    // Directory at <db_path>/gi/savepoint/ with numbered .dat files.
+    // Each file contains a contiguous range of main arena buckets.
+    // The last file also contains all extension slot data.
 
     struct SavepointFileDesc {
         uint32_t file_index;
@@ -162,20 +140,17 @@ private:
         bool is_last;
     };
 
+    Status writeSavepoint(const std::string& dir) const;
     std::vector<SavepointFileDesc> computeFileLayout() const;
     Status writeSavepointFile(const std::string& dir,
                              const SavepointFileDesc& fd) const;
 
-    // v9 binary savepoint — read
-    Status loadBinarySavepoint(const std::string& dir);
-    Status loadSavepointFile(const std::string& fpath,
+    Status readSavepoint(const std::string& dir);
+    Status readSavepointFile(const std::string& fpath,
                             uint32_t stride,
                             uint64_t& out_entries,
                             uint64_t& out_key_count,
                             uint32_t& out_ext_count);
-
-    // v7 single-file savepoint — read
-    Status loadV7Savepoint(const std::string& path);
 
     // --- Data ---
     ReadWriteDeltaHashTable dht_;
@@ -192,7 +167,6 @@ private:
     Options options_;
     bool is_open_ = false;
     std::unique_ptr<GlobalIndexWAL> wal_;
-    uint64_t updates_since_savepoint_ = 0;
     uint64_t max_version_ = 0;
 };
 

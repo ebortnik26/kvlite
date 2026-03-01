@@ -100,11 +100,10 @@ Status GlobalIndex::recover() {
     Status s = wal_->truncate(max_version_);
     if (!s.ok()) return s;
 
-    // Load savepoint (v9 binary or v7 fallback) if one exists.
+    // Load savepoint (v9 binary) if one exists.
     std::error_code ec;
-    if ((fs::exists(savepointDirV9(), ec) && fs::is_directory(savepointDirV9(), ec)) ||
-        fs::exists(savepointPath(), ec)) {
-        s = loadSavepoint(savepointPath());
+    if (fs::exists(savepointDir(), ec) && fs::is_directory(savepointDir(), ec)) {
+        s = readSavepoint(savepointDir());
         if (!s.ok()) return s;
     }
 
@@ -136,10 +135,7 @@ Status GlobalIndex::close() {
     if (!is_open_) {
         return Status::OK();
     }
-    // Persist index to v7 savepoint as fallback.
-    // For fast binary savepoints, the caller should invoke savepoint(version)
-    // before close().
-    Status s = saveSavepoint(savepointPath());
+    Status s = storeSavepoint(max_version_);
     if (!s.ok()) {
         wal_->close();
         is_open_ = false;
@@ -161,7 +157,10 @@ Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment
     Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
     applyPut(hkey, packed_version, segment_id);
-    updates_since_savepoint_++;
+    if (packed_version > max_version_) {
+        max_version_ = packed_version;
+        wal_->updateMaxVersion(packed_version);
+    }
     return Status::OK();
 }
 
@@ -214,7 +213,6 @@ Status GlobalIndex::relocate(uint64_t hkey, uint64_t packed_version,
     Status s = wal_->appendRelocate(hkey, packed_version, old_segment_id, new_segment_id, WalProducer::kGC);
     if (!s.ok()) return s;
     applyRelocate(hkey, packed_version, old_segment_id, new_segment_id);
-    updates_since_savepoint_++;
     return Status::OK();
 }
 
@@ -224,7 +222,6 @@ Status GlobalIndex::eliminate(uint64_t hkey, uint64_t packed_version,
     Status s = wal_->appendEliminate(hkey, packed_version, segment_id, WalProducer::kGC);
     if (!s.ok()) return s;
     applyEliminate(hkey, packed_version, segment_id);
-    updates_since_savepoint_++;
     return Status::OK();
 }
 
@@ -267,12 +264,12 @@ Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
     namespace fs = std::filesystem;
     std::unique_lock<std::shared_mutex> lock(savepoint_mu_);
 
-    std::string valid_dir = savepointDirV9();
+    std::string valid_dir = savepointDir();
     std::string tmp_dir = valid_dir + ".tmp";
     std::string old_dir = valid_dir + ".old";
 
     // Write savepoint to temporary directory.
-    Status s = saveBinarySavepoint(tmp_dir);
+    Status s = writeSavepoint(tmp_dir);
     if (!s.ok()) return s;
 
     // Atomic swap: valid → old, tmp → valid, remove old.
@@ -301,8 +298,10 @@ Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
 
     s = wal_->truncate(max_version_);
     if (!s.ok()) return s;
-    updates_since_savepoint_ = 0;
-    return Status::OK();
+
+    // Start a fresh WAL file so replayed records from the old active
+    // file don't duplicate the savepoint data on next recovery.
+    return wal_->startNewFile();
 }
 
 // --- Statistics ---
@@ -319,54 +318,13 @@ size_t GlobalIndex::memoryUsage() const {
     return dht_.memoryUsage();
 }
 
-uint64_t GlobalIndex::updatesSinceSavepoint() const {
-    return updates_since_savepoint_;
-}
-
-// --- Persistence (v7) ---
+// --- Persistence ---
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
-static constexpr uint32_t kVersionV7 = 7;
-static constexpr uint32_t kVersionV9 = 9;
+static constexpr uint32_t kFormatVersion = 9;
 static constexpr uint64_t kMaxFileSize = 1ULL << 30;  // 1 GB
 
-Status GlobalIndex::saveSavepoint(const std::string& path) const {
-    std::ofstream file(path, std::ios::binary);
-    if (!file) {
-        return Status::IOError("Failed to create savepoint file: " + path);
-    }
-
-    CRC32Writer writer(file);
-
-    // Header
-    writer.write(kMagic, 4);
-    writer.writeVal(kVersionV7);
-
-    uint64_t num_entries = dht_.size();
-    writer.writeVal(num_entries);
-
-    uint64_t key_count = key_count_;
-    writer.writeVal(key_count);
-
-    // Per entry: [hash:8][packed_version:8][segment_id:4]
-    dht_.forEach([&writer](uint64_t hash, uint64_t packed_version, uint32_t id) {
-        writer.writeVal(hash);
-        writer.writeVal(packed_version);
-        writer.writeVal(id);
-    });
-
-    // Checksum
-    uint32_t checksum = writer.finalize();
-    file.write(reinterpret_cast<const char*>(&checksum), sizeof(checksum));
-
-    if (!file.good()) {
-        return Status::IOError("Failed to write savepoint file: " + path);
-    }
-
-    return Status::OK();
-}
-
-// --- Persistence (v8 binary, multi-file) ---
+// --- Savepoint persistence (binary, multi-file) ---
 //
 // Multi-file binary savepoint format (v8):
 //
@@ -427,7 +385,7 @@ Status GlobalIndex::writeSavepointFile(const std::string& dir,
 
     // Global header (33 bytes)
     writer.write(kMagic, 4);
-    writer.writeVal(kVersionV9);
+    writer.writeVal(kFormatVersion);
     writer.writeVal(num_entries);
     writer.writeVal(key_count);
     writer.writeVal(cfg.bucket_bits);
@@ -462,7 +420,7 @@ Status GlobalIndex::writeSavepointFile(const std::string& dir,
     return Status::OK();
 }
 
-Status GlobalIndex::saveBinarySavepoint(const std::string& dir) const {
+Status GlobalIndex::writeSavepoint(const std::string& dir) const {
     namespace fs = std::filesystem;
 
     std::error_code ec;
@@ -519,7 +477,7 @@ Status GlobalIndex::saveBinarySavepoint(const std::string& dir) const {
     return has_error.load() ? first_error : Status::OK();
 }
 
-Status GlobalIndex::loadSavepointFile(const std::string& fpath,
+Status GlobalIndex::readSavepointFile(const std::string& fpath,
                                      uint32_t stride,
                                      uint64_t& out_entries,
                                      uint64_t& out_key_count,
@@ -537,7 +495,7 @@ Status GlobalIndex::loadSavepointFile(const std::string& fpath,
         return Status::Corruption("Invalid savepoint magic in: " + fpath);
     }
     uint32_t format_version;
-    if (!reader.readVal(format_version) || format_version != kVersionV9) {
+    if (!reader.readVal(format_version) || format_version != kFormatVersion) {
         return Status::Corruption("Unsupported savepoint version in: " + fpath);
     }
 
@@ -594,7 +552,7 @@ Status GlobalIndex::loadSavepointFile(const std::string& fpath,
     return Status::OK();
 }
 
-Status GlobalIndex::loadBinarySavepoint(const std::string& dir) {
+Status GlobalIndex::readSavepoint(const std::string& dir) {
     namespace fs = std::filesystem;
 
     if (!fs::exists(dir) || !fs::is_directory(dir)) {
@@ -620,70 +578,13 @@ Status GlobalIndex::loadBinarySavepoint(const std::string& dir) {
     uint32_t ext_count = 0;
 
     for (const auto& fpath : files) {
-        Status s = loadSavepointFile(fpath, stride, entries, key_count, ext_count);
+        Status s = readSavepointFile(fpath, stride, entries, key_count, ext_count);
         if (!s.ok()) return s;
     }
 
     dht_.setSize(entries);
     key_count_ = static_cast<size_t>(key_count);
     return Status::OK();
-}
-
-Status GlobalIndex::loadV7Savepoint(const std::string& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return Status::IOError("Failed to open savepoint file: " + path);
-    }
-
-    CRC32Reader reader(file);
-
-    char magic[4];
-    if (!reader.read(magic, 4) || std::memcmp(magic, kMagic, 4) != 0) {
-        return Status::Corruption("Invalid savepoint magic");
-    }
-    uint32_t format_version;
-    if (!reader.readVal(format_version) || format_version != kVersionV7) {
-        return Status::Corruption("Unsupported savepoint version");
-    }
-
-    uint64_t num_entries, key_count;
-    if (!reader.readVal(num_entries) || !reader.readVal(key_count)) {
-        return Status::Corruption("Failed to read v7 header");
-    }
-
-    clear();
-
-    for (uint64_t i = 0; i < num_entries; ++i) {
-        uint64_t hash, packed_ver;
-        uint32_t seg;
-        if (!reader.readVal(hash) || !reader.readVal(packed_ver) || !reader.readVal(seg)) {
-            return Status::Corruption("Failed to read entry");
-        }
-        dht_.addEntry(hash, packed_ver, seg);
-    }
-
-    key_count_ = static_cast<size_t>(key_count);
-
-    uint32_t expected_crc = reader.finalize();
-    uint32_t stored_crc;
-    file.read(reinterpret_cast<char*>(&stored_crc), sizeof(stored_crc));
-    if (!file.good()) {
-        return Status::Corruption("Failed to read checksum");
-    }
-    if (stored_crc != expected_crc) {
-        return Status::ChecksumMismatch("Snapshot checksum mismatch");
-    }
-    return Status::OK();
-}
-
-Status GlobalIndex::loadSavepoint(const std::string& path) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    std::string dir_v9 = savepointDirV9();
-    if (fs::exists(dir_v9, ec) && fs::is_directory(dir_v9, ec)) {
-        return loadBinarySavepoint(dir_v9);
-    }
-    return loadV7Savepoint(path);
 }
 
 // --- Private ---
@@ -712,12 +613,8 @@ Status GlobalIndex::maybeSavepoint() {
     return Status::OK();
 }
 
-std::string GlobalIndex::savepointPath() const {
+std::string GlobalIndex::savepointDir() const {
     return db_path_ + "/gi/savepoint";
-}
-
-std::string GlobalIndex::savepointDirV9() const {
-    return db_path_ + "/gi/savepoint.v9";
 }
 
 }  // namespace internal
