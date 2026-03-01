@@ -113,10 +113,11 @@ target_link_libraries(kvlite_segment_index_test
         pthread
 )
 
-# WriteBuffer tests (Memtable unit tests)
+# WriteBuffer tests (Memtable unit tests + WriteBuffer orchestrator tests)
 add_executable(kvlite_wb_test
     test_write_buffer.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/memtable.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
@@ -354,4 +355,4 @@ add_test(NAME wal_tests COMMAND kvlite_wal_test)
 add_test(NAME wal_stream_tests COMMAND kvlite_wal_stream_test)
 
 # Default parallel level for ctest
-set(CTEST_PARALLEL_LEVEL 2 CACHE STRING "Number of tests to run in parallel")
+set(CTEST_PARALLEL_LEVEL 4 CACHE STRING "Number of tests to run in parallel")

@@ -271,7 +271,8 @@ bool Memtable::getByVersion(const std::string& key, uint64_t upper_bound,
     uint32_t bi = bucketIndex(hash);
     uint32_t fp = fingerprint(hash);
 
-    locks_[bi].lock();
+    bool sealed = sealed_.load(std::memory_order_acquire);
+    if (!sealed) locks_[bi].lock();
 
     bool found = false;
     uint64_t best_version = 0;
@@ -303,7 +304,7 @@ bool Memtable::getByVersion(const std::string& key, uint64_t upper_bound,
         tombstone = best_pv.tombstone();
     }
 
-    locks_[bi].unlock();
+    if (!sealed) locks_[bi].unlock();
     return found;
 }
 
@@ -410,9 +411,10 @@ private:
 
 std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) const {
     std::vector<MemtableStream::Record> all;
+    bool sealed = sealed_.load(std::memory_order_acquire);
 
     for (uint32_t bi = 0; bi < kNumBuckets; ++bi) {
-        locks_[bi].lock();
+        if (!sealed) locks_[bi].lock();
 
         const Bucket* b = &buckets_[bi];
         while (b) {
@@ -434,7 +436,7 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
             b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
         }
 
-        locks_[bi].unlock();
+        if (!sealed) locks_[bi].unlock();
     }
 
     const uint8_t* data_ptr = data_.get();

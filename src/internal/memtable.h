@@ -28,8 +28,9 @@ class Segment;
 //                  Each bucket holds fixed-size slots of {fingerprint, offset}.
 //   Overflow     – block-allocated overflow buckets chained from full primaries.
 //
-// Thread-safety: Per-bucket spinlocks protect concurrent put/get operations.
-// forEach() and clear() are called during flush when writes are paused.
+// Thread-safety: Per-bucket spinlocks protect concurrent put/get operations
+// while the Memtable is mutable. After seal(), the Memtable becomes read-only
+// and all read operations skip spinlock acquisition.
 class Memtable {
 public:
     struct Entry {
@@ -94,6 +95,11 @@ public:
     // per key (only the latest version <= snapshot_version).
     std::unique_ptr<EntryStream> createStream(uint64_t snapshot_version) const;
 
+    // Mark this Memtable as immutable. After seal(), reads skip spinlocks.
+    // Must not be called concurrently with put/putBatch.
+    void seal() { sealed_.store(true, std::memory_order_release); }
+    bool isSealed() const { return sealed_.load(std::memory_order_acquire); }
+
     void pin() { pin_count_.fetch_add(1, std::memory_order_relaxed); }
     void unpin() { pin_count_.fetch_sub(1, std::memory_order_release); }
     uint32_t pinCount() const { return pin_count_.load(std::memory_order_acquire); }
@@ -150,6 +156,7 @@ private:
     std::atomic<size_t> size_{0};
     std::atomic<size_t> key_count_{0};
     std::atomic<uint32_t> pin_count_{0};
+    std::atomic<bool> sealed_{false};
 
     // --- Helpers ---
 

@@ -92,6 +92,7 @@ void WriteBuffer::maybeSeal() {
 void WriteBuffer::sealActive() {
     // Caller must hold mu_.
     if (active_->empty()) return;
+    active_->seal();  // read-only from here — reads skip spinlocks
     immutables_.push_back(std::move(active_));
     active_ = std::make_unique<Memtable>();
     flush_cv_.notify_one();

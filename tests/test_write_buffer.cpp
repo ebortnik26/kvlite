@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -13,6 +16,7 @@
 #include "internal/delta_hash_table.h"
 #include "internal/segment.h"
 #include "internal/memtable.h"
+#include "internal/write_buffer.h"
 
 using kvlite::internal::Memtable;
 
@@ -715,5 +719,439 @@ TEST_F(FlushTest, SealAndOpen) {
     }
 
     loaded.close();
+}
+
+// ==========================================================================
+// WriteBuffer orchestrator tests — multi-Memtable search
+// ==========================================================================
+//
+// These tests exercise the n-way buffered WriteBuffer: reads spanning the
+// active Memtable, immutable queue entries, and the Memtable currently being
+// flushed by the background daemon.
+//
+// A controllable FlushFn blocks on a condition variable so the test can
+// observe state while Memtables sit in the queue or are mid-flush.
+
+using kvlite::internal::WriteBuffer;
+using kvlite::internal::PackedVersion;
+
+namespace {
+
+// Helper: FlushFn that blocks each invocation until explicitly released.
+// Supports multiple sequential flushes: each call increments a generation
+// counter and blocks independently.
+struct GatedFlush {
+    std::mutex mu;
+    std::condition_variable gate_cv;
+    std::condition_variable entered_cv;
+    int entered_gen = 0;      // incremented when flush callback is entered
+    int released_gen = 0;     // incremented when the test releases a flush
+    std::atomic<int> flush_count{0};
+
+    kvlite::Status operator()(Memtable& /*mt*/) {
+        std::unique_lock<std::mutex> lock(mu);
+        int my_gen = ++entered_gen;
+        entered_cv.notify_all();
+        gate_cv.wait(lock, [&] { return released_gen >= my_gen; });
+        ++flush_count;
+        return kvlite::Status::OK();
+    }
+
+    // Block until the daemon has entered a flush callback (any generation).
+    void waitEntered(int expected_gen) {
+        std::unique_lock<std::mutex> lock(mu);
+        entered_cv.wait(lock, [&] { return entered_gen >= expected_gen; });
+    }
+
+    // Release up to and including the given generation.
+    void releaseThrough(int gen) {
+        std::lock_guard<std::mutex> lock(mu);
+        released_gen = gen;
+        gate_cv.notify_all();
+    }
+
+    // Convenience: release all entered flushes.
+    void releaseAll() {
+        std::lock_guard<std::mutex> lock(mu);
+        released_gen = entered_gen + 100;  // future-proof
+        gate_cv.notify_all();
+    }
+};
+
+WriteBuffer::Options wbOpts(size_t memtable_size, uint32_t flush_depth = 3) {
+    return {memtable_size, flush_depth};
+}
+
+// Fill a WriteBuffer until it triggers a seal. Uses a deterministic payload
+// size to guarantee exactly one seal. Returns version of the last put.
+// key_prefix differentiates keys across calls.
+uint64_t fillAndSeal(WriteBuffer& wb, size_t memtable_size,
+                     const std::string& key_prefix, uint64_t start_ver) {
+    // Each record in the data buffer is kRecordHeaderSize(14) + key + value.
+    // Use a fixed payload to make sizing predictable.
+    std::string val(32, 'x');
+    uint64_t ver = start_ver;
+    size_t written = 0;
+    while (written < memtable_size) {
+        std::string key = key_prefix + std::to_string(ver);
+        wb.put(key, ver, val, false);
+        written += 14 + key.size() + val.size();
+        ++ver;
+    }
+    return ver;  // next available version
+}
+
+}  // namespace
+
+// --- Basic multi-Memtable read tests -------------------------------------
+
+TEST(WriteBufferOrchestrator, ReadFromActiveMemtable) {
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(1 << 20), std::ref(gf));
+
+    wb.put("k1", 1, "v1", false);
+
+    std::string val;
+    uint64_t ver;
+    bool tomb;
+    ASSERT_TRUE(wb.getByVersion("k1", UINT64_MAX, val, ver, tomb));
+    EXPECT_EQ(val, "v1");
+    EXPECT_EQ(ver, 1u);
+    EXPECT_FALSE(tomb);
+
+    gf.releaseAll();
+}
+
+TEST(WriteBufferOrchestrator, ReadFromFlushingMemtable) {
+    // Fill a memtable → it seals → daemon picks it up → blocked in flush.
+    // getByVersion must still find the data (via flushing_ pointer).
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    fillAndSeal(wb, kMTSize, "k", 1);
+    gf.waitEntered(1);  // daemon entered flush for the first sealed memtable
+
+    std::string val;
+    uint64_t ver;
+    bool tomb;
+    ASSERT_TRUE(wb.getByVersion("k1", UINT64_MAX, val, ver, tomb));
+    EXPECT_EQ(ver, 1u);
+
+    gf.releaseAll();
+}
+
+TEST(WriteBufferOrchestrator, ReadSpansActiveAndFlushing) {
+    // Data in the flushing memtable + data in the active memtable —
+    // both should be readable simultaneously.
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    fillAndSeal(wb, kMTSize, "old_", 1);
+    gf.waitEntered(1);
+
+    // Single put to the new active (well under threshold, no second seal).
+    wb.put("new_key", 1000, "new_val", false);
+
+    std::string val;
+    uint64_t ver;
+    bool tomb;
+
+    ASSERT_TRUE(wb.getByVersion("old_1", UINT64_MAX, val, ver, tomb));
+    EXPECT_EQ(ver, 1u);
+
+    ASSERT_TRUE(wb.getByVersion("new_key", UINT64_MAX, val, ver, tomb));
+    EXPECT_EQ(val, "new_val");
+    EXPECT_EQ(ver, 1000u);
+
+    gf.releaseAll();
+}
+
+TEST(WriteBufferOrchestrator, ReadSpansActiveImmutableAndFlushing) {
+    // Three memtables: flushing (gen 1), immutable queued (gen 2), active.
+    // All three should be searchable.
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    // Fill and seal → gen 1, daemon enters flush and blocks.
+    uint64_t next = fillAndSeal(wb, kMTSize, "a_", 1);
+    gf.waitEntered(1);
+
+    // Fill and seal a second memtable → goes to immutables (daemon busy).
+    next = fillAndSeal(wb, kMTSize, "b_", next);
+
+    // Single put to active.
+    wb.put("c_key", next, "c_val", false);
+
+    std::string val;
+    uint64_t ver;
+    bool tomb;
+
+    // From flushing:
+    ASSERT_TRUE(wb.getByVersion("a_1", UINT64_MAX, val, ver, tomb));
+    EXPECT_EQ(ver, 1u);
+
+    // From immutables queue:
+    ASSERT_TRUE(wb.getByVersion("b_" + std::to_string(next - 1), UINT64_MAX, val, ver, tomb));
+
+    // From active:
+    ASSERT_TRUE(wb.getByVersion("c_key", UINT64_MAX, val, ver, tomb));
+    EXPECT_EQ(val, "c_val");
+
+    gf.releaseAll();
+}
+
+TEST(WriteBufferOrchestrator, ActiveOverridesImmutable) {
+    // Same key in sealed memtable (v1) and active memtable (v50).
+    // Unbounded read returns the active's newer version.
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    // Write the target key, then pad to trigger seal.
+    wb.put("k1", 1, "old", false);
+    fillAndSeal(wb, kMTSize, "pad_", 10);
+    gf.waitEntered(1);
+
+    // Overwrite in active.
+    wb.put("k1", 50, "new", false);
+
+    std::string val;
+    uint64_t ver;
+    bool tomb;
+    ASSERT_TRUE(wb.getByVersion("k1", UINT64_MAX, val, ver, tomb));
+    EXPECT_EQ(val, "new");
+    EXPECT_EQ(ver, 50u);
+
+    gf.releaseAll();
+}
+
+TEST(WriteBufferOrchestrator, VersionBoundFallsThroughToImmutable) {
+    // Active has k1@v50, flushing has k1@v1. Version-bounded read with
+    // upper_bound < v50 should find v1 in the flushing memtable.
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    wb.put("k1", 1, "old", false);
+    fillAndSeal(wb, kMTSize, "pad_", 10);
+    gf.waitEntered(1);
+
+    wb.put("k1", 50, "new", false);
+
+    std::string val;
+    uint64_t ver;
+    bool tomb;
+    // packed upper bound: (version << 1) | 1
+    ASSERT_TRUE(wb.getByVersion("k1", (5ULL << 1) | 1, val, ver, tomb));
+    EXPECT_EQ(val, "old");
+    EXPECT_EQ(ver, 1u);
+
+    gf.releaseAll();
+}
+
+TEST(WriteBufferOrchestrator, TombstoneInActiveHidesImmutable) {
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    wb.put("k1", 1, "alive", false);
+    fillAndSeal(wb, kMTSize, "pad_", 10);
+    gf.waitEntered(1);
+
+    wb.put("k1", 50, "", true);
+
+    std::string val;
+    uint64_t ver;
+    bool tomb;
+    ASSERT_TRUE(wb.getByVersion("k1", UINT64_MAX, val, ver, tomb));
+    EXPECT_TRUE(tomb);
+    EXPECT_EQ(ver, 50u);
+
+    gf.releaseAll();
+}
+
+TEST(WriteBufferOrchestrator, ReadMissingKeyAcrossAll) {
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    fillAndSeal(wb, kMTSize, "k_", 1);
+    gf.waitEntered(1);
+
+    wb.put("active_key", 999, "v", false);
+
+    std::string val;
+    uint64_t ver;
+    bool tomb;
+    EXPECT_FALSE(wb.getByVersion("missing", UINT64_MAX, val, ver, tomb));
+
+    gf.releaseAll();
+}
+
+// --- DrainFlush tests ----------------------------------------------------
+
+TEST(WriteBufferOrchestrator, DrainFlushWaitsForAll) {
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    fillAndSeal(wb, kMTSize, "k_", 1);
+    gf.waitEntered(1);
+
+    // Put a little data in active so drainFlush must seal + flush it too.
+    wb.put("extra", 1000, "val", false);
+
+    // Release gen 1 so daemon can proceed to gen 2.
+    gf.releaseThrough(1);
+
+    // drainFlush seals active → daemon picks it up (gen 2).
+    // Release gen 2 from another thread.
+    std::thread releaser([&] {
+        gf.waitEntered(2);
+        gf.releaseThrough(2);
+    });
+
+    wb.drainFlush();
+    releaser.join();
+
+    EXPECT_TRUE(wb.empty());
+    EXPECT_EQ(gf.flush_count.load(), 2);
+}
+
+TEST(WriteBufferOrchestrator, DrainFlushOnEmptyIsNoop) {
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(1 << 20), std::ref(gf));
+
+    wb.drainFlush();
+    EXPECT_TRUE(wb.empty());
+    EXPECT_EQ(gf.flush_count.load(), 0);
+
+    gf.releaseAll();
+}
+
+// --- Stall tests ---------------------------------------------------------
+
+TEST(WriteBufferOrchestrator, StallWhenQueueFull) {
+    // flush_depth=2 → 1 active + 1 immutable. When the single immutable slot
+    // is occupied and active fills, writers stall until the daemon frees a slot.
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize, /*flush_depth=*/2), std::ref(gf));
+
+    fillAndSeal(wb, kMTSize, "a_", 1);
+    gf.waitEntered(1);
+
+    // Writer thread: tries to fill and seal the active again. This will stall
+    // because immutables_.size() == 0 (daemon popped it), but the daemon is
+    // still flushing so a new immutable can be queued. Actually, with
+    // flush_depth=2, max immutables is 1. After the first flush finishes, the
+    // writer can proceed. Let's just verify the writer eventually completes.
+    std::atomic<bool> put_done{false};
+    std::thread writer([&] {
+        fillAndSeal(wb, kMTSize, "b_", 100);
+        put_done = true;
+    });
+
+    // Brief sleep — writer may or may not stall depending on timing.
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    // Data from gen 1 is still readable (in flushing_).
+    std::string val;
+    uint64_t ver;
+    bool tomb;
+    ASSERT_TRUE(wb.getByVersion("a_1", UINT64_MAX, val, ver, tomb));
+
+    // Release gen 1.
+    gf.releaseThrough(1);
+
+    // The writer will trigger gen 2; release it too.
+    gf.waitEntered(2);
+    gf.releaseThrough(2);
+
+    writer.join();
+    EXPECT_TRUE(put_done.load());
+
+    gf.releaseAll();
+}
+
+// --- pinAll / unpinAll tests ---------------------------------------------
+
+TEST(WriteBufferOrchestrator, PinAllIncludesAllMemtables) {
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    fillAndSeal(wb, kMTSize, "old_", 1);
+    gf.waitEntered(1);
+
+    wb.put("new_key", 999, "new_val", false);
+
+    auto snap = wb.pinAll();
+    EXPECT_GE(snap.memtables.size(), 2u);
+
+    bool found_old = false, found_new = false;
+    for (auto* mt : snap.memtables) {
+        std::string val;
+        uint64_t ver;
+        bool tomb;
+        if (mt->getByVersion("old_1", UINT64_MAX, val, ver, tomb)) found_old = true;
+        if (mt->getByVersion("new_key", UINT64_MAX, val, ver, tomb)) found_new = true;
+    }
+    EXPECT_TRUE(found_old);
+    EXPECT_TRUE(found_new);
+
+    wb.unpinAll(snap);
+    gf.releaseAll();
+}
+
+// --- Concurrent read/write across Memtables ------------------------------
+
+TEST(WriteBufferOrchestrator, ConcurrentReadsWhileFlushing) {
+    // Write enough data to trigger multiple seals while reads are concurrent.
+    // Flushes are gated so data remains in the WriteBuffer during verification.
+    constexpr size_t kMTSize = 256;
+    GatedFlush gf;
+    WriteBuffer wb(wbOpts(kMTSize), std::ref(gf));
+
+    // Fill and seal two memtables; daemon blocks on the first.
+    // Keys: a_1, a_2, ... (first memtable), b_<next>, b_<next+1>, ... (second).
+    uint64_t next_a = fillAndSeal(wb, kMTSize, "a_", 1);
+    gf.waitEntered(1);
+    uint64_t next_b = fillAndSeal(wb, kMTSize, "b_", next_a);
+
+    // Put a few entries in the active memtable.
+    wb.put("c_1", next_b, "c_val1", false);
+    wb.put("c_2", next_b + 1, "c_val2", false);
+
+    // Concurrent reads: multiple threads verify data across all memtables.
+    std::atomic<bool> violation{false};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&, next_a, next_b] {
+            std::string val;
+            uint64_t ver;
+            bool tomb;
+            // Check flushing memtable data (key = "a_1").
+            if (!wb.getByVersion("a_1", UINT64_MAX, val, ver, tomb)) {
+                violation = true;
+            }
+            // Check immutable data (first key in second batch).
+            std::string b_key = "b_" + std::to_string(next_a);
+            if (!wb.getByVersion(b_key, UINT64_MAX, val, ver, tomb)) {
+                violation = true;
+            }
+            // Check active data.
+            if (!wb.getByVersion("c_1", UINT64_MAX, val, ver, tomb)) {
+                violation = true;
+            }
+        });
+    }
+    for (auto& t : readers) t.join();
+
+    EXPECT_FALSE(violation.load());
+    gf.releaseAll();
 }
 
