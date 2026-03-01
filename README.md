@@ -199,7 +199,8 @@ options.l2_cache_size = 256 * 1024 * 1024;           // 256MB LRU cache
 // Garbage Collection
 options.gc_policy = kvlite::GCPolicy::HIGHEST_DEAD_RATIO;
 options.gc_threshold = 0.5;                          // 50% dead triggers GC
-options.gc_max_files = 10;                           // Max files per GC run
+options.gc_max_segments = 10;                        // Max segments per GC run
+options.gc_interval_sec = 10;                        // GC daemon wake-up interval
 ```
 
 ## Design Details

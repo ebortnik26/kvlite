@@ -384,6 +384,18 @@ size_t GlobalIndex::memoryUsage() const {
     return dht_.memoryUsage();
 }
 
+double GlobalIndex::estimateDeadRatio() const {
+    size_t total_groups = 0;
+    size_t multi_version_groups = 0;
+    forEachGroup([&](uint64_t, const auto& pvs, const auto&) {
+        ++total_groups;
+        if (pvs.size() > 1) ++multi_version_groups;
+    });
+    if (total_groups == 0) return 0.0;
+    return static_cast<double>(multi_version_groups) /
+           static_cast<double>(total_groups);
+}
+
 // --- Persistence ---
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};

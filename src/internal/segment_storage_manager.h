@@ -58,6 +58,9 @@ public:
     // Close and unregister a segment, deleting its file from disk.
     Status removeSegment(uint32_t id);
 
+    // Move a sealed segment into the registry (used by GC to register outputs).
+    void adoptSegment(uint32_t id, Segment seg);
+
     Segment* getSegment(uint32_t id);
     const Segment* getSegment(uint32_t id) const;
     

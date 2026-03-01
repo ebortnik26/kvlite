@@ -1,9 +1,12 @@
 #ifndef KVLITE_DB_H
 #define KVLITE_DB_H
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kvlite/status.h"
@@ -139,6 +142,14 @@ private:
     Status flush();
     void cleanupRetiredBuffers();
 
+    void startGCLoop();
+    void stopGCLoop();
+    void gcLoop();
+    Status runGC();
+    std::vector<uint32_t> selectGCInputs();
+    Status mergeSegments(const std::vector<uint32_t>& input_ids);
+    double estimateDeadRatio() const;
+
     std::string db_path_;
     Options options_;
     std::unique_ptr<internal::Manifest> manifest_;
@@ -149,6 +160,11 @@ private:
     std::vector<std::unique_ptr<internal::WriteBuffer>> retired_buffers_;
     uint32_t current_segment_id_ = 0;
     bool is_open_ = false;
+
+    std::thread gc_thread_;
+    std::mutex gc_mu_;
+    std::condition_variable gc_cv_;
+    bool gc_stop_ = false;
 
 };
 

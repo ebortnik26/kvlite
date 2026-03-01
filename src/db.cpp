@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "internal/delta_hash_table.h"
+#include "internal/gc.h"
 #include "internal/manifest.h"
 #include "internal/version_manager.h"
 #include "internal/global_index.h"
@@ -103,6 +104,8 @@ Status DB::open(const std::string& path, const Options& options) {
     current_segment_id_ = storage_->allocateSegmentId();
 
     is_open_ = true;
+
+    startGCLoop();
     return Status::OK();
 }
 
@@ -118,6 +121,8 @@ Status DB::close() {
         s1 = flush();
     }
     write_buffer_.reset();
+
+    stopGCLoop();
 
     is_open_ = false;
 
@@ -487,6 +492,125 @@ uint64_t DB::getLatestVersion() const {
 
 uint64_t DB::getOldestVersion() const {
     return versions_->oldestSnapshotVersion();
+}
+
+// --- GC Daemon ---
+
+void DB::startGCLoop() {
+    if (options_.gc_interval_sec > 0 && options_.gc_policy != GCPolicy::MANUAL) {
+        gc_stop_ = false;
+        gc_thread_ = std::thread(&DB::gcLoop, this);
+    }
+}
+
+void DB::stopGCLoop() {
+    {
+        std::lock_guard<std::mutex> lock(gc_mu_);
+        gc_stop_ = true;
+    }
+    gc_cv_.notify_one();
+    if (gc_thread_.joinable()) gc_thread_.join();
+}
+
+void DB::gcLoop() {
+    std::unique_lock<std::mutex> lock(gc_mu_);
+    while (!gc_stop_) {
+        gc_cv_.wait_for(lock, std::chrono::seconds(options_.gc_interval_sec),
+                        [this] { return gc_stop_; });
+        if (gc_stop_) break;
+        lock.unlock();
+
+        double ratio = estimateDeadRatio();
+        if (ratio > options_.gc_threshold) {
+            runGC();
+        }
+
+        lock.lock();
+    }
+}
+
+double DB::estimateDeadRatio() const {
+    return global_index_->estimateDeadRatio();
+}
+
+std::vector<uint32_t> DB::selectGCInputs() {
+    auto all_ids = storage_->getSegmentIds();
+    std::vector<uint32_t> input_ids;
+    if (all_ids.size() <= 1) return input_ids;
+
+    uint32_t newest_id = all_ids.back();
+    for (uint32_t id : all_ids) {
+        if (id == newest_id) break;
+        if (input_ids.size() >= static_cast<size_t>(options_.gc_max_segments))
+            break;
+        auto* seg = storage_->getSegment(id);
+        if (seg && seg->state() == internal::Segment::State::kReadable) {
+            input_ids.push_back(id);
+        }
+    }
+    return input_ids;
+}
+
+Status DB::mergeSegments(const std::vector<uint32_t>& input_ids) {
+    // Pin input segments.
+    std::vector<const internal::Segment*> inputs;
+    for (uint32_t id : input_ids) {
+        storage_->pinSegment(id);
+        inputs.push_back(storage_->getSegment(id));
+    }
+
+    auto snapshot_versions = versions_->snapshotVersions();
+
+    // Merge under BatchGuard.
+    internal::GC::Result result;
+    Status s;
+    {
+        internal::GlobalIndex::BatchGuard guard(*global_index_);
+        s = internal::GC::merge(
+            snapshot_versions, inputs, options_.log_file_size,
+            [this](uint32_t id) { return storage_->segmentPath(id); },
+            [this]() { return storage_->allocateSegmentId(); },
+            [this](uint64_t hkey, uint64_t pv, uint32_t old_id,
+                   uint32_t new_id) {
+                global_index_->relocate(hkey, pv, old_id, new_id);
+            },
+            [this](uint64_t hkey, uint64_t pv, uint32_t old_id) {
+                global_index_->eliminate(hkey, pv, old_id);
+            },
+            result);
+        if (!s.ok()) {
+            for (uint32_t id : input_ids) storage_->unpinSegment(id);
+            return s;
+        }
+        s = global_index_->commitGC();
+    }
+    if (!s.ok()) {
+        for (uint32_t id : input_ids) storage_->unpinSegment(id);
+        return s;
+    }
+
+    // Adopt output segments and register in Manifest.
+    std::vector<uint32_t> output_ids;
+    for (auto& seg : result.outputs) {
+        uint32_t oid = seg.getId();
+        output_ids.push_back(oid);
+        storage_->adoptSegment(oid, std::move(seg));
+    }
+    return storage_->registerSegments(output_ids);
+}
+
+Status DB::runGC() {
+    auto input_ids = selectGCInputs();
+    if (input_ids.empty()) return Status::OK();
+
+    Status s = mergeSegments(input_ids);
+    if (!s.ok()) return s;
+
+    for (uint32_t id : input_ids) {
+        storage_->unpinSegment(id);
+        storage_->removeSegment(id);
+    }
+    return Status::OK();
 }
 
 }  // namespace kvlite

@@ -133,6 +133,9 @@ public:
     size_t entryCount() const;
     size_t memoryUsage() const;
 
+    // Fraction of key groups with more than one version (0.0–1.0).
+    double estimateDeadRatio() const;
+
 private:
     // --- Core DHT mutations (no WAL, no savepoint counter) ---
     // Used by both the public API (which also writes to WAL) and WAL replay.

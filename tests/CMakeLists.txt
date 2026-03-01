@@ -15,6 +15,7 @@ add_executable(kvlite_test
     test_iterator.cpp
     test_concurrency.cpp
     test_db.cpp
+    test_gc_daemon.cpp
 )
 
 target_include_directories(kvlite_test

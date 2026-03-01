@@ -62,9 +62,13 @@ struct Options {
     // Default: 0.5
     double gc_threshold = 0.5;
 
-    // Maximum number of files to compact in a single GC run
+    // Maximum number of segments to compact in a single GC run
     // Default: 10
-    int gc_max_files = 10;
+    int gc_max_segments = 10;
+
+    // Seconds between GC daemon wake-ups (0 = disable daemon)
+    // Default: 10
+    uint32_t gc_interval_sec = 10;
 
     // --- General Options ---
 

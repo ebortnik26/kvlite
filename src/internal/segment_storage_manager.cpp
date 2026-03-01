@@ -194,6 +194,11 @@ void SegmentStorageManager::unpinSegment(uint32_t id) {
     }
 }
 
+void SegmentStorageManager::adoptSegment(uint32_t id, Segment seg) {
+    std::unique_lock lock(mutex_);
+    segments_.emplace(id, std::move(seg));
+}
+
 Segment* SegmentStorageManager::getSegment(uint32_t id) {
     std::shared_lock lock(mutex_);
     auto it = segments_.find(id);

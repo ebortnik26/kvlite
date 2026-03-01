@@ -45,6 +45,7 @@ set(KVLITE_SOURCES
     src/internal/global_index_wal.cpp
     src/internal/wal_stream.cpp
     src/internal/entry_stream.cpp
+    src/internal/gc.cpp
 )
 
 # Create library
