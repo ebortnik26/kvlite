@@ -408,14 +408,19 @@ Status DB::flush() {
     auto result = write_buffer_->flush(*seg);
     if (!result.status.ok()) return result.status;
 
-    // Stage all GI entries without auto-commit, then commit once.
-    for (const auto& e : result.entries) {
-        s = global_index_->stagePut(e.hkey, e.packed_ver, current_segment_id_);
+    // Hold the savepoint lock for the entire GI batch (stage + commit).
+    // This blocks savepoints but allows concurrent GC.
+    {
+        internal::GlobalIndex::BatchGuard guard(*global_index_);
+
+        for (const auto& e : result.entries) {
+            s = global_index_->stagePut(e.hkey, e.packed_ver, current_segment_id_);
+            if (!s.ok()) return s;
+        }
+
+        s = global_index_->commitWB(result.max_version);
         if (!s.ok()) return s;
     }
-
-    s = global_index_->commitWB(result.max_version);
-    if (!s.ok()) return s;
 
     // Manifest update is the commit point — makes the flush visible.
     s = storage_->registerSegments({current_segment_id_});

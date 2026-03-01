@@ -695,6 +695,8 @@ TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
     std::vector<uint64_t> snapshots = {2};
     std::vector<const Segment*> inputs = {&seg};
 
+    // Hold the savepoint lock for the entire GC merge.
+    GlobalIndex::BatchGuard guard(gi);
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
@@ -737,6 +739,7 @@ TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
     std::vector<uint64_t> snapshots = {2};
     std::vector<const Segment*> inputs = {&seg1, &seg2};
 
+    GlobalIndex::BatchGuard guard(gi);
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
@@ -784,6 +787,7 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
     std::vector<uint64_t> snapshots = {2};
     std::vector<const Segment*> inputs = {&seg};
 
+    GlobalIndex::BatchGuard guard(gi);
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
         [this](uint32_t id) { return pathForOutput(id); },
@@ -841,20 +845,23 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
     std::vector<uint64_t> snapshots = {2};
     std::vector<const Segment*> inputs = {&seg};
 
-    Status s = GC::merge(
-        snapshots, inputs, /*max_segment_size=*/1 << 20,
-        [this](uint32_t id) { return pathForOutput(id); },
-        [this]() { return allocateId(); },
-        [&](uint64_t hkey, uint64_t packed_version,
-              uint32_t old_id, uint32_t new_id) {
-            gi.relocate(hkey, packed_version, old_id, new_id);
-        },
-        [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
-            gi.eliminate(hkey, packed_version, old_id);
-        },
-        last_result_);
+    {
+        GlobalIndex::BatchGuard guard(gi);
+        Status s = GC::merge(
+            snapshots, inputs, /*max_segment_size=*/1 << 20,
+            [this](uint32_t id) { return pathForOutput(id); },
+            [this]() { return allocateId(); },
+            [&](uint64_t hkey, uint64_t packed_version,
+                  uint32_t old_id, uint32_t new_id) {
+                gi.relocate(hkey, packed_version, old_id, new_id);
+            },
+            [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
+                gi.eliminate(hkey, packed_version, old_id);
+            },
+            last_result_);
 
-    ASSERT_TRUE(s.ok());
+        ASSERT_TRUE(s.ok());
+    }
     // Tombstone is kept (relocated) — it's the latest visible entry.
     EXPECT_EQ(last_result_.entries_written, 1u);
     EXPECT_EQ(last_result_.entries_eliminated, 0u);
@@ -867,7 +874,10 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
     // when all snapshots are released and a GC eliminates it).
     uint64_t tomb_pv = PackedVersion(2, true).data;
     uint32_t new_seg_id = last_result_.outputs[0].getId();
-    gi.eliminate(H("key1"), tomb_pv, new_seg_id);
+    {
+        GlobalIndex::BatchGuard guard(gi);
+        gi.eliminate(H("key1"), tomb_pv, new_seg_id);
+    }
 
     // Now the key is fully gone from GlobalIndex.
     EXPECT_EQ(gi.keyCount(), 0u);

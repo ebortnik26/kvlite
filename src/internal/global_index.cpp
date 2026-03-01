@@ -197,6 +197,8 @@ bool GlobalIndex::isOpen() const {
 // --- Index Operations ---
 
 Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
+    // Self-locking convenience for single inserts. For batch operations use
+    // BatchGuard + stagePut() + commitWB().
     std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
     Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
@@ -209,7 +211,7 @@ Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment
 }
 
 Status GlobalIndex::stagePut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
-    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
+    // Caller must hold a BatchGuard.
     Status s = wal_->stagePut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
     applyPut(hkey, packed_version, segment_id);
@@ -265,7 +267,7 @@ bool GlobalIndex::contains(uint64_t hkey) const {
 
 Status GlobalIndex::relocate(uint64_t hkey, uint64_t packed_version,
                               uint32_t old_segment_id, uint32_t new_segment_id) {
-    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
+    // Caller must hold a BatchGuard.
     Status s = wal_->appendRelocate(hkey, packed_version, old_segment_id, new_segment_id, WalProducer::kGC);
     if (!s.ok()) return s;
     applyRelocate(hkey, packed_version, old_segment_id, new_segment_id);
@@ -274,7 +276,7 @@ Status GlobalIndex::relocate(uint64_t hkey, uint64_t packed_version,
 
 Status GlobalIndex::eliminate(uint64_t hkey, uint64_t packed_version,
                                uint32_t segment_id) {
-    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
+    // Caller must hold a BatchGuard.
     Status s = wal_->appendEliminate(hkey, packed_version, segment_id, WalProducer::kGC);
     if (!s.ok()) return s;
     applyEliminate(hkey, packed_version, segment_id);
@@ -303,14 +305,14 @@ void GlobalIndex::clear() {
 // --- WAL commit ---
 
 Status GlobalIndex::commitWB(uint64_t max_version) {
-    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
+    // Caller must hold a BatchGuard.
     if (max_version > max_version_) max_version_ = max_version;
     wal_->updateMaxVersion(max_version);
     return wal_->commit(WalProducer::kWB);
 }
 
 Status GlobalIndex::commitGC() {
-    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
+    // Caller must hold a BatchGuard.
     return wal_->commit(WalProducer::kGC);
 }
 

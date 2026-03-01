@@ -35,10 +35,10 @@ class Manifest;
 // in the underlying DeltaHashTable. Lifecycle methods (open/recover/close)
 // must be called from a single thread.
 //
-// Savepoint locking: storeSavepoint() takes an exclusive lock on savepoint_mu_
-// to block WB flush and GC writes. Normal reads are unaffected (per-bucket
-// spinlocks suffice). Writers (put/relocate/eliminate) and commit methods
-// take a shared lock on savepoint_mu_.
+// Savepoint locking: callers must hold a BatchGuard (shared lock on
+// savepoint_mu_) for the duration of a WB flush or GC merge. This blocks
+// storeSavepoint() (which takes an exclusive lock) but allows WB flush and
+// GC to run concurrently. Reads don't acquire savepoint_mu_.
 class GlobalIndex {
 public:
     struct Options {
@@ -50,6 +50,18 @@ public:
 
         // Number of threads for parallel savepoint writes
         uint32_t savepoint_threads = 4;
+    };
+
+    // RAII guard that holds a shared lock on savepoint_mu_.
+    // Callers must hold a BatchGuard for the entire WB flush or GC merge.
+    // This allows concurrent WB/GC operations but blocks savepoints.
+    class BatchGuard {
+    public:
+        explicit BatchGuard(GlobalIndex& gi) : lock_(gi.savepoint_mu_) {}
+        BatchGuard(const BatchGuard&) = delete;
+        BatchGuard& operator=(const BatchGuard&) = delete;
+    private:
+        std::shared_lock<std::shared_mutex> lock_;
     };
 
     explicit GlobalIndex(Manifest& manifest);
@@ -67,10 +79,12 @@ public:
 
     // --- Index Operations ---
 
+    // Single-insert convenience (self-locking). For batch operations use
+    // BatchGuard + stagePut() + commitWB().
     Status put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
 
     // Stage a put in the WAL buffer without auto-commit.
-    // Caller must call commitWB() to flush and sync.
+    // Caller must hold a BatchGuard and call commitWB() when done.
     Status stagePut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
 
     bool get(uint64_t hkey,
@@ -85,11 +99,11 @@ public:
 
     bool contains(uint64_t hkey) const;
 
-    // Update segment_id for an existing entry.
+    // Update segment_id for an existing entry. Caller must hold a BatchGuard.
     Status relocate(uint64_t hkey, uint64_t packed_version,
                     uint32_t old_segment_id, uint32_t new_segment_id);
 
-    // Remove an entry. If the key's fingerprint group becomes empty, decrements key_count_.
+    // Remove an entry. Caller must hold a BatchGuard.
     Status eliminate(uint64_t hkey, uint64_t packed_version,
                      uint32_t segment_id);
 
@@ -102,7 +116,7 @@ public:
 
     void clear();
 
-    // --- WAL commit (hides producer IDs from callers) ---
+    // --- WAL commit (caller must hold a BatchGuard) ---
 
     Status commitWB(uint64_t max_version);
     Status commitGC();
