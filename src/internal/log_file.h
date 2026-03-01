@@ -28,10 +28,13 @@ public:
     LogFile& operator=(LogFile&& other) noexcept;
 
     // Open an existing file for reading and writing.
-    Status open(const std::string& path);
+    // When sync=true, the fd is opened with O_DSYNC so every write is
+    // durable on return (no separate fdatasync needed).
+    Status open(const std::string& path, bool sync = false);
 
     // Create a new file, truncating if it already exists.
-    Status create(const std::string& path);
+    // When sync=true, the fd is opened with O_DSYNC.
+    Status create(const std::string& path, bool sync = false);
 
     // Close the file.
     Status close();

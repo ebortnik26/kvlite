@@ -39,12 +39,14 @@ LogFile& LogFile::operator=(LogFile&& other) noexcept {
     return *this;
 }
 
-Status LogFile::open(const std::string& path) {
+Status LogFile::open(const std::string& path, bool sync) {
     if (isOpen()) {
         return Status::IOError("file already open: " + path_);
     }
 
-    int fd = ::open(path.c_str(), O_RDWR);
+    int flags = O_RDWR;
+    if (sync) flags |= O_DSYNC;
+    int fd = ::open(path.c_str(), flags);
     if (fd < 0) {
         return Status::IOError("open failed: " + path + ": " + std::strerror(errno));
     }
@@ -61,12 +63,14 @@ Status LogFile::open(const std::string& path) {
     return Status::OK();
 }
 
-Status LogFile::create(const std::string& path) {
+Status LogFile::create(const std::string& path, bool sync) {
     if (isOpen()) {
         return Status::IOError("file already open: " + path_);
     }
 
-    int fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0644);
+    int flags = O_CREAT | O_TRUNC | O_RDWR;
+    if (sync) flags |= O_DSYNC;
+    int fd = ::open(path.c_str(), flags, 0644);
     if (fd < 0) {
         return Status::IOError("create failed: " + path + ": " + std::strerror(errno));
     }

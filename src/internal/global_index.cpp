@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <unistd.h>
 
 #include "internal/crc32.h"
 #include "internal/global_index_wal.h"
@@ -481,6 +483,14 @@ Status GlobalIndex::writeSavepointFile(const std::string& dir,
     if (!file.good()) {
         return Status::IOError("Failed to write savepoint file: " + fpath);
     }
+    file.flush();
+
+    // fsync the file so data is durable before the directory rename.
+    int sync_fd = ::open(fpath.c_str(), O_RDONLY);
+    if (sync_fd >= 0) {
+        ::fdatasync(sync_fd);
+        ::close(sync_fd);
+    }
     return Status::OK();
 }
 
@@ -505,40 +515,47 @@ Status GlobalIndex::writeSavepoint(const std::string& dir) const {
             Status s = writeSavepointFile(dir, fd);
             if (!s.ok()) return s;
         }
-        return Status::OK();
-    }
+    } else {
+        // Parallel path: workers grab files from an atomic counter.
+        std::atomic<uint32_t> next_file{0};
+        std::atomic<bool> has_error{false};
+        Status first_error;
+        std::mutex error_mu;
 
-    // Parallel path: workers grab files from an atomic counter.
-    std::atomic<uint32_t> next_file{0};
-    std::atomic<bool> has_error{false};
-    Status first_error;
-    std::mutex error_mu;
-
-    auto worker = [&]() {
-        while (!has_error.load(std::memory_order_relaxed)) {
-            uint32_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
-            if (fi >= files.size()) return;
-            Status s = writeSavepointFile(dir, files[fi]);
-            if (!s.ok()) {
-                std::lock_guard<std::mutex> lock(error_mu);
-                if (!has_error.exchange(true, std::memory_order_relaxed)) {
-                    first_error = s;
+        auto worker = [&]() {
+            while (!has_error.load(std::memory_order_relaxed)) {
+                uint32_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
+                if (fi >= files.size()) return;
+                Status s = writeSavepointFile(dir, files[fi]);
+                if (!s.ok()) {
+                    std::lock_guard<std::mutex> lock(error_mu);
+                    if (!has_error.exchange(true, std::memory_order_relaxed)) {
+                        first_error = s;
+                    }
+                    return;
                 }
-                return;
             }
+        };
+
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads);
+        for (uint32_t i = 0; i < num_threads; ++i) {
+            threads.emplace_back(worker);
         }
-    };
+        for (auto& t : threads) {
+            t.join();
+        }
 
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-    for (uint32_t i = 0; i < num_threads; ++i) {
-        threads.emplace_back(worker);
-    }
-    for (auto& t : threads) {
-        t.join();
+        if (has_error.load()) return first_error;
     }
 
-    return has_error.load() ? first_error : Status::OK();
+    // fsync the directory so all file entries are durable before rename.
+    int dfd = ::open(dir.c_str(), O_RDONLY);
+    if (dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
+    }
+    return Status::OK();
 }
 
 Status GlobalIndex::readSavepointFile(const std::string& fpath,

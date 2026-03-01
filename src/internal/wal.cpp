@@ -36,7 +36,8 @@ WAL& WAL::operator=(WAL&& other) noexcept {
 }
 
 Status WAL::create(const std::string& path) {
-    Status s = log_file_.create(path);
+    // O_DSYNC: every write is durable on return — no separate fdatasync needed.
+    Status s = log_file_.create(path, /*sync=*/true);
     if (!s.ok()) return s;
     batch_buf_.clear();
     max_version_ = 0;
@@ -44,7 +45,7 @@ Status WAL::create(const std::string& path) {
 }
 
 Status WAL::open(const std::string& path) {
-    Status s = log_file_.open(path);
+    Status s = log_file_.open(path, /*sync=*/true);
     if (!s.ok()) return s;
     batch_buf_.clear();
     return Status::OK();
@@ -78,7 +79,7 @@ void WAL::put(const void* data, size_t len) {
     std::memcpy(p + 1, data, len);
 }
 
-Status WAL::commit(bool do_sync) {
+Status WAL::commit(bool /*do_sync*/) {
     // Commit record: [body_len:4][type:1][max_version:8][txn_crc32:4]
     // txn_crc32 covers all bytes from batch start through max_version (inclusive).
     uint32_t body_len = 1 + 8 + 4; // type + max_version + crc = 13
@@ -99,19 +100,11 @@ Status WAL::commit(bool do_sync) {
     batch_buf_.resize(crc_offset + 4);
     std::memcpy(batch_buf_.data() + crc_offset, &checksum, 4);
 
-    // Write entire batch to disk.
+    // O_DSYNC: single write is atomically durable on return.
     uint64_t write_offset;
     Status s = log_file_.append(batch_buf_.data(), batch_buf_.size(), write_offset);
     batch_buf_.clear();
-
-    if (!s.ok()) return s;
-
-    if (do_sync) {
-        s = log_file_.sync();
-        if (!s.ok()) return s;
-    }
-
-    return Status::OK();
+    return s;
 }
 
 void WAL::abort() {

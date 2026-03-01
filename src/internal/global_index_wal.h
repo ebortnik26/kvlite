@@ -163,8 +163,11 @@ private:
     // Caller must hold mu_.
     Status rollover();
 
-    // Allocate the next file ID (increments next_file_id_ and persists to Manifest).
-    Status allocateFileId(uint32_t& file_id);
+    // Compute the next file ID without persisting.
+    uint32_t nextFileId() const;
+
+    // Persist file_id to the Manifest and update in-memory state.
+    Status persistFileId(uint32_t file_id);
 
     // Load file IDs and next_file_id from Manifest.
     void loadManifestState();

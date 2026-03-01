@@ -56,13 +56,17 @@ Status GlobalIndexWAL::openActiveFile() {
         return wal_.open(walFilePath(dir, current_file_id_));
     }
 
-    uint32_t id;
-    Status s = allocateFileId(id);
+    // Create file on disk before persisting to Manifest.
+    uint32_t id = nextFileId();
+    Status s = wal_.create(walFilePath(dir, id));
     if (!s.ok()) return s;
+
+    s = persistFileId(id);
+    if (!s.ok()) return s;
+
     current_file_id_ = id;
     file_ids_.push_back(id);
-
-    return wal_.create(walFilePath(dir, id));
+    return Status::OK();
 }
 
 Status GlobalIndexWAL::open(const std::string& db_path, Manifest& manifest,
@@ -219,33 +223,40 @@ Status GlobalIndexWAL::rollover() {
     Status s = wal_.close();
     if (!s.ok()) return s;
 
-    // Allocate a new file ID and update max in Manifest.
-    uint32_t new_id;
-    s = allocateFileId(new_id);
-    if (!s.ok()) return s;
-
-    // Create the new file and inherit the running max_version.
-    current_file_id_ = new_id;
-    file_ids_.push_back(new_id);
+    // Create the file on disk BEFORE updating the Manifest.
+    // If we crash after create but before the Manifest write, the orphan
+    // file is harmless — next attempt reuses the same ID (O_TRUNC).
+    uint32_t new_id = nextFileId();
     s = wal_.create(walFilePath(walDir(), new_id));
     if (!s.ok()) return s;
+
+    s = persistFileId(new_id);
+    if (!s.ok()) return s;
+
+    current_file_id_ = new_id;
+    file_ids_.push_back(new_id);
     wal_.updateMaxVersion(closing_max);
     return Status::OK();
 }
 
-Status GlobalIndexWAL::allocateFileId(uint32_t& file_id) {
+uint32_t GlobalIndexWAL::nextFileId() const {
+    return has_files_ ? max_file_id_ + 1 : 0;
+}
+
+Status GlobalIndexWAL::persistFileId(uint32_t file_id) {
     if (!has_files_) {
-        file_id = 0;
-        min_file_id_ = 0;
-        max_file_id_ = 0;
         has_files_ = true;
-        Status s = manifest_->set(ManifestKey::kGiWalMinFileId, "0");
+        min_file_id_ = file_id;
+        max_file_id_ = file_id;
+        Status s = manifest_->set(ManifestKey::kGiWalMinFileId,
+                                  std::to_string(file_id));
         if (!s.ok()) return s;
-        return manifest_->set(ManifestKey::kGiWalMaxFileId, "0");
+        return manifest_->set(ManifestKey::kGiWalMaxFileId,
+                              std::to_string(file_id));
     }
-    file_id = max_file_id_ + 1;
     max_file_id_ = file_id;
-    return manifest_->set(ManifestKey::kGiWalMaxFileId, std::to_string(file_id));
+    return manifest_->set(ManifestKey::kGiWalMaxFileId,
+                          std::to_string(file_id));
 }
 
 std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
@@ -260,15 +271,16 @@ Status GlobalIndexWAL::startNewFile() {
     Status s = wal_.close();
     if (!s.ok()) return s;
 
-    // Allocate a new file ID.
-    uint32_t new_id;
-    s = allocateFileId(new_id);
+    // Create the file on disk BEFORE updating the Manifest.
+    uint32_t new_id = nextFileId();
+    s = wal_.create(walFilePath(walDir(), new_id));
+    if (!s.ok()) return s;
+
+    s = persistFileId(new_id);
     if (!s.ok()) return s;
 
     current_file_id_ = new_id;
     file_ids_.push_back(new_id);
-    s = wal_.create(walFilePath(walDir(), new_id));
-    if (!s.ok()) return s;
     wal_.updateMaxVersion(closing_max);
     return Status::OK();
 }
