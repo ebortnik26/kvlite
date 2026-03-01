@@ -44,13 +44,6 @@ struct Options {
     // Default: 10
     uint32_t savepoint_interval_sec = 10;
 
-    // --- SegmentIndex Cache Options ---
-
-    // Size of the LRU cache for SegmentIndex instances in bytes
-    // Hot log file indices are kept in memory
-    // Default: 256MB
-    size_t segment_index_cache_size = 256 * 1024 * 1024;
-
     // --- Garbage Collection Options ---
 
     // Policy for selecting log files to compact

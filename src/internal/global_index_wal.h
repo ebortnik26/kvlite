@@ -123,9 +123,6 @@ public:
     // Update the running max version for the active WAL file.
     void updateMaxVersion(uint64_t v);
 
-    // Truncate WAL (resets staging buffers only, no file deletion).
-    Status truncate();
-
     // Version-based truncation: delete obsolete WAL files whose max_version
     // is <= cutoff_version. The active file is never deleted.
     // Also clears staging buffers.

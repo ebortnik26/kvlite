@@ -33,8 +33,6 @@ struct DBStats {
     uint64_t num_live_entries = 0;
     uint64_t num_historical_entries = 0;
     uint64_t global_index_size = 0;
-    uint64_t segment_index_cache_size = 0;
-    uint64_t segment_index_cached_count = 0;
     uint64_t current_version = 0;
     uint64_t oldest_version = 0;
     uint64_t active_snapshots = 0;

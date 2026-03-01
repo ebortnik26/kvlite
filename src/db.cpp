@@ -465,8 +465,6 @@ Status DB::getStats(DBStats& stats) const {
     stats.num_log_files = storage_->segmentCount();
     stats.total_log_size = storage_->totalDataSize();
     stats.global_index_size = global_index_->memoryUsage();
-    stats.segment_index_cache_size = 0;   // no separate cache
-    stats.segment_index_cached_count = 0; // no separate cache
     stats.current_version = versions_->latestVersion();
     stats.oldest_version = versions_->oldestSnapshotVersion();
 

@@ -309,16 +309,6 @@ void GlobalIndexWAL::updateMaxVersion(uint64_t v) {
     wal_.updateMaxVersion(v);
 }
 
-Status GlobalIndexWAL::truncate() {
-    total_size_ = 0;
-    for (auto& p : producers_) {
-        p.data.clear();
-        p.record_count = 0;
-    }
-    wal_.abort();
-    return Status::OK();
-}
-
 Status GlobalIndexWAL::truncate(uint64_t cutoff_version) {
     (void)cutoff_version;
 

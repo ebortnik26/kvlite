@@ -199,8 +199,6 @@ bool GlobalIndex::isOpen() const {
 // --- Index Operations ---
 
 Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
-    // Self-locking convenience for single inserts. For batch operations use
-    // BatchGuard + stagePut() + commitWB().
     std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
     Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
