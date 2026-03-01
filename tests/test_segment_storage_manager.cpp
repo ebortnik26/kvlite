@@ -22,13 +22,12 @@ protected:
     }
 
     // Create manifest + SegmentStorageManager, open (which also recovers).
-    Status openSM(bool create = true,
-                  SegmentStorageManager::Options opts = SegmentStorageManager::Options{}) {
+    Status openSM(bool create = true) {
         manifest_ = std::make_unique<Manifest>();
         Status s = create ? manifest_->create(path_) : manifest_->open(path_);
         if (!s.ok()) return s;
         sm_ = std::make_unique<SegmentStorageManager>(*manifest_);
-        return sm_->open(path_, opts);
+        return sm_->open(path_);
     }
 
     void closeSM() {
@@ -83,7 +82,7 @@ TEST_F(SegmentStorageManagerTest, RemoveSegmentDeletesFile) {
     closeSM();
 }
 
-// recover() with purge_untracked_files=true should delete orphan segment files.
+// recover() should delete orphan segment files not tracked by the manifest.
 TEST_F(SegmentStorageManagerTest, RecoverPurgesOrphanFiles) {
     // Phase 1: create a tracked segment and an orphan file.
     {
@@ -97,11 +96,9 @@ TEST_F(SegmentStorageManagerTest, RecoverPurgesOrphanFiles) {
     ASSERT_TRUE(std::filesystem::exists(
         path_ + "/segments/segment_999.data"));
 
-    // Phase 2: reopen with purge enabled.
+    // Phase 2: reopen — orphan should be purged.
     {
-        SegmentStorageManager::Options opts;
-        opts.purge_untracked_files = true;
-        ASSERT_TRUE(openSM(false, opts).ok());
+        ASSERT_TRUE(openSM(false).ok());
 
         // Orphan should be gone.
         EXPECT_FALSE(std::filesystem::exists(
@@ -109,27 +106,6 @@ TEST_F(SegmentStorageManagerTest, RecoverPurgesOrphanFiles) {
 
         // Tracked segment should still exist.
         EXPECT_EQ(sm_->segmentCount(), 1u);
-
-        closeSM();
-    }
-}
-
-// recover() with purge_untracked_files=false (default) should keep orphan files.
-TEST_F(SegmentStorageManagerTest, RecoverKeepsOrphansByDefault) {
-    {
-        ASSERT_TRUE(openSM().ok());
-        createTrackedSegment("k1", "v1");
-        closeSM();
-    }
-
-    createOrphanFile(999);
-
-    {
-        ASSERT_TRUE(openSM(false).ok());
-
-        // Orphan should still be present.
-        EXPECT_TRUE(std::filesystem::exists(
-            path_ + "/segments/segment_999.data"));
 
         closeSM();
     }
@@ -207,7 +183,7 @@ TEST_F(SegmentStorageManagerTest, MonotonicIdsAcrossReopen) {
     }
 }
 
-// Orphan file outside the [min, max] range is purged when enabled.
+// Orphan file outside the [min, max] range is purged on recovery.
 TEST_F(SegmentStorageManagerTest, OrphanOutsideRangeIsPurged) {
     {
         ASSERT_TRUE(openSM().ok());
@@ -221,9 +197,7 @@ TEST_F(SegmentStorageManagerTest, OrphanOutsideRangeIsPurged) {
         path_ + "/segments/segment_12345.data"));
 
     {
-        SegmentStorageManager::Options opts;
-        opts.purge_untracked_files = true;
-        ASSERT_TRUE(openSM(false, opts).ok());
+        ASSERT_TRUE(openSM(false).ok());
 
         EXPECT_FALSE(std::filesystem::exists(
             path_ + "/segments/segment_12345.data"));
@@ -232,9 +206,9 @@ TEST_F(SegmentStorageManagerTest, OrphanOutsideRangeIsPurged) {
     }
 }
 
-// Non-contiguous IDs with purge enabled: orphans outside [min, max] are
-// deleted, but gaps within the range are simply skipped.
-TEST_F(SegmentStorageManagerTest, NonContiguousWithPurge) {
+// Non-contiguous IDs with orphan outside range: orphans are purged,
+// gaps within the [min, max] range are simply skipped.
+TEST_F(SegmentStorageManagerTest, NonContiguousWithOrphanPurge) {
     // Create segments 1, 2, 3.
     ASSERT_TRUE(openSM().ok());
     uint32_t id1 = createTrackedSegment("k1", "v1");
@@ -249,9 +223,7 @@ TEST_F(SegmentStorageManagerTest, NonContiguousWithPurge) {
     createOrphanFile(999);
 
     {
-        SegmentStorageManager::Options opts;
-        opts.purge_untracked_files = true;
-        ASSERT_TRUE(openSM(false, opts).ok());
+        ASSERT_TRUE(openSM(false).ok());
 
         // Gap at id2 is tolerated: 2 segments loaded.
         EXPECT_EQ(sm_->segmentCount(), 2u);

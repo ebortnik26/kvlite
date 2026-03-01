@@ -86,9 +86,7 @@ Status DB::open(const std::string& path, const Options& options) {
     // Initialize storage manager
     storage_ = std::make_unique<internal::SegmentStorageManager>(*manifest_);
 
-    internal::SegmentStorageManager::Options sm_opts;
-    sm_opts.purge_untracked_files = options.purge_untracked_files;
-    s = storage_->open(path, sm_opts);
+    s = storage_->open(path);
     if (!s.ok()) {
         versions_->close();
         global_index_->close();
@@ -410,15 +408,17 @@ Status DB::flush() {
     auto result = write_buffer_->flush(*seg);
     if (!result.status.ok()) return result.status;
 
-    s = storage_->registerSegments({current_segment_id_});
-    if (!s.ok()) return s;
-
+    // Stage all GI entries without auto-commit, then commit once.
     for (const auto& e : result.entries) {
-        s = global_index_->put(e.hkey, e.packed_ver, current_segment_id_);
+        s = global_index_->stagePut(e.hkey, e.packed_ver, current_segment_id_);
         if (!s.ok()) return s;
     }
 
     s = global_index_->commitWB(result.max_version);
+    if (!s.ok()) return s;
+
+    // Manifest update is the commit point — makes the flush visible.
+    s = storage_->registerSegments({current_segment_id_});
     if (!s.ok()) return s;
 
     current_segment_id_ = storage_->allocateSegmentId();

@@ -145,6 +145,15 @@ Status GlobalIndexWAL::appendPut(uint64_t hkey, uint64_t packed_version,
     return Status::OK();
 }
 
+Status GlobalIndexWAL::stagePut(uint64_t hkey, uint64_t packed_version,
+                                 uint32_t segment_id, uint8_t producer_id) {
+    std::shared_lock lock(rw_mu_);
+    if (!open_) return Status::IOError("WAL not open");
+    serializeRecord(producers_[producer_id], WalOp::kPut, producer_id,
+                    packed_version, hkey, &segment_id, 1);
+    return Status::OK();
+}
+
 Status GlobalIndexWAL::appendRelocate(uint64_t hkey, uint64_t packed_version,
                                        uint32_t old_segment_id, uint32_t new_segment_id,
                                        uint8_t producer_id) {

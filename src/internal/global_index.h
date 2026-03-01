@@ -69,6 +69,10 @@ public:
 
     Status put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
 
+    // Stage a put in the WAL buffer without auto-commit.
+    // Caller must call commitWB() to flush and sync.
+    Status stagePut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
+
     bool get(uint64_t hkey,
              std::vector<uint32_t>& segment_ids,
              std::vector<uint64_t>& packed_versions) const;

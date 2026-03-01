@@ -118,17 +118,28 @@ Status GlobalIndex::recover() {
         if (!s.ok()) return s;
     }
 
+    // Determine the valid segment range from the Manifest.
+    // WAL entries referencing segments beyond max_seg_id are orphans
+    // from a flush that crashed before the Manifest commit point.
+    std::string seg_val;
+    bool has_max_seg = manifest_.get(ManifestKey::kSegmentsMaxSegId, seg_val);
+    uint32_t max_seg_id = has_max_seg
+        ? static_cast<uint32_t>(std::stoul(seg_val)) : 0;
+
     // Replay all remaining WAL records, ordered by file (= by max_version).
+    // Skip entries that reference unregistered segments.
     auto stream = wal_->replayStream();
     while (stream->valid()) {
         const auto& rec = stream->record();
         switch (rec.op) {
             case WalOp::kPut:
+                if (!has_max_seg || rec.segment_id > max_seg_id) break;
                 applyPut(rec.hkey, rec.packed_version, rec.segment_id);
                 if (rec.packed_version > max_version_)
                     max_version_ = rec.packed_version;
                 break;
             case WalOp::kRelocate:
+                if (!has_max_seg || rec.new_segment_id > max_seg_id) break;
                 applyRelocate(rec.hkey, rec.packed_version,
                               rec.segment_id, rec.new_segment_id);
                 break;
@@ -188,6 +199,18 @@ bool GlobalIndex::isOpen() const {
 Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
     std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
     Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
+    if (!s.ok()) return s;
+    applyPut(hkey, packed_version, segment_id);
+    if (packed_version > max_version_) {
+        max_version_ = packed_version;
+        wal_->updateMaxVersion(packed_version);
+    }
+    return Status::OK();
+}
+
+Status GlobalIndex::stagePut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
+    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
+    Status s = wal_->stagePut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
     applyPut(hkey, packed_version, segment_id);
     if (packed_version > max_version_) {

@@ -16,13 +16,7 @@ SegmentStorageManager::SegmentStorageManager(Manifest& manifest) : manifest_(man
 SegmentStorageManager::~SegmentStorageManager() = default;
 
 Status SegmentStorageManager::open(const std::string& db_path) {
-    return open(db_path, Options{});
-}
-
-Status SegmentStorageManager::open(const std::string& db_path,
-                            const Options& options) {
     db_path_ = db_path;
-    options_ = options;
     is_open_ = true;
 
     // Create segments/ subdirectory if needed.
@@ -76,8 +70,9 @@ Status SegmentStorageManager::recover() {
         segments_.emplace(id, std::move(seg));
     }
 
-    // Purge orphan segment files not tracked by manifest.
-    if (options_.purge_untracked_files) {
+    // Purge orphan segment files not tracked by manifest (e.g., from
+    // a flush that crashed before the Manifest commit point).
+    {
         std::error_code ec;
         for (const auto& entry :
              std::filesystem::directory_iterator(segmentsDir(), ec)) {

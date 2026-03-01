@@ -28,10 +28,6 @@ class Manifest;
 // Thread-safety: All public methods are thread-safe.
 class SegmentStorageManager {
 public:
-    struct Options {
-        bool purge_untracked_files = false;
-    };
-
     explicit SegmentStorageManager(Manifest& manifest);
     ~SegmentStorageManager();
 
@@ -43,7 +39,6 @@ public:
 
     // Open storage at the given path and recover state from disk.
     Status open(const std::string& db_path);
-    Status open(const std::string& db_path, const Options& options);
 
     // Close storage.
     Status close();
@@ -91,7 +86,6 @@ private:
     Status recover();
 
     std::string db_path_;
-    Options options_;
     Manifest& manifest_;
     bool is_open_ = false;
     std::atomic<uint32_t> next_segment_id_{1};

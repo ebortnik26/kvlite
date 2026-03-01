@@ -92,6 +92,12 @@ public:
     Status appendPut(uint64_t hkey, uint64_t packed_version,
                      uint32_t segment_id, uint8_t producer_id);
 
+    // Stage a put record without auto-commit. The record is buffered
+    // in-memory and only becomes durable when commit() is called.
+    // Used by flush() to stage all entries atomically.
+    Status stagePut(uint64_t hkey, uint64_t packed_version,
+                    uint32_t segment_id, uint8_t producer_id);
+
     Status appendRelocate(uint64_t hkey, uint64_t packed_version,
                           uint32_t old_segment_id, uint32_t new_segment_id,
                           uint8_t producer_id);
