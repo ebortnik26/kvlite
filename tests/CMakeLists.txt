@@ -92,7 +92,7 @@ add_executable(kvlite_segment_index_test
     ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/entry_stream.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/memtable.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_storage_manager.cpp
@@ -113,10 +113,10 @@ target_link_libraries(kvlite_segment_index_test
         pthread
 )
 
-# WriteBuffer tests
+# WriteBuffer tests (Memtable unit tests)
 add_executable(kvlite_wb_test
     test_write_buffer.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/memtable.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
@@ -260,7 +260,7 @@ add_executable(kvlite_entry_stream_test
     test_entry_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/entry_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
-    ${CMAKE_SOURCE_DIR}/src/internal/write_buffer.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/memtable.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
 
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp

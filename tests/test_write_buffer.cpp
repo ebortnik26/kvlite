@@ -12,12 +12,12 @@
 #include "internal/crc32.h"
 #include "internal/delta_hash_table.h"
 #include "internal/segment.h"
-#include "internal/write_buffer.h"
+#include "internal/memtable.h"
 
-using kvlite::internal::WriteBuffer;
+using kvlite::internal::Memtable;
 
-TEST(WriteBuffer, PutAndGetSingleEntry) {
-    WriteBuffer wb;
+TEST(Memtable, PutAndGetSingleEntry) {
+    Memtable wb;
     wb.put("key1", 1, "value1", false);
 
     std::string value;
@@ -29,16 +29,16 @@ TEST(WriteBuffer, PutAndGetSingleEntry) {
     EXPECT_FALSE(tombstone);
 }
 
-TEST(WriteBuffer, GetMissing) {
-    WriteBuffer wb;
+TEST(Memtable, GetMissing) {
+    Memtable wb;
     std::string value;
     uint64_t version;
     bool tombstone;
     EXPECT_FALSE(wb.get("missing", value, version, tombstone));
 }
 
-TEST(WriteBuffer, GetReturnsLatestVersion) {
-    WriteBuffer wb;
+TEST(Memtable, GetReturnsLatestVersion) {
+    Memtable wb;
     wb.put("key1", 1, "v1", false);
     wb.put("key1", 5, "v5", false);
     wb.put("key1", 3, "v3", false);
@@ -52,8 +52,8 @@ TEST(WriteBuffer, GetReturnsLatestVersion) {
     EXPECT_EQ(version, 5u);
 }
 
-TEST(WriteBuffer, Tombstone) {
-    WriteBuffer wb;
+TEST(Memtable, Tombstone) {
+    Memtable wb;
     wb.put("key1", 1, "", true);
 
     std::string value;
@@ -64,8 +64,8 @@ TEST(WriteBuffer, Tombstone) {
     EXPECT_EQ(version, 1u);
 }
 
-TEST(WriteBuffer, GetByVersionExact) {
-    WriteBuffer wb;
+TEST(Memtable, GetByVersionExact) {
+    Memtable wb;
     wb.put("key1", 1, "v1", false);
     wb.put("key1", 3, "v3", false);
     wb.put("key1", 5, "v5", false);
@@ -80,8 +80,8 @@ TEST(WriteBuffer, GetByVersionExact) {
     EXPECT_EQ(version, 3u);
 }
 
-TEST(WriteBuffer, GetByVersionBetween) {
-    WriteBuffer wb;
+TEST(Memtable, GetByVersionBetween) {
+    Memtable wb;
     wb.put("key1", 1, "v1", false);
     wb.put("key1", 3, "v3", false);
     wb.put("key1", 5, "v5", false);
@@ -95,8 +95,8 @@ TEST(WriteBuffer, GetByVersionBetween) {
     EXPECT_EQ(version, 3u);
 }
 
-TEST(WriteBuffer, GetByVersionTooLow) {
-    WriteBuffer wb;
+TEST(Memtable, GetByVersionTooLow) {
+    Memtable wb;
     wb.put("key1", 5, "v5", false);
 
     std::string value;
@@ -105,22 +105,22 @@ TEST(WriteBuffer, GetByVersionTooLow) {
     EXPECT_FALSE(wb.getByVersion("key1", (3ULL << 1) | 1, value, version, tombstone));
 }
 
-TEST(WriteBuffer, GetByVersionMissingKey) {
-    WriteBuffer wb;
+TEST(Memtable, GetByVersionMissingKey) {
+    Memtable wb;
     std::string value;
     uint64_t version;
     bool tombstone;
     EXPECT_FALSE(wb.getByVersion("missing", (100ULL << 1) | 1, value, version, tombstone));
 }
 
-TEST(WriteBuffer, ForEach) {
-    WriteBuffer wb;
+TEST(Memtable, ForEach) {
+    Memtable wb;
     wb.put("a", 1, "va", false);
     wb.put("b", 2, "vb", false);
     wb.put("a", 3, "va2", false);
 
     std::vector<std::pair<std::string, size_t>> collected;
-    wb.forEach([&](const std::string& key, const std::vector<WriteBuffer::Entry>& entries) {
+    wb.forEach([&](const std::string& key, const std::vector<Memtable::Entry>& entries) {
         collected.push_back({key, entries.size()});
     });
 
@@ -134,8 +134,8 @@ TEST(WriteBuffer, ForEach) {
     EXPECT_EQ(collected[1].second, 1u);
 }
 
-TEST(WriteBuffer, ClearResetsEverything) {
-    WriteBuffer wb;
+TEST(Memtable, ClearResetsEverything) {
+    Memtable wb;
     wb.put("key1", 1, "v1", false);
     wb.put("key2", 2, "v2", false);
 
@@ -157,8 +157,8 @@ TEST(WriteBuffer, ClearResetsEverything) {
     EXPECT_FALSE(wb.get("key1", value, version, tombstone));
 }
 
-TEST(WriteBuffer, Statistics) {
-    WriteBuffer wb;
+TEST(Memtable, Statistics) {
+    Memtable wb;
     EXPECT_TRUE(wb.empty());
     EXPECT_EQ(wb.keyCount(), 0u);
     EXPECT_EQ(wb.entryCount(), 0u);
@@ -177,8 +177,8 @@ TEST(WriteBuffer, Statistics) {
     EXPECT_EQ(wb.entryCount(), 3u);
 }
 
-TEST(WriteBuffer, ManyKeys) {
-    WriteBuffer wb;
+TEST(Memtable, ManyKeys) {
+    Memtable wb;
     const int N = 10000;
     for (int i = 0; i < N; ++i) {
         wb.put("key_" + std::to_string(i), static_cast<uint64_t>(i), "val_" + std::to_string(i), false);
@@ -195,8 +195,8 @@ TEST(WriteBuffer, ManyKeys) {
     EXPECT_EQ(version, 42u);
 }
 
-TEST(WriteBuffer, ConcurrentPuts) {
-    WriteBuffer wb;
+TEST(Memtable, ConcurrentPuts) {
+    Memtable wb;
     const int kThreads = 4;
     const int kPerThread = 5000;
 
@@ -226,8 +226,8 @@ TEST(WriteBuffer, ConcurrentPuts) {
     }
 }
 
-TEST(WriteBuffer, ConcurrentPutsSameKey) {
-    WriteBuffer wb;
+TEST(Memtable, ConcurrentPutsSameKey) {
+    Memtable wb;
     const int kThreads = 4;
     const int kPerThread = 1000;
 
@@ -248,13 +248,13 @@ TEST(WriteBuffer, ConcurrentPutsSameKey) {
 
 // --- putBatch tests ------------------------------------------------------
 
-TEST(WriteBuffer, PutBatchSameVersion) {
-    WriteBuffer wb;
+TEST(Memtable, PutBatchSameVersion) {
+    Memtable wb;
 
     std::string k1 = "alpha", k2 = "beta", k3 = "gamma";
     std::string v1 = "a_val", v2 = "b_val", v3 = "g_val";
 
-    std::vector<WriteBuffer::BatchOp> ops = {
+    std::vector<Memtable::BatchOp> ops = {
         {&k1, &v1, false},
         {&k2, &v2, false},
         {&k3, &v3, true},
@@ -285,8 +285,8 @@ TEST(WriteBuffer, PutBatchSameVersion) {
     EXPECT_TRUE(tombstone);
 }
 
-TEST(WriteBuffer, PutBatchKeyCountWithExisting) {
-    WriteBuffer wb;
+TEST(Memtable, PutBatchKeyCountWithExisting) {
+    Memtable wb;
     // Pre-populate a key.
     wb.put("alpha", 1, "old", false);
     EXPECT_EQ(wb.keyCount(), 1u);
@@ -295,7 +295,7 @@ TEST(WriteBuffer, PutBatchKeyCountWithExisting) {
     std::string k1 = "alpha", k2 = "beta";
     std::string v1 = "new", v2 = "b";
 
-    std::vector<WriteBuffer::BatchOp> ops = {
+    std::vector<Memtable::BatchOp> ops = {
         {&k1, &v1, false},
         {&k2, &v2, false},
     };
@@ -313,17 +313,17 @@ TEST(WriteBuffer, PutBatchKeyCountWithExisting) {
     EXPECT_EQ(version, 10u);
 }
 
-TEST(WriteBuffer, PutBatchEmpty) {
-    WriteBuffer wb;
-    std::vector<WriteBuffer::BatchOp> ops;
+TEST(Memtable, PutBatchEmpty) {
+    Memtable wb;
+    std::vector<Memtable::BatchOp> ops;
     wb.putBatch(ops, 1);  // should be a no-op
     EXPECT_EQ(wb.entryCount(), 0u);
 }
 
-TEST(WriteBuffer, PutBatchConcurrentWritersSameVersion) {
+TEST(Memtable, PutBatchConcurrentWritersSameVersion) {
     // Multiple threads write batches to disjoint key sets concurrently.
     // After all threads finish, verify that each batch's keys share one version.
-    WriteBuffer wb;
+    Memtable wb;
     const int kThreads = 4;
     const int kBatchesPerThread = 200;
     const int kKeysPerBatch = 5;
@@ -343,7 +343,7 @@ TEST(WriteBuffer, PutBatchConcurrentWritersSameVersion) {
                 vals[k] = "v" + std::to_string(k);
             }
 
-            std::vector<WriteBuffer::BatchOp> ops;
+            std::vector<Memtable::BatchOp> ops;
             ops.reserve(kKeysPerBatch);
             for (int k = 0; k < kKeysPerBatch; ++k) {
                 ops.push_back({&keys[k], &vals[k], false});
@@ -382,12 +382,12 @@ TEST(WriteBuffer, PutBatchConcurrentWritersSameVersion) {
     }
 }
 
-TEST(WriteBuffer, PutBatchMonotonicVisibility) {
+TEST(Memtable, PutBatchMonotonicVisibility) {
     // With two-phase locking, a concurrent reader doing sequential get()
     // calls should see monotonically non-decreasing versions for keys
     // from the same batch group, because putBatch makes all entries
     // visible simultaneously.
-    WriteBuffer wb;
+    Memtable wb;
 
     const int kIterations = 3000;
     std::atomic<bool> stop{false};
@@ -397,7 +397,7 @@ TEST(WriteBuffer, PutBatchMonotonicVisibility) {
         std::string k1 = "x1", k2 = "x2", k3 = "x3";
         for (int i = 1; i <= kIterations && !violation; ++i) {
             std::string v = std::to_string(i);
-            std::vector<WriteBuffer::BatchOp> ops = {
+            std::vector<Memtable::BatchOp> ops = {
                 {&k1, &v, false},
                 {&k2, &v, false},
                 {&k3, &v, false},
@@ -526,7 +526,7 @@ protected:
 } // namespace
 
 TEST_F(FlushTest, EmptyBuffer) {
-    WriteBuffer wb;
+    Memtable wb;
     auto result = wb.flush(seg_);
     ASSERT_TRUE(result.status.ok());
     EXPECT_EQ(seg_.dataSize(), 0u);
@@ -534,7 +534,7 @@ TEST_F(FlushTest, EmptyBuffer) {
 }
 
 TEST_F(FlushTest, SingleEntry) {
-    WriteBuffer wb;
+    Memtable wb;
     wb.put("hello", 42, "world", false);
 
     auto result = wb.flush(seg_);
@@ -561,7 +561,7 @@ TEST_F(FlushTest, SingleEntry) {
 }
 
 TEST_F(FlushTest, TombstoneEntry) {
-    WriteBuffer wb;
+    Memtable wb;
     wb.put("deleted", 7, "", true);
 
     auto result = wb.flush(seg_);
@@ -576,7 +576,7 @@ TEST_F(FlushTest, TombstoneEntry) {
 }
 
 TEST_F(FlushTest, SortOrderHashThenVersion) {
-    WriteBuffer wb;
+    Memtable wb;
     // Insert multiple keys with multiple versions
     wb.put("aaa", 10, "v10", false);
     wb.put("bbb", 5, "v5", false);
@@ -611,7 +611,7 @@ TEST_F(FlushTest, SortOrderHashThenVersion) {
 }
 
 TEST_F(FlushTest, RoundTrip) {
-    WriteBuffer wb;
+    Memtable wb;
     wb.put("key1", 1, "val1", false);
     wb.put("key1", 2, "val2", false);
     wb.put("key2", 3, "val3", true);
@@ -677,7 +677,7 @@ TEST_F(FlushTest, RoundTrip) {
 }
 
 TEST_F(FlushTest, SealAndOpen) {
-    WriteBuffer wb;
+    Memtable wb;
     wb.put("alpha", 1, "v1", false);
     wb.put("alpha", 2, "v2", false);
     wb.put("beta", 10, "vb", true);

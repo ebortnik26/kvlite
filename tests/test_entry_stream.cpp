@@ -13,7 +13,7 @@
 #include "internal/log_file.h"
 #include "internal/manifest.h"
 #include "internal/segment.h"
-#include "internal/write_buffer.h"
+#include "internal/memtable.h"
 
 using namespace kvlite::internal;
 using kvlite::Status;
@@ -385,15 +385,15 @@ TEST_F(EntryStreamTest, Classify_AllEliminate) {
     EXPECT_FALSE(classified->valid());
 }
 
-// --- ScanWriteBuffer Tests ---
+// --- ScanMemtable Tests ---
 
-TEST(ScanWriteBufferTest, Basic) {
-    WriteBuffer wb;
+TEST(ScanMemtableTest, Basic) {
+    Memtable wb;
     wb.put("key1", 1, "val1", false);
     wb.put("key2", 2, "val2", false);
 
     // Packed snapshot bound: (logical_version << 1) | 1
-    auto s = stream::scanWriteBuffer(wb, (2ULL << 1) | 1);
+    auto s = stream::scanMemtable(wb, (2ULL << 1) | 1);
 
     std::vector<std::string> keys;
     while (s->valid()) {
@@ -404,14 +404,14 @@ TEST(ScanWriteBufferTest, Basic) {
     EXPECT_EQ(keys.size(), 2u);
 }
 
-TEST(ScanWriteBufferTest, SnapshotBound) {
-    WriteBuffer wb;
+TEST(ScanMemtableTest, SnapshotBound) {
+    Memtable wb;
     wb.put("key1", 1, "val1", false);
     wb.put("key2", 5, "val2", false);
     wb.put("key3", 10, "val3", false);
 
     // Only entries with version <= 5 should be included.
-    auto s = stream::scanWriteBuffer(wb, (5ULL << 1) | 1);
+    auto s = stream::scanMemtable(wb, (5ULL << 1) | 1);
 
     std::vector<std::string> keys;
     while (s->valid()) {
@@ -422,13 +422,13 @@ TEST(ScanWriteBufferTest, SnapshotBound) {
     EXPECT_EQ(keys.size(), 2u);
 }
 
-TEST(ScanWriteBufferTest, LatestPerKey) {
-    WriteBuffer wb;
+TEST(ScanMemtableTest, LatestPerKey) {
+    Memtable wb;
     wb.put("key1", 1, "v1", false);
     wb.put("key1", 3, "v3", false);
     wb.put("key1", 5, "v5", false);
 
-    auto s = stream::scanWriteBuffer(wb, (5ULL << 1) | 1);
+    auto s = stream::scanMemtable(wb, (5ULL << 1) | 1);
 
     ASSERT_TRUE(s->valid());
     EXPECT_EQ(s->entry().key, "key1");
@@ -439,14 +439,14 @@ TEST(ScanWriteBufferTest, LatestPerKey) {
     EXPECT_FALSE(s->valid());
 }
 
-TEST(ScanWriteBufferTest, LatestPerKeyWithSnapshotBound) {
-    WriteBuffer wb;
+TEST(ScanMemtableTest, LatestPerKeyWithSnapshotBound) {
+    Memtable wb;
     wb.put("key1", 1, "v1", false);
     wb.put("key1", 3, "v3", false);
     wb.put("key1", 5, "v5", false);
 
     // Only versions <= 3 visible.
-    auto s = stream::scanWriteBuffer(wb, (3ULL << 1) | 1);
+    auto s = stream::scanMemtable(wb, (3ULL << 1) | 1);
 
     ASSERT_TRUE(s->valid());
     EXPECT_EQ(s->entry().key, "key1");
@@ -457,19 +457,19 @@ TEST(ScanWriteBufferTest, LatestPerKeyWithSnapshotBound) {
     EXPECT_FALSE(s->valid());
 }
 
-TEST(ScanWriteBufferTest, Empty) {
-    WriteBuffer wb;
+TEST(ScanMemtableTest, Empty) {
+    Memtable wb;
 
-    auto s = stream::scanWriteBuffer(wb, (100ULL << 1) | 1);
+    auto s = stream::scanMemtable(wb, (100ULL << 1) | 1);
     EXPECT_FALSE(s->valid());
 }
 
-TEST(ScanWriteBufferTest, Tombstone) {
-    WriteBuffer wb;
+TEST(ScanMemtableTest, Tombstone) {
+    Memtable wb;
     wb.put("key1", 1, "val1", false);
     wb.put("key1", 2, "", true);  // tombstone
 
-    auto s = stream::scanWriteBuffer(wb, (2ULL << 1) | 1);
+    auto s = stream::scanMemtable(wb, (2ULL << 1) | 1);
 
     ASSERT_TRUE(s->valid());
     EXPECT_EQ(s->entry().key, "key1");
@@ -479,14 +479,14 @@ TEST(ScanWriteBufferTest, Tombstone) {
     EXPECT_FALSE(s->valid());
 }
 
-TEST(ScanWriteBufferTest, SortedByHash) {
-    WriteBuffer wb;
+TEST(ScanMemtableTest, SortedByHash) {
+    Memtable wb;
     // Insert multiple keys; stream should yield them in hash order.
     wb.put("alpha", 1, "A", false);
     wb.put("beta", 2, "B", false);
     wb.put("gamma", 3, "G", false);
 
-    auto s = stream::scanWriteBuffer(wb, (3ULL << 1) | 1);
+    auto s = stream::scanMemtable(wb, (3ULL << 1) | 1);
 
     uint64_t prev_hash = 0;
     size_t count = 0;
@@ -499,10 +499,10 @@ TEST(ScanWriteBufferTest, SortedByHash) {
     EXPECT_EQ(count, 3u);
 }
 
-// --- WriteBuffer Pin/Unpin Tests ---
+// --- Memtable Pin/Unpin Tests ---
 
-TEST(WriteBufferPinTest, PinUnpin) {
-    WriteBuffer wb;
+TEST(MemtablePinTest, PinUnpin) {
+    Memtable wb;
     wb.put("key1", 1, "val1", false);
 
     EXPECT_EQ(wb.pinCount(), 0u);

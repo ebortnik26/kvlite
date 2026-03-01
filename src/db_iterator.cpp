@@ -8,6 +8,7 @@
 #include "internal/entry_stream.h"
 #include "internal/global_index.h"
 #include "internal/log_entry.h"
+#include "internal/memtable.h"
 #include "internal/segment.h"
 #include "internal/segment_storage_manager.h"
 #include "internal/write_buffer.h"
@@ -32,8 +33,7 @@ class Iterator::Impl {
 public:
     Impl(DB* db, Snapshot snapshot, bool owns_snapshot)
         : db_(db), snapshot_(snapshot), owns_snapshot_(owns_snapshot) {
-        pinned_wb_ = db_->write_buffer_.get();
-        pinned_wb_->pin();
+        pinned_snap_ = db_->write_buffer_->pinAll();
 
         segment_ids_ = db_->storage_->getSegmentIds();
         for (uint32_t id : segment_ids_) {
@@ -49,8 +49,7 @@ public:
         for (uint32_t id : segment_ids_) {
             db_->storage_->unpinSegment(id);
         }
-        pinned_wb_->unpin();
-        db_->cleanupRetiredBuffers();
+        db_->write_buffer_->unpinAll(pinned_snap_);
         if (owns_snapshot_) {
             db_->releaseSnapshot(snapshot_);
         }
@@ -83,18 +82,16 @@ private:
             if (!seg_stream_ || !seg_stream_->valid()) {
                 if (!openNextSegment()) {
                     phase_ = 1;
-                    wb_stream_ = internal::stream::scanWriteBuffer(
-                        *pinned_wb_, packed_bound);
+                    // Create merged stream from all pinned Memtables.
+                    openNextMemtable();
                     break;
                 }
                 continue;
             }
 
             // Read scalars from the entry ref before next() invalidates it.
-            // Defer string copies: version check is free, key is needed for
-            // WB/GI lookups, value is only needed on the emit path.
             const auto& e = seg_stream_->entry();
-            uint64_t version = e.version();  // logical version
+            uint64_t version = e.version();
 
             // Cheap scalar check — skip without any string copies.
             if (version > snap_ver) {
@@ -107,20 +104,24 @@ private:
             scan_value_.assign(e.value.data(), e.value.size());
             seg_stream_->next();
 
-            // WB precedence: if WB has a version for this key at snapshot,
-            // skip — it will be emitted in Phase 2.
+            // WB precedence: if any pinned Memtable has a version for this key
+            // at snapshot, skip — it will be emitted in Phase 2.
             {
+                bool wb_has_key = false;
                 uint64_t wver;
                 bool wtomb;
-                if (pinned_wb_->getByVersion(scan_key_, packed_bound,
-                                             wb_probe_, wver, wtomb)) {
-                    continue;
+                for (auto* mt : pinned_snap_.memtables) {
+                    if (mt->getByVersion(scan_key_, packed_bound,
+                                         wb_probe_, wver, wtomb)) {
+                        wb_has_key = true;
+                        break;
+                    }
                 }
+                if (wb_has_key) continue;
             }
 
             // GI pertinence: only emit if this segment+version is the
             // pertinent entry for the key in the GlobalIndex.
-            // GI stores packed versions; compare packed forms.
             uint64_t gi_packed_version;
             uint32_t gi_segment_id;
             uint64_t scan_hkey = internal::dhtHashBytes(scan_key_.data(), scan_key_.size());
@@ -144,22 +145,28 @@ private:
             return;
         }
 
-        // Phase 2 — emit WriteBuffer entries pertinent at the snapshot.
-        while (wb_stream_ && wb_stream_->valid()) {
-            const auto& e = wb_stream_->entry();
+        // Phase 2 — emit Memtable entries pertinent at the snapshot.
+        while (true) {
+            // Advance within current stream.
+            while (wb_stream_ && wb_stream_->valid()) {
+                const auto& e = wb_stream_->entry();
 
-            if (e.tombstone()) {
+                if (e.tombstone()) {
+                    wb_stream_->next();
+                    continue;
+                }
+
+                current_key_.assign(e.key.data(), e.key.size());
+                current_value_.assign(e.value.data(), e.value.size());
+                current_version_ = e.version();
                 wb_stream_->next();
-                continue;
+
+                valid_ = true;
+                return;
             }
 
-            current_key_.assign(e.key.data(), e.key.size());
-            current_value_.assign(e.value.data(), e.value.size());
-            current_version_ = e.version();
-            wb_stream_->next();
-
-            valid_ = true;
-            return;
+            // Try next Memtable.
+            if (!openNextMemtable()) break;
         }
 
         valid_ = false;
@@ -180,11 +187,26 @@ private:
         return false;
     }
 
+    bool openNextMemtable() {
+        wb_stream_.reset();
+        uint64_t snap_ver = snapshot_.version();
+        uint64_t packed_bound = (snap_ver << internal::PackedVersion::kVersionShift)
+                               | internal::PackedVersion::kTombstoneMask;
+        while (mt_idx_ < pinned_snap_.memtables.size()) {
+            auto* mt = pinned_snap_.memtables[mt_idx_++];
+            if (mt->empty()) continue;
+            wb_stream_ = mt->createStream(packed_bound);
+            if (wb_stream_->valid()) return true;
+            wb_stream_.reset();
+        }
+        return false;
+    }
+
     DB* db_;
     Snapshot snapshot_;
     bool owns_snapshot_;
 
-    internal::WriteBuffer* pinned_wb_ = nullptr;
+    internal::WriteBuffer::PinnedSnapshot pinned_snap_;
     std::vector<uint32_t> segment_ids_;
 
     // Phase 1: segments
@@ -193,7 +215,8 @@ private:
     uint32_t current_segment_id_ = 0;
     std::unique_ptr<internal::EntryStream> seg_stream_;
 
-    // Phase 2: write buffer
+    // Phase 2: memtables
+    size_t mt_idx_ = 0;
     std::unique_ptr<internal::EntryStream> wb_stream_;
 
     // Reusable buffers — avoid per-entry allocations in the scan loop.

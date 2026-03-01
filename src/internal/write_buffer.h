@@ -1,178 +1,99 @@
 #ifndef KVLITE_INTERNAL_WRITE_BUFFER_H
 #define KVLITE_INTERNAL_WRITE_BUFFER_H
 
-#include <atomic>
+#include <condition_variable>
 #include <cstdint>
-#include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "internal/memtable.h"
 #include "internal/entry_stream.h"
-#include "internal/spinlock.h"
-#include "log_entry.h"
 #include "kvlite/status.h"
 
 namespace kvlite {
 namespace internal {
 
-class Segment;
-
-// In-memory buffer for pending writes before flush to log files.
+// N-way buffered write pipeline with background flush.
 //
-// Layout:
-//   Data buffer  – contiguous, append-only byte array (1 GB default).
-//                  Each record: [key_len:2][value_len:4][packed_version:8][key][value]
-//   Hash index   – contiguous array of 2^k buckets (k=13 → 8192 buckets).
-//                  Each bucket holds fixed-size slots of {fingerprint, offset}.
-//   Overflow     – block-allocated overflow buckets chained from full primaries.
-//
-// Thread-safety: Per-bucket spinlocks protect concurrent put/get operations.
-// forEach() and clear() are called during flush when writes are paused.
+// Manages a mutable Memtable for incoming writes and a queue of immutable
+// Memtables being flushed by a background daemon. When the active Memtable
+// hits capacity, it is sealed (made immutable) and enqueued; a fresh mutable
+// Memtable is created immediately so writes can continue. If all slots are
+// occupied (queue saturated), put() stalls until the daemon frees a slot.
 class WriteBuffer {
 public:
-    struct Entry {
-        PackedVersion pv;
-        std::string value;
+    // Callback invoked by the flush daemon for each immutable Memtable.
+    // Must flush it to storage + GlobalIndex. Called without mu_ held.
+    using FlushFn = std::function<Status(Memtable&)>;
 
-        uint64_t version() const { return pv.version(); }
-        bool tombstone() const { return pv.tombstone(); }
-
-        bool operator<(const Entry& other) const { return pv < other.pv; }
+    struct Options {
+        size_t memtable_size;    // capacity threshold per Memtable
+        uint32_t flush_depth;    // max simultaneous Memtables (default 3)
     };
 
-    WriteBuffer();
+    WriteBuffer(const Options& opts, FlushFn flush_fn);
     ~WriteBuffer();
 
     WriteBuffer(const WriteBuffer&) = delete;
     WriteBuffer& operator=(const WriteBuffer&) = delete;
 
+    // --- Write operations (delegate to active Memtable) ---
+    // Stalls if all flush_depth slots are occupied.
     void put(const std::string& key, uint64_t version,
              const std::string& value, bool tombstone);
+    void putBatch(const std::vector<Memtable::BatchOp>& ops, uint64_t version);
 
-    // Atomic batch insert: all operations share the same version.
-    // Two-phase locking with bucket-ordered acquisition prevents deadlocks.
-    struct BatchOp {
-        const std::string* key;
-        const std::string* value;
-        bool tombstone;
-    };
-    void putBatch(const std::vector<BatchOp>& ops, uint64_t version);
-
-    bool get(const std::string& key,
-             std::string& value, uint64_t& version, bool& tombstone) const;
-
+    // --- Read operations (check active + flushing + immutable queue) ---
     bool getByVersion(const std::string& key, uint64_t upper_bound,
                       std::string& value, uint64_t& version, bool& tombstone) const;
 
-    // Called when writes are paused — no locking.
-    void forEach(const std::function<void(const std::string&,
-                                          const std::vector<Entry>&)>& fn) const;
+    // --- Lifecycle ---
+    // Seal active Memtable and block until all queued flushes complete.
+    void drainFlush();
 
-    void clear();
+    // Memory usage of active Memtable.
+    size_t memoryUsage() const;
+    bool empty() const;
 
-    struct FlushedEntry { uint64_t hkey; uint64_t packed_ver; };
-
-    struct FlushResult {
-        Status status;
-        std::vector<FlushedEntry> entries;
-        uint64_t max_version = 0;  // max logical version across all flushed entries
+    // --- Iterator support ---
+    // Snapshot of pinned Memtables for iteration.
+    struct PinnedSnapshot {
+        std::vector<Memtable*> memtables;  // active first, then immutables oldest-to-newest
     };
 
-    // Flush all entries to a Segment that is already in Writing state.
-    // Writes entries sorted by (hash, version) ascending, records each
-    // in the Segment's SegmentIndex, and seals it.
-    // Returns a vector of (key, packed_ver) pairs ordered by
-    // (hash asc, packed_ver asc) — entries for the same key are adjacent.
-    // The caller uses this to register flushed entries in the GlobalIndex.
-    FlushResult flush(Segment& out);
-
-    // Create a stream of entries visible at snapshot_version.
-    // Thread-safe: locks each bucket during collection.
-    // Returns entries sorted by (hash asc, version asc), deduplicated
-    // per key (only the latest version <= snapshot_version).
-    std::unique_ptr<EntryStream> createStream(uint64_t snapshot_version) const;
-
-    void pin() { pin_count_.fetch_add(1, std::memory_order_relaxed); }
-    void unpin() { pin_count_.fetch_sub(1, std::memory_order_release); }
-    uint32_t pinCount() const { return pin_count_.load(std::memory_order_acquire); }
-
-    const uint8_t* dataPtr() const { return data_.get(); }
-
-    size_t keyCount() const { return key_count_.load(std::memory_order_relaxed); }
-    size_t entryCount() const { return size_.load(std::memory_order_relaxed); }
-    size_t memoryUsage() const { return data_end_.load(std::memory_order_relaxed); }
-    bool empty() const { return size_.load(std::memory_order_relaxed) == 0; }
+    // Pin the active Memtable + all immutable ones for iteration.
+    PinnedSnapshot pinAll();
+    void unpinAll(const PinnedSnapshot& snap);
 
 private:
-    // --- Configuration ---
-    static constexpr uint32_t kBucketBits = 13;
-    static constexpr uint32_t kNumBuckets = 1u << kBucketBits;          // 8192
-    static constexpr size_t kDefaultDataCapacity = 1ULL << 30;          // 1 GB
-    static constexpr uint32_t kSlotsPerBucket = 63;
-    static constexpr size_t kRecordHeaderSize = 14;  // key_len(2) + value_len(4) + pv(8)
+    void maybeSeal();           // seal active if over capacity (must hold mu_)
+    void sealActive();          // move active to immutable queue (must hold mu_)
+    void flushLoop();           // daemon thread function
 
-    // Overflow pool block sizing
-    static constexpr uint32_t kOverflowBlockShift = 10;
-    static constexpr uint32_t kOverflowBlockSize = 1u << kOverflowBlockShift;  // 1024
-    static constexpr uint32_t kMaxOverflowBlocks = 256;  // up to 256K overflow buckets
+    Options opts_;
+    FlushFn flush_fn_;
 
-    // --- Hash index structures ---
+    mutable std::mutex mu_;     // protects active_, immutables_, flushing_, retired_, stop_
+    std::condition_variable flush_cv_;   // signals daemon: new immutable available
+    std::condition_variable stall_cv_;   // signals writers: slot freed after flush
 
-    struct Slot {
-        uint32_t fingerprint;  // lower 32 bits of hash (fast rejection)
-        uint32_t offset;       // byte offset into data buffer
-    };
+    std::unique_ptr<Memtable> active_;
+    std::deque<std::unique_ptr<Memtable>> immutables_;  // FIFO flush queue
 
-    struct Bucket {
-        uint32_t count;     // used slots in this bucket
-        uint32_t overflow;  // 1-based overflow bucket index, 0 = none
-        Slot slots[kSlotsPerBucket];
-    };
-    // sizeof(Bucket) = 8 + 63*8 = 512
+    // Memtable currently being flushed by the daemon (readable but not in immutables_).
+    // Kept here so getByVersion/pinAll can still see it during the flush.
+    Memtable* flushing_ = nullptr;
 
-    // --- Data buffer (append-only) ---
-    std::unique_ptr<uint8_t[]> data_;
-    size_t data_capacity_;
-    std::atomic<size_t> data_end_{0};
+    std::thread flush_thread_;
+    bool stop_ = false;
 
-    // --- Hash index (contiguous) ---
-    std::unique_ptr<Bucket[]> buckets_;
-    std::unique_ptr<Spinlock[]> locks_;
-
-    // --- Overflow pool (block-allocated) ---
-    Bucket* overflow_blocks_[kMaxOverflowBlocks];
-    std::atomic<uint32_t> overflow_count_{0};
-    Spinlock overflow_alloc_lock_;
-
-    // --- Stats ---
-    std::atomic<size_t> size_{0};
-    std::atomic<size_t> key_count_{0};
-    std::atomic<uint32_t> pin_count_{0};
-
-    // --- Helpers ---
-
-    uint32_t bucketIndex(uint64_t hash) const {
-        return static_cast<uint32_t>(hash >> (64 - kBucketBits));
-    }
-
-    uint32_t fingerprint(uint64_t hash) const {
-        return static_cast<uint32_t>(hash);
-    }
-
-    uint32_t appendRecord(const std::string& key, PackedVersion pv,
-                          const std::string& value);
-
-    bool keyMatches(uint32_t offset, const std::string& key) const;
-    PackedVersion readPackedVersion(uint32_t offset) const;
-    void readValue(uint32_t offset, std::string& value) const;
-    std::string readKey(uint32_t offset) const;
-
-    Bucket& getOverflowBucket(uint32_t idx);
-    const Bucket& getOverflowBucket(uint32_t idx) const;
-    uint32_t allocOverflowBucket();
-    void freeOverflow();
+    // Retired Memtables pinned by iterators (unpinned → deleted).
+    std::vector<std::unique_ptr<Memtable>> retired_;
 };
 
 } // namespace internal

@@ -12,6 +12,7 @@
 #include "internal/global_index.h"
 #include "internal/segment_storage_manager.h"
 #include "internal/write_buffer.h"
+#include "internal/memtable.h"
 #include "internal/log_entry.h"
 #include "internal/segment.h"
 
@@ -98,9 +99,40 @@ Status DB::open(const std::string& path, const Options& options) {
         return s;
     }
 
-    // Initialize write buffer and allocate first segment ID
-    write_buffer_ = std::make_unique<internal::WriteBuffer>();
-    current_segment_id_ = storage_->allocateSegmentId();
+    // Initialize write buffer with flush callback.
+    internal::WriteBuffer::Options wb_opts;
+    wb_opts.memtable_size = options.write_buffer_size;
+    wb_opts.flush_depth = options.flush_depth;
+
+    auto flush_fn = [this](internal::Memtable& mt) -> Status {
+        uint32_t seg_id = storage_->allocateSegmentId();
+
+        Status s = storage_->createSegment(seg_id, false);
+        if (!s.ok()) return s;
+
+        auto* seg = storage_->getSegment(seg_id);
+        auto result = mt.flush(*seg);
+        if (!result.status.ok()) return result.status;
+
+        // Hold the savepoint lock for the entire GI batch (stage + commit).
+        {
+            internal::GlobalIndex::BatchGuard guard(*global_index_);
+
+            for (const auto& e : result.entries) {
+                s = global_index_->stagePut(e.hkey, e.packed_ver, seg_id);
+                if (!s.ok()) return s;
+            }
+
+            s = global_index_->commitWB(result.max_version);
+            if (!s.ok()) return s;
+        }
+
+        // Manifest update is the commit point — makes the flush visible.
+        s = storage_->registerSegments({seg_id});
+        return s;
+    };
+
+    write_buffer_ = std::make_unique<internal::WriteBuffer>(wb_opts, flush_fn);
 
     is_open_ = true;
 
@@ -116,9 +148,9 @@ Status DB::close() {
 
     Status s1;
 
-    // Flush write buffer before closing (must happen while is_open_ is true)
+    // Drain all pending flushes before closing.
     if (write_buffer_ && !write_buffer_->empty()) {
-        s1 = flush();
+        write_buffer_->drainFlush();
     }
     write_buffer_.reset();
 
@@ -153,7 +185,6 @@ Status DB::close() {
         manifest_.reset();
     }
 
-    if (!s1.ok()) return s1;
     if (!s2.ok()) return s2;
     if (!s3.ok()) return s3;
     if (!s4.ok()) return s4;
@@ -177,9 +208,8 @@ Status DB::put(const std::string& key, const std::string& value,
     write_buffer_->put(key, version, value, false);
     versions_->commitVersion(version);
 
-    if (options.sync ||
-        write_buffer_->memoryUsage() >= options_.write_buffer_size) {
-        return flush();
+    if (options.sync) {
+        write_buffer_->drainFlush();
     }
     return Status::OK();
 }
@@ -216,7 +246,7 @@ Status DB::resolve(const std::string& key, uint64_t upper_bound,
         return Status::InvalidArgument("Database not open");
     }
 
-    // 1. Check WriteBuffer first.
+    // 1. Check WriteBuffer first (active + immutables).
     if (write_buffer_->getByVersion(key, upper_bound,
                                     result.wb_value, result.wb_version,
                                     result.wb_tombstone)) {
@@ -276,9 +306,8 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
     write_buffer_->put(key, version, "", true);
     versions_->commitVersion(version);
 
-    if (options.sync ||
-        write_buffer_->memoryUsage() >= options_.write_buffer_size) {
-        return flush();
+    if (options.sync) {
+        write_buffer_->drainFlush();
     }
     return Status::OK();
 }
@@ -326,10 +355,10 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
     // All operations in batch get the same version.
     // committed_version_ fence ensures snapshots see all-or-nothing.
     // Two-phase bucket locking inside putBatch() guarantees atomicity
-    // at the WriteBuffer level.
+    // at the Memtable level.
     uint64_t version = versions_->allocateVersion();
 
-    std::vector<internal::WriteBuffer::BatchOp> ops;
+    std::vector<internal::Memtable::BatchOp> ops;
     ops.reserve(batch.operations().size());
     for (const auto& op : batch.operations()) {
         ops.push_back({&op.key, &op.value,
@@ -338,9 +367,8 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
     write_buffer_->putBatch(ops, version);
     versions_->commitVersion(version);
 
-    if (options.sync ||
-        write_buffer_->memoryUsage() >= options_.write_buffer_size) {
-        return flush();
+    if (options.sync) {
+        write_buffer_->drainFlush();
     }
     return Status::OK();
 }
@@ -403,56 +431,8 @@ Status DB::flush() {
         return Status::InvalidArgument("Database not open");
     }
 
-    if (write_buffer_->empty()) {
-        return Status::OK();
-    }
-
-    Status s = storage_->createSegment(current_segment_id_, false);
-    if (!s.ok()) return s;
-
-    auto* seg = storage_->getSegment(current_segment_id_);
-    auto result = write_buffer_->flush(*seg);
-    if (!result.status.ok()) return result.status;
-
-    // Hold the savepoint lock for the entire GI batch (stage + commit).
-    // This blocks savepoints but allows concurrent GC.
-    {
-        internal::GlobalIndex::BatchGuard guard(*global_index_);
-
-        for (const auto& e : result.entries) {
-            s = global_index_->stagePut(e.hkey, e.packed_ver, current_segment_id_);
-            if (!s.ok()) return s;
-        }
-
-        s = global_index_->commitWB(result.max_version);
-        if (!s.ok()) return s;
-    }
-
-    // Manifest update is the commit point — makes the flush visible.
-    s = storage_->registerSegments({current_segment_id_});
-    if (!s.ok()) return s;
-
-    current_segment_id_ = storage_->allocateSegmentId();
-
-    // Clear or retire the write buffer.
-    if (write_buffer_->pinCount() == 0) {
-        write_buffer_->clear();
-    } else {
-        // Iterators are pinning this buffer — retire it and allocate a fresh one.
-        retired_buffers_.push_back(std::move(write_buffer_));
-        write_buffer_ = std::make_unique<internal::WriteBuffer>();
-    }
-
+    write_buffer_->drainFlush();
     return Status::OK();
-}
-
-void DB::cleanupRetiredBuffers() {
-    retired_buffers_.erase(
-        std::remove_if(retired_buffers_.begin(), retired_buffers_.end(),
-                        [](const std::unique_ptr<internal::WriteBuffer>& wb) {
-                            return wb->pinCount() == 0;
-                        }),
-        retired_buffers_.end());
 }
 
 // --- Statistics ---

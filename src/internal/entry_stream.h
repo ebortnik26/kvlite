@@ -14,7 +14,7 @@ namespace kvlite {
 namespace internal {
 
 class LogFile;
-class WriteBuffer;
+class Memtable;
 
 // Abstract base for composable entry streams.
 //
@@ -55,11 +55,11 @@ std::unique_ptr<EntryStream> scan(const LogFile& lf, uint64_t data_size);
 // Wrap any EntryStream, yielding only entries matching the predicate.
 std::unique_ptr<EntryStream> filter(std::unique_ptr<EntryStream> input, Predicate pred);
 
-// Stream entries from an in-memory WriteBuffer, filtered to snapshot_version.
+// Stream entries from an in-memory Memtable, filtered to snapshot_version.
 // Thread-safe: locks each bucket during collection. Returns entries sorted
 // by (hash asc, version asc), deduplicated per key (latest version <= snapshot).
-std::unique_ptr<EntryStream> scanWriteBuffer(
-    const WriteBuffer& wb, uint64_t snapshot_version);
+std::unique_ptr<EntryStream> scanMemtable(
+    const Memtable& mt, uint64_t snapshot_version);
 
 }  // namespace stream
 

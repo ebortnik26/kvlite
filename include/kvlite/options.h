@@ -37,6 +37,11 @@ struct Options {
     // Default: 64MB
     size_t write_buffer_size = 64 * 1024 * 1024;
 
+    // Number of Memtables in the write buffer pipeline (default 3).
+    // 1 mutable + up to (flush_depth - 1) immutable in the flush queue.
+    // Higher values reduce stall probability at the cost of memory.
+    uint32_t flush_depth = 3;
+
     // --- GlobalIndex Options ---
 
     // Seconds between savepoint daemon wake-ups (0 = disable daemon).

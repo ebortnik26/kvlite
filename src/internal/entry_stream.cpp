@@ -8,7 +8,7 @@
 #include "internal/delta_hash_table.h"
 #include "internal/log_entry.h"
 #include "internal/log_file.h"
-#include "internal/write_buffer.h"
+#include "internal/memtable.h"
 
 namespace kvlite {
 namespace internal {
@@ -206,9 +206,9 @@ std::unique_ptr<EntryStream> filter(std::unique_ptr<EntryStream> input, Predicat
     return std::make_unique<FilterStream>(std::move(input), std::move(pred));
 }
 
-std::unique_ptr<EntryStream> scanWriteBuffer(
-    const WriteBuffer& wb, uint64_t snapshot_version) {
-    return wb.createStream(snapshot_version);
+std::unique_ptr<EntryStream> scanMemtable(
+    const Memtable& mt, uint64_t snapshot_version) {
+    return mt.createStream(snapshot_version);
 }
 
 }  // namespace stream

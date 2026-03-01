@@ -138,7 +138,6 @@ private:
                    ResolveResult& result);
 
     Status flush();
-    void cleanupRetiredBuffers();
 
     void startGCLoop();
     void stopGCLoop();
@@ -159,8 +158,6 @@ private:
     std::unique_ptr<internal::GlobalIndex> global_index_;
     std::unique_ptr<internal::SegmentStorageManager> storage_;
     std::unique_ptr<internal::WriteBuffer> write_buffer_;
-    std::vector<std::unique_ptr<internal::WriteBuffer>> retired_buffers_;
-    uint32_t current_segment_id_ = 0;
     bool is_open_ = false;
 
     std::thread gc_thread_;

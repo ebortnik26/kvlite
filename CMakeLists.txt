@@ -36,6 +36,7 @@ set(KVLITE_SOURCES
     src/internal/global_index.cpp
     src/internal/segment_index.cpp
     src/internal/version_manager.cpp
+    src/internal/memtable.cpp
     src/internal/write_buffer.cpp
     src/internal/log_file.cpp
     src/internal/segment.cpp
