@@ -149,7 +149,6 @@ private:
     std::vector<std::unique_ptr<internal::WriteBuffer>> retired_buffers_;
     uint32_t current_segment_id_ = 0;
     bool is_open_ = false;
-    bool clean_close_persisted_ = true;
 
 };
 

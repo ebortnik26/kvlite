@@ -1,5 +1,5 @@
-#ifndef KVLITE_INTERNAL_L2_INDEX_H
-#define KVLITE_INTERNAL_L2_INDEX_H
+#ifndef KVLITE_INTERNAL_SEGMENT_INDEX_H
+#define KVLITE_INTERNAL_SEGMENT_INDEX_H
 
 #include <cstdint>
 #include <functional>
@@ -88,4 +88,4 @@ private:
 }  // namespace internal
 }  // namespace kvlite
 
-#endif  // KVLITE_INTERNAL_L2_INDEX_H
+#endif  // KVLITE_INTERNAL_SEGMENT_INDEX_H

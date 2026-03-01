@@ -5,22 +5,37 @@
 #include <map>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include "kvlite/status.h"
 
 namespace kvlite {
 namespace internal {
 
-// Manifest: Append-only changelog for DB-level metadata.
+// All manifest keys, centralized for discoverability.
+enum class ManifestKey {
+    kVmNextVersionBlock,   // "vm.next_version_block"
+    kSegmentsMinSegId,     // "segments.min_seg_id"
+    kSegmentsMaxSegId,     // "segments.max_seg_id"
+    kGiWalMinFileId,       // "gi.wal.min_file_id"
+    kGiWalMaxFileId,       // "gi.wal.max_file_id"
+    kGiSavepointMaxVersion, // "gi.savepoint.max_version"
+};
+
+const char* manifestKeyStr(ManifestKey key);
+
+// Manifest: persistent key-value map for DB-level metadata.
 //
-// Each record is a CRC-protected key-value mutation. On recovery the log is
-// replayed to rebuild an in-memory std::map. compact() atomically rewrites
-// the full state as a snapshot.
+// Conceptually has two sections: Data (one entry per key) and Log (appended
+// mutations). set() appends to the log. get() is served from the in-memory
+// map (log supersedes data). compact() replays the log into data, creates a
+// new file, and switches to it atomically.
+//
+// open() calls compact() after recovery. DB::close() calls compact() before
+// close(). Every set() is followed by fdatasync.
 //
 // File layout:
 //   [magic:4 = "MNFT"] [format_version:4 = 1]     -- header (8 bytes)
-//   [record 0] [record 1] ...                      -- records
+//   [record 0] [record 1] ...                      -- records (data, then log)
 //
 // Record format:
 //   [record_len:4][type:1][key_len:2][value_len:4][key][value][crc32:4]
@@ -48,32 +63,28 @@ public:
     Status close();
     bool isOpen() const;
 
-    // --- Read ---
+    // --- Read (served from in-memory map) ---
 
     bool get(const std::string& key, std::string& value) const;
-    std::vector<std::string> getKeysWithPrefix(const std::string& prefix) const;
+    bool get(ManifestKey key, std::string& value) const;
 
-    // --- Write (append record + update in-memory map) ---
+    // --- Write (append record + fdatasync + update in-memory map) ---
 
     Status set(const std::string& key, const std::string& value);
-    Status remove(const std::string& key);
-    Status sync();
+    Status set(ManifestKey key, const std::string& value);
 
     // --- Maintenance ---
 
     Status compact();
 
 private:
-    enum RecordType : uint8_t {
-        kSet = 1,
-        kDelete = 2,
-    };
+    static constexpr uint8_t kRecordTypeSet = 1;
 
     Status recover();
+    Status compactUnlocked();
     Status writeHeader(int fd);
     Status validateHeader(int fd);
-    Status appendRecord(RecordType type, const std::string& key,
-                        const std::string& value);
+    Status appendRecord(const std::string& key, const std::string& value);
 
     std::string manifestPath() const;
     std::string manifestTmpPath() const;

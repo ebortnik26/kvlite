@@ -22,19 +22,23 @@ GlobalIndexWAL::~GlobalIndexWAL() {
 
 void GlobalIndexWAL::loadManifestState() {
     std::string val;
-    if (manifest_->get(next_file_id_key_, val)) {
-        next_file_id_ = static_cast<uint32_t>(std::stoul(val));
-    } else {
-        next_file_id_ = 0;
+    has_files_ = false;
+    file_ids_.clear();
+
+    if (manifest_->get(ManifestKey::kGiWalMinFileId, val)) {
+        min_file_id_ = static_cast<uint32_t>(std::stoul(val));
+        has_files_ = true;
+    }
+    if (manifest_->get(ManifestKey::kGiWalMaxFileId, val)) {
+        max_file_id_ = static_cast<uint32_t>(std::stoul(val));
+        has_files_ = true;
     }
 
-    file_ids_.clear();
-    auto keys = manifest_->getKeysWithPrefix(file_prefix_);
-    for (const auto& key : keys) {
-        std::string id_str = key.substr(file_prefix_.size());
-        file_ids_.push_back(static_cast<uint32_t>(std::stoul(id_str)));
+    if (has_files_) {
+        for (uint32_t id = min_file_id_; id <= max_file_id_; ++id) {
+            file_ids_.push_back(id);
+        }
     }
-    std::sort(file_ids_.begin(), file_ids_.end());
 }
 
 Status GlobalIndexWAL::openActiveFile() {
@@ -58,9 +62,6 @@ Status GlobalIndexWAL::openActiveFile() {
     current_file_id_ = id;
     file_ids_.push_back(id);
 
-    s = manifest_->set(file_prefix_ + std::to_string(id), "");
-    if (!s.ok()) return s;
-
     return wal_.create(walFilePath(dir, id));
 }
 
@@ -69,8 +70,6 @@ Status GlobalIndexWAL::open(const std::string& db_path, Manifest& manifest,
     db_path_ = db_path;
     manifest_ = &manifest;
     options_ = options;
-    next_file_id_key_ = "gi.wal.next_file_id";
-    file_prefix_ = "gi.wal.file.";
 
     ::mkdir((db_path + "/gi").c_str(), 0755);
     ::mkdir(walDir().c_str(), 0755);
@@ -105,10 +104,6 @@ Status GlobalIndexWAL::close() {
             }
         }
     }
-    // Persist the active file's max_version to Manifest.
-    manifest_->set(file_prefix_ + std::to_string(current_file_id_),
-                   std::to_string(wal_.maxVersion()));
-
     wal_.abort();
     return wal_.close();
 }
@@ -210,23 +205,14 @@ Status GlobalIndexWAL::flushProducer(uint8_t producer_id) {
 Status GlobalIndexWAL::rollover() {
     // Accumulate size of the file we're closing.
     total_size_ += wal_.size();
-
-    // Persist the closing file's max_version to Manifest.
     uint64_t closing_max = wal_.maxVersion();
-    Status s = manifest_->set(file_prefix_ + std::to_string(current_file_id_),
-                              std::to_string(closing_max));
+
+    Status s = wal_.close();
     if (!s.ok()) return s;
 
-    s = wal_.close();
-    if (!s.ok()) return s;
-
-    // Allocate a new file ID.
+    // Allocate a new file ID and update max in Manifest.
     uint32_t new_id;
     s = allocateFileId(new_id);
-    if (!s.ok()) return s;
-
-    // Register in Manifest.
-    s = manifest_->set(file_prefix_ + std::to_string(new_id), "");
     if (!s.ok()) return s;
 
     // Create the new file and inherit the running max_version.
@@ -239,8 +225,18 @@ Status GlobalIndexWAL::rollover() {
 }
 
 Status GlobalIndexWAL::allocateFileId(uint32_t& file_id) {
-    file_id = next_file_id_++;
-    return manifest_->set(next_file_id_key_, std::to_string(next_file_id_));
+    if (!has_files_) {
+        file_id = 0;
+        min_file_id_ = 0;
+        max_file_id_ = 0;
+        has_files_ = true;
+        Status s = manifest_->set(ManifestKey::kGiWalMinFileId, "0");
+        if (!s.ok()) return s;
+        return manifest_->set(ManifestKey::kGiWalMaxFileId, "0");
+    }
+    file_id = max_file_id_ + 1;
+    max_file_id_ = file_id;
+    return manifest_->set(ManifestKey::kGiWalMaxFileId, std::to_string(file_id));
 }
 
 std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
@@ -250,23 +246,14 @@ std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
 Status GlobalIndexWAL::startNewFile() {
     // Accumulate size of the file we're closing.
     total_size_ += wal_.size();
-
-    // Persist the closing file's max_version to Manifest.
     uint64_t closing_max = wal_.maxVersion();
-    Status s = manifest_->set(file_prefix_ + std::to_string(current_file_id_),
-                              std::to_string(closing_max));
-    if (!s.ok()) return s;
 
-    s = wal_.close();
+    Status s = wal_.close();
     if (!s.ok()) return s;
 
     // Allocate a new file ID.
     uint32_t new_id;
     s = allocateFileId(new_id);
-    if (!s.ok()) return s;
-
-    // Register in Manifest and create.
-    s = manifest_->set(file_prefix_ + std::to_string(new_id), "");
     if (!s.ok()) return s;
 
     current_file_id_ = new_id;
@@ -292,6 +279,8 @@ Status GlobalIndexWAL::truncate() {
 }
 
 Status GlobalIndexWAL::truncate(uint64_t cutoff_version) {
+    (void)cutoff_version;
+
     // Clear staging buffers.
     for (auto& p : producers_) {
         p.data.clear();
@@ -299,46 +288,21 @@ Status GlobalIndexWAL::truncate(uint64_t cutoff_version) {
     }
     wal_.abort();
 
-    // Delete obsolete WAL files (all except the active file)
-    // whose max_version <= cutoff_version.
+    // Delete all closed WAL files (all except the active file).
     std::string dir = walDir();
-    std::vector<uint32_t> kept;
-    for (uint32_t fid : file_ids_) {
-        if (fid == current_file_id_) {
-            kept.push_back(fid);
-            continue;
-        }
-
-        // Read max_version from Manifest.
-        std::string key = file_prefix_ + std::to_string(fid);
-        std::string val;
-        uint64_t file_max = 0;
-        if (manifest_->get(key, val) && !val.empty()) {
-            file_max = std::stoull(val);
-        }
-
-        if (file_max <= cutoff_version) {
-            // Delete file from disk.
-            std::string path = walFilePath(dir, fid);
-            std::remove(path.c_str());
-            // Remove from Manifest.
-            manifest_->remove(key);
-        } else {
-            kept.push_back(fid);
-        }
-    }
-    file_ids_ = std::move(kept);
-    total_size_ = 0;
-
-    // Recompute total_size_ from remaining closed files.
     for (uint32_t fid : file_ids_) {
         if (fid == current_file_id_) continue;
-        struct stat st;
-        if (::stat(walFilePath(dir, fid).c_str(), &st) == 0) {
-            total_size_ += static_cast<uint64_t>(st.st_size);
-        }
+        std::string path = walFilePath(dir, fid);
+        std::remove(path.c_str());
     }
 
+    // Update range: only the active file remains.
+    file_ids_.clear();
+    file_ids_.push_back(current_file_id_);
+    min_file_id_ = current_file_id_;
+    manifest_->set(ManifestKey::kGiWalMinFileId, std::to_string(min_file_id_));
+
+    total_size_ = 0;
     return Status::OK();
 }
 

@@ -111,21 +111,21 @@ TEST_F(VersionManagerTest, BlockBoundaryPersistence) {
 
         // Check manifest: should contain "4".
         std::string val;
-        ASSERT_TRUE(manifest_->get("next_version_id", val));
+        ASSERT_TRUE(manifest_->get(ManifestKey::kVmNextVersionBlock, val));
         EXPECT_EQ(val, "4");
 
         // Allocate versions 2, 3, 4: all <= 4, no new persist.
         v = vm_->allocateVersion(); EXPECT_EQ(v, 2u); vm_->commitVersion(v);
         v = vm_->allocateVersion(); EXPECT_EQ(v, 3u); vm_->commitVersion(v);
         v = vm_->allocateVersion(); EXPECT_EQ(v, 4u); vm_->commitVersion(v);
-        ASSERT_TRUE(manifest_->get("next_version_id", val));
+        ASSERT_TRUE(manifest_->get(ManifestKey::kVmNextVersionBlock, val));
         EXPECT_EQ(val, "4");
 
         // Allocate version 5: exceeds 4, should persist 8.
         v = vm_->allocateVersion();
         EXPECT_EQ(v, 5u);
         vm_->commitVersion(v);
-        ASSERT_TRUE(manifest_->get("next_version_id", val));
+        ASSERT_TRUE(manifest_->get(ManifestKey::kVmNextVersionBlock, val));
         EXPECT_EQ(val, "8");
 
         // Simulate crash: do NOT call close() — just close the manifest.

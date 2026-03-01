@@ -1,5 +1,5 @@
-#ifndef KVLITE_INTERNAL_L1_INDEX_H
-#define KVLITE_INTERNAL_L1_INDEX_H
+#ifndef KVLITE_INTERNAL_GLOBAL_INDEX_H
+#define KVLITE_INTERNAL_GLOBAL_INDEX_H
 
 #include <cstdint>
 #include <functional>
@@ -29,27 +29,27 @@ class Manifest;
 //
 // The GlobalIndex is always fully loaded in memory. It is persisted via:
 // 1. WAL (append-only delta log for crash recovery)
-// 2. Periodic snapshots (full dump every N updates + on shutdown)
+// 2. Periodic savepoints (full dump every N updates + on shutdown)
 //
 // Thread-safety: Index operations are thread-safe via per-bucket spinlocks
 // in the underlying DeltaHashTable. Lifecycle methods (open/recover/close)
 // must be called from a single thread.
 //
-// Snapshot locking: snapshot() takes an exclusive lock on snapshot_mu_ to
-// block WB flush and GC writes. Normal reads are unaffected (per-bucket
+// Savepoint locking: storeSavepoint() takes an exclusive lock on savepoint_mu_
+// to block WB flush and GC writes. Normal reads are unaffected (per-bucket
 // spinlocks suffice). Writers (put/relocate/eliminate) and commit methods
-// take a shared lock on snapshot_mu_.
+// take a shared lock on savepoint_mu_.
 class GlobalIndex {
 public:
     struct Options {
-        // Number of updates before auto-snapshot (0 = disabled)
-        uint64_t snapshot_interval = 10'000'000;
+        // Number of updates before auto-savepoint (0 = disabled)
+        uint64_t savepoint_interval = 1ULL << 24;
 
         // Sync WAL to disk on every write (slower but more durable)
         bool sync_writes = false;
 
-        // Number of threads for parallel binary snapshot writes
-        uint32_t snapshot_threads = 4;
+        // Number of threads for parallel binary savepoint writes
+        uint32_t savepoint_threads = 4;
     };
 
     explicit GlobalIndex(Manifest& manifest);
@@ -103,26 +103,25 @@ public:
     Status commitWB(uint64_t max_version);
     Status commitGC();
 
-    // --- Binary snapshot ---
+    // --- Savepoint ---
 
-    // Takes exclusive lock on snapshot_mu_, records snapshot_version in Manifest,
-    // writes binary v9 snapshot to disk, truncates WAL, resets update counter.
-    // snapshot_version is the DB version at the time of snapshot (from VersionManager).
-    Status storeSnapshot(uint64_t snapshot_version);
+    // Takes exclusive lock on savepoint_mu_, writes binary v9 savepoint to
+    // disk, persists max_version to Manifest, truncates WAL, resets counter.
+    Status storeSavepoint(uint64_t snapshot_version);
 
     // --- Statistics ---
 
     size_t keyCount() const;
     size_t entryCount() const;
     size_t memoryUsage() const;
-    uint64_t updatesSinceSnapshot() const;
+    uint64_t updatesSinceSavepoint() const;
 
     // --- Persistence (low-level) ---
 
-    Status saveSnapshot(const std::string& path) const;
-    Status loadSnapshot(const std::string& path);
+    Status saveSavepoint(const std::string& path) const;
+    Status loadSavepoint(const std::string& path);
 
-    // v7 snapshot file format (hash-based, single file):
+    // v7 savepoint file format (hash-based, single file):
     // [magic: 4 bytes]["L1IX"]
     // [format_version: 4 bytes][7]
     // [num_entries: 8 bytes]
@@ -133,14 +132,14 @@ public:
     //   [segment_id: 4 bytes]
     // [checksum: 4 bytes]
     //
-    // v9 snapshot format (binary, multi-file):
+    // v9 savepoint format (binary, multi-file):
     // Directory at <db_path>/gi/snapshot.v9/ with numbered files.
     // Each file contains a contiguous range of main arena buckets.
     // The last file also contains all extension slot data.
-    // See saveBinarySnapshot() / loadBinarySnapshot() for details.
+    // See saveBinarySavepoint() / loadBinarySavepoint() for details.
 
 private:
-    // --- Core DHT mutations (no WAL, no snapshot counter) ---
+    // --- Core DHT mutations (no WAL, no savepoint counter) ---
     // Used by both the public API (which also writes to WAL) and WAL replay.
     void applyPut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
     void applyRelocate(uint64_t hkey, uint64_t packed_version,
@@ -149,43 +148,43 @@ private:
                         uint32_t segment_id);
 
     Status recover();
-    Status maybeSnapshot();
-    std::string snapshotPath() const;       // v7 single file path
-    std::string snapshotDirV9() const;      // v9 directory path
+    Status maybeSavepoint();
+    std::string savepointPath() const;       // v7 single file path
+    std::string savepointDirV9() const;      // v9 directory path
 
-    // v9 binary snapshot — write
-    Status saveBinarySnapshot(const std::string& dir) const;
+    // v9 binary savepoint — write
+    Status saveBinarySavepoint(const std::string& dir) const;
 
-    struct SnapshotFileDesc {
+    struct SavepointFileDesc {
         uint32_t file_index;
         uint32_t bucket_start;
         uint32_t bucket_count;
         bool is_last;
     };
 
-    std::vector<SnapshotFileDesc> computeFileLayout() const;
-    Status writeSnapshotFile(const std::string& dir,
-                             const SnapshotFileDesc& fd) const;
+    std::vector<SavepointFileDesc> computeFileLayout() const;
+    Status writeSavepointFile(const std::string& dir,
+                             const SavepointFileDesc& fd) const;
 
-    // v9 binary snapshot — read
-    Status loadBinarySnapshot(const std::string& dir);
-    Status loadSnapshotFile(const std::string& fpath,
+    // v9 binary savepoint — read
+    Status loadBinarySavepoint(const std::string& dir);
+    Status loadSavepointFile(const std::string& fpath,
                             uint32_t stride,
                             uint64_t& out_entries,
                             uint64_t& out_key_count,
                             uint32_t& out_ext_count);
 
-    // v7 single-file snapshot — read
-    Status loadV7Snapshot(const std::string& path);
+    // v7 single-file savepoint — read
+    Status loadV7Savepoint(const std::string& path);
 
     // --- Data ---
     ReadWriteDeltaHashTable dht_;
     size_t key_count_ = 0;
 
     // --- Concurrency ---
-    // Snapshot mutex: shared for writes (put/relocate/eliminate/commit),
-    // exclusive for snapshot(). Reads don't acquire this lock.
-    mutable std::shared_mutex snapshot_mu_;
+    // Savepoint mutex: shared for writes (put/relocate/eliminate/commit),
+    // exclusive for storeSavepoint(). Reads don't acquire this lock.
+    mutable std::shared_mutex savepoint_mu_;
 
     // --- Lifecycle / persistence ---
     Manifest& manifest_;
@@ -193,11 +192,11 @@ private:
     Options options_;
     bool is_open_ = false;
     std::unique_ptr<GlobalIndexWAL> wal_;
-    uint64_t updates_since_snapshot_ = 0;
+    uint64_t updates_since_savepoint_ = 0;
     uint64_t max_version_ = 0;
 };
 
 } // namespace internal
 } // namespace kvlite
 
-#endif // KVLITE_INTERNAL_L1_INDEX_H
+#endif // KVLITE_INTERNAL_GLOBAL_INDEX_H

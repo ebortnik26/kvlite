@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <vector>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -10,6 +11,18 @@
 
 namespace kvlite {
 namespace internal {
+
+const char* manifestKeyStr(ManifestKey key) {
+    switch (key) {
+        case ManifestKey::kVmNextVersionBlock:   return "vm.next_version_block";
+        case ManifestKey::kSegmentsMinSegId:     return "segments.min_seg_id";
+        case ManifestKey::kSegmentsMaxSegId:     return "segments.max_seg_id";
+        case ManifestKey::kGiWalMinFileId:       return "gi.wal.min_file_id";
+        case ManifestKey::kGiWalMaxFileId:       return "gi.wal.max_file_id";
+        case ManifestKey::kGiSavepointMaxVersion: return "gi.savepoint.max_version";
+    }
+    return "";
+}
 
 Manifest::Manifest() = default;
 
@@ -82,6 +95,16 @@ Status Manifest::open(const std::string& db_path) {
     }
 
     is_open_ = true;
+
+    // Compact on open: replay log into data for fast future recovery.
+    s = compactUnlocked();
+    if (!s.ok()) {
+        ::close(fd_);
+        fd_ = -1;
+        is_open_ = false;
+        return s;
+    }
+
     return Status::OK();
 }
 
@@ -116,45 +139,20 @@ bool Manifest::get(const std::string& key, std::string& value) const {
     return true;
 }
 
-std::vector<std::string> Manifest::getKeysWithPrefix(
-    const std::string& prefix) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<std::string> result;
-    // Use lower_bound to start at the prefix.
-    for (auto it = state_.lower_bound(prefix); it != state_.end(); ++it) {
-        if (it->first.compare(0, prefix.size(), prefix) != 0) {
-            break;
-        }
-        result.push_back(it->first);
-    }
-    return result;
-}
-
 Status Manifest::set(const std::string& key, const std::string& value) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Status s = appendRecord(kSet, key, value);
+    Status s = appendRecord(key, value);
     if (!s.ok()) return s;
     state_[key] = value;
     return Status::OK();
 }
 
-Status Manifest::remove(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    Status s = appendRecord(kDelete, key, "");
-    if (!s.ok()) return s;
-    state_.erase(key);
-    return Status::OK();
+bool Manifest::get(ManifestKey key, std::string& value) const {
+    return get(manifestKeyStr(key), value);
 }
 
-Status Manifest::sync() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (fd_ < 0) {
-        return Status::IOError("Manifest not open");
-    }
-    if (::fdatasync(fd_) != 0) {
-        return Status::IOError("Failed to fdatasync MANIFEST");
-    }
-    return Status::OK();
+Status Manifest::set(ManifestKey key, const std::string& value) {
+    return set(manifestKeyStr(key), value);
 }
 
 Status Manifest::compact() {
@@ -162,7 +160,10 @@ Status Manifest::compact() {
     if (!is_open_) {
         return Status::InvalidArgument("Manifest not open");
     }
+    return compactUnlocked();
+}
 
+Status Manifest::compactUnlocked() {
     std::string tmp_path = manifestTmpPath();
     int tmp_fd = ::open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (tmp_fd < 0) {
@@ -183,7 +184,7 @@ Status Manifest::compact() {
         }
     }
 
-    // Write one SET record per in-memory KV pair.
+    // Write one record per in-memory KV pair (the Data section).
     for (const auto& [key, value] : state_) {
         uint16_t key_len = static_cast<uint16_t>(key.size());
         uint32_t value_len = static_cast<uint32_t>(value.size());
@@ -194,7 +195,7 @@ Status Manifest::compact() {
         size_t payload_size = kRecordHeaderSize + key_len + value_len;
         std::vector<char> payload(payload_size);
         size_t off = 0;
-        payload[off++] = static_cast<char>(kSet);
+        payload[off++] = static_cast<char>(kRecordTypeSet);
         std::memcpy(payload.data() + off, &key_len, 2);
         off += 2;
         std::memcpy(payload.data() + off, &value_len, 4);
@@ -289,8 +290,8 @@ Status Manifest::recover() {
 
         // Parse payload.
         size_t off = 0;
-        auto type = static_cast<RecordType>(buf[off++]);
-        if (type != kSet && type != kDelete) break;
+        uint8_t type = static_cast<uint8_t>(buf[off++]);
+        if (type != kRecordTypeSet) break;
 
         uint16_t key_len;
         std::memcpy(&key_len, buf.data() + off, 2);
@@ -310,11 +311,7 @@ Status Manifest::recover() {
         off += key_len;
         std::string value(buf.data() + off, value_len);
 
-        if (type == kSet) {
-            state_[key] = value;
-        } else {
-            state_.erase(key);
-        }
+        state_[key] = value;
 
         pos += kRecordLenSize + record_len;
         last_valid = pos;
@@ -366,7 +363,7 @@ Status Manifest::validateHeader(int fd) {
     return Status::OK();
 }
 
-Status Manifest::appendRecord(RecordType type, const std::string& key,
+Status Manifest::appendRecord(const std::string& key,
                                const std::string& value) {
     if (fd_ < 0) {
         return Status::IOError("Manifest not open");
@@ -379,7 +376,7 @@ Status Manifest::appendRecord(RecordType type, const std::string& key,
     size_t payload_size = kRecordHeaderSize + key_len + value_len;
     std::vector<char> payload(payload_size);
     size_t off = 0;
-    payload[off++] = static_cast<char>(type);
+    payload[off++] = static_cast<char>(kRecordTypeSet);
     std::memcpy(payload.data() + off, &key_len, 2);
     off += 2;
     std::memcpy(payload.data() + off, &value_len, 4);
@@ -391,7 +388,7 @@ Status Manifest::appendRecord(RecordType type, const std::string& key,
     uint32_t checksum = crc32(payload.data(), payload_size);
     uint32_t record_len = static_cast<uint32_t>(payload_size + kRecordChecksumSize);
 
-    // Write atomically: record_len + payload + crc32
+    // Write: record_len + payload + crc32
     size_t total = kRecordLenSize + payload_size + kRecordChecksumSize;
     std::vector<char> record(total);
     size_t roff = 0;
@@ -404,6 +401,10 @@ Status Manifest::appendRecord(RecordType type, const std::string& key,
     ssize_t written = ::write(fd_, record.data(), total);
     if (written != static_cast<ssize_t>(total)) {
         return Status::IOError("Failed to append MANIFEST record");
+    }
+
+    if (::fdatasync(fd_) != 0) {
+        return Status::IOError("Failed to fdatasync MANIFEST");
     }
 
     return Status::OK();

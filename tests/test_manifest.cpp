@@ -4,7 +4,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string>
-#include <vector>
 
 #include "internal/manifest.h"
 
@@ -83,26 +82,6 @@ TEST_F(ManifestTest, SetThenRecover) {
     }
 }
 
-TEST_F(ManifestTest, DeleteAndRecover) {
-    {
-        Manifest m;
-        ASSERT_TRUE(m.create(path_).ok());
-        ASSERT_TRUE(m.set("k1", "v1").ok());
-        ASSERT_TRUE(m.set("k2", "v2").ok());
-        ASSERT_TRUE(m.remove("k1").ok());
-        ASSERT_TRUE(m.close().ok());
-    }
-    {
-        Manifest m;
-        ASSERT_TRUE(m.open(path_).ok());
-        std::string val;
-        EXPECT_FALSE(m.get("k1", val));
-        ASSERT_TRUE(m.get("k2", val));
-        EXPECT_EQ(val, "v2");
-        ASSERT_TRUE(m.close().ok());
-    }
-}
-
 TEST_F(ManifestTest, OverwriteAndRecover) {
     {
         Manifest m;
@@ -125,12 +104,9 @@ TEST_F(ManifestTest, CompactReducesFileSize) {
     Manifest m;
     ASSERT_TRUE(m.create(path_).ok());
 
-    // Write many records then delete most.
+    // Write many overwrites to accumulate log entries.
     for (int i = 0; i < 100; ++i) {
-        ASSERT_TRUE(m.set("key" + std::to_string(i), std::string(100, 'x')).ok());
-    }
-    for (int i = 0; i < 90; ++i) {
-        ASSERT_TRUE(m.remove("key" + std::to_string(i)).ok());
+        ASSERT_TRUE(m.set("key", std::string(100, 'a' + (i % 26))).ok());
     }
 
     // Get file size before compaction.
@@ -142,18 +118,10 @@ TEST_F(ManifestTest, CompactReducesFileSize) {
     auto size_after = std::filesystem::file_size(manifest_path);
     EXPECT_LT(size_after, size_before);
 
-    // Verify state is intact.
-    for (int i = 0; i < 90; ++i) {
-        std::string val;
-        EXPECT_FALSE(m.get("key" + std::to_string(i), val))
-            << "key" << i << " should be deleted";
-    }
-    for (int i = 90; i < 100; ++i) {
-        std::string val;
-        ASSERT_TRUE(m.get("key" + std::to_string(i), val))
-            << "key" << i << " should exist";
-        EXPECT_EQ(val, std::string(100, 'x'));
-    }
+    // Verify last value survived.
+    std::string val;
+    ASSERT_TRUE(m.get("key", val));
+    EXPECT_EQ(val, std::string(100, 'a' + (99 % 26)));
 
     ASSERT_TRUE(m.close().ok());
 }
@@ -164,8 +132,7 @@ TEST_F(ManifestTest, CompactThenRecover) {
         ASSERT_TRUE(m.create(path_).ok());
         ASSERT_TRUE(m.set("k1", "v1").ok());
         ASSERT_TRUE(m.set("k2", "v2").ok());
-        ASSERT_TRUE(m.set("k3", "v3").ok());
-        ASSERT_TRUE(m.remove("k2").ok());
+        ASSERT_TRUE(m.set("k2", "v2_updated").ok());
         ASSERT_TRUE(m.compact().ok());
         ASSERT_TRUE(m.close().ok());
     }
@@ -175,9 +142,8 @@ TEST_F(ManifestTest, CompactThenRecover) {
         std::string val;
         ASSERT_TRUE(m.get("k1", val));
         EXPECT_EQ(val, "v1");
-        EXPECT_FALSE(m.get("k2", val));
-        ASSERT_TRUE(m.get("k3", val));
-        EXPECT_EQ(val, "v3");
+        ASSERT_TRUE(m.get("k2", val));
+        EXPECT_EQ(val, "v2_updated");
         ASSERT_TRUE(m.close().ok());
     }
 }
@@ -218,33 +184,6 @@ TEST_F(ManifestTest, PartialWriteRecovery) {
 
         ASSERT_TRUE(m.close().ok());
     }
-}
-
-TEST_F(ManifestTest, GetKeysWithPrefix) {
-    Manifest m;
-    ASSERT_TRUE(m.create(path_).ok());
-
-    ASSERT_TRUE(m.set("segment.1", "").ok());
-    ASSERT_TRUE(m.set("segment.2", "").ok());
-    ASSERT_TRUE(m.set("segment.10", "").ok());
-    ASSERT_TRUE(m.set("next_version_id", "100").ok());
-    ASSERT_TRUE(m.set("next_segment_id", "11").ok());
-
-    auto keys = m.getKeysWithPrefix("segment.");
-    ASSERT_EQ(keys.size(), 3u);
-    // std::map is sorted, so keys should be in order.
-    EXPECT_EQ(keys[0], "segment.1");
-    EXPECT_EQ(keys[1], "segment.10");
-    EXPECT_EQ(keys[2], "segment.2");
-
-    auto version_keys = m.getKeysWithPrefix("next_version");
-    ASSERT_EQ(version_keys.size(), 1u);
-    EXPECT_EQ(version_keys[0], "next_version_id");
-
-    auto empty_keys = m.getKeysWithPrefix("nonexistent");
-    EXPECT_TRUE(empty_keys.empty());
-
-    ASSERT_TRUE(m.close().ok());
 }
 
 TEST_F(ManifestTest, AppendAfterCompact) {

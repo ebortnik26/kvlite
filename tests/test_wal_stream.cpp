@@ -22,6 +22,7 @@ using kvlite::internal::WalOp;
 using kvlite::internal::WALReplayStream;
 using kvlite::internal::WALRecord;
 using kvlite::internal::WALStream;
+using kvlite::internal::ManifestKey;
 
 namespace WalProducer = kvlite::internal::WalProducer;
 
@@ -677,7 +678,8 @@ TEST_F(WALStreamTest, VersionBasedTruncationPreservesActiveFile) {
 }
 
 TEST_F(WALStreamTest, MaxVersionPersistsAcrossRollover) {
-    // Verify that max_version is inherited by new files after rollover.
+    // Verify that max_version is inherited by new files after rollover
+    // and that the file range is tracked correctly in Manifest.
     Manifest manifest;
     ASSERT_TRUE(manifest.create(dir_.string()).ok());
 
@@ -700,18 +702,13 @@ TEST_F(WALStreamTest, MaxVersionPersistsAcrossRollover) {
 
     ASSERT_GT(wal.fileCount(), 1u) << "Need rollover for this test";
 
-    // Check that max_version is stored in Manifest for closed files.
+    // Check that min/max file IDs are tracked in Manifest.
     std::string val;
-    bool found = false;
-    for (uint32_t i = 0; i < wal.fileCount() - 1; ++i) {
-        std::string key = "gi.wal.file." + std::to_string(i);
-        if (manifest.get(key, val) && !val.empty()) {
-            uint64_t file_max = std::stoull(val);
-            EXPECT_GE(file_max, 500u);
-            found = true;
-        }
-    }
-    EXPECT_TRUE(found) << "At least one closed file should have max_version in Manifest";
+    ASSERT_TRUE(manifest.get(ManifestKey::kGiWalMinFileId, val));
+    uint32_t min_id = static_cast<uint32_t>(std::stoul(val));
+    ASSERT_TRUE(manifest.get(ManifestKey::kGiWalMaxFileId, val));
+    uint32_t max_id = static_cast<uint32_t>(std::stoul(val));
+    EXPECT_EQ(max_id - min_id + 1, wal.fileCount());
 
     ASSERT_TRUE(wal.close().ok());
     manifest.close();

@@ -1,5 +1,5 @@
-#ifndef KVLITE_INTERNAL_L1_WAL_H
-#define KVLITE_INTERNAL_L1_WAL_H
+#ifndef KVLITE_INTERNAL_GLOBAL_INDEX_WAL_H
+#define KVLITE_INTERNAL_GLOBAL_INDEX_WAL_H
 
 #include <cstdint>
 #include <memory>
@@ -168,8 +168,6 @@ private:
 
     Manifest* manifest_ = nullptr;
     std::string db_path_;
-    std::string next_file_id_key_;   // "gi.wal.next_file_id"
-    std::string file_prefix_;        // "gi.wal.file."
     Options options_;
 
     // Lifecycle lock: shared for append/commit, exclusive for close.
@@ -185,15 +183,17 @@ private:
 
     // File ID of the currently open WAL file.
     uint32_t current_file_id_ = 0;
-    // Next file ID to allocate (persisted in Manifest as "gi.wal.next_file_id").
-    uint32_t next_file_id_ = 0;
+    // Min/max file IDs (persisted in Manifest).
+    uint32_t min_file_id_ = 0;
+    uint32_t max_file_id_ = 0;
+    bool has_files_ = false;
     // Sum of sizes of all closed WAL files.
     uint64_t total_size_ = 0;
-    // Set of all live WAL file IDs (from Manifest "gi.wal.file.<id>" keys).
+    // In-memory list of all live WAL file IDs, derived from [min, max] range.
     std::vector<uint32_t> file_ids_;
 };
 
 } // namespace internal
 } // namespace kvlite
 
-#endif // KVLITE_INTERNAL_L1_WAL_H
+#endif // KVLITE_INTERNAL_GLOBAL_INDEX_WAL_H

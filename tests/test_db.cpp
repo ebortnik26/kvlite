@@ -2,7 +2,6 @@
 //           remove with buffer, batch operations, snapshots, iterators.
 #include <gtest/gtest.h>
 #include <kvlite/kvlite.h>
-#include "internal/manifest.h"
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -623,48 +622,6 @@ TEST_F(DBTest, RecoverMultipleFlushes) {
         std::string val;
         ASSERT_TRUE(db_.get("key" + std::to_string(i), val).ok());
         EXPECT_EQ(val, "val" + std::to_string(i));
-    }
-}
-
-// ── Clean close flag ────────────────────────────────────────────────────────
-
-TEST_F(DBTest, CleanCloseFlag) {
-    ASSERT_TRUE(openDB().ok());
-
-    // Before any mutation, clean_close should be absent or "1" (from prior close).
-    {
-        kvlite::internal::Manifest m;
-        ASSERT_TRUE(m.open(test_dir_.string()).ok());
-        std::string val;
-        // Fresh DB: flag absent is fine; if present it should be "1".
-        if (m.get("clean_close", val)) {
-            EXPECT_EQ(val, "1");
-        }
-        m.close();
-    }
-
-    // First mutation should set clean_close=0.
-    ASSERT_TRUE(db_.put("k1", "v1", syncOpts()).ok());
-
-    {
-        kvlite::internal::Manifest m;
-        ASSERT_TRUE(m.open(test_dir_.string()).ok());
-        std::string val;
-        ASSERT_TRUE(m.get("clean_close", val));
-        EXPECT_EQ(val, "0");
-        m.close();
-    }
-
-    // Close should set clean_close=1.
-    ASSERT_TRUE(db_.close().ok());
-
-    {
-        kvlite::internal::Manifest m;
-        ASSERT_TRUE(m.open(test_dir_.string()).ok());
-        std::string val;
-        ASSERT_TRUE(m.get("clean_close", val));
-        EXPECT_EQ(val, "1");
-        m.close();
     }
 }
 

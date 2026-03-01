@@ -37,14 +37,14 @@ struct Options {
     // Default: 64MB
     size_t write_buffer_size = 64 * 1024 * 1024;
 
-    // --- L1 Index Options ---
+    // --- GlobalIndex Options ---
 
-    // Number of updates before persisting GlobalIndex snapshot
-    // L1 WAL is truncated after successful snapshot
+    // Number of updates before persisting GlobalIndex savepoint.
+    // WAL is truncated after successful savepoint.
     // Default: 10 million
-    uint64_t global_index_snapshot_interval = 10'000'000;
+    uint64_t global_index_savepoint_interval = 1ULL << 24;
 
-    // --- L2 Index Cache Options ---
+    // --- SegmentIndex Cache Options ---
 
     // Size of the LRU cache for SegmentIndex instances in bytes
     // Hot log file indices are kept in memory

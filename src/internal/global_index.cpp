@@ -76,9 +76,9 @@ Status GlobalIndex::open(const std::string& db_path, const Options& options) {
     Status s = wal_->open(db_path, manifest_, wal_opts);
     if (!s.ok()) return s;
 
-    // Load persisted max_version from last snapshot (if any).
+    // Load persisted max_version from last savepoint (if any).
     std::string mv_str;
-    if (manifest_.get("gi.snapshot.max_version", mv_str) && !mv_str.empty()) {
+    if (manifest_.get(ManifestKey::kGiSavepointMaxVersion, mv_str) && !mv_str.empty()) {
         max_version_ = std::stoull(mv_str);
     }
 
@@ -95,16 +95,16 @@ Status GlobalIndex::open(const std::string& db_path, const Options& options) {
 Status GlobalIndex::recover() {
     namespace fs = std::filesystem;
 
-    // Re-truncate WAL: delete files with max_version <= snapshot max_version.
+    // Re-truncate WAL: delete files with max_version <= savepoint max_version.
     // Idempotent — safe if the previous truncation partially completed.
     Status s = wal_->truncate(max_version_);
     if (!s.ok()) return s;
 
-    // Load snapshot (v9 binary or v7 fallback) if one exists.
+    // Load savepoint (v9 binary or v7 fallback) if one exists.
     std::error_code ec;
-    if ((fs::exists(snapshotDirV9(), ec) && fs::is_directory(snapshotDirV9(), ec)) ||
-        fs::exists(snapshotPath(), ec)) {
-        s = loadSnapshot(snapshotPath());
+    if ((fs::exists(savepointDirV9(), ec) && fs::is_directory(savepointDirV9(), ec)) ||
+        fs::exists(savepointPath(), ec)) {
+        s = loadSavepoint(savepointPath());
         if (!s.ok()) return s;
     }
 
@@ -136,10 +136,10 @@ Status GlobalIndex::close() {
     if (!is_open_) {
         return Status::OK();
     }
-    // Persist index to v7 snapshot as fallback.
-    // For fast binary snapshots, the caller should invoke snapshot(version)
+    // Persist index to v7 savepoint as fallback.
+    // For fast binary savepoints, the caller should invoke savepoint(version)
     // before close().
-    Status s = saveSnapshot(snapshotPath());
+    Status s = saveSavepoint(savepointPath());
     if (!s.ok()) {
         wal_->close();
         is_open_ = false;
@@ -157,11 +157,11 @@ bool GlobalIndex::isOpen() const {
 // --- Index Operations ---
 
 Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
-    std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
+    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
     Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
     applyPut(hkey, packed_version, segment_id);
-    updates_since_snapshot_++;
+    updates_since_savepoint_++;
     return Status::OK();
 }
 
@@ -210,21 +210,21 @@ bool GlobalIndex::contains(uint64_t hkey) const {
 
 Status GlobalIndex::relocate(uint64_t hkey, uint64_t packed_version,
                               uint32_t old_segment_id, uint32_t new_segment_id) {
-    std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
+    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
     Status s = wal_->appendRelocate(hkey, packed_version, old_segment_id, new_segment_id, WalProducer::kGC);
     if (!s.ok()) return s;
     applyRelocate(hkey, packed_version, old_segment_id, new_segment_id);
-    updates_since_snapshot_++;
+    updates_since_savepoint_++;
     return Status::OK();
 }
 
 Status GlobalIndex::eliminate(uint64_t hkey, uint64_t packed_version,
                                uint32_t segment_id) {
-    std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
+    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
     Status s = wal_->appendEliminate(hkey, packed_version, segment_id, WalProducer::kGC);
     if (!s.ok()) return s;
     applyEliminate(hkey, packed_version, segment_id);
-    updates_since_snapshot_++;
+    updates_since_savepoint_++;
     return Status::OK();
 }
 
@@ -250,34 +250,29 @@ void GlobalIndex::clear() {
 // --- WAL commit ---
 
 Status GlobalIndex::commitWB(uint64_t max_version) {
-    std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
+    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
     if (max_version > max_version_) max_version_ = max_version;
     wal_->updateMaxVersion(max_version);
     return wal_->commit(WalProducer::kWB);
 }
 
 Status GlobalIndex::commitGC() {
-    std::shared_lock<std::shared_mutex> lock(snapshot_mu_);
+    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
     return wal_->commit(WalProducer::kGC);
 }
 
-// --- Binary snapshot ---
+// --- Binary savepoint ---
 
-Status GlobalIndex::storeSnapshot(uint64_t snapshot_version) {
+Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
     namespace fs = std::filesystem;
-    std::unique_lock<std::shared_mutex> lock(snapshot_mu_);
+    std::unique_lock<std::shared_mutex> lock(savepoint_mu_);
 
-    // Record the DB version at the moment the exclusive lock is acquired.
-    // Used during recovery to determine which WAL entries to replay.
-    Status ts = manifest_.set("gi.snapshot.version", std::to_string(snapshot_version));
-    if (!ts.ok()) return ts;
-
-    std::string valid_dir = snapshotDirV9();
+    std::string valid_dir = savepointDirV9();
     std::string tmp_dir = valid_dir + ".tmp";
     std::string old_dir = valid_dir + ".old";
 
-    // Write snapshot to temporary directory.
-    Status s = saveBinarySnapshot(tmp_dir);
+    // Write savepoint to temporary directory.
+    Status s = saveBinarySavepoint(tmp_dir);
     if (!s.ok()) return s;
 
     // Atomic swap: valid → old, tmp → valid, remove old.
@@ -286,27 +281,27 @@ Status GlobalIndex::storeSnapshot(uint64_t snapshot_version) {
         fs::remove_all(old_dir, ec);  // clean up any leftover
         fs::rename(valid_dir, old_dir, ec);
         if (ec) {
-            return Status::IOError("Failed to move old snapshot: " + ec.message());
+            return Status::IOError("Failed to move old savepoint: " + ec.message());
         }
     }
     fs::rename(tmp_dir, valid_dir, ec);
     if (ec) {
-        // Try to restore old snapshot.
+        // Try to restore old savepoint.
         std::error_code ec2;
         if (fs::exists(old_dir, ec2)) {
             fs::rename(old_dir, valid_dir, ec2);
         }
-        return Status::IOError("Failed to install snapshot: " + ec.message());
+        return Status::IOError("Failed to install savepoint: " + ec.message());
     }
     fs::remove_all(old_dir, ec);  // best-effort cleanup
 
     // Persist the GlobalIndex max_version for recovery.
-    ts = manifest_.set("gi.snapshot.max_version", std::to_string(max_version_));
-    if (!ts.ok()) return ts;
+    s = manifest_.set(ManifestKey::kGiSavepointMaxVersion, std::to_string(max_version_));
+    if (!s.ok()) return s;
 
     s = wal_->truncate(max_version_);
     if (!s.ok()) return s;
-    updates_since_snapshot_ = 0;
+    updates_since_savepoint_ = 0;
     return Status::OK();
 }
 
@@ -324,8 +319,8 @@ size_t GlobalIndex::memoryUsage() const {
     return dht_.memoryUsage();
 }
 
-uint64_t GlobalIndex::updatesSinceSnapshot() const {
-    return updates_since_snapshot_;
+uint64_t GlobalIndex::updatesSinceSavepoint() const {
+    return updates_since_savepoint_;
 }
 
 // --- Persistence (v7) ---
@@ -335,10 +330,10 @@ static constexpr uint32_t kVersionV7 = 7;
 static constexpr uint32_t kVersionV9 = 9;
 static constexpr uint64_t kMaxFileSize = 1ULL << 30;  // 1 GB
 
-Status GlobalIndex::saveSnapshot(const std::string& path) const {
+Status GlobalIndex::saveSavepoint(const std::string& path) const {
     std::ofstream file(path, std::ios::binary);
     if (!file) {
-        return Status::IOError("Failed to create snapshot file: " + path);
+        return Status::IOError("Failed to create savepoint file: " + path);
     }
 
     CRC32Writer writer(file);
@@ -365,7 +360,7 @@ Status GlobalIndex::saveSnapshot(const std::string& path) const {
     file.write(reinterpret_cast<const char*>(&checksum), sizeof(checksum));
 
     if (!file.good()) {
-        return Status::IOError("Failed to write snapshot file: " + path);
+        return Status::IOError("Failed to write savepoint file: " + path);
     }
 
     return Status::OK();
@@ -373,9 +368,9 @@ Status GlobalIndex::saveSnapshot(const std::string& path) const {
 
 // --- Persistence (v8 binary, multi-file) ---
 //
-// Multi-file binary snapshot format (v8):
+// Multi-file binary savepoint format (v8):
 //
-// Directory: <db_path>/gi/snapshot.v9/
+// Directory: <db_path>/gi/savepoint.v9/
 // Files: 00000000.dat, 00000001.dat, ...
 //
 // Each file:
@@ -384,7 +379,7 @@ Status GlobalIndex::saveSnapshot(const std::string& path) const {
 //   Extension data (last file only, ext_count × stride bytes) +
 //   CRC32 footer (4 bytes)
 
-std::vector<GlobalIndex::SnapshotFileDesc> GlobalIndex::computeFileLayout() const {
+std::vector<GlobalIndex::SavepointFileDesc> GlobalIndex::computeFileLayout() const {
     static constexpr size_t kOverhead = 33 + 12 + 4;  // headers + footer
 
     uint32_t num_buckets = dht_.numBuckets();
@@ -400,7 +395,7 @@ std::vector<GlobalIndex::SnapshotFileDesc> GlobalIndex::computeFileLayout() cons
         if (buckets_per_file == 0) buckets_per_file = 1;
     }
 
-    std::vector<SnapshotFileDesc> files;
+    std::vector<SavepointFileDesc> files;
     uint32_t bs = 0, fi = 0;
     while (bs < num_buckets) {
         uint32_t cnt = std::min(buckets_per_file, num_buckets - bs);
@@ -411,15 +406,15 @@ std::vector<GlobalIndex::SnapshotFileDesc> GlobalIndex::computeFileLayout() cons
     return files;
 }
 
-Status GlobalIndex::writeSnapshotFile(const std::string& dir,
-                                      const SnapshotFileDesc& fd) const {
+Status GlobalIndex::writeSavepointFile(const std::string& dir,
+                                      const SavepointFileDesc& fd) const {
     char fname[16];
     std::snprintf(fname, sizeof(fname), "%08u.dat", fd.file_index);
     std::string fpath = dir + "/" + fname;
 
     std::ofstream file(fpath, std::ios::binary);
     if (!file) {
-        return Status::IOError("Failed to create snapshot file: " + fpath);
+        return Status::IOError("Failed to create savepoint file: " + fpath);
     }
 
     const auto& cfg = dht_.config();
@@ -462,12 +457,12 @@ Status GlobalIndex::writeSnapshotFile(const std::string& dir,
     file.write(reinterpret_cast<const char*>(&checksum), sizeof(checksum));
 
     if (!file.good()) {
-        return Status::IOError("Failed to write snapshot file: " + fpath);
+        return Status::IOError("Failed to write savepoint file: " + fpath);
     }
     return Status::OK();
 }
 
-Status GlobalIndex::saveBinarySnapshot(const std::string& dir) const {
+Status GlobalIndex::saveBinarySavepoint(const std::string& dir) const {
     namespace fs = std::filesystem;
 
     std::error_code ec;
@@ -476,16 +471,16 @@ Status GlobalIndex::saveBinarySnapshot(const std::string& dir) const {
     }
     fs::create_directories(dir, ec);
     if (ec) {
-        return Status::IOError("Failed to create snapshot dir: " + dir + ": " + ec.message());
+        return Status::IOError("Failed to create savepoint dir: " + dir + ": " + ec.message());
     }
 
     auto files = computeFileLayout();
 
-    uint32_t num_threads = std::min(options_.snapshot_threads,
+    uint32_t num_threads = std::min(options_.savepoint_threads,
                                      static_cast<uint32_t>(files.size()));
     if (num_threads <= 1) {
         for (const auto& fd : files) {
-            Status s = writeSnapshotFile(dir, fd);
+            Status s = writeSavepointFile(dir, fd);
             if (!s.ok()) return s;
         }
         return Status::OK();
@@ -501,7 +496,7 @@ Status GlobalIndex::saveBinarySnapshot(const std::string& dir) const {
         while (!has_error.load(std::memory_order_relaxed)) {
             uint32_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
             if (fi >= files.size()) return;
-            Status s = writeSnapshotFile(dir, files[fi]);
+            Status s = writeSavepointFile(dir, files[fi]);
             if (!s.ok()) {
                 std::lock_guard<std::mutex> lock(error_mu);
                 if (!has_error.exchange(true, std::memory_order_relaxed)) {
@@ -524,14 +519,14 @@ Status GlobalIndex::saveBinarySnapshot(const std::string& dir) const {
     return has_error.load() ? first_error : Status::OK();
 }
 
-Status GlobalIndex::loadSnapshotFile(const std::string& fpath,
+Status GlobalIndex::loadSavepointFile(const std::string& fpath,
                                      uint32_t stride,
                                      uint64_t& out_entries,
                                      uint64_t& out_key_count,
                                      uint32_t& out_ext_count) {
     std::ifstream file(fpath, std::ios::binary);
     if (!file) {
-        return Status::IOError("Failed to open snapshot file: " + fpath);
+        return Status::IOError("Failed to open savepoint file: " + fpath);
     }
 
     CRC32Reader reader(file);
@@ -539,11 +534,11 @@ Status GlobalIndex::loadSnapshotFile(const std::string& fpath,
     // Global header (33 bytes)
     char magic[4];
     if (!reader.read(magic, 4) || std::memcmp(magic, kMagic, 4) != 0) {
-        return Status::Corruption("Invalid snapshot magic in: " + fpath);
+        return Status::Corruption("Invalid savepoint magic in: " + fpath);
     }
     uint32_t format_version;
     if (!reader.readVal(format_version) || format_version != kVersionV9) {
-        return Status::Corruption("Unsupported snapshot version in: " + fpath);
+        return Status::Corruption("Unsupported savepoint version in: " + fpath);
     }
 
     uint8_t bucket_bits;
@@ -599,7 +594,7 @@ Status GlobalIndex::loadSnapshotFile(const std::string& fpath,
     return Status::OK();
 }
 
-Status GlobalIndex::loadBinarySnapshot(const std::string& dir) {
+Status GlobalIndex::loadBinarySavepoint(const std::string& dir) {
     namespace fs = std::filesystem;
 
     if (!fs::exists(dir) || !fs::is_directory(dir)) {
@@ -615,7 +610,7 @@ Status GlobalIndex::loadBinarySnapshot(const std::string& dir) {
     std::sort(files.begin(), files.end());
 
     if (files.empty()) {
-        return Status::Corruption("No snapshot files in directory: " + dir);
+        return Status::Corruption("No savepoint files in directory: " + dir);
     }
 
     clear();
@@ -625,7 +620,7 @@ Status GlobalIndex::loadBinarySnapshot(const std::string& dir) {
     uint32_t ext_count = 0;
 
     for (const auto& fpath : files) {
-        Status s = loadSnapshotFile(fpath, stride, entries, key_count, ext_count);
+        Status s = loadSavepointFile(fpath, stride, entries, key_count, ext_count);
         if (!s.ok()) return s;
     }
 
@@ -634,21 +629,21 @@ Status GlobalIndex::loadBinarySnapshot(const std::string& dir) {
     return Status::OK();
 }
 
-Status GlobalIndex::loadV7Snapshot(const std::string& path) {
+Status GlobalIndex::loadV7Savepoint(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
-        return Status::IOError("Failed to open snapshot file: " + path);
+        return Status::IOError("Failed to open savepoint file: " + path);
     }
 
     CRC32Reader reader(file);
 
     char magic[4];
     if (!reader.read(magic, 4) || std::memcmp(magic, kMagic, 4) != 0) {
-        return Status::Corruption("Invalid snapshot magic");
+        return Status::Corruption("Invalid savepoint magic");
     }
     uint32_t format_version;
     if (!reader.readVal(format_version) || format_version != kVersionV7) {
-        return Status::Corruption("Unsupported snapshot version");
+        return Status::Corruption("Unsupported savepoint version");
     }
 
     uint64_t num_entries, key_count;
@@ -681,14 +676,14 @@ Status GlobalIndex::loadV7Snapshot(const std::string& path) {
     return Status::OK();
 }
 
-Status GlobalIndex::loadSnapshot(const std::string& path) {
+Status GlobalIndex::loadSavepoint(const std::string& path) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    std::string dir_v9 = snapshotDirV9();
+    std::string dir_v9 = savepointDirV9();
     if (fs::exists(dir_v9, ec) && fs::is_directory(dir_v9, ec)) {
-        return loadBinarySnapshot(dir_v9);
+        return loadBinarySavepoint(dir_v9);
     }
-    return loadV7Snapshot(path);
+    return loadV7Savepoint(path);
 }
 
 // --- Private ---
@@ -712,17 +707,17 @@ void GlobalIndex::applyEliminate(uint64_t hkey, uint64_t packed_version,
     }
 }
 
-Status GlobalIndex::maybeSnapshot() {
-    // Stub: no auto-snapshot yet.
+Status GlobalIndex::maybeSavepoint() {
+    // Stub: no auto-savepoint yet.
     return Status::OK();
 }
 
-std::string GlobalIndex::snapshotPath() const {
-    return db_path_ + "/gi/snapshot";
+std::string GlobalIndex::savepointPath() const {
+    return db_path_ + "/gi/savepoint";
 }
 
-std::string GlobalIndex::snapshotDirV9() const {
-    return db_path_ + "/gi/snapshot.v9";
+std::string GlobalIndex::savepointDirV9() const {
+    return db_path_ + "/gi/savepoint.v9";
 }
 
 }  // namespace internal

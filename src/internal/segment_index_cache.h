@@ -1,5 +1,5 @@
-#ifndef KVLITE_INTERNAL_L2_CACHE_H
-#define KVLITE_INTERNAL_L2_CACHE_H
+#ifndef KVLITE_INTERNAL_SEGMENT_INDEX_CACHE_H
+#define KVLITE_INTERNAL_SEGMENT_INDEX_CACHE_H
 
 #include <cstdint>
 #include <string>
@@ -145,4 +145,4 @@ auto SegmentIndexCache::withIndex(uint32_t file_id, Func&& fn)
 } // namespace internal
 } // namespace kvlite
 
-#endif // KVLITE_INTERNAL_L2_CACHE_H
+#endif // KVLITE_INTERNAL_SEGMENT_INDEX_CACHE_H

@@ -1,5 +1,6 @@
 #include "internal/segment_storage_manager.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <set>
 #include <string>
@@ -9,8 +10,7 @@
 namespace kvlite {
 namespace internal {
 
-static constexpr char kNextSegmentIdKey[] = "next_segment_id";
-static const std::string kSegmentPrefix = "segment.";
+using MK = ManifestKey;
 
 SegmentStorageManager::SegmentStorageManager(Manifest& manifest) : manifest_(manifest) {}
 SegmentStorageManager::~SegmentStorageManager() = default;
@@ -38,21 +38,26 @@ Status SegmentStorageManager::open(const std::string& db_path,
 }
 
 Status SegmentStorageManager::recover() {
-    // Read next_segment_id from manifest.
+    // Read segment ID range from manifest.
     std::string val;
-    if (manifest_.get(kNextSegmentIdKey, val)) {
-        next_segment_id_.store(static_cast<uint32_t>(std::stoul(val)),
-                               std::memory_order_relaxed);
+    uint32_t min_id = 0, max_id = 0;
+    bool has_range = false;
+    if (manifest_.get(MK::kSegmentsMinSegId, val)) {
+        min_id = static_cast<uint32_t>(std::stoul(val));
+        has_range = true;
+    }
+    if (manifest_.get(MK::kSegmentsMaxSegId, val)) {
+        max_id = static_cast<uint32_t>(std::stoul(val));
+        has_range = true;
     }
 
-    // Reopen segments listed in manifest.
-    std::set<std::string> tracked_files;
-    auto keys = manifest_.getKeysWithPrefix(kSegmentPrefix);
-    for (const auto& key : keys) {
-        // Parse segment ID from "segment.<id>".
-        std::string id_str = key.substr(kSegmentPrefix.size());
-        uint32_t id = static_cast<uint32_t>(std::stoul(id_str));
+    if (has_range) {
+        next_segment_id_.store(max_id + 1, std::memory_order_relaxed);
+    }
 
+    // Reopen segments in [min_id, max_id].
+    std::set<std::string> tracked_files;
+    for (uint32_t id = min_id; has_range && id <= max_id; ++id) {
         std::string path = segmentPath(id);
         tracked_files.insert(std::filesystem::path(path).filename().string());
 
@@ -111,14 +116,25 @@ Status SegmentStorageManager::createSegment(uint32_t id, bool register_in_manife
     lock.unlock();
 
     if (register_in_manifest) {
-        manifest_.set(std::string(kSegmentPrefix) + std::to_string(id), "");
+        manifest_.set(MK::kSegmentsMaxSegId, std::to_string(id));
+        // Set min if this is the first segment.
+        std::string val;
+        if (!manifest_.get(MK::kSegmentsMinSegId, val)) {
+            manifest_.set(MK::kSegmentsMinSegId, std::to_string(id));
+        }
     }
     return Status::OK();
 }
 
 Status SegmentStorageManager::registerSegments(const std::vector<uint32_t>& ids) {
-    for (uint32_t id : ids) {
-        manifest_.set(std::string(kSegmentPrefix) + std::to_string(id), "");
+    if (ids.empty()) return Status::OK();
+    uint32_t max_id = *std::max_element(ids.begin(), ids.end());
+    manifest_.set(MK::kSegmentsMaxSegId, std::to_string(max_id));
+    // Set min if not already set.
+    std::string val;
+    if (!manifest_.get(MK::kSegmentsMinSegId, val)) {
+        uint32_t min_id = *std::min_element(ids.begin(), ids.end());
+        manifest_.set(MK::kSegmentsMinSegId, std::to_string(min_id));
     }
     return Status::OK();
 }
@@ -143,7 +159,15 @@ Status SegmentStorageManager::removeSegment(uint32_t id) {
     lock.unlock();
 
     std::string path = segmentPath(id);
-    manifest_.remove(std::string(kSegmentPrefix) + std::to_string(id));
+
+    // Advance min_segment_id if we're removing the lowest segment.
+    std::string val;
+    if (manifest_.get(MK::kSegmentsMinSegId, val)) {
+        uint32_t min_id = static_cast<uint32_t>(std::stoul(val));
+        if (id == min_id) {
+            manifest_.set(MK::kSegmentsMinSegId, std::to_string(min_id + 1));
+        }
+    }
 
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -208,9 +232,7 @@ uint64_t SegmentStorageManager::totalDataSize() const {
 }
 
 uint32_t SegmentStorageManager::allocateSegmentId() {
-    uint32_t id = next_segment_id_.fetch_add(1, std::memory_order_relaxed);
-    manifest_.set(kNextSegmentIdKey, std::to_string(id + 1));
-    return id;
+    return next_segment_id_.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::string SegmentStorageManager::segmentPath(uint32_t segment_id) const {

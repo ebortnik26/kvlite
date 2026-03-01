@@ -138,11 +138,11 @@ TEST_F(GlobalIndexDHT, Snapshot) {
     index->put(hkey1, 200, 2);
     index->put(hkey2, 300, 3);
 
-    Status s = index->saveSnapshot(path);
+    Status s = index->saveSavepoint(path);
     ASSERT_TRUE(s.ok()) << s.toString();
 
     GlobalIndex index2(manifest_);
-    s = index2.loadSnapshot(path);
+    s = index2.loadSavepoint(path);
     ASSERT_TRUE(s.ok()) << s.toString();
 
     EXPECT_EQ(index2.keyCount(), 2u);
@@ -169,11 +169,11 @@ TEST_F(GlobalIndexDHT, SnapshotWithManyEntries) {
     index->put(hkey1, 300, 3);
     index->put(hkey2, 400, 4);
 
-    Status s = index->saveSnapshot(path);
+    Status s = index->saveSavepoint(path);
     ASSERT_TRUE(s.ok()) << s.toString();
 
     GlobalIndex index2(manifest_);
-    s = index2.loadSnapshot(path);
+    s = index2.loadSavepoint(path);
     ASSERT_TRUE(s.ok()) << s.toString();
 
     EXPECT_EQ(index2.keyCount(), 2u);
@@ -1576,7 +1576,7 @@ TEST(BucketArena, ConcurrentAllocate) {
 }
 
 // ============================================================
-// Binary snapshot (v9) tests
+// Binary savepoint (v9) tests
 // ============================================================
 
 class BinarySnapshotTest : public ::testing::Test {
@@ -1613,7 +1613,7 @@ TEST_F(BinarySnapshotTest, RoundTripBasic) {
     ASSERT_EQ(index_->entryCount(), static_cast<size_t>(N));
     ASSERT_EQ(index_->keyCount(), static_cast<size_t>(N));
 
-    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
     ASSERT_TRUE(index_->close().ok());
     manifest_.close();
@@ -1623,7 +1623,7 @@ TEST_F(BinarySnapshotTest, RoundTripBasic) {
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
     ASSERT_TRUE(index2.open(db_dir_, opts).ok());
-    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+    ASSERT_TRUE(index2.loadSavepoint(db_dir_ + "/gi/savepoint").ok());
 
     EXPECT_EQ(index2.entryCount(), static_cast<size_t>(N));
     EXPECT_EQ(index2.keyCount(), static_cast<size_t>(N));
@@ -1653,7 +1653,7 @@ TEST_F(BinarySnapshotTest, RoundTripMultiVersion) {
     ASSERT_EQ(index_->entryCount(), 500u);
     ASSERT_EQ(index_->keyCount(), 100u);
 
-    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
     ASSERT_TRUE(index_->close().ok());
     manifest_.close();
 
@@ -1662,7 +1662,7 @@ TEST_F(BinarySnapshotTest, RoundTripMultiVersion) {
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
     ASSERT_TRUE(index2.open(db_dir_, opts).ok());
-    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+    ASSERT_TRUE(index2.loadSavepoint(db_dir_ + "/gi/savepoint").ok());
 
     EXPECT_EQ(index2.entryCount(), 500u);
     EXPECT_EQ(index2.keyCount(), 100u);
@@ -1693,7 +1693,7 @@ TEST_F(BinarySnapshotTest, SnapshotWithExtensions) {
     size_t key_count = index_->keyCount();
     ASSERT_GT(entry_count, 0u);
 
-    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
     ASSERT_TRUE(index_->close().ok());
     manifest_.close();
 
@@ -1702,7 +1702,7 @@ TEST_F(BinarySnapshotTest, SnapshotWithExtensions) {
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
     ASSERT_TRUE(index2.open(db_dir_, opts).ok());
-    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+    ASSERT_TRUE(index2.loadSavepoint(db_dir_ + "/gi/savepoint").ok());
 
     EXPECT_EQ(index2.entryCount(), entry_count);
     EXPECT_EQ(index2.keyCount(), key_count);
@@ -1739,7 +1739,7 @@ TEST_F(BinarySnapshotTest, SnapshotBlocksConcurrentPut) {
     });
 
     snapshot_started.store(true, std::memory_order_release);
-    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
     snapshot_done.store(true, std::memory_order_release);
 
     writer.join();
@@ -1759,9 +1759,9 @@ TEST_F(BinarySnapshotTest, AtomicSwapLeavesValidDir) {
         ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
 
-    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
-    std::string valid_dir = db_dir_ + "/gi/snapshot.v9";
+    std::string valid_dir = db_dir_ + "/gi/savepoint.v9";
     std::string tmp_dir = valid_dir + ".tmp";
     std::string old_dir = valid_dir + ".old";
 
@@ -1774,7 +1774,7 @@ TEST_F(BinarySnapshotTest, AtomicSwapLeavesValidDir) {
         std::string key = "key_" + std::to_string(i);
         ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
-    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
     EXPECT_TRUE(std::filesystem::exists(valid_dir));
     EXPECT_FALSE(std::filesystem::exists(tmp_dir));
@@ -1786,13 +1786,13 @@ TEST_F(BinarySnapshotTest, SnapshotResetsWALCounter) {
         std::string key = "key_" + std::to_string(i);
         ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
-    EXPECT_EQ(index_->updatesSinceSnapshot(), 100u);
+    EXPECT_EQ(index_->updatesSinceSavepoint(), 100u);
 
-    ASSERT_TRUE(index_->storeSnapshot(0).ok());
-    EXPECT_EQ(index_->updatesSinceSnapshot(), 0u);
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
+    EXPECT_EQ(index_->updatesSinceSavepoint(), 0u);
 
     ASSERT_TRUE(index_->put(H("new_key"), 1, 1).ok());
-    EXPECT_EQ(index_->updatesSinceSnapshot(), 1u);
+    EXPECT_EQ(index_->updatesSinceSavepoint(), 1u);
 }
 
 TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
@@ -1801,10 +1801,10 @@ TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
         ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
 
-    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
     ASSERT_TRUE(index_->close().ok());
 
-    std::string valid_dir = db_dir_ + "/gi/snapshot.v9";
+    std::string valid_dir = db_dir_ + "/gi/savepoint.v9";
     EXPECT_TRUE(std::filesystem::exists(valid_dir));
 
     // Re-open and verify data is loaded from v9 snapshot.
@@ -1814,7 +1814,7 @@ TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
     ASSERT_TRUE(index2.open(db_dir_, opts).ok());
-    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+    ASSERT_TRUE(index2.loadSavepoint(db_dir_ + "/gi/savepoint").ok());
 
     EXPECT_EQ(index2.entryCount(), 50u);
     EXPECT_EQ(index2.keyCount(), 50u);
@@ -1832,7 +1832,7 @@ TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
 
 TEST_F(BinarySnapshotTest, EmptyIndexSnapshot) {
     // Snapshot an empty index — should produce valid snapshot with 0 entries.
-    ASSERT_TRUE(index_->storeSnapshot(0).ok());
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
     ASSERT_TRUE(index_->close().ok());
     manifest_.close();
@@ -1842,7 +1842,7 @@ TEST_F(BinarySnapshotTest, EmptyIndexSnapshot) {
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
     ASSERT_TRUE(index2.open(db_dir_, opts).ok());
-    ASSERT_TRUE(index2.loadSnapshot(db_dir_ + "/gi/snapshot").ok());
+    ASSERT_TRUE(index2.loadSavepoint(db_dir_ + "/gi/savepoint").ok());
 
     EXPECT_EQ(index2.entryCount(), 0u);
     EXPECT_EQ(index2.keyCount(), 0u);

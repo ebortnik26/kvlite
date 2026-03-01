@@ -70,7 +70,7 @@ Status DB::open(const std::string& path, const Options& options) {
     // Initialize GlobalIndex
     global_index_ = std::make_unique<internal::GlobalIndex>(*manifest_);
     internal::GlobalIndex::Options global_index_opts;
-    global_index_opts.snapshot_interval = options.global_index_snapshot_interval;
+    global_index_opts.savepoint_interval = options.global_index_savepoint_interval;
     global_index_opts.sync_writes = options.sync_writes;
 
     s = global_index_->open(path, global_index_opts);
@@ -144,7 +144,6 @@ Status DB::close() {
     // Compact manifest for fast recovery, then close.
     Status s5;
     if (manifest_) {
-        manifest_->set("clean_close", "1");
         s5 = manifest_->compact();
         manifest_->close();
         manifest_.reset();
@@ -168,11 +167,6 @@ Status DB::put(const std::string& key, const std::string& value,
                const WriteOptions& options) {
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
-    }
-
-    if (clean_close_persisted_) {
-        manifest_->set("clean_close", "0");
-        clean_close_persisted_ = false;
     }
 
     uint64_t version = versions_->allocateVersion();
@@ -274,11 +268,6 @@ Status DB::remove(const std::string& key, const WriteOptions& options) {
         return Status::InvalidArgument("Database not open");
     }
 
-    if (clean_close_persisted_) {
-        manifest_->set("clean_close", "0");
-        clean_close_persisted_ = false;
-    }
-
     uint64_t version = versions_->allocateVersion();
     write_buffer_->put(key, version, "", true);
     versions_->commitVersion(version);
@@ -328,11 +317,6 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
 
     if (batch.empty()) {
         return Status::OK();
-    }
-
-    if (clean_close_persisted_) {
-        manifest_->set("clean_close", "0");
-        clean_close_persisted_ = false;
     }
 
     // All operations in batch get the same version.
