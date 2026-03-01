@@ -56,10 +56,14 @@ Status SegmentStorageManager::recover() {
     }
 
     // Reopen segments in [min_id, max_id].
+    // Gaps are tolerated: a missing file means the segment was removed
+    // (e.g., by GC) but min/max weren't fully updated before a crash.
     std::set<std::string> tracked_files;
     for (uint32_t id = min_id; has_range && id <= max_id; ++id) {
         std::string path = segmentPath(id);
         tracked_files.insert(std::filesystem::path(path).filename().string());
+
+        if (!std::filesystem::exists(path)) continue;
 
         Segment seg;
         Status s = seg.open(path);

@@ -135,9 +135,10 @@ TEST_F(SegmentStorageManagerTest, RecoverKeepsOrphansByDefault) {
     }
 }
 
-// recover() should fail gracefully when a manifest-tracked segment file
-// is missing from disk.
-TEST_F(SegmentStorageManagerTest, RecoverMissingManifestFile) {
+// recover() should tolerate missing segment files within the [min, max] range.
+// This happens when a segment is removed (e.g., by GC) but min/max aren't
+// fully updated before a crash, leaving a gap.
+TEST_F(SegmentStorageManagerTest, RecoverToleratesMissingFile) {
     {
         ASSERT_TRUE(openSM().ok());
         uint32_t id = createTrackedSegment("k1", "v1");
@@ -147,7 +148,134 @@ TEST_F(SegmentStorageManagerTest, RecoverMissingManifestFile) {
         std::filesystem::remove(path_ + "/segments/segment_" + std::to_string(id) + ".data");
     }
 
-    // Reopen — recover should report an error for the missing file.
-    Status s = openSM(false);
-    EXPECT_FALSE(s.ok());
+    // Reopen — recover should succeed, treating the gap as a removed segment.
+    ASSERT_TRUE(openSM(false).ok());
+    EXPECT_EQ(sm_->segmentCount(), 0u);
+    closeSM();
+}
+
+// Non-contiguous segment IDs: gaps in [min, max] range are tolerated.
+// Simulates GC removing middle segments without updating min/max.
+TEST_F(SegmentStorageManagerTest, RecoverNonContiguousIds) {
+    // Create segments 1, 2, 3.
+    ASSERT_TRUE(openSM().ok());
+    uint32_t id1 = createTrackedSegment("k1", "v1");
+    uint32_t id2 = createTrackedSegment("k2", "v2");
+    uint32_t id3 = createTrackedSegment("k3", "v3");
+    closeSM();
+
+    // Delete segment 2's file (simulate GC crash that removed the file
+    // but didn't update the manifest).
+    std::filesystem::remove(path_ + "/segments/segment_" + std::to_string(id2) + ".data");
+
+    // Reopen — should succeed with only segments 1 and 3.
+    ASSERT_TRUE(openSM(false).ok());
+    EXPECT_EQ(sm_->segmentCount(), 2u);
+    EXPECT_NE(sm_->getSegment(id1), nullptr);
+    EXPECT_EQ(sm_->getSegment(id2), nullptr);  // gap
+    EXPECT_NE(sm_->getSegment(id3), nullptr);
+    closeSM();
+}
+
+// Segment IDs remain monotonic across close/reopen cycles.
+TEST_F(SegmentStorageManagerTest, MonotonicIdsAcrossReopen) {
+    uint32_t last_id;
+
+    // Cycle 1: create segments.
+    {
+        ASSERT_TRUE(openSM().ok());
+        createTrackedSegment("k1", "v1");
+        last_id = createTrackedSegment("k2", "v2");
+        closeSM();
+    }
+
+    // Cycle 2: reopen and allocate more IDs.
+    {
+        ASSERT_TRUE(openSM(false).ok());
+        uint32_t new_id = sm_->allocateSegmentId();
+        EXPECT_GT(new_id, last_id);  // strictly monotonic
+        last_id = createTrackedSegment("k3", "v3");
+        closeSM();
+    }
+
+    // Cycle 3: reopen again.
+    {
+        ASSERT_TRUE(openSM(false).ok());
+        uint32_t new_id = sm_->allocateSegmentId();
+        EXPECT_GT(new_id, last_id);
+        closeSM();
+    }
+}
+
+// Orphan file outside the [min, max] range is purged when enabled.
+TEST_F(SegmentStorageManagerTest, OrphanOutsideRangeIsPurged) {
+    {
+        ASSERT_TRUE(openSM().ok());
+        createTrackedSegment("k1", "v1");
+        closeSM();
+    }
+
+    // Plant orphan with ID far outside the tracked range.
+    createOrphanFile(12345);
+    ASSERT_TRUE(std::filesystem::exists(
+        path_ + "/segments/segment_12345.data"));
+
+    {
+        SegmentStorageManager::Options opts;
+        opts.purge_untracked_files = true;
+        ASSERT_TRUE(openSM(false, opts).ok());
+
+        EXPECT_FALSE(std::filesystem::exists(
+            path_ + "/segments/segment_12345.data"));
+        EXPECT_EQ(sm_->segmentCount(), 1u);
+        closeSM();
+    }
+}
+
+// Non-contiguous IDs with purge enabled: orphans outside [min, max] are
+// deleted, but gaps within the range are simply skipped.
+TEST_F(SegmentStorageManagerTest, NonContiguousWithPurge) {
+    // Create segments 1, 2, 3.
+    ASSERT_TRUE(openSM().ok());
+    uint32_t id1 = createTrackedSegment("k1", "v1");
+    uint32_t id2 = createTrackedSegment("k2", "v2");
+    uint32_t id3 = createTrackedSegment("k3", "v3");
+    closeSM();
+
+    // Delete segment 2's file (gap).
+    std::filesystem::remove(path_ + "/segments/segment_" + std::to_string(id2) + ".data");
+
+    // Also plant an orphan outside the range.
+    createOrphanFile(999);
+
+    {
+        SegmentStorageManager::Options opts;
+        opts.purge_untracked_files = true;
+        ASSERT_TRUE(openSM(false, opts).ok());
+
+        // Gap at id2 is tolerated: 2 segments loaded.
+        EXPECT_EQ(sm_->segmentCount(), 2u);
+        EXPECT_NE(sm_->getSegment(id1), nullptr);
+        EXPECT_EQ(sm_->getSegment(id2), nullptr);
+        EXPECT_NE(sm_->getSegment(id3), nullptr);
+
+        // Orphan outside range is purged.
+        EXPECT_FALSE(std::filesystem::exists(
+            path_ + "/segments/segment_999.data"));
+
+        closeSM();
+    }
+}
+
+// New DB (empty manifest) recovers successfully with no segments.
+TEST_F(SegmentStorageManagerTest, RecoverEmptyDB) {
+    ASSERT_TRUE(openSM().ok());
+    EXPECT_EQ(sm_->segmentCount(), 0u);
+    EXPECT_EQ(sm_->allocateSegmentId(), 1u);
+    closeSM();
+
+    // Reopen on the same dir — still empty.
+    ASSERT_TRUE(openSM(false).ok());
+    EXPECT_EQ(sm_->segmentCount(), 0u);
+    closeSM();
 }
