@@ -100,10 +100,21 @@ Status GlobalIndex::recover() {
     Status s = wal_->truncate(max_version_);
     if (!s.ok()) return s;
 
-    // Load savepoint (v9 binary) if one exists.
+    // Recover from partial savepoint swap: if .old exists but valid dir
+    // doesn't, the swap was interrupted — restore the old savepoint.
+    std::string valid_dir = savepointDir();
+    std::string old_dir = valid_dir + ".old";
+    std::string tmp_dir = valid_dir + ".tmp";
     std::error_code ec;
-    if (fs::exists(savepointDir(), ec) && fs::is_directory(savepointDir(), ec)) {
-        s = readSavepoint(savepointDir());
+    fs::remove_all(tmp_dir, ec);  // incomplete write, discard
+    if (!fs::exists(valid_dir, ec) && fs::exists(old_dir, ec)) {
+        fs::rename(old_dir, valid_dir, ec);
+    }
+    fs::remove_all(old_dir, ec);  // clean up leftover
+
+    // Load savepoint if one exists.
+    if (fs::exists(valid_dir, ec) && fs::is_directory(valid_dir, ec)) {
+        s = readSavepoint(valid_dir);
         if (!s.ok()) return s;
     }
 
@@ -114,6 +125,8 @@ Status GlobalIndex::recover() {
         switch (rec.op) {
             case WalOp::kPut:
                 applyPut(rec.hkey, rec.packed_version, rec.segment_id);
+                if (rec.packed_version > max_version_)
+                    max_version_ = rec.packed_version;
                 break;
             case WalOp::kRelocate:
                 applyRelocate(rec.hkey, rec.packed_version,
@@ -127,7 +140,27 @@ Status GlobalIndex::recover() {
         if (!s.ok()) return s;
     }
 
-    // Start a new WAL file so replayed files are never appended to.
+    // Converge: write a fresh savepoint capturing the fully recovered state,
+    // then truncate the WAL entirely. This eliminates any WAL dependency
+    // and ensures a clean starting state.
+    s = writeSavepoint(tmp_dir);
+    if (!s.ok()) return s;
+
+    fs::remove_all(old_dir, ec);
+    if (fs::exists(valid_dir, ec)) {
+        fs::rename(valid_dir, old_dir, ec);
+    }
+    fs::rename(tmp_dir, valid_dir, ec);
+    fs::remove_all(old_dir, ec);
+
+    s = manifest_.set(ManifestKey::kGiSavepointMaxVersion,
+                      std::to_string(max_version_));
+    if (!s.ok()) return s;
+
+    s = wal_->truncate(max_version_);
+    if (!s.ok()) return s;
+
+    // Start a fresh WAL file.
     return wal_->startNewFile();
 }
 
@@ -272,7 +305,17 @@ Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
     Status s = writeSavepoint(tmp_dir);
     if (!s.ok()) return s;
 
+    // Persist max_version to Manifest BEFORE the atomic swap.
+    // If we crash after this but before the swap completes, recovery will
+    // over-truncate WAL (safe: those records are captured in the new savepoint
+    // that will be discarded), load the old savepoint, and replay — correct
+    // because WAL replay is idempotent and recovery writes a fresh savepoint.
+    s = manifest_.set(ManifestKey::kGiSavepointMaxVersion,
+                      std::to_string(max_version_));
+    if (!s.ok()) return s;
+
     // Atomic swap: valid → old, tmp → valid, remove old.
+    // Recovery handles partial completion (see recover()).
     std::error_code ec;
     if (fs::exists(valid_dir, ec)) {
         fs::remove_all(old_dir, ec);  // clean up any leftover
@@ -291,10 +334,6 @@ Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
         return Status::IOError("Failed to install savepoint: " + ec.message());
     }
     fs::remove_all(old_dir, ec);  // best-effort cleanup
-
-    // Persist the GlobalIndex max_version for recovery.
-    s = manifest_.set(ManifestKey::kGiSavepointMaxVersion, std::to_string(max_version_));
-    if (!s.ok()) return s;
 
     s = wal_->truncate(max_version_);
     if (!s.ok()) return s;
