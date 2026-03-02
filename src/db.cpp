@@ -7,6 +7,7 @@
 
 #include "internal/delta_hash_table.h"
 #include "internal/gc.h"
+#include "internal/periodic_daemon.h"
 #include "internal/manifest.h"
 #include "internal/version_manager.h"
 #include "internal/global_index.h"
@@ -131,8 +132,23 @@ Status DB::open(const std::string& path, const Options& options) {
 
     is_open_ = true;
 
-    startGCLoop();
-    startSavepointLoop();
+    if (options_.gc_interval_sec > 0 && options_.gc_policy != GCPolicy::MANUAL) {
+        gc_daemon_ = std::make_unique<internal::PeriodicDaemon>();
+        gc_daemon_->start(options_.gc_interval_sec, [this] {
+            double ratio = global_index_->estimateDeadRatio();
+            if (ratio > options_.gc_threshold) {
+                runGC();
+            }
+        });
+    }
+
+    if (options_.savepoint_interval_sec > 0) {
+        sp_daemon_ = std::make_unique<internal::PeriodicDaemon>();
+        sp_daemon_->start(options_.savepoint_interval_sec, [this] {
+            global_index_->maybeSavepoint();
+        });
+    }
+
     return Status::OK();
 }
 
@@ -149,8 +165,8 @@ Status DB::close() {
     }
     write_buffer_.reset();
 
-    stopGCLoop();
-    stopSavepointLoop();
+    gc_daemon_.reset();
+    sp_daemon_.reset();
 
     is_open_ = false;
 
@@ -477,45 +493,6 @@ uint64_t DB::getOldestVersion() const {
     return versions_->oldestSnapshotVersion();
 }
 
-// --- GC Daemon ---
-
-void DB::startGCLoop() {
-    if (options_.gc_interval_sec > 0 && options_.gc_policy != GCPolicy::MANUAL) {
-        gc_stop_ = false;
-        gc_thread_ = std::thread(&DB::gcLoop, this);
-    }
-}
-
-void DB::stopGCLoop() {
-    {
-        std::lock_guard<std::mutex> lock(gc_mu_);
-        gc_stop_ = true;
-    }
-    gc_cv_.notify_one();
-    if (gc_thread_.joinable()) gc_thread_.join();
-}
-
-void DB::gcLoop() {
-    std::unique_lock<std::mutex> lock(gc_mu_);
-    while (!gc_stop_) {
-        gc_cv_.wait_for(lock, std::chrono::seconds(options_.gc_interval_sec),
-                        [this] { return gc_stop_; });
-        if (gc_stop_) break;
-        lock.unlock();
-
-        double ratio = estimateDeadRatio();
-        if (ratio > options_.gc_threshold) {
-            runGC();
-        }
-
-        lock.lock();
-    }
-}
-
-double DB::estimateDeadRatio() const {
-    return global_index_->estimateDeadRatio();
-}
-
 std::vector<uint32_t> DB::selectGCInputs() {
     auto all_ids = storage_->getSegmentIds();
     std::vector<uint32_t> input_ids;
@@ -594,38 +571,6 @@ Status DB::runGC() {
         storage_->removeSegment(id);
     }
     return Status::OK();
-}
-
-// --- Savepoint Daemon ---
-
-void DB::startSavepointLoop() {
-    if (options_.savepoint_interval_sec > 0) {
-        sp_stop_ = false;
-        sp_thread_ = std::thread(&DB::savepointLoop, this);
-    }
-}
-
-void DB::stopSavepointLoop() {
-    {
-        std::lock_guard<std::mutex> lock(sp_mu_);
-        sp_stop_ = true;
-    }
-    sp_cv_.notify_one();
-    if (sp_thread_.joinable()) sp_thread_.join();
-}
-
-void DB::savepointLoop() {
-    std::unique_lock<std::mutex> lock(sp_mu_);
-    while (!sp_stop_) {
-        sp_cv_.wait_for(lock, std::chrono::seconds(options_.savepoint_interval_sec),
-                        [this] { return sp_stop_; });
-        if (sp_stop_) break;
-        lock.unlock();
-
-        global_index_->maybeSavepoint();
-
-        lock.lock();
-    }
 }
 
 }  // namespace kvlite

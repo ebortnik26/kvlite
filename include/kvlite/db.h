@@ -1,12 +1,9 @@
 #ifndef KVLITE_DB_H
 #define KVLITE_DB_H
 
-#include <condition_variable>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "kvlite/status.h"
@@ -20,6 +17,7 @@ namespace kvlite {
 namespace internal {
 class GlobalIndex;
 class Manifest;
+class PeriodicDaemon;
 class Segment;
 class SegmentStorageManager;
 class VersionManager;
@@ -139,17 +137,10 @@ private:
 
     Status flush();
 
-    void startGCLoop();
-    void stopGCLoop();
-    void gcLoop();
     Status runGC();
     std::vector<uint32_t> selectGCInputs();
     Status mergeSegments(const std::vector<uint32_t>& input_ids);
-    double estimateDeadRatio() const;
 
-    void startSavepointLoop();
-    void stopSavepointLoop();
-    void savepointLoop();
 
     std::string db_path_;
     Options options_;
@@ -160,15 +151,8 @@ private:
     std::unique_ptr<internal::WriteBuffer> write_buffer_;
     bool is_open_ = false;
 
-    std::thread gc_thread_;
-    std::mutex gc_mu_;
-    std::condition_variable gc_cv_;
-    bool gc_stop_ = false;
-
-    std::thread sp_thread_;
-    std::mutex sp_mu_;
-    std::condition_variable sp_cv_;
-    bool sp_stop_ = false;
+    std::unique_ptr<internal::PeriodicDaemon> gc_daemon_;
+    std::unique_ptr<internal::PeriodicDaemon> sp_daemon_;
 
 };
 
