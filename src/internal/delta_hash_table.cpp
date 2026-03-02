@@ -735,6 +735,7 @@ void DeltaHashTable::forEach(
 
     for (uint32_t bi = 0; bi < num_buckets; ++bi) {
         const Bucket* b = &buckets_[bi];
+        if (isEmptyBucket(*b) && !nextBucket(*b)) continue;
         while (b) {
             auto contents = decodeBucket(*b);
             for (const auto& key : contents.keys) {
@@ -756,10 +757,13 @@ void DeltaHashTable::forEachGroup(
     uint32_t num_buckets = 1u << config_.bucket_bits;
 
     for (uint32_t bi = 0; bi < num_buckets; ++bi) {
+        const Bucket* first = &buckets_[bi];
+        if (isEmptyBucket(*first) && !nextBucket(*first)) continue;
+
         // Merge across extension chain by suffix using sorted vector + binary search.
         std::vector<KeyEntry> groups;
 
-        const Bucket* b = &buckets_[bi];
+        const Bucket* b = first;
         while (b) {
             auto contents = decodeBucket(*b);
             for (auto& key : contents.keys) {

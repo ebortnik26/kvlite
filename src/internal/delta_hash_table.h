@@ -2,6 +2,7 @@
 #define KVLITE_INTERNAL_DELTA_HASH_TABLE_H
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -97,6 +98,13 @@ protected:
     DeltaHashTable& operator=(const DeltaHashTable&) = delete;
     DeltaHashTable(DeltaHashTable&&) noexcept;
     DeltaHashTable& operator=(DeltaHashTable&&) noexcept;
+
+    // Fast empty check: reads only the N_k count (first 2 bytes).
+    bool isEmptyBucket(const Bucket& bucket) const {
+        uint16_t num_keys = 0;
+        std::memcpy(&num_keys, bucket.data, sizeof(uint16_t));
+        return num_keys == 0;
+    }
 
     // --- Hash decomposition ---
 
