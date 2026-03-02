@@ -109,14 +109,10 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
         bool suffix_found = (sit != scan.suffixes.end() && *sit == suffix);
 
         if (suffix_found) {
-            BitReader reader(bucket->data, scan.versions_start_bit);
-            for (size_t k = 0; k < suffix_idx; ++k) {
-                BucketCodec::skipKeyData(reader);
-            }
-            auto key = BucketCodec::decodeKeyData(reader, suffix);
+            auto key = codec_.decodeKeyAt(*bucket, static_cast<uint16_t>(suffix_idx),
+                                          suffix, scan.data_start_bit);
 
             is_new = false;
-            uint32_t old_nv = static_cast<uint32_t>(key.packed_versions.size());
 
             auto pos = std::lower_bound(key.packed_versions.begin(),
                                         key.packed_versions.end(),
@@ -125,58 +121,9 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
             size_t vidx = pos - key.packed_versions.begin();
 
             size_t current_bits = codec_.decodeBucketUsedBits(*bucket);
-            size_t extra_bits = 0;
-
-            {
-                // Helper: eliasGammaBits for uint32_t.
-                auto egb = [](uint32_t n) -> uint8_t {
-                    uint8_t k = 31 - __builtin_clz(n);
-                    return 2 * k + 1;
-                };
-                auto egb64 = [](uint64_t n) -> uint8_t {
-                    uint8_t k = 63 - __builtin_clzll(n);
-                    return 2 * k + 1;
-                };
-                auto zzEnc = [](int32_t v) -> uint32_t {
-                    return static_cast<uint32_t>((v << 1) ^ (v >> 31));
-                };
-
-                extra_bits += egb(old_nv + 1);
-                extra_bits -= egb(old_nv);
-
-                if (old_nv == 0) {
-                    extra_bits += 64 + 32;
-                } else if (vidx == 0) {
-                    uint64_t old_first_pv = key.packed_versions[0];
-                    uint32_t old_first_id = key.ids[0];
-                    uint64_t pv_delta = packed_version - old_first_pv;
-                    int32_t id_delta = static_cast<int32_t>(old_first_id) - static_cast<int32_t>(id);
-                    extra_bits += egb64(pv_delta + 1);
-                    extra_bits += egb(zzEnc(id_delta) + 1);
-                } else if (vidx == old_nv) {
-                    uint64_t prev_pv = key.packed_versions[old_nv - 1];
-                    uint32_t prev_id = key.ids[old_nv - 1];
-                    extra_bits += BucketCodec::bitsForAppendVersion(prev_pv, packed_version, prev_id, id);
-                } else {
-                    uint64_t prev_pv = key.packed_versions[vidx - 1];
-                    uint64_t next_pv = key.packed_versions[vidx];
-                    uint32_t prev_id = key.ids[vidx - 1];
-                    uint32_t next_id = key.ids[vidx];
-                    uint64_t old_pv_delta = prev_pv - next_pv;
-                    uint64_t delta_prev_new = prev_pv - packed_version;
-                    uint64_t delta_new_next = packed_version - next_pv;
-                    extra_bits += egb64(delta_prev_new + 1);
-                    extra_bits += egb64(delta_new_next + 1);
-                    extra_bits -= egb64(old_pv_delta + 1);
-
-                    int32_t old_id_delta = static_cast<int32_t>(next_id) - static_cast<int32_t>(prev_id);
-                    int32_t id_delta_prev_new = static_cast<int32_t>(id) - static_cast<int32_t>(prev_id);
-                    int32_t id_delta_new_next = static_cast<int32_t>(next_id) - static_cast<int32_t>(id);
-                    extra_bits += egb(zzEnc(id_delta_prev_new) + 1);
-                    extra_bits += egb(zzEnc(id_delta_new_next) + 1);
-                    extra_bits -= egb(zzEnc(old_id_delta) + 1);
-                }
-            }
+            size_t extra_bits = codec_.bitsForAddVersion(
+                *bucket, static_cast<uint16_t>(suffix_idx),
+                packed_version, id, vidx);
 
             if (current_bits + extra_bits <= codec_.bucketDataBits()) {
                 auto contents = codec_.decodeBucket(*bucket);
@@ -211,14 +158,9 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
             }
 
             size_t current_bits = codec_.decodeBucketUsedBits(*bucket);
-            bool has_prev = (suffix_idx > 0);
-            bool has_next = (suffix_idx < scan.suffixes.size());
-            uint64_t prev_suffix = has_prev ? scan.suffixes[suffix_idx - 1] : 0;
-            uint64_t next_suffix = has_next ? scan.suffixes[suffix_idx] : 0;
-
-            size_t extra_bits = BucketCodec::bitsForNewEntry(suffix, prev_suffix, next_suffix,
-                                                has_prev, has_next, suffix_bits_,
-                                                packed_version, id);
+            size_t extra_bits = codec_.bitsForNewEntry(
+                *bucket, static_cast<uint16_t>(suffix_idx),
+                suffix, packed_version, id);
 
             if (current_bits + extra_bits <= codec_.bucketDataBits()) {
                 auto contents = codec_.decodeBucket(*bucket);
@@ -291,7 +233,7 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
             for (size_t j = 0; j < it->packed_versions.size(); ++j) {
                 if (it->packed_versions[j] == packed_version && it->ids[j] == old_id) {
                     it->ids[j] = new_id;
-                    size_t bits = BucketCodec::contentsBitsNeeded(contents, suffix_bits_);
+                    size_t bits = codec_.contentsBitsNeeded(contents);
                     if (bits <= codec_.bucketDataBits()) {
                         codec_.encodeBucket(*bucket, contents);
                         return true;
@@ -333,11 +275,8 @@ bool DeltaHashTable::findAllByHash(uint32_t bi, uint64_t suffix,
         auto it = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
         if (it != scan.suffixes.end() && *it == suffix) {
             size_t idx = it - scan.suffixes.begin();
-            BitReader reader(bucket->data, scan.versions_start_bit);
-            for (size_t k = 0; k < idx; ++k) {
-                BucketCodec::skipKeyData(reader);
-            }
-            auto key = BucketCodec::decodeKeyData(reader, suffix);
+            auto key = codec_.decodeKeyAt(*bucket, static_cast<uint16_t>(idx),
+                                          suffix, scan.data_start_bit);
             packed_versions.insert(packed_versions.end(),
                                    key.packed_versions.begin(),
                                    key.packed_versions.end());
@@ -360,18 +299,12 @@ bool DeltaHashTable::findFirstByHash(uint32_t bi, uint64_t suffix,
         auto it = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
         if (it != scan.suffixes.end() && *it == suffix) {
             size_t idx = it - scan.suffixes.begin();
-            BitReader reader(bucket->data, scan.versions_start_bit);
-            for (size_t k = 0; k < idx; ++k) {
-                BucketCodec::skipKeyData(reader);
-            }
-            auto key = BucketCodec::decodeKeyData(reader, suffix);
-            if (!key.packed_versions.empty()) {
-                uint64_t pv = key.packed_versions[0];
-                if (!found || pv > best_pv) {
-                    best_pv = pv;
-                    best_id = key.ids[0];
-                    found = true;
-                }
+            auto [pv, fid] = codec_.decodeFirstEntry(
+                *bucket, static_cast<uint16_t>(idx), scan.data_start_bit);
+            if (!found || pv > best_pv) {
+                best_pv = pv;
+                best_id = fid;
+                found = true;
             }
         }
         bucket = nextBucket(*bucket);

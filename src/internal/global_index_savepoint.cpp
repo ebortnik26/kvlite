@@ -55,7 +55,7 @@ struct CRC32Reader {
 };
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
-static constexpr uint32_t kFormatVersion = 11;
+static constexpr uint32_t kFormatVersion = 13;
 static constexpr uint64_t kMaxFileSize = 1ULL << 30;  // 1 GB
 
 std::vector<FileDesc> computeFileLayout(

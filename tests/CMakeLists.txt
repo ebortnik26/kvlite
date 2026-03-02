@@ -409,5 +409,26 @@ target_link_libraries(kvlite_bench_savepoint
 
 add_test(NAME savepoint_bench COMMAND kvlite_bench_savepoint)
 
+# BucketCodec benchmark (columnar vs legacy row-oriented)
+add_executable(kvlite_bench_bucket_codec
+    bench_bucket_codec.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/bucket_codec.cpp
+)
+
+target_include_directories(kvlite_bench_bucket_codec
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_bench_bucket_codec
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
+add_test(NAME bucket_codec_bench COMMAND kvlite_bench_bucket_codec)
+
 # Default parallel level for ctest
 set(CTEST_PARALLEL_LEVEL 8 CACHE STRING "Number of tests to run in parallel")

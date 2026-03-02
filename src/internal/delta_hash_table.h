@@ -30,6 +30,9 @@ inline uint64_t dhtHashBytes(const void* data, size_t len) {
     return hash;
 }
 
+// Production codec type — always columnar layout.
+using Codec = BucketCodec<ColumnarLayout>;
+
 // Base class for Delta Hash Tables using sorted suffix arrays per bucket.
 //
 // Each bucket stores unique key suffixes (the hash bits not used for bucket
@@ -47,10 +50,10 @@ public:
         uint32_t bucket_bytes = 512;
     };
 
-    // Type aliases forwarded from BucketCodec (preserves existing API).
-    using KeyEntry = BucketCodec::KeyEntry;
-    using BucketContents = BucketCodec::BucketContents;
-    using SuffixScanResult = BucketCodec::SuffixScanResult;
+    // Type aliases forwarded from namespace-level types.
+    using KeyEntry = ::kvlite::internal::KeyEntry;
+    using BucketContents = ::kvlite::internal::BucketContents;
+    using SuffixScanResult = ::kvlite::internal::SuffixScanResult;
 
     // --- Public read API (no locking) ---
 
@@ -150,7 +153,7 @@ protected:
 
     Config config_;
     uint8_t suffix_bits_;   // 64 - bucket_bits
-    BucketCodec codec_;     // bucket encode/decode
+    Codec codec_;           // bucket encode/decode (columnar layout)
     std::unique_ptr<uint8_t[]> arena_;
     std::vector<Bucket> buckets_;
     BucketArena* ext_arena_;    // non-owning; set by derived class

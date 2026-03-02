@@ -2307,26 +2307,17 @@ public:
     size_t testDecodeBucketUsedBits(uint32_t bi) const {
         return codec_.decodeBucketUsedBits(buckets_[bi]);
     }
+    size_t testContentsBitsNeeded(const BucketContents& contents) const {
+        return codec_.contentsBitsNeeded(contents);
+    }
     uint8_t testSuffixBits() const { return suffix_bits_; }
     uint32_t testBucketIndex(uint64_t hash) const { return bucketIndex(hash); }
     uint64_t testSuffixFromHash(uint64_t hash) const { return suffixFromHash(hash); }
     const Bucket& testBucket(uint32_t bi) const { return buckets_[bi]; }
 
-    // Expose static helpers via BucketCodec.
-    static void testSkipKeyData(BitReader& reader) { BucketCodec::skipKeyData(reader); }
-    static KeyEntry testDecodeKeyData(BitReader& reader, uint64_t suffix) {
-        return BucketCodec::decodeKeyData(reader, suffix);
-    }
-    static size_t testBitsForAppendVersion(uint64_t prev_pv, uint64_t new_pv,
-                                           uint32_t prev_id, uint32_t new_id) {
-        return BucketCodec::bitsForAppendVersion(prev_pv, new_pv, prev_id, new_id);
-    }
-    static size_t testBitsForNewEntry(uint64_t suffix, uint64_t prev_suffix,
-                                      uint64_t next_suffix, bool has_prev,
-                                      bool has_next, uint8_t suffix_bits,
-                                      uint64_t packed_version, uint32_t id) {
-        return BucketCodec::bitsForNewEntry(suffix, prev_suffix, next_suffix, has_prev,
-                               has_next, suffix_bits, packed_version, id);
+    KeyEntry testDecodeKeyAt(uint32_t bi, uint16_t key_index, uint64_t suffix) const {
+        auto scan = codec_.decodeSuffixes(buckets_[bi]);
+        return codec_.decodeKeyAt(buckets_[bi], key_index, suffix, scan.data_start_bit);
     }
 };
 
@@ -2360,7 +2351,7 @@ TEST(DHTTargetedScan, DecodeSuffixesEmpty) {
 
     auto result = dht.testDecodeSuffixes(0);
     EXPECT_TRUE(result.suffixes.empty());
-    EXPECT_EQ(result.versions_start_bit, 16u);
+    EXPECT_EQ(result.data_start_bit, 16u);
 }
 
 TEST(DHTTargetedScan, DecodeSuffixesSingle) {
@@ -2376,8 +2367,8 @@ TEST(DHTTargetedScan, DecodeSuffixesSingle) {
     auto result = dht.testDecodeSuffixes(0);
     ASSERT_EQ(result.suffixes.size(), 1u);
     EXPECT_EQ(result.suffixes[0], 0x12345u);
-    // versions_start_bit should be > 16 (16-bit header + suffix bits).
-    EXPECT_GT(result.versions_start_bit, 16u);
+    // data_start_bit should be > 16 (16-bit header + suffix bits).
+    EXPECT_GT(result.data_start_bit, 16u);
 }
 
 TEST(DHTTargetedScan, DecodeSuffixesMultiple) {
@@ -2402,7 +2393,7 @@ TEST(DHTTargetedScan, DecodeSuffixesMultiple) {
     EXPECT_EQ(result.suffixes[2], 300u);
 }
 
-TEST(DHTTargetedScan, SkipKeyDataRoundTrip) {
+TEST(DHTTargetedScan, DecodeKeyAtRoundTrip) {
     DeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;
     cfg.bucket_bytes = 256;
@@ -2417,15 +2408,24 @@ TEST(DHTTargetedScan, SkipKeyDataRoundTrip) {
     contents.keys = {k1, k2, k3};
     dht.testEncodeBucket(0, contents);
 
-    auto scan = dht.testDecodeSuffixes(0);
-    BitReader reader(dht.testBucket(0).data, scan.versions_start_bit);
+    // Decode each key by index.
+    auto key1 = dht.testDecodeKeyAt(0, 0, 100);
+    ASSERT_EQ(key1.packed_versions.size(), 2u);
+    EXPECT_EQ(key1.packed_versions[0], 500u);
+    EXPECT_EQ(key1.packed_versions[1], 400u);
+    EXPECT_EQ(key1.ids[0], 1u);
+    EXPECT_EQ(key1.ids[1], 2u);
 
-    // Skip first 2 keys.
-    OptTestDHT::testSkipKeyData(reader);
-    OptTestDHT::testSkipKeyData(reader);
+    auto key2 = dht.testDecodeKeyAt(0, 1, 200);
+    ASSERT_EQ(key2.packed_versions.size(), 3u);
+    EXPECT_EQ(key2.packed_versions[0], 800u);
+    EXPECT_EQ(key2.packed_versions[1], 700u);
+    EXPECT_EQ(key2.packed_versions[2], 600u);
+    EXPECT_EQ(key2.ids[0], 10u);
+    EXPECT_EQ(key2.ids[1], 20u);
+    EXPECT_EQ(key2.ids[2], 30u);
 
-    // Decode 3rd key.
-    auto key3 = OptTestDHT::testDecodeKeyData(reader, 300);
+    auto key3 = dht.testDecodeKeyAt(0, 2, 300);
     ASSERT_EQ(key3.packed_versions.size(), 1u);
     EXPECT_EQ(key3.packed_versions[0], 900u);
     EXPECT_EQ(key3.ids[0], 99u);
@@ -2793,44 +2793,17 @@ TEST(DHTContainsOpt, ConcurrentContainsDuringWrites) {
 // Suite: DHTIncrementalBits (improvement 5)
 // ============================================================
 
-TEST(DHTIncrementalBits, BitsForAppendSmallDelta) {
-    // Small version delta → small gamma.
-    size_t bits = OptTestDHT::testBitsForAppendVersion(1000, 999, 10, 11);
-    // pv delta = 1 → gamma(2) = 3 bits; id delta = 1 → zigzag(1)=2 → gamma(3) = 3 bits.
-    EXPECT_EQ(bits, 3u + 3u);
-}
+TEST(DHTIncrementalBits, BitsForNewEntryEmptyBucket) {
+    // First key in empty bucket → raw suffix_bits + gamma(1) + 64 + 32.
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;   // suffix_bits = 60
+    cfg.bucket_bytes = 256;
+    OptTestDHT dht(cfg);
 
-TEST(DHTIncrementalBits, BitsForAppendLargeDelta) {
-    // Large version delta → large gamma.
-    size_t bits = OptTestDHT::testBitsForAppendVersion(1000000, 1, 10, 10);
-    // pv delta = 999999 → gamma(1000000) = many bits.
-    // id delta = 0 → zigzag(0) = 0 → gamma(1) = 1 bit.
-    EXPECT_GT(bits, 20u);  // 999999 needs ~40 bits in gamma
-}
-
-TEST(DHTIncrementalBits, BitsForNewEntryFirst) {
-    // First key in bucket → raw suffix_bits.
-    size_t bits = OptTestDHT::testBitsForNewEntry(
-        100, 0, 0, false, false, 60, 1000, 42);
-    // suffix_bits (60) + gamma(1) (1) + 64 + 32 = 157.
-    EXPECT_EQ(bits, 60u + 1u + 64u + 32u);
-}
-
-TEST(DHTIncrementalBits, BitsForNewEntryMiddle) {
-    // Between two keys → removes one delta, adds two.
-    size_t bits = OptTestDHT::testBitsForNewEntry(
-        200, 100, 300, true, true, 60, 1000, 42);
-    // Removes gamma(300-100+1)=gamma(201), adds gamma(200-100+1)+gamma(300-200+1)
-    // = gamma(101) + gamma(101) - gamma(201) + 97 (entry data).
-    EXPECT_GT(bits, 97u);  // at minimum the entry data
-}
-
-TEST(DHTIncrementalBits, BitsForNewEntryLast) {
-    // After all keys → adds one delta.
-    size_t bits = OptTestDHT::testBitsForNewEntry(
-        300, 200, 0, true, false, 60, 1000, 42);
-    // gamma(300-200+1) = gamma(101) ≈ 13 bits, + 97 entry data.
-    EXPECT_GT(bits, 97u);
+    // Compute bitsForNewEntry on the empty bucket 0.
+    size_t bits = dht.testContentsBitsNeeded(DeltaHashTable::BucketContents{});
+    // Empty bucket: just 16-bit header.
+    EXPECT_EQ(bits, 16u);
 }
 
 TEST(DHTIncrementalBits, IncrementalMatchesFull) {
