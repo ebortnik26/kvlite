@@ -36,6 +36,7 @@ public:
     bool isIOError() const { return code_ == kIOError; }
     bool isBusy() const { return code_ == kBusy; }
     bool isGCInProgress() const { return code_ == kGCInProgress; }
+    bool isInvalidArgument() const { return code_ == kInvalidArgument; }
     bool isChecksumMismatch() const { return code_ == kChecksumMismatch; }
 
     // Return a string representation of this status

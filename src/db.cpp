@@ -203,6 +203,9 @@ Status DB::put(const std::string& key, const std::string& value,
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
     }
+    if (key.empty()) {
+        return Status::InvalidArgument("Empty key");
+    }
 
     uint64_t version = versions_->allocateVersion();
     write_buffer_->put(key, version, value, false);
@@ -244,6 +247,9 @@ Status DB::resolve(const std::string& key, uint64_t upper_bound,
                    ResolveResult& result) {
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
+    }
+    if (key.empty()) {
+        return Status::InvalidArgument("Empty key");
     }
 
     // 1. Check WriteBuffer first (active + immutables).
@@ -300,6 +306,9 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
 Status DB::remove(const std::string& key, const WriteOptions& options) {
     if (!isOpen()) {
         return Status::InvalidArgument("Database not open");
+    }
+    if (key.empty()) {
+        return Status::InvalidArgument("Empty key");
     }
 
     uint64_t version = versions_->allocateVersion();

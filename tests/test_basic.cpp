@@ -201,14 +201,14 @@ TEST_F(BasicTest, EmptyValue) {
     EXPECT_EQ(value, "");
 }
 
-TEST_F(BasicTest, EmptyKey) {
+TEST_F(BasicTest, EmptyKeyRejected) {
     ASSERT_TRUE(openDB().ok());
 
-    ASSERT_TRUE(db_.put("", "value").ok());
+    EXPECT_TRUE(db_.put("", "value").isInvalidArgument());
 
     std::string value;
-    ASSERT_TRUE(db_.get("", value).ok());
-    EXPECT_EQ(value, "value");
+    EXPECT_TRUE(db_.get("", value).isInvalidArgument());
+    EXPECT_TRUE(db_.remove("").isInvalidArgument());
 }
 
 // --- Binary Data Tests ---
