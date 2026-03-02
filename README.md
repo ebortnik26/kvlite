@@ -20,32 +20,34 @@ kvlite implements an **index-plus-log** architecture in software, providing effi
 │                         kvlite API                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                  Global Version Counter                         │
-│              (monotonic, persisted in MANIFEST)                 │
+│              (monotonic, persisted in Manifest)                 │
 ├─────────────────────────────────────────────────────────────────┤
-│      Level 1 Index: key → [(version₁, file_id₁), ...]          │
+│   GlobalIndex: key → [(version₁, segment_id₁), ...]            │
 │                    (always in memory)                           │
 ├────────────────────────┬────────────────────────────────────────┤
-│     L1 Index WAL       │       L1 Index Snapshot                │
-│  (append-only deltas)  │   (every 10M updates + shutdown)       │
+│   GlobalIndex WAL      │      GlobalIndex Savepoint             │
+│  (append-only deltas)  │   (periodic + on shutdown)             │
 ├────────────────────────┴────────────────────────────────────────┤
-│                    L2 Index Cache (LRU)                         │
-│      L2 Index: key → [(version₁, offset₁), ...]                │
+│               SegmentIndex Cache (LRU)                          │
+│   SegmentIndex: key → [(version₁, offset₁), ...]               │
 ├─────────────────────────────────────────────────────────────────┤
 │                      Write Buffer                               │
 ├──────────────┬──────────────┬──────────────┬────────────────────┤
-│  log_N.data  │ log_N+1.data │ log_N+2.data │  ...    (≤1GB each)│
+│  seg_N.data  │ seg_N+1.data │ seg_N+2.data │  ...  (≤1GB each) │
 ├──────────────┼──────────────┼──────────────┼────────────────────┤
-│  log_N.idx   │ log_N+1.idx  │ log_N+2.idx  │  ...    (L2 files) │
+│  seg_N.idx   │ seg_N+1.idx  │ seg_N+2.idx  │  ...  (per-file)  │
 └──────────────┴──────────────┴──────────────┴────────────────────┘
 ```
 
 ## Log Entry Format
 
 ```
-┌─────────┬─────────┬───────────┬───────────┬─────┬───────┬──────────┐
-│ version │ key_len │ value_len │ tombstone │ key │ value │ checksum │
-│ 8 bytes │ 4 bytes │  4 bytes  │  1 byte   │ var │  var  │ 4 bytes  │
-└─────────┴─────────┴───────────┴───────────┴─────┴───────┴──────────┘
+┌─────────┬──────────────────────┬───────────┬─────┬───────┬──────────┐
+│ version │ key_len | tombstone  │ value_len │ key │ value │ checksum │
+│ 8 bytes │      2 bytes         │  4 bytes  │ var │  var  │ 4 bytes  │
+└─────────┴──────────────────────┴───────────┴─────┴───────┴──────────┘
+         key_len: 15 bits (max 32767), tombstone: 1 bit (MSB)
+                        Header: 14 bytes
 ```
 
 ## Quick Start
@@ -59,22 +61,31 @@ int main() {
     kvlite::Options options;
     options.create_if_missing = true;
 
-    db.open("/path/to/db", options);
+    db.open("/tmp/mydb", options);
 
-    // Write (creates version 1)
+    // Write
     db.put("key", "value1");
 
-    // Update (creates version 2)
+    // Take a snapshot before updating
+    kvlite::Snapshot snap = db.createSnapshot();
+
+    // Update
     db.put("key", "value2");
 
     // Read latest
     std::string value;
     uint64_t version;
-    db.get("key", value, version);  // value="value2", version=2
+    db.get("key", value, version);
+    std::cout << value << " (v" << version << ")" << std::endl;  // "value2"
 
-    // Read at specific version
-    db.getByVersion("key", 2, value);  // value="value1" (version < 2)
+    // Read at snapshot (sees state before the update)
+    kvlite::ReadOptions ro;
+    ro.snapshot = &snap;
+    db.get("key", value, ro);
+    std::cout << value << std::endl;  // "value1"
 
+    db.releaseSnapshot(snap);
+    db.close();
     return 0;
 }
 ```
@@ -85,21 +96,22 @@ int main() {
 
 ```cpp
 // Write (creates new version)
-Status put(const std::string& key, const std::string& value);
+Status put(const std::string& key, const std::string& value,
+           const WriteOptions& options = WriteOptions());
 
 // Read latest version
-Status get(const std::string& key, std::string& value);
-Status get(const std::string& key, std::string& value, uint64_t& version);
-
-// Read at specific version (largest version < upper_bound)
-Status getByVersion(const std::string& key, uint64_t upper_bound,
-                    std::string& value);
+Status get(const std::string& key, std::string& value,
+           const ReadOptions& options = ReadOptions());
+Status get(const std::string& key, std::string& value, uint64_t& version,
+           const ReadOptions& options = ReadOptions());
 
 // Delete (creates tombstone with new version)
-Status remove(const std::string& key);
+Status remove(const std::string& key,
+              const WriteOptions& options = WriteOptions());
 
 // Check existence
-Status exists(const std::string& key, bool& exists);
+Status exists(const std::string& key, bool& exists,
+              const ReadOptions& options = ReadOptions());
 ```
 
 ### Batch Operations
@@ -109,19 +121,22 @@ Status exists(const std::string& key, bool& exists);
 kvlite::WriteBatch wbatch;
 wbatch.put("key1", "value1");
 wbatch.put("key2", "value2");
-wbatch.remove("key3");
-db.write(wbatch);  // All 3 ops get version=N
+db.write(wbatch);  // Both ops get the same version
 
 // Consistent read batch - all reads at same snapshot
 kvlite::ReadBatch rbatch;
 rbatch.get("key1");
 rbatch.get("key2");
 rbatch.get("key3");
-db.read(rbatch);  // All reads at same version
+db.read(rbatch);
 
+std::cout << "Read at version " << rbatch.snapshotVersion() << std::endl;
 for (const auto& result : rbatch.results()) {
-    if (result.ok()) {
-        std::cout << result.key << " = " << result.value << std::endl;
+    if (result.status.ok()) {
+        std::cout << result.key << " = " << result.value
+                  << " (v" << result.version << ")" << std::endl;
+    } else if (result.status.isNotFound()) {
+        std::cout << result.key << " not found" << std::endl;
     }
 }
 ```
@@ -130,21 +145,23 @@ for (const auto& result : rbatch.results()) {
 
 ```cpp
 // Create a snapshot at current version
-std::unique_ptr<kvlite::DB::Snapshot> snapshot;
-db.createSnapshot(snapshot);
-std::cout << "Snapshot at version " << snapshot->version() << std::endl;
+kvlite::Snapshot snap = db.createSnapshot();
+std::cout << "Snapshot at version " << snap.version() << std::endl;
 
-// Reads through snapshot always see same version
+// Reads through snapshot always see the same point-in-time
+kvlite::ReadOptions ro;
+ro.snapshot = &snap;
+
 std::string v1, v2;
-snapshot->get("key1", v1);
+db.get("key1", v1, ro);
 
 db.put("key1", "new_value");  // New write after snapshot
 
-snapshot->get("key1", v2);   // Still sees old value
+db.get("key1", v2, ro);   // Still sees old value
 assert(v1 == v2);
 
 // Release snapshot to allow GC of old versions
-db.releaseSnapshot(std::move(snapshot));
+db.releaseSnapshot(snap);
 ```
 
 ### Iteration
@@ -152,7 +169,7 @@ db.releaseSnapshot(std::move(snapshot));
 Unordered iteration over all keys (useful for full database copy/replication):
 
 ```cpp
-std::unique_ptr<kvlite::DB::Iterator> iter;
+std::unique_ptr<kvlite::Iterator> iter;
 db.createIterator(iter);
 
 std::string key, value;
@@ -163,19 +180,16 @@ while (iter->next(key, value, version).ok()) {
 ```
 
 Note: Keys are returned in arbitrary order (not sorted). The iterator scans
-L2 index files sequentially, using L1 to filter out old versions.
+segment files sequentially, using the GlobalIndex to filter out old versions.
 
-### Maintenance Operations
+### Statistics
 
 ```cpp
-// Get statistics
 kvlite::DBStats stats;
 db.getStats(stats);
 std::cout << "Current version: " << stats.current_version << std::endl;
 std::cout << "Active snapshots: " << stats.active_snapshots << std::endl;
-
-// Force flush write buffer to disk
-db.flush();
+std::cout << "Live entries: " << stats.num_live_entries << std::endl;
 ```
 
 Note: Garbage collection runs automatically in the background based on the
@@ -187,20 +201,38 @@ configured `gc_policy` and `gc_threshold` options.
 kvlite::Options options;
 
 // Storage
-options.log_file_size = 1ULL * 1024 * 1024 * 1024;  // 1GB per log file
+options.log_file_size = 1ULL * 1024 * 1024 * 1024;  // 1GB per segment file
 options.write_buffer_size = 64 * 1024 * 1024;        // 64MB write buffer
+options.flush_depth = 3;                              // Pipeline depth (mutable + immutable)
 
-// L1 Index
-options.l1_snapshot_interval = 10'000'000;           // Snapshot every 10M updates
-
-// L2 Cache
-options.l2_cache_size = 256 * 1024 * 1024;           // 256MB LRU cache
+// GlobalIndex Persistence
+options.savepoint_interval_sec = 10;                  // Savepoint daemon interval (0 = disable)
 
 // Garbage Collection
 options.gc_policy = kvlite::GCPolicy::HIGHEST_DEAD_RATIO;
-options.gc_threshold = 0.5;                          // 50% dead triggers GC
-options.gc_max_segments = 10;                        // Max segments per GC run
-options.gc_interval_sec = 10;                        // GC daemon wake-up interval
+options.gc_threshold = 0.5;                           // 50% dead triggers GC
+options.gc_max_segments = 10;                         // Max segments per GC run
+options.gc_interval_sec = 10;                         // GC daemon interval (0 = disable)
+
+// General
+options.create_if_missing = true;                     // Create DB dir if absent
+options.sync_writes = false;                          // fsync on every write
+options.verify_checksums = true;                      // CRC32 verification on reads
+```
+
+### Read/Write Options
+
+```cpp
+// Per-operation read options
+kvlite::ReadOptions ro;
+ro.verify_checksums = true;             // Verify CRC32 on this read
+ro.fill_cache = true;                   // Cache SegmentIndex if not cached
+ro.snapshot = &snap;                    // Read at snapshot's point-in-time
+
+// Per-operation write options
+kvlite::WriteOptions wo;
+wo.sync = true;                         // fsync this write to disk
+db.put("key", "value", wo);
 ```
 
 ## Design Details
@@ -211,27 +243,27 @@ options.gc_interval_sec = 10;                        // GC daemon wake-up interv
 - WriteBatch: all operations get the same version (atomic snapshot)
 - Single put/remove: gets its own version
 - Tombstones have versions (enables "key not found at version X")
-- Version counter persisted to MANIFEST using block-aligned write-ahead: advances in fixed blocks (default 2^20), bounding crash-recovery waste to one block
+- Version counter persisted to Manifest using block-aligned write-ahead: advances in fixed blocks (default 2^20), bounding crash-recovery waste to one block
 
 ### Index Structure
 
-Both L1 and L2 indices have the same structure:
+Both GlobalIndex and SegmentIndex use the same DeltaHashTable structure:
 
 ```
 key → [(version₁, location₁), (version₂, location₂), ...]
-       sorted by version, ascending
+       sorted by version, descending (latest first)
 
-L1: location = file_id
-L2: location = offset within file
+GlobalIndex:   location = segment_id
+SegmentIndex:  location = offset within file
 ```
 
 ### Snapshots
 
 - Lightweight: a snapshot is just a pinned version number (~8 bytes), no data is copied
-- Reads through a snapshot (`get`, `exists`) return the value visible at that version (highest version <= snapshot version)
+- Reads through a snapshot (via `ReadOptions`) return the value visible at that version (highest version <= snapshot version)
 - Keys written after the snapshot are invisible; keys deleted after are still visible
 - Multiple snapshots can coexist at different versions
-- Iterators use snapshots internally: `createIterator()` creates an owned snapshot, or an iterator can borrow an existing one
+- Iterators use snapshots internally: `createIterator()` creates an owned snapshot
 - `ReadBatch` acquires an implicit snapshot (records the version used, but does not pin it for GC)
 - Releasing a snapshot allows GC to reclaim the versions it was protecting
 
@@ -263,21 +295,21 @@ No active snapshots:
 
 1. Increment global version
 2. Write to buffer with version
-3. If buffer full → flush to new log file + create L2 index
-4. Update L1 index: append (version, file_id) to key's list
-5. Append to L1 WAL
+3. If buffer full → flush to new segment (data file + index file)
+4. Update GlobalIndex: append (version, segment_id) to key's list
+5. Append to GlobalIndex WAL
 
 ### Read Path (latest)
 
-1. L1 lookup: key → get last entry → (version, file_id)
-2. L2 lookup: key → get last entry → (version, offset)
-3. Read value from log file at offset
+1. GlobalIndex lookup: key → first entry → (version, segment_id)
+2. SegmentIndex lookup: key → first entry → (version, offset)
+3. Read value from segment data file at offset, verify CRC32
 
-### Read Path (by version)
+### Read Path (by snapshot)
 
-1. L1 lookup: key → binary search for largest version < upper_bound
-2. L2 lookup: same binary search
-3. Read value from log file at offset
+1. GlobalIndex lookup: key → scan for largest version <= snapshot version
+2. SegmentIndex lookup: same scan within the target segment
+3. Read value from segment data file at offset, verify CRC32
 
 ## Examples
 
@@ -289,9 +321,11 @@ No active snapshots:
 
 void backupToFile(kvlite::DB& db, const std::string& backup_path) {
     // Create snapshot - all reads will see consistent state
-    std::unique_ptr<kvlite::DB::Snapshot> snapshot;
-    db.createSnapshot(snapshot);
-    std::cout << "Backing up at version " << snapshot->version() << std::endl;
+    kvlite::Snapshot snap = db.createSnapshot();
+    std::cout << "Backing up at version " << snap.version() << std::endl;
+
+    kvlite::ReadOptions ro;
+    ro.snapshot = &snap;
 
     std::ofstream out(backup_path);
 
@@ -300,13 +334,13 @@ void backupToFile(kvlite::DB& db, const std::string& backup_path) {
     for (const auto& key : keys_to_backup) {
         std::string value;
         uint64_t version;
-        if (snapshot->get(key, value, version).ok()) {
+        if (db.get(key, value, version, ro).ok()) {
             out << key << ":" << version << ":" << value << "\n";
         }
     }
 
     // Release when done - allows GC of old versions
-    db.releaseSnapshot(std::move(snapshot));
+    db.releaseSnapshot(snap);
 }
 ```
 
@@ -314,36 +348,37 @@ void backupToFile(kvlite::DB& db, const std::string& backup_path) {
 
 ```cpp
 #include <kvlite/kvlite.h>
-#include <thread>
 
 void demonstrateConcurrentSnapshots(kvlite::DB& db) {
-    db.put("counter", "100");  // version 1
+    db.put("counter", "100");  // version N
 
     // Snapshot A sees counter=100
-    std::unique_ptr<kvlite::DB::Snapshot> snapshotA;
-    db.createSnapshot(snapshotA);
+    kvlite::Snapshot snapA = db.createSnapshot();
 
-    db.put("counter", "200");  // version 2
+    db.put("counter", "200");  // version N+1
 
     // Snapshot B sees counter=200
-    std::unique_ptr<kvlite::DB::Snapshot> snapshotB;
-    db.createSnapshot(snapshotB);
+    kvlite::Snapshot snapB = db.createSnapshot();
 
-    db.put("counter", "300");  // version 3
+    db.put("counter", "300");  // version N+2
+
+    kvlite::ReadOptions roA, roB;
+    roA.snapshot = &snapA;
+    roB.snapshot = &snapB;
 
     std::string vA, vB, vLatest;
-    snapshotA->get("counter", vA);   // "100"
-    snapshotB->get("counter", vB);   // "200"
+    db.get("counter", vA, roA);      // "100"
+    db.get("counter", vB, roB);      // "200"
     db.get("counter", vLatest);      // "300"
 
-    std::cout << "Snapshot A (v" << snapshotA->version() << "): " << vA << std::endl;
-    std::cout << "Snapshot B (v" << snapshotB->version() << "): " << vB << std::endl;
+    std::cout << "Snapshot A (v" << snapA.version() << "): " << vA << std::endl;
+    std::cout << "Snapshot B (v" << snapB.version() << "): " << vB << std::endl;
     std::cout << "Latest: " << vLatest << std::endl;
 
-    // GC can only collect versions < snapshotA->version()
-    // After releasing A, GC can collect up to snapshotB->version()
-    db.releaseSnapshot(std::move(snapshotA));
-    db.releaseSnapshot(std::move(snapshotB));
+    // GC can only collect versions < snapA.version()
+    // After releasing A, GC can collect up to snapB.version()
+    db.releaseSnapshot(snapA);
+    db.releaseSnapshot(snapB);
 }
 ```
 
@@ -369,83 +404,42 @@ void loadUserProfile(kvlite::DB& db, const std::string& user_id) {
 
     // Process results
     for (const auto& result : batch.results()) {
-        if (result.ok()) {
+        if (result.status.ok()) {
             std::cout << result.key << " = " << result.value
                       << " (v" << result.version << ")" << std::endl;
-        } else if (result.notFound()) {
+        } else if (result.status.isNotFound()) {
             std::cout << result.key << " not found" << std::endl;
         }
     }
 }
 ```
 
-### ReadBatch with Bulk Keys
+### Iterator for Full Scan
 
 ```cpp
 #include <kvlite/kvlite.h>
+#include <iostream>
 
-std::map<std::string, std::string> bulkGet(
-    kvlite::DB& db,
-    const std::vector<std::string>& keys
-) {
-    kvlite::ReadBatch batch;
-    batch.get(keys);  // Add all keys at once
-
-    db.read(batch);
-
-    std::map<std::string, std::string> result;
-    for (const auto& r : batch.results()) {
-        if (r.ok()) {
-            result[r.key] = r.value;
-        }
-    }
-    return result;
-}
-
-// Usage
-void example(kvlite::DB& db) {
-    std::vector<std::string> product_keys = {
-        "product:1001", "product:1002", "product:1003"
-    };
-
-    auto products = bulkGet(db, product_keys);
-    for (const auto& [key, value] : products) {
-        std::cout << key << ": " << value << std::endl;
-    }
-}
-```
-
-### Combining Snapshot with Version History
-
-```cpp
-#include <kvlite/kvlite.h>
-
-void auditKeyHistory(kvlite::DB& db, const std::string& key) {
-    std::string value;
-    uint64_t version;
-
-    // Get current version info
-    if (!db.get(key, value, version).ok()) {
-        std::cout << "Key not found" << std::endl;
+void dumpAllKeys(kvlite::DB& db) {
+    std::unique_ptr<kvlite::Iterator> iter;
+    kvlite::Status s = db.createIterator(iter);
+    if (!s.ok()) {
+        std::cerr << "Failed to create iterator: " << s.message() << std::endl;
         return;
     }
 
-    std::cout << "Current: " << value << " (v" << version << ")" << std::endl;
+    std::cout << "Iterator snapshot at version "
+              << iter->snapshot().version() << std::endl;
 
-    // Walk backwards through history (if versions still retained)
-    kvlite::DBStats stats;
-    db.getStats(stats);
-
-    for (uint64_t v = version; v > stats.oldest_version; ) {
-        std::string old_value;
-        uint64_t entry_version;
-        if (db.getByVersion(key, v, old_value, entry_version).ok()) {
-            std::cout << "v" << entry_version << ": " << old_value << std::endl;
-            v = entry_version;  // Move to previous version
-        } else {
-            break;  // No more history
-        }
+    std::string key, value;
+    uint64_t version;
+    size_t count = 0;
+    while (iter->next(key, value, version).ok()) {
+        std::cout << key << " = " << value << " (v" << version << ")" << std::endl;
+        ++count;
     }
+
+    std::cout << "Total keys: " << count << std::endl;
 }
 ```
 
