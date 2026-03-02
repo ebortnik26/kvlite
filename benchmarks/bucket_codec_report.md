@@ -80,10 +80,45 @@ pattern. Full decode is used infrequently (bucket splits, GC).
 ## 4. findFirstByHash Hot Path
 
 This is the read-path bottleneck: `DB::get` -> `GlobalIndex::getLatest` ->
-`findFirstByHash`. Pre-optimization: `decodeSuffixes` + `decodeKeyAt` (decodes
-full key entry, extracts first version). Post-optimization: `decodeSuffixes` +
-`decodeFirstEntry` (reads only counts + first-PV + first-ID columns, never
-touches tail data).
+`findFirstByHash`. The pre-optimization code path was `decodeSuffixes` +
+`decodeKeyAt` (row layout, decodes full key entry, extracts first version). The
+post-optimization code path is `decodeSuffixes` + `decodeFirstEntry` (columnar
+layout, reads only counts + first-PV + first-ID columns, never touches tail
+data).
+
+The reported speedup reflects **two combined changes**: the row-to-columnar
+layout switch and the new `decodeFirstEntry` method. To attribute them
+separately:
+
+### 4a. Columnar layout alone (decodeKeyAt on both)
+
+The columnar layout by itself provides **no targeted-decode latency gain**.
+Column-scanning overhead roughly cancels out any benefit:
+
+| Scenario | Keys | V/K | Row decodeKeyAt | Col decodeKeyAt | Ratio |
+|------------|------|-----|-----------------|-----------------|-------|
+| sequential | 50 | 10 | 5366 ns | 6714 ns | 1.25x slower |
+| clustered | 50 | 10 | 5665 ns | 5755 ns | 1.02x (parity) |
+| random | 50 | 10 | 5842 ns | 7844 ns | 1.34x slower |
+
+The columnar layout's contribution is **space savings** (Section 1), not
+targeted-decode latency.
+
+### 4b. decodeFirstEntry on columnar layout
+
+Nearly all the latency reduction comes from `decodeFirstEntry`, which skips
+tail-PV and tail-ID columns entirely:
+
+| Scenario | Keys | V/K | Col decodeKeyAt | Col decodeFirstEntry | Speedup |
+|------------|------|-----|-----------------|----------------------|---------|
+| sequential | 50 | 10 | 6714 ns | 1126 ns | **6.0x** |
+| clustered | 50 | 10 | 5755 ns | 1047 ns | **5.5x** |
+| random | 50 | 10 | 7844 ns | 1331 ns | **5.9x** |
+| 1key-100v | 1 | 100 | 1266 ns | 39 ns | **32x** |
+
+### 4c. Combined: row decodeKeyAt vs columnar decodeFirstEntry
+
+This is the end-to-end gain on the `findFirstByHash` hot path:
 
 | Scenario | Keys | V/K | Pre (row decodeKeyAt) | Post (col decodeFirstEntry) | Speedup |
 |------------|------|-----|-----------------------|-----------------------------|---------|
@@ -101,15 +136,11 @@ touches tail data).
 | random | 50 | 10 | 5842 ns | 1331 ns | **4.4x** |
 | 1key-100v | 1 | 100 | 1832 ns | 39 ns | **47x** |
 
-**Summary**: The `decodeFirstEntry` optimization delivers **4-5x speedup** for
-multi-version buckets (V/K >= 10), and **1.4-1.7x** for V/K=3. For the extreme
-case (1 key with 100 versions), the speedup is **47x** -- the columnar layout
-reads 2 values (first PV + first ID) while the row layout must scan all 100
-versions.
-
-The gain scales with versions-per-key because `decodeFirstEntry` skips
-O(total_tail_versions) of gamma-coded data. With V/K=10 and 50 keys, that is
-roughly 450 gamma reads eliminated.
+**Summary**: The combined speedup is **4-5x** for V/K >= 10 and **1.4-1.7x**
+for V/K=3. The gain is almost entirely from `decodeFirstEntry` (which requires
+the columnar layout to be effective -- it skips O(total_tail_versions) gamma
+reads that are only separable in columnar form). The columnar layout is a
+necessary precondition but does not reduce targeted-decode latency on its own.
 
 ## 5. Overhead for Single-Version Buckets
 
@@ -129,20 +160,21 @@ tombstones), so this case is uncommon.
 
 ## Summary
 
-| Metric | Gain | When |
-|------------------------------|-------------------|--------------------------------------|
-| **Space** | **51-81% smaller** | Multi-key structured data |
-| **Space** | **14-29% smaller** | Multi-key random data |
-| **findFirstByHash latency** | **4-5x faster** | V/K >= 10 (common in production) |
-| **findFirstByHash latency** | **1.4-1.7x faster** | V/K = 3 |
-| **findFirstByHash latency** | **47x faster** | Single key, many versions |
-| Encode overhead | 1.0-1.6x slower | Write path (non-critical) |
-| Full decode | ~1.0x (parity) | Bucket split/GC (infrequent) |
+| Metric | Source | Gain | When |
+|------------------------------|------------------------|-------------------|--------------------------------------|
+| **Space** | Columnar layout | **51-81% smaller** | Multi-key structured data |
+| **Space** | Columnar layout | **14-29% smaller** | Multi-key random data |
+| **findFirstByHash latency** | `decodeFirstEntry` | **4-5x faster** | V/K >= 10 (vs row decodeKeyAt) |
+| **findFirstByHash latency** | `decodeFirstEntry` | **1.4-1.7x faster** | V/K = 3 (vs row decodeKeyAt) |
+| Targeted decodeKeyAt | Columnar layout alone | ~1.0-1.3x slower | Column-scanning overhead |
+| Encode overhead | Columnar layout | 1.0-1.6x slower | Write path (non-critical) |
+| Full decode | Columnar layout | ~1.0x (parity) | Bucket split/GC (infrequent) |
 
-The optimization primarily benefits the **read hot path** (`DB::get`). The
-`findFirstByHash` call -- the single most frequent index operation -- sees a
-4-5x latency reduction for typical multi-version workloads, while bucket
-storage shrinks by 50-80%.
+The columnar layout provides **space savings** (50-80%). The `decodeFirstEntry`
+method (which requires the columnar layout) provides the **latency win** on
+the read hot path (4-5x for `findFirstByHash`). The columnar layout alone
+does not reduce targeted-decode latency -- it is slightly slower due to
+column-scanning overhead.
 
 ## Raw Benchmark Output
 
