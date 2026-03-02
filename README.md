@@ -443,4 +443,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 Design inspired by:
+- [Bitcask](https://riak.com/assets/bitcask-intro.pdf) — the index-plus-log model and in-memory key directory
 - LevelDB, RocksDB, and other LSM-tree storage engines
