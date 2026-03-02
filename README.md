@@ -17,37 +17,28 @@ kvlite implements an **index-plus-log** architecture in software, providing effi
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         kvlite API                              │
+│                      DB  (public API)                           │
+│           put · get · remove · write · read · snapshot          │
 ├─────────────────────────────────────────────────────────────────┤
-│                  Global Version Counter                         │
-│              (monotonic, persisted in Manifest)                 │
+│                                                                 │
+│  VersionManager    WriteBuffer        GlobalIndex               │
+│  (monotonic IDs)   (Memtable ×N)      (in-memory DHT)          │
+│                         │                  │                    │
+│                         │ flush            │ lookup             │
+│                         ▼                  ▼                    │
+│               SegmentStorageManager   SegmentIndex Cache        │
+│                         │                  │  (LRU)             │
+│                         ▼                  ▼                    │
+│   ┌──────────┐  ┌──────────┐  ┌──────────┐                     │
+│   │ Segment  │  │ Segment  │  │ Segment  │  ...                 │
+│   │ .data    │  │ .data    │  │ .data    │                      │
+│   │ .idx     │  │ .idx     │  │ .idx     │                      │
+│   └──────────┘  └──────────┘  └──────────┘                      │
 ├─────────────────────────────────────────────────────────────────┤
-│   GlobalIndex: key → [(version₁, segment_id₁), ...]            │
-│                    (always in memory)                           │
-├────────────────────────┬────────────────────────────────────────┤
-│   GlobalIndex WAL      │      GlobalIndex Savepoint             │
-│  (append-only deltas)  │   (periodic + on shutdown)             │
-├────────────────────────┴────────────────────────────────────────┤
-│               SegmentIndex Cache (LRU)                          │
-│   SegmentIndex: key → [(version₁, offset₁), ...]               │
+│  Manifest  ·  GlobalIndex WAL  ·  GlobalIndex Savepoints        │
 ├─────────────────────────────────────────────────────────────────┤
-│                      Write Buffer                               │
-├──────────────┬──────────────┬──────────────┬────────────────────┤
-│  seg_N.data  │ seg_N+1.data │ seg_N+2.data │  ...  (≤1GB each) │
-├──────────────┼──────────────┼──────────────┼────────────────────┤
-│  seg_N.idx   │ seg_N+1.idx  │ seg_N+2.idx  │  ...  (per-file)  │
-└──────────────┴──────────────┴──────────────┴────────────────────┘
-```
-
-## Log Entry Format
-
-```
-┌─────────┬──────────────────────┬───────────┬─────┬───────┬──────────┐
-│ version │ key_len | tombstone  │ value_len │ key │ value │ checksum │
-│ 8 bytes │      2 bytes         │  4 bytes  │ var │  var  │ 4 bytes  │
-└─────────┴──────────────────────┴───────────┴─────┴───────┴──────────┘
-         key_len: 15 bits (max 32767), tombstone: 1 bit (MSB)
-                        Header: 14 bytes
+│  Background:  GC Daemon (compaction) · Savepoint Daemon         │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Quick Start
@@ -293,23 +284,25 @@ No active snapshots:
 
 ### Write Path
 
-1. Increment global version
-2. Write to buffer with version
-3. If buffer full → flush to new segment (data file + index file)
-4. Update GlobalIndex: append (version, segment_id) to key's list
-5. Append to GlobalIndex WAL
+1. VersionManager allocates a monotonic version
+2. Entry buffered in WriteBuffer (in-memory Memtable)
+3. When buffer full → flush: write sorted entries to new Segment, seal with SegmentIndex
+4. Update GlobalIndex with (key, version, segment_id) for each flushed entry
+5. Commit to GlobalIndex WAL
 
 ### Read Path (latest)
 
-1. GlobalIndex lookup: key → first entry → (version, segment_id)
-2. SegmentIndex lookup: key → first entry → (version, offset)
-3. Read value from segment data file at offset, verify CRC32
+1. Check WriteBuffer for unflushed entries (in-memory hit)
+2. GlobalIndex lookup: key → first entry → (version, segment_id)
+3. SegmentIndex lookup (from cache or disk): key → (version, offset)
+4. Read value from segment data file at offset, verify CRC32
 
 ### Read Path (by snapshot)
 
-1. GlobalIndex lookup: key → scan for largest version <= snapshot version
-2. SegmentIndex lookup: same scan within the target segment
-3. Read value from segment data file at offset, verify CRC32
+1. Check WriteBuffer for matching entries <= snapshot version
+2. GlobalIndex lookup: key → scan for largest version <= snapshot version
+3. SegmentIndex lookup: same scan within the target segment
+4. Read value from segment data file at offset, verify CRC32
 
 ## Examples
 
