@@ -371,5 +371,37 @@ add_test(NAME concurrency_1 COMMAND kvlite_int_concurrency
 add_test(NAME concurrency_2 COMMAND kvlite_int_concurrency
     --gtest_filter=ConcurrencyTest.VersionOrderingUnderConcurrency:ConcurrencyTest.StressTest:ConcurrencyTest.ReadBatchAtomicity:ConcurrencyTest.WriteBatchAllOrNothingViaReadBatch:ConcurrencyTest.SnapshotDoesNotSeeUncommittedVersion:ConcurrencyTest.SnapshotGetWaitsForInFlightPuts:ConcurrencyTest.SnapshotExistsWaitsForInFlightPuts:ConcurrencyTest.WriteBatchSameVersionUnderConcurrency)
 
+# Savepoint benchmarks (regression bounds, same sources as kvlite_dht_test)
+add_executable(kvlite_bench_savepoint
+    bench_savepoint.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
+
+    ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/status.cpp
+)
+
+target_include_directories(kvlite_bench_savepoint
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(kvlite_bench_savepoint
+    PRIVATE
+        GTest::gtest
+        GTest::gtest_main
+        pthread
+)
+
+add_test(NAME savepoint_bench COMMAND kvlite_bench_savepoint)
+
 # Default parallel level for ctest
 set(CTEST_PARALLEL_LEVEL 8 CACHE STRING "Number of tests to run in parallel")
