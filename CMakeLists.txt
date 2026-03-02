@@ -49,6 +49,7 @@ set(KVLITE_SOURCES
     src/internal/wal_stream.cpp
     src/internal/entry_stream.cpp
     src/internal/gc.cpp
+    src/internal/gc_stream.cpp
 )
 
 # Create library

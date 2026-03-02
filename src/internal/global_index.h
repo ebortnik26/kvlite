@@ -147,6 +147,9 @@ private:
                         uint32_t segment_id);
 
     Status recover();
+    Status recoverPartialSwap(const std::string& valid_dir);
+    Status replayWAL();
+    Status writeConvergenceSavepoint(const std::string& valid_dir);
     std::string savepointDir() const;
 
     // --- Data ---

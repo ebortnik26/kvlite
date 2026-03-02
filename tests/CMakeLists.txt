@@ -90,6 +90,7 @@ add_executable(kvlite_segment_index_test
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/gc_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/entry_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/memtable.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
@@ -260,6 +261,7 @@ add_executable(kvlite_entry_stream_test
     test_entry_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/entry_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/gc_stream.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/memtable.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_codec.cpp

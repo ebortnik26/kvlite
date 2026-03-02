@@ -52,31 +52,50 @@ Status GlobalIndex::open(const std::string& db_path, const Options& options) {
 }
 
 Status GlobalIndex::recover() {
-    namespace fs = std::filesystem;
-
     // Re-truncate WAL: delete files with max_version <= savepoint max_version.
     // Idempotent — safe if the previous truncation partially completed.
     Status s = wal_->truncate(max_version_.load(std::memory_order_relaxed));
     if (!s.ok()) return s;
 
-    // Recover from partial savepoint swap: if .old exists but valid dir
-    // doesn't, the swap was interrupted — restore the old savepoint.
     std::string valid_dir = savepointDir();
-    std::string old_dir = valid_dir + ".old";
-    std::string tmp_dir = valid_dir + ".tmp";
-    std::error_code ec;
-    fs::remove_all(tmp_dir, ec);  // incomplete write, discard
-    if (!fs::exists(valid_dir, ec) && fs::exists(old_dir, ec)) {
-        fs::rename(old_dir, valid_dir, ec);
-    }
-    fs::remove_all(old_dir, ec);  // clean up leftover
+
+    s = recoverPartialSwap(valid_dir);
+    if (!s.ok()) return s;
 
     // Load savepoint if one exists.
+    namespace fs = std::filesystem;
+    std::error_code ec;
     if (fs::exists(valid_dir, ec) && fs::is_directory(valid_dir, ec)) {
         s = savepoint::load(valid_dir, dht_, key_count_, options_.savepoint_threads);
         if (!s.ok()) return s;
     }
 
+    s = replayWAL();
+    if (!s.ok()) return s;
+
+    return writeConvergenceSavepoint(valid_dir);
+}
+
+Status GlobalIndex::recoverPartialSwap(const std::string& valid_dir) {
+    namespace fs = std::filesystem;
+    std::string old_dir = valid_dir + ".old";
+    std::string tmp_dir = valid_dir + ".tmp";
+    std::error_code ec;
+
+    // Discard incomplete write.
+    fs::remove_all(tmp_dir, ec);
+
+    // If .old exists but valid dir doesn't, the swap was interrupted — restore.
+    if (!fs::exists(valid_dir, ec) && fs::exists(old_dir, ec)) {
+        fs::rename(old_dir, valid_dir, ec);
+    }
+
+    // Clean up leftover.
+    fs::remove_all(old_dir, ec);
+    return Status::OK();
+}
+
+Status GlobalIndex::replayWAL() {
     // Determine the valid segment range from the Manifest.
     // WAL entries referencing segments beyond max_seg_id are orphans
     // from a flush that crashed before the Manifest commit point.
@@ -109,18 +128,25 @@ Status GlobalIndex::recover() {
                 applyEliminate(rec.hkey, rec.packed_version, rec.segment_id);
                 break;
         }
-        s = stream->next();
+        Status s = stream->next();
         if (!s.ok()) return s;
     }
+    return Status::OK();
+}
 
-    // Converge: write a fresh savepoint capturing the fully recovered state,
-    // then truncate the WAL entirely. This eliminates any WAL dependency
-    // and ensures a clean starting state.
-    s = savepoint::store(tmp_dir, dht_,
+Status GlobalIndex::writeConvergenceSavepoint(const std::string& valid_dir) {
+    namespace fs = std::filesystem;
+    std::string tmp_dir = valid_dir + ".tmp";
+    std::string old_dir = valid_dir + ".old";
+    std::error_code ec;
+
+    // Write a fresh savepoint capturing the fully recovered state.
+    Status s = savepoint::store(tmp_dir, dht_,
                          key_count_.load(std::memory_order_relaxed),
                          options_.savepoint_threads);
     if (!s.ok()) return s;
 
+    // Atomic swap: valid → old, tmp → valid, remove old.
     fs::remove_all(old_dir, ec);
     if (fs::exists(valid_dir, ec)) {
         fs::rename(valid_dir, old_dir, ec);
