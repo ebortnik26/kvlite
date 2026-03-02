@@ -1764,6 +1764,74 @@ TEST_F(SavepointTest, SavepointBlocksConcurrentPut) {
     EXPECT_EQ(seg, 42u);
 }
 
+// stagePut/commitWB (flush path) runs concurrently with savepoint.
+// After both complete, the flushed entries should be visible.
+TEST_F(SavepointTest, SavepointConcurrentWithFlush) {
+    // Pre-populate so the savepoint has work to do.
+    for (int i = 0; i < 200; ++i) {
+        std::string key = "pre_" + std::to_string(i);
+        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
+    }
+
+    std::atomic<bool> go{false};
+    std::atomic<bool> flush_done{false};
+
+    // Flush thread: stages entries via stagePut + commitWB (no BatchGuard).
+    const int flush_count = 100;
+    std::thread flusher([&]() {
+        while (!go.load(std::memory_order_acquire)) {}
+        for (int i = 0; i < flush_count; ++i) {
+            std::string key = "flush_" + std::to_string(i);
+            uint64_t hkey = H(key);
+            uint64_t pv = static_cast<uint64_t>(1000 + i);
+            Status s = index_->stagePut(hkey, pv, 99);
+            EXPECT_TRUE(s.ok()) << s.toString();
+        }
+        Status s = index_->commitWB(1000 + flush_count - 1);
+        EXPECT_TRUE(s.ok()) << s.toString();
+        flush_done.store(true, std::memory_order_release);
+    });
+
+    // Savepoint thread: run concurrently.
+    go.store(true, std::memory_order_release);
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
+    flusher.join();
+    EXPECT_TRUE(flush_done.load());
+
+    // All flushed entries must be visible.
+    for (int i = 0; i < flush_count; ++i) {
+        std::string key = "flush_" + std::to_string(i);
+        uint64_t pv;
+        uint32_t seg;
+        EXPECT_TRUE(index_->getLatest(H(key), pv, seg).ok()) << "missing: " << key;
+        EXPECT_EQ(pv, static_cast<uint64_t>(1000 + i));
+        EXPECT_EQ(seg, 99u);
+    }
+
+    // Reopen and verify entries survived (savepoint or WAL replay).
+    ASSERT_TRUE(index_->close().ok());
+    manifest_.close();
+
+    Manifest manifest2;
+    ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    GlobalIndex index2(manifest2);
+    GlobalIndex::Options opts;
+    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+
+    for (int i = 0; i < flush_count; ++i) {
+        std::string key = "flush_" + std::to_string(i);
+        uint64_t pv;
+        uint32_t seg;
+        EXPECT_TRUE(index2.getLatest(H(key), pv, seg).ok()) << "missing after reopen: " << key;
+    }
+
+    // Pre-populated entries should also survive.
+    EXPECT_GE(index2.keyCount(), 200u);
+
+    index2.close();
+    manifest2.close();
+}
+
 TEST_F(SavepointTest, AtomicSwapLeavesValidDir) {
     for (int i = 0; i < 10; ++i) {
         std::string key = "key_" + std::to_string(i);
@@ -1844,6 +1912,95 @@ TEST_F(SavepointTest, EmptyIndexSavepoint) {
 
     index2.close();
     manifest2.close();
+}
+
+// ============================================================
+// RWDHT snapshotBucketChain / loadBucketChain tests
+// ============================================================
+
+TEST(RWDHTChainSnapshot, RoundTripSingleBucket) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;      // 16 buckets
+    cfg.bucket_bytes = 64;    // small buckets to force extensions
+    ReadWriteDeltaHashTable src(cfg);
+
+    // Insert entries that will land in the same bucket and force extensions.
+    // Use a single key with many versions.
+    uint64_t hkey = H("chain_test_key");
+    for (int i = 1; i <= 100; ++i) {
+        src.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+    ASSERT_EQ(src.size(), 100u);
+
+    // Snapshot the bucket containing our key.
+    uint32_t bi = hkey >> (64 - cfg.bucket_bits);
+    std::vector<uint8_t> buf;
+    uint32_t chain_len = src.snapshotBucketChain(bi, buf);
+    ASSERT_GE(chain_len, 1u);
+    ASSERT_EQ(buf.size(), static_cast<size_t>(chain_len) * src.bucketStride());
+
+    // Load into a fresh DHT.
+    ReadWriteDeltaHashTable dst(cfg);
+    dst.loadBucketChain(bi, buf.data(), static_cast<uint8_t>(chain_len));
+
+    // Verify all entries round-tripped.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dst.findAll(hkey, pvs, ids));
+    EXPECT_EQ(pvs.size(), 100u);
+
+    std::set<uint32_t> id_set(ids.begin(), ids.end());
+    for (int i = 1; i <= 100; ++i) {
+        EXPECT_EQ(id_set.count(static_cast<uint32_t>(i)), 1u) << "missing id " << i;
+    }
+}
+
+TEST(RWDHTChainSnapshot, EmptyBucket) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 128;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    // Bucket 0 should be empty.
+    std::vector<uint8_t> buf;
+    uint32_t chain_len = dht.snapshotBucketChain(0, buf);
+    EXPECT_EQ(chain_len, 0u);
+    EXPECT_TRUE(buf.empty());
+}
+
+TEST(RWDHTChainSnapshot, MultipleKeysSameBucket) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 1;      // 2 buckets — most keys collide
+    cfg.bucket_bytes = 64;
+    ReadWriteDeltaHashTable src(cfg);
+
+    // Insert many distinct keys to force extensions.
+    for (int k = 0; k < 20; ++k) {
+        uint64_t hkey = H("mk_" + std::to_string(k));
+        for (int v = 1; v <= 3; ++v) {
+            src.addEntry(hkey, static_cast<uint64_t>(v), static_cast<uint32_t>(k));
+        }
+    }
+
+    // Snapshot + load all buckets into a fresh DHT.
+    ReadWriteDeltaHashTable dst(cfg);
+    std::vector<uint8_t> buf;
+    for (uint32_t bi = 0; bi < dst.numBuckets(); ++bi) {
+        uint32_t cl = src.snapshotBucketChain(bi, buf);
+        if (cl > 0) {
+            dst.loadBucketChain(bi, buf.data(), static_cast<uint8_t>(cl));
+        }
+    }
+    dst.setSize(src.size());
+
+    // Verify all keys round-tripped.
+    for (int k = 0; k < 20; ++k) {
+        uint64_t hkey = H("mk_" + std::to_string(k));
+        std::vector<uint64_t> pvs;
+        std::vector<uint32_t> ids;
+        ASSERT_TRUE(dst.findAll(hkey, pvs, ids)) << "missing key mk_" << k;
+        EXPECT_EQ(pvs.size(), 3u);
+    }
 }
 
 // ============================================================

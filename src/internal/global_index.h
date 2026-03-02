@@ -1,6 +1,7 @@
 #ifndef KVLITE_INTERNAL_GLOBAL_INDEX_H
 #define KVLITE_INTERNAL_GLOBAL_INDEX_H
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -35,23 +36,20 @@ class Manifest;
 // in the underlying DeltaHashTable. Lifecycle methods (open/recover/close)
 // must be called from a single thread.
 //
-// Savepoint locking: callers must hold a BatchGuard (shared lock on
-// savepoint_mu_) for the duration of a WB flush or GC merge. This blocks
-// storeSavepoint() (which takes an exclusive lock) but allows WB flush and
-// GC to run concurrently. Reads don't acquire savepoint_mu_.
+// Savepoint locking: savepoint_mu_ blocks only GC (which removes/relocates
+// entries). Flush (stagePut/commitWB) runs concurrently with savepoints —
+// per-bucket spinlocks ensure consistent bucket snapshots. BatchGuard is
+// only needed for GC operations. Reads don't acquire savepoint_mu_.
 class GlobalIndex {
 public:
     struct Options {
         // Sync WAL to disk on every write (slower but more durable)
         bool sync_writes = false;
-
-        // Number of threads for parallel savepoint writes
-        uint32_t savepoint_threads = 4;
     };
 
     // RAII guard that holds a shared lock on savepoint_mu_.
-    // Callers must hold a BatchGuard for the entire WB flush or GC merge.
-    // This allows concurrent WB/GC operations but blocks savepoints.
+    // Only needed for GC merges (which remove/relocate entries).
+    // Flush (stagePut/commitWB) no longer requires BatchGuard.
     class BatchGuard {
     public:
         explicit BatchGuard(GlobalIndex& gi) : lock_(gi.savepoint_mu_) {}
@@ -81,7 +79,7 @@ public:
     Status put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
 
     // Stage a put in the WAL buffer without auto-commit.
-    // Caller must hold a BatchGuard and call commitWB() when done.
+    // Caller does not need BatchGuard. Call commitWB() when done.
     Status stagePut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
 
     bool get(uint64_t hkey,
@@ -113,8 +111,9 @@ public:
 
     void clear();
 
-    // --- WAL commit (caller must hold a BatchGuard) ---
+    // --- WAL commit ---
 
+    // Commit staged WB entries. Caller does not need BatchGuard.
     Status commitWB(uint64_t max_version);
     Status commitGC();
 
@@ -174,11 +173,11 @@ private:
 
     // --- Data ---
     ReadWriteDeltaHashTable dht_;
-    size_t key_count_ = 0;
+    std::atomic<size_t> key_count_{0};
 
     // --- Concurrency ---
-    // Savepoint mutex: shared for writes (put/relocate/eliminate/commit),
-    // exclusive for storeSavepoint(). Reads don't acquire this lock.
+    // Savepoint mutex: exclusive for storeSavepoint() and GC (BatchGuard).
+    // Flush (stagePut/commitWB) and reads don't acquire this lock.
     mutable std::shared_mutex savepoint_mu_;
 
     // --- Lifecycle / persistence ---
@@ -187,7 +186,7 @@ private:
     Options options_;
     bool is_open_ = false;
     std::unique_ptr<GlobalIndexWAL> wal_;
-    uint64_t max_version_ = 0;
+    std::atomic<uint64_t> max_version_{0};
 };
 
 } // namespace internal

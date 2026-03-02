@@ -1,12 +1,10 @@
 #include "internal/global_index.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
-#include <thread>
 #include <unistd.h>
 
 #include "internal/crc32.h"
@@ -81,7 +79,7 @@ Status GlobalIndex::open(const std::string& db_path, const Options& options) {
     // Load persisted max_version from last savepoint (if any).
     std::string mv_str;
     if (manifest_.get(ManifestKey::kGiSavepointMaxVersion, mv_str) && !mv_str.empty()) {
-        max_version_ = std::stoull(mv_str);
+        max_version_.store(std::stoull(mv_str), std::memory_order_relaxed);
     }
 
     s = recover();
@@ -99,7 +97,7 @@ Status GlobalIndex::recover() {
 
     // Re-truncate WAL: delete files with max_version <= savepoint max_version.
     // Idempotent — safe if the previous truncation partially completed.
-    Status s = wal_->truncate(max_version_);
+    Status s = wal_->truncate(max_version_.load(std::memory_order_relaxed));
     if (!s.ok()) return s;
 
     // Recover from partial savepoint swap: if .old exists but valid dir
@@ -137,8 +135,11 @@ Status GlobalIndex::recover() {
             case WalOp::kPut:
                 if (!has_max_seg || rec.segment_id > max_seg_id) break;
                 applyPut(rec.hkey, rec.packed_version, rec.segment_id);
-                if (rec.packed_version > max_version_)
-                    max_version_ = rec.packed_version;
+                {
+                    uint64_t cur = max_version_.load(std::memory_order_relaxed);
+                    if (rec.packed_version > cur)
+                        max_version_.store(rec.packed_version, std::memory_order_relaxed);
+                }
                 break;
             case WalOp::kRelocate:
                 if (!has_max_seg || rec.new_segment_id > max_seg_id) break;
@@ -167,10 +168,10 @@ Status GlobalIndex::recover() {
     fs::remove_all(old_dir, ec);
 
     s = manifest_.set(ManifestKey::kGiSavepointMaxVersion,
-                      std::to_string(max_version_));
+                      std::to_string(max_version_.load(std::memory_order_relaxed)));
     if (!s.ok()) return s;
 
-    s = wal_->truncate(max_version_);
+    s = wal_->truncate(max_version_.load(std::memory_order_relaxed));
     if (!s.ok()) return s;
 
     // Start a fresh WAL file.
@@ -181,7 +182,7 @@ Status GlobalIndex::close() {
     if (!is_open_) {
         return Status::OK();
     }
-    Status s = storeSavepoint(max_version_);
+    Status s = storeSavepoint(max_version_.load(std::memory_order_relaxed));
     if (!s.ok()) {
         wal_->close();
         is_open_ = false;
@@ -203,22 +204,23 @@ Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment
     Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
     applyPut(hkey, packed_version, segment_id);
-    if (packed_version > max_version_) {
-        max_version_ = packed_version;
-        wal_->updateMaxVersion(packed_version);
-    }
+    uint64_t cur = max_version_.load(std::memory_order_relaxed);
+    while (packed_version > cur &&
+           !max_version_.compare_exchange_weak(cur, packed_version,
+               std::memory_order_relaxed)) {}
+    wal_->updateMaxVersion(packed_version);
     return Status::OK();
 }
 
 Status GlobalIndex::stagePut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
-    // Caller must hold a BatchGuard.
+    applyPut(hkey, packed_version, segment_id);  // DHT first
     Status s = wal_->stagePut(hkey, packed_version, segment_id, WalProducer::kWB);
     if (!s.ok()) return s;
-    applyPut(hkey, packed_version, segment_id);
-    if (packed_version > max_version_) {
-        max_version_ = packed_version;
-        wal_->updateMaxVersion(packed_version);
-    }
+    uint64_t cur = max_version_.load(std::memory_order_relaxed);
+    while (packed_version > cur &&
+           !max_version_.compare_exchange_weak(cur, packed_version,
+               std::memory_order_relaxed)) {}
+    wal_->updateMaxVersion(packed_version);
     return Status::OK();
 }
 
@@ -299,14 +301,16 @@ void GlobalIndex::forEachGroup(
 
 void GlobalIndex::clear() {
     dht_.clear();
-    key_count_ = 0;
+    key_count_.store(0, std::memory_order_relaxed);
 }
 
 // --- WAL commit ---
 
 Status GlobalIndex::commitWB(uint64_t max_version) {
-    // Caller must hold a BatchGuard.
-    if (max_version > max_version_) max_version_ = max_version;
+    uint64_t cur = max_version_.load(std::memory_order_relaxed);
+    while (max_version > cur &&
+           !max_version_.compare_exchange_weak(cur, max_version,
+               std::memory_order_relaxed)) {}
     wal_->updateMaxVersion(max_version);
     return wal_->commit(WalProducer::kWB);
 }
@@ -322,6 +326,8 @@ Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
     namespace fs = std::filesystem;
     std::unique_lock<std::shared_mutex> lock(savepoint_mu_);
 
+    uint64_t snapshot_version = max_version_.load(std::memory_order_relaxed);
+
     std::string valid_dir = savepointDir();
     std::string tmp_dir = valid_dir + ".tmp";
     std::string old_dir = valid_dir + ".old";
@@ -330,13 +336,13 @@ Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
     Status s = writeSavepoint(tmp_dir);
     if (!s.ok()) return s;
 
-    // Persist max_version to Manifest BEFORE the atomic swap.
+    // Persist snapshot_version to Manifest BEFORE the atomic swap.
     // If we crash after this but before the swap completes, recovery will
     // over-truncate WAL (safe: those records are captured in the new savepoint
     // that will be discarded), load the old savepoint, and replay — correct
     // because WAL replay is idempotent and recovery writes a fresh savepoint.
     s = manifest_.set(ManifestKey::kGiSavepointMaxVersion,
-                      std::to_string(max_version_));
+                      std::to_string(snapshot_version));
     if (!s.ok()) return s;
 
     // Atomic swap: valid → old, tmp → valid, remove old.
@@ -360,7 +366,7 @@ Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
     }
     fs::remove_all(old_dir, ec);  // best-effort cleanup
 
-    s = wal_->truncate(max_version_);
+    s = wal_->truncateForSavepoint(snapshot_version);
     if (!s.ok()) return s;
 
     // Start a fresh WAL file so replayed records from the old active
@@ -371,7 +377,7 @@ Status GlobalIndex::storeSavepoint(uint64_t /*savepoint_version*/) {
 // --- Statistics ---
 
 size_t GlobalIndex::keyCount() const {
-    return key_count_;
+    return key_count_.load(std::memory_order_relaxed);
 }
 
 size_t GlobalIndex::entryCount() const {
@@ -397,40 +403,25 @@ double GlobalIndex::estimateDeadRatio() const {
 // --- Persistence ---
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
-static constexpr uint32_t kFormatVersion = 10;
+static constexpr uint32_t kFormatVersion = 11;
 static constexpr uint64_t kMaxFileSize = 1ULL << 30;  // 1 GB
 
-// RLE block tags for v10 savepoint arena encoding.
-static constexpr uint8_t kRleTagEmpty = 0x00;
-static constexpr uint8_t kRleTagPopulated = 0x01;
-
-// Check if a bucket in the raw arena is empty: N_k == 0 and no extension pointer.
-static bool isArenaBucketEmpty(const uint8_t* bucket_data, uint32_t bucket_bytes) {
-    uint16_t num_keys = 0;
-    std::memcpy(&num_keys, bucket_data, sizeof(uint16_t));
-    if (num_keys != 0) return false;
-    uint64_t ext_ptr = 0;
-    std::memcpy(&ext_ptr, bucket_data + bucket_bytes - 8, 8);
-    return ext_ptr == 0;
-}
 
 // --- Savepoint persistence (binary, multi-file) ---
 //
-// Multi-file binary savepoint format (v10, RLE):
+// Multi-file binary savepoint format (v11, per-bucket chains):
 //
 // Directory: <db_path>/gi/savepoint/
 // Files: 00000000.dat, 00000001.dat, ...
 //
 // Each file:
 //   Global header (33 bytes) + File header (12 bytes) +
-//   RLE-encoded arena data (sequence of blocks) +
-//   Extension data (last file only, ext_count × stride bytes) +
+//   Per-bucket chain records +
 //   CRC32 footer (4 bytes)
 //
-// RLE block:
-//   tag (uint8_t): 0x00 = empty range (no data), 0x01 = populated (raw data follows)
-//   bucket_count (uint32_t): number of consecutive buckets
-//   [if tag=0x01: bucket_count × stride bytes of raw data]
+// Per-bucket record:
+//   chain_len (uint8_t): 0 = empty, 1+ = main + extensions
+//   if chain_len > 0: chain_len × stride bytes of bucket data
 
 std::vector<GlobalIndex::SavepointFileDesc> GlobalIndex::computeFileLayout() const {
     static constexpr size_t kOverhead = 33 + 12 + 4;  // headers + footer
@@ -471,10 +462,9 @@ Status GlobalIndex::writeSavepointFile(const std::string& dir,
     }
 
     const auto& cfg = dht_.config();
-    uint32_t stride = dht_.bucketStride();
-    uint32_t ext_count = dht_.extCount();
     uint64_t num_entries = dht_.size();
-    uint64_t key_count = key_count_;
+    uint64_t key_count = key_count_.load(std::memory_order_relaxed);
+    uint32_t ext_count = 0;  // extensions are inline in chain data
 
     CRC32Writer writer(file);
 
@@ -492,34 +482,15 @@ Status GlobalIndex::writeSavepointFile(const std::string& dir,
     writer.writeVal(fd.bucket_start);
     writer.writeVal(fd.bucket_count);
 
-    // Main arena data — RLE encoded.
-    const uint8_t* arena = dht_.arenaData();
+    // Per-bucket chain records.
+    std::vector<uint8_t> chain_buf;
     uint32_t bucket_end = fd.bucket_start + fd.bucket_count;
-    uint32_t bi = fd.bucket_start;
-    while (bi < bucket_end) {
-        const uint8_t* bdata = arena + static_cast<size_t>(bi) * stride;
-        bool empty = isArenaBucketEmpty(bdata, cfg.bucket_bytes);
-        uint32_t run_start = bi;
-        ++bi;
-        while (bi < bucket_end) {
-            const uint8_t* next = arena + static_cast<size_t>(bi) * stride;
-            if (isArenaBucketEmpty(next, cfg.bucket_bytes) != empty) break;
-            ++bi;
-        }
-        uint32_t run_count = bi - run_start;
-        uint8_t tag = empty ? kRleTagEmpty : kRleTagPopulated;
-        writer.writeVal(tag);
-        writer.writeVal(run_count);
-        if (!empty) {
-            size_t offset = static_cast<size_t>(run_start) * stride;
-            writer.write(arena + offset, static_cast<size_t>(run_count) * stride);
-        }
-    }
-
-    // Extension data (only in last file)
-    if (fd.is_last && ext_count > 0) {
-        for (uint32_t i = 1; i <= ext_count; ++i) {
-            writer.write(dht_.extSlotData(i), stride);
+    for (uint32_t bi = fd.bucket_start; bi < bucket_end; ++bi) {
+        uint32_t chain_len = dht_.snapshotBucketChain(bi, chain_buf);
+        uint8_t cl8 = static_cast<uint8_t>(chain_len);
+        writer.writeVal(cl8);
+        if (chain_len > 0) {
+            writer.write(chain_buf.data(), chain_buf.size());
         }
     }
 
@@ -554,46 +525,9 @@ Status GlobalIndex::writeSavepoint(const std::string& dir) const {
     }
 
     auto files = computeFileLayout();
-
-    uint32_t num_threads = std::min(options_.savepoint_threads,
-                                     static_cast<uint32_t>(files.size()));
-    if (num_threads <= 1) {
-        for (const auto& fd : files) {
-            Status s = writeSavepointFile(dir, fd);
-            if (!s.ok()) return s;
-        }
-    } else {
-        // Parallel path: workers grab files from an atomic counter.
-        std::atomic<uint32_t> next_file{0};
-        std::atomic<bool> has_error{false};
-        Status first_error;
-        std::mutex error_mu;
-
-        auto worker = [&]() {
-            while (!has_error.load(std::memory_order_relaxed)) {
-                uint32_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
-                if (fi >= files.size()) return;
-                Status s = writeSavepointFile(dir, files[fi]);
-                if (!s.ok()) {
-                    std::lock_guard<std::mutex> lock(error_mu);
-                    if (!has_error.exchange(true, std::memory_order_relaxed)) {
-                        first_error = s;
-                    }
-                    return;
-                }
-            }
-        };
-
-        std::vector<std::thread> threads;
-        threads.reserve(num_threads);
-        for (uint32_t i = 0; i < num_threads; ++i) {
-            threads.emplace_back(worker);
-        }
-        for (auto& t : threads) {
-            t.join();
-        }
-
-        if (has_error.load()) return first_error;
+    for (const auto& fd : files) {
+        Status s = writeSavepointFile(dir, fd);
+        if (!s.ok()) return s;
     }
 
     // fsync the directory so all file entries are durable before rename.
@@ -649,39 +583,22 @@ Status GlobalIndex::readSavepointFile(const std::string& fpath,
         return Status::Corruption("Failed to read file header in: " + fpath);
     }
 
-    // Read RLE-encoded arena data.
-    uint8_t* arena_base = const_cast<uint8_t*>(dht_.arenaData());
-    uint32_t buckets_read = 0;
-    while (buckets_read < bucket_count) {
-        uint8_t tag;
-        uint32_t run_count;
-        if (!reader.readVal(tag) || !reader.readVal(run_count)) {
-            return Status::Corruption("Failed to read RLE block header in: " + fpath);
+    // Read per-bucket chain records.
+    std::vector<uint8_t> chain_buf;
+    for (uint32_t i = 0; i < bucket_count; ++i) {
+        uint8_t chain_len;
+        if (!reader.readVal(chain_len)) {
+            return Status::Corruption("Failed to read chain_len in: " + fpath);
         }
-        if (run_count == 0 || buckets_read + run_count > bucket_count) {
-            return Status::Corruption("Invalid RLE run count in: " + fpath);
-        }
-        if (tag == kRleTagPopulated) {
-            size_t offset = static_cast<size_t>(bucket_start + buckets_read) * stride;
-            size_t len = static_cast<size_t>(run_count) * stride;
-            if (!reader.read(arena_base + offset, len)) {
-                return Status::Corruption("Failed to read RLE populated data in: " + fpath);
+        if (chain_len > 0) {
+            size_t data_size = static_cast<size_t>(chain_len) * stride;
+            chain_buf.resize(data_size);
+            if (!reader.read(chain_buf.data(), data_size)) {
+                return Status::Corruption("Failed to read chain data in: " + fpath);
             }
-        } else if (tag != kRleTagEmpty) {
-            return Status::Corruption("Unknown RLE tag in: " + fpath);
+            dht_.loadBucketChain(bucket_start + i, chain_buf.data(), chain_len);
         }
-        // Empty blocks: arena is already zero-initialized, nothing to do.
-        buckets_read += run_count;
-    }
-
-    // Extension data (only in last file)
-    bool is_last = (bucket_start + bucket_count >= dht_.numBuckets());
-    if (is_last && ext_count > 0) {
-        std::vector<uint8_t> ext_buf(static_cast<size_t>(ext_count) * stride);
-        if (!reader.read(ext_buf.data(), ext_buf.size())) {
-            return Status::Corruption("Failed to read extension data in: " + fpath);
-        }
-        dht_.loadExtensions(ext_buf.data(), ext_count, stride);
+        // chain_len == 0: bucket is empty, already zeroed from clear()
     }
 
     // Verify CRC32 footer
@@ -737,7 +654,7 @@ Status GlobalIndex::readSavepoint(const std::string& dir) {
 void GlobalIndex::applyPut(uint64_t hkey, uint64_t packed_version,
                            uint32_t segment_id) {
     if (dht_.addEntryIsNew(hkey, packed_version, segment_id)) {
-        ++key_count_;
+        key_count_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -749,7 +666,7 @@ void GlobalIndex::applyRelocate(uint64_t hkey, uint64_t packed_version,
 void GlobalIndex::applyEliminate(uint64_t hkey, uint64_t packed_version,
                                  uint32_t segment_id) {
     if (dht_.removeEntry(hkey, packed_version, segment_id)) {
-        --key_count_;
+        key_count_.fetch_sub(1, std::memory_order_relaxed);
     }
 }
 
@@ -757,7 +674,7 @@ Status GlobalIndex::maybeSavepoint() {
     if (wal_->size() == 0) {
         return Status::OK();
     }
-    return storeSavepoint(max_version_);
+    return storeSavepoint(max_version_.load(std::memory_order_relaxed));
 }
 
 std::string GlobalIndex::savepointDir() const {

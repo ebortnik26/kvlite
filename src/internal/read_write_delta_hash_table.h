@@ -64,6 +64,13 @@ public:
     void loadExtensions(const uint8_t* data, uint32_t count, uint32_t data_stride);
     void setSize(size_t n);
 
+    // Snapshot bucket bi's chain (main + extensions) under its spinlock.
+    // Returns chain length (0 = empty bucket). buf receives chain_len × stride bytes.
+    uint32_t snapshotBucketChain(uint32_t bi, std::vector<uint8_t>& buf) const;
+
+    // Load chain data into bucket bi + allocate extensions and wire ext_ptrs.
+    void loadBucketChain(uint32_t bi, const uint8_t* data, uint8_t chain_len);
+
 private:
     bool addImpl(uint32_t bi, uint64_t suffix,
                  uint64_t packed_version, uint32_t id);

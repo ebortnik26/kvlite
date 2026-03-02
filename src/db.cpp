@@ -114,18 +114,13 @@ Status DB::open(const std::string& path, const Options& options) {
         auto result = mt.flush(*seg, versions_->snapshotVersions());
         if (!result.status.ok()) return result.status;
 
-        // Hold the savepoint lock for the entire GI batch (stage + commit).
-        {
-            internal::GlobalIndex::BatchGuard guard(*global_index_);
-
-            for (const auto& e : result.entries) {
-                s = global_index_->stagePut(e.hkey, e.packed_ver, seg_id);
-                if (!s.ok()) return s;
-            }
-
-            s = global_index_->commitWB(result.max_version);
+        for (const auto& e : result.entries) {
+            s = global_index_->stagePut(e.hkey, e.packed_ver, seg_id);
             if (!s.ok()) return s;
         }
+
+        s = global_index_->commitWB(result.max_version);
+        if (!s.ok()) return s;
 
         // Manifest update is the commit point — makes the flush visible.
         s = storage_->registerSegments({seg_id});

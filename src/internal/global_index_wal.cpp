@@ -284,6 +284,8 @@ std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
 }
 
 Status GlobalIndexWAL::startNewFile() {
+    std::lock_guard<std::mutex> lock(mu_);
+
     // Accumulate size of the file we're closing.
     total_size_ += wal_.size();
     uint64_t closing_max = wal_.maxVersion();
@@ -333,6 +335,31 @@ Status GlobalIndexWAL::truncate(uint64_t cutoff_version) {
     min_file_id_ = current_file_id_;
     manifest_->set(ManifestKey::kGiWalMinFileId, std::to_string(min_file_id_));
 
+    total_size_ = 0;
+    return Status::OK();
+}
+
+Status GlobalIndexWAL::truncateForSavepoint(uint64_t cutoff_version) {
+    (void)cutoff_version;
+
+    // Only clear GC staging buffer (GC is blocked by exclusive savepoint_mu_).
+    // WB staging buffer may be in use by concurrent flush — leave it alone.
+    producers_[WalProducer::kGC].data.clear();
+    producers_[WalProducer::kGC].record_count = 0;
+
+    std::lock_guard<std::mutex> lock(mu_);  // serialize with flushProducer
+    wal_.abort();
+
+    std::string dir = walDir();
+    for (uint32_t fid : file_ids_) {
+        if (fid == current_file_id_) continue;
+        std::remove(walFilePath(dir, fid).c_str());
+    }
+
+    file_ids_.clear();
+    file_ids_.push_back(current_file_id_);
+    min_file_id_ = current_file_id_;
+    manifest_->set(ManifestKey::kGiWalMinFileId, std::to_string(min_file_id_));
     total_size_ = 0;
     return Status::OK();
 }

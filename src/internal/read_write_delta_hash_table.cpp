@@ -139,5 +139,38 @@ void ReadWriteDeltaHashTable::setSize(size_t n) {
     size_.store(n, std::memory_order_relaxed);
 }
 
+uint32_t ReadWriteDeltaHashTable::snapshotBucketChain(
+    uint32_t bi, std::vector<uint8_t>& buf) const {
+    SpinlockGuard guard(bucket_locks_[bi]);
+    const Bucket* b = &buckets_[bi];
+    if (isEmptyBucket(*b) && !nextBucket(*b)) return 0;
+
+    uint32_t stride = bucketStride();
+    buf.clear();
+    uint32_t chain_len = 0;
+    while (b) {
+        buf.insert(buf.end(), b->data, b->data + stride);
+        ++chain_len;
+        b = nextBucket(*b);
+    }
+    return chain_len;
+}
+
+void ReadWriteDeltaHashTable::loadBucketChain(
+    uint32_t bi, const uint8_t* data, uint8_t chain_len) {
+    uint32_t stride = bucketStride();
+    // Main bucket
+    std::memcpy(buckets_[bi].data, data, stride);
+    Bucket* prev = &buckets_[bi];
+    for (uint8_t i = 1; i < chain_len; ++i) {
+        uint32_t slot = ext_arena_owned_.allocate();
+        Bucket* ext = ext_arena_owned_.get(slot);
+        std::memcpy(ext->data, data + static_cast<size_t>(i) * stride, stride);
+        setExtensionPtr(*prev, slot);
+        prev = ext;
+    }
+    setExtensionPtr(*prev, 0);  // terminate chain
+}
+
 }  // namespace internal
 }  // namespace kvlite

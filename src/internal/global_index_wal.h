@@ -128,6 +128,10 @@ public:
     // Also clears staging buffers.
     Status truncate(uint64_t cutoff_version);
 
+    // Savepoint-safe truncation: clears GC staging buffer and closed WAL files.
+    // Leaves WB staging buffer intact (concurrent flush may be in progress).
+    Status truncateForSavepoint(uint64_t cutoff_version);
+
     // Close the active WAL file and start a new one.
     // Used after recovery so replayed files are never appended to.
     Status startNewFile();
