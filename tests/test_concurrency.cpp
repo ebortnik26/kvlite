@@ -22,7 +22,10 @@ static kvlite::ReadOptions snapOpts(const kvlite::Snapshot& snap) {
 class ConcurrencyTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        test_dir_ = fs::temp_directory_path() / "kvlite_test_concurrency";
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        std::string dir_name = std::string("kvlite_conc_") + info->name() +
+                               "_" + std::to_string(reinterpret_cast<uintptr_t>(this));
+        test_dir_ = fs::temp_directory_path() / dir_name;
         fs::remove_all(test_dir_);
         fs::create_directories(test_dir_);
 

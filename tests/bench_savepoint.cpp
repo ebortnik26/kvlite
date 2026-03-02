@@ -168,6 +168,55 @@ TEST_F(SavepointBench, ConcurrentFlushAndSavepoint) {
 }
 
 // ---------------------------------------------------------------------------
+// MultiThreadedSavepointSpeedup: compare 1-thread vs 4-thread savepoint write.
+// Informational — prints the speedup ratio but does not enforce a hard bound.
+// ---------------------------------------------------------------------------
+TEST_F(SavepointBench, MultiThreadedSavepointSpeedup) {
+    const int kNumKeys = 100'000;
+    for (int i = 0; i < kNumKeys; ++i) {
+        std::string key = "mtsp_" + std::to_string(i);
+        ASSERT_TRUE(index_->put(H(key), i + 1, i + 1).ok());
+    }
+
+    // --- 1-thread baseline: reopen with savepoint_threads=1 ---
+    index_->close();
+    index_.reset();
+    manifest_.close();
+
+    ASSERT_TRUE(manifest_.open(db_dir_).ok());
+    index_ = std::make_unique<GlobalIndex>(manifest_);
+    GlobalIndex::Options opts1;
+    opts1.savepoint_threads = 1;
+    ASSERT_TRUE(index_->open(db_dir_, opts1).ok());
+
+    // Re-populate (open loaded the savepoint, so data is present).
+    auto t0 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
+    auto t1 = std::chrono::steady_clock::now();
+    double ms_1t = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    // --- 4-thread: reopen with savepoint_threads=4 ---
+    index_->close();
+    index_.reset();
+    manifest_.close();
+
+    ASSERT_TRUE(manifest_.open(db_dir_).ok());
+    index_ = std::make_unique<GlobalIndex>(manifest_);
+    GlobalIndex::Options opts4;
+    opts4.savepoint_threads = 4;
+    ASSERT_TRUE(index_->open(db_dir_, opts4).ok());
+
+    auto t2 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(index_->storeSavepoint(0).ok());
+    auto t3 = std::chrono::steady_clock::now();
+    double ms_4t = std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+    double speedup = ms_1t / std::max(ms_4t, 0.1);
+    std::cout << "[BENCH] MultiThreadedSavepointSpeedup: 1-thread=" << ms_1t
+              << " ms, 4-thread=" << ms_4t << " ms, speedup=" << speedup << "x\n";
+}
+
+// ---------------------------------------------------------------------------
 // LoadBucketChain: read-path bucket loading (1M buckets, 100K keys)
 // ---------------------------------------------------------------------------
 TEST_F(SavepointBench, LoadBucketChain) {

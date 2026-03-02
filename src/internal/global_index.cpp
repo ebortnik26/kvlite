@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <unistd.h>
 
 #include "internal/crc32.h"
@@ -114,7 +115,7 @@ Status GlobalIndex::recover() {
 
     // Load savepoint if one exists.
     if (fs::exists(valid_dir, ec) && fs::is_directory(valid_dir, ec)) {
-        s = readSavepoint(valid_dir);
+        s = loadSavepoint(valid_dir);
         if (!s.ok()) return s;
     }
 
@@ -428,16 +429,23 @@ std::vector<GlobalIndex::SavepointFileDesc> GlobalIndex::computeFileLayout() con
 
     uint32_t num_buckets = dht_.numBuckets();
     uint32_t stride = dht_.bucketStride();
+    uint32_t min_files = std::max(static_cast<uint8_t>(1), options_.savepoint_threads);
 
-    uint32_t buckets_per_file;
+    // Compute number of files: at least savepoint_threads, more if data exceeds 1 GB per file.
+    uint32_t num_files;
     if (stride == 0) {
-        buckets_per_file = num_buckets;
+        num_files = 1;
     } else {
         uint64_t budget = kMaxFileSize - kOverhead;
-        buckets_per_file = static_cast<uint32_t>(
+        uint32_t max_bpf = static_cast<uint32_t>(
             std::min(static_cast<uint64_t>(num_buckets), budget / stride));
-        if (buckets_per_file == 0) buckets_per_file = 1;
+        if (max_bpf == 0) max_bpf = 1;
+        uint32_t files_for_size = (num_buckets + max_bpf - 1) / max_bpf;
+        num_files = std::max(static_cast<uint32_t>(min_files), files_for_size);
     }
+    if (num_files > num_buckets) num_files = num_buckets;
+
+    uint32_t buckets_per_file = (num_buckets + num_files - 1) / num_files;
 
     std::vector<SavepointFileDesc> files;
     uint32_t bs = 0, fi = 0;
@@ -502,13 +510,6 @@ Status GlobalIndex::writeSavepointFile(const std::string& dir,
         return Status::IOError("Failed to write savepoint file: " + fpath);
     }
     file.flush();
-
-    // fsync the file so data is durable before the directory rename.
-    int sync_fd = ::open(fpath.c_str(), O_RDONLY);
-    if (sync_fd >= 0) {
-        ::fdatasync(sync_fd);
-        ::close(sync_fd);
-    }
     return Status::OK();
 }
 
@@ -525,9 +526,42 @@ Status GlobalIndex::writeSavepoint(const std::string& dir) const {
     }
 
     auto files = computeFileLayout();
-    for (const auto& fd : files) {
-        Status s = writeSavepointFile(dir, fd);
-        if (!s.ok()) return s;
+    uint32_t num_threads = std::min(
+        static_cast<uint32_t>(std::max(static_cast<uint8_t>(1), options_.savepoint_threads)),
+        static_cast<uint32_t>(files.size()));
+
+    if (num_threads <= 1) {
+        // Sequential path.
+        for (const auto& fd : files) {
+            Status s = writeSavepointFile(dir, fd);
+            if (!s.ok()) return s;
+        }
+    } else {
+        // Parallel path: distribute files round-robin across threads.
+        std::vector<Status> statuses(num_threads, Status::OK());
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads - 1);
+
+        auto worker = [&](uint32_t tid) {
+            for (uint32_t i = tid; i < files.size(); i += num_threads) {
+                Status s = writeSavepointFile(dir, files[i]);
+                if (!s.ok()) {
+                    statuses[tid] = s;
+                    return;
+                }
+            }
+        };
+
+        for (uint32_t t = 1; t < num_threads; ++t) {
+            threads.emplace_back(worker, t);
+        }
+        worker(0);  // main thread takes tid 0
+
+        for (auto& th : threads) th.join();
+
+        for (const auto& s : statuses) {
+            if (!s.ok()) return s;
+        }
     }
 
     // fsync the directory so all file entries are durable before rename.
@@ -539,7 +573,7 @@ Status GlobalIndex::writeSavepoint(const std::string& dir) const {
     return Status::OK();
 }
 
-Status GlobalIndex::readSavepointFile(const std::string& fpath,
+Status GlobalIndex::loadSavepointFile(const std::string& fpath,
                                      uint32_t stride,
                                      uint64_t& out_entries,
                                      uint64_t& out_key_count,
@@ -614,7 +648,7 @@ Status GlobalIndex::readSavepointFile(const std::string& fpath,
     return Status::OK();
 }
 
-Status GlobalIndex::readSavepoint(const std::string& dir) {
+Status GlobalIndex::loadSavepoint(const std::string& dir) {
     namespace fs = std::filesystem;
 
     if (!fs::exists(dir) || !fs::is_directory(dir)) {
@@ -636,16 +670,62 @@ Status GlobalIndex::readSavepoint(const std::string& dir) {
     clear();
 
     uint32_t stride = dht_.bucketStride();
-    uint64_t entries = 0, key_count = 0;
-    uint32_t ext_count = 0;
+    uint32_t num_threads = std::min(
+        static_cast<uint32_t>(std::max(static_cast<uint8_t>(1), options_.savepoint_threads)),
+        static_cast<uint32_t>(files.size()));
 
-    for (const auto& fpath : files) {
-        Status s = readSavepointFile(fpath, stride, entries, key_count, ext_count);
-        if (!s.ok()) return s;
+    // Per-thread output slots for header values.
+    struct FileResult {
+        uint64_t entries = 0;
+        uint64_t key_count = 0;
+        uint32_t ext_count = 0;
+        Status status;
+    };
+
+    if (num_threads <= 1) {
+        // Sequential path.
+        uint64_t entries = 0, key_count = 0;
+        uint32_t ext_count = 0;
+        for (const auto& fpath : files) {
+            Status s = loadSavepointFile(fpath, stride, entries, key_count, ext_count);
+            if (!s.ok()) return s;
+        }
+        dht_.setSize(entries);
+        key_count_ = static_cast<size_t>(key_count);
+    } else {
+        // Parallel path: distribute files round-robin across threads.
+        std::vector<FileResult> results(num_threads);
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads - 1);
+
+        auto worker = [&](uint32_t tid) {
+            for (uint32_t i = tid; i < files.size(); i += num_threads) {
+                Status s = loadSavepointFile(files[i], stride,
+                    results[tid].entries, results[tid].key_count,
+                    results[tid].ext_count);
+                if (!s.ok()) {
+                    results[tid].status = s;
+                    return;
+                }
+            }
+        };
+
+        for (uint32_t t = 1; t < num_threads; ++t) {
+            threads.emplace_back(worker, t);
+        }
+        worker(0);  // main thread takes tid 0
+
+        for (auto& th : threads) th.join();
+
+        for (const auto& r : results) {
+            if (!r.status.ok()) return r.status;
+        }
+
+        // All files carry the same global header; use file 0's values.
+        dht_.setSize(results[0].entries);
+        key_count_ = static_cast<size_t>(results[0].key_count);
     }
 
-    dht_.setSize(entries);
-    key_count_ = static_cast<size_t>(key_count);
     return Status::OK();
 }
 

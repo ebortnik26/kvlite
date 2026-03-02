@@ -45,6 +45,8 @@ public:
     struct Options {
         // Sync WAL to disk on every write (slower but more durable)
         bool sync_writes = false;
+        // Number of threads for savepoint write/load (1 = sequential)
+        uint8_t savepoint_threads = 4;
     };
 
     // RAII guard that holds a shared lock on savepoint_mu_.
@@ -164,8 +166,8 @@ private:
     Status writeSavepointFile(const std::string& dir,
                              const SavepointFileDesc& fd) const;
 
-    Status readSavepoint(const std::string& dir);
-    Status readSavepointFile(const std::string& fpath,
+    Status loadSavepoint(const std::string& dir);
+    Status loadSavepointFile(const std::string& fpath,
                             uint32_t stride,
                             uint64_t& out_entries,
                             uint64_t& out_key_count,
