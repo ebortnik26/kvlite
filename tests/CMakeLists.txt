@@ -7,8 +7,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(googletest)
 
-# Test executable (integration tests - requires full library implementation)
-add_executable(kvlite_test
+# Integration tests — one executable per suite for parallel ctest runs.
+# Each suite uses its own temp directory so they are safe to run concurrently.
+set(INTEGRATION_TEST_SOURCES
     test_basic.cpp
     test_batch.cpp
     test_versioning.cpp
@@ -18,18 +19,14 @@ add_executable(kvlite_test
     test_gc_daemon.cpp
 )
 
-target_include_directories(kvlite_test
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-)
+foreach(src ${INTEGRATION_TEST_SOURCES})
+    get_filename_component(name ${src} NAME_WE)           # e.g. test_basic
+    string(REPLACE "test_" "kvlite_int_" target ${name})  # e.g. kvlite_int_basic
 
-target_link_libraries(kvlite_test
-    PRIVATE
-        kvlite
-        GTest::gtest
-        GTest::gtest_main
-        pthread
-)
+    add_executable(${target} ${src})
+    target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(${target} PRIVATE kvlite GTest::gtest GTest::gtest_main pthread)
+endforeach()
 
 # BitStream unit tests (header-only, no extra sources needed)
 add_executable(kvlite_bitstream_test
@@ -337,12 +334,12 @@ target_link_libraries(kvlite_wal_stream_test
         pthread
 )
 
-# Register test executables with CTest (one test per executable).
-# This allows safe parallel execution with ctest -j2 since each executable
-# uses its own temp directories.
+# Register test executables with CTest.
+# Integration suites are split into separate executables for parallel runs.
+
+# Unit tests
 add_test(NAME entry_stream_tests COMMAND kvlite_entry_stream_test)
 add_test(NAME storage_manager_tests COMMAND kvlite_sm_test)
-add_test(NAME integration_tests COMMAND kvlite_test)
 add_test(NAME bitstream_tests COMMAND kvlite_bitstream_test)
 add_test(NAME dht_tests COMMAND kvlite_dht_test)
 add_test(NAME segment_index_tests COMMAND kvlite_segment_index_test)
@@ -354,5 +351,14 @@ add_test(NAME manifest_tests COMMAND kvlite_manifest_test)
 add_test(NAME wal_tests COMMAND kvlite_wal_test)
 add_test(NAME wal_stream_tests COMMAND kvlite_wal_stream_test)
 
+# Integration tests (one per suite)
+add_test(NAME basic_tests COMMAND kvlite_int_basic)
+add_test(NAME batch_tests COMMAND kvlite_int_batch)
+add_test(NAME versioning_tests COMMAND kvlite_int_versioning)
+add_test(NAME iterator_tests COMMAND kvlite_int_iterator)
+add_test(NAME concurrency_tests COMMAND kvlite_int_concurrency)
+add_test(NAME db_tests COMMAND kvlite_int_db)
+add_test(NAME gc_daemon_tests COMMAND kvlite_int_gc_daemon)
+
 # Default parallel level for ctest
-set(CTEST_PARALLEL_LEVEL 4 CACHE STRING "Number of tests to run in parallel")
+set(CTEST_PARALLEL_LEVEL 8 CACHE STRING "Number of tests to run in parallel")
