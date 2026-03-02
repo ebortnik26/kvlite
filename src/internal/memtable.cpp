@@ -6,6 +6,7 @@
 #include "internal/delta_hash_table.h"
 #include "internal/entry_stream.h"
 #include "internal/segment.h"
+#include "internal/version_dedup.h"
 
 namespace kvlite {
 namespace internal {
@@ -485,7 +486,8 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
     return std::make_unique<MemtableStream>(data_ptr, std::move(deduped));
 }
 
-Memtable::FlushResult Memtable::flush(Segment& out) {
+Memtable::FlushResult Memtable::flush(Segment& out,
+                                      const std::vector<uint64_t>& snapshot_versions) {
     Status s;
 
     struct FlatEntry {
@@ -497,12 +499,21 @@ Memtable::FlushResult Memtable::flush(Segment& out) {
     };
 
     std::vector<FlushedEntry> flushed;
-    flushed.reserve(size_.load(std::memory_order_relaxed));
+    flushed.reserve(key_count_.load(std::memory_order_relaxed));
     uint64_t max_ver = 0;
 
     // Process one bucket at a time. Iterating buckets 0..N gives hash-prefix
-    // order; we only need to sort within each bucket by (hash, version).
+    // order; we only need to sort within each bucket by (hash, key).
     std::vector<FlatEntry> bucket_entries;
+
+    auto emit = [&](const FlatEntry& e) -> Status {
+        Status st = out.put(e.key, e.pv.version(), e.value, e.pv.tombstone());
+        if (!st.ok()) return st;
+        flushed.push_back({e.hash, e.packed_ver});
+        uint64_t v = e.pv.version();
+        if (v > max_ver) max_ver = v;
+        return Status::OK();
+    };
 
     for (uint32_t bi = 0; bi < kNumBuckets; ++bi) {
         const Bucket* b = &buckets_[bi];
@@ -524,18 +535,49 @@ Memtable::FlushResult Memtable::flush(Segment& out) {
             b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
         }
 
+        // Sort by (hash asc, version asc) to group entries per hash
+        // in version order for the dedup algorithm — same as GC.
         std::sort(bucket_entries.begin(), bucket_entries.end(),
                   [](const FlatEntry& a, const FlatEntry& b) {
                       if (a.hash != b.hash) return a.hash < b.hash;
-                      return a.packed_ver < b.packed_ver;
+                      return a.pv.version() < b.pv.version();  // asc
                   });
 
-        for (const auto& e : bucket_entries) {
-            s = out.put(e.key, e.pv.version(), e.value, e.pv.tombstone());
-            if (!s.ok()) return {s, {}, 0};
-            flushed.push_back({e.hash, e.packed_ver});
-            uint64_t v = e.pv.version();
-            if (v > max_ver) max_ver = v;
+        // Dedup: for each hash group, use the two-pointer scan to
+        // decide which versions to keep based on snapshot visibility.
+        // Same grouping as GC — by hash, not by full key.
+        size_t i = 0;
+        while (i < bucket_entries.size()) {
+            // Find the end of this hash group.
+            size_t j = i + 1;
+            while (j < bucket_entries.size() &&
+                   bucket_entries[j].hash == bucket_entries[i].hash) {
+                ++j;
+            }
+            size_t group_size = j - i;
+
+            if (snapshot_versions.empty() || group_size == 1) {
+                // No snapshots or single entry: keep only latest (last in asc order).
+                s = emit(bucket_entries[j - 1]);
+                if (!s.ok()) return {s, {}, 0};
+            } else {
+                // Extract versions for dedup.
+                std::vector<uint64_t> vers(group_size);
+                for (size_t k = 0; k < group_size; ++k) {
+                    vers[k] = bucket_entries[i + k].pv.version();
+                }
+                std::unique_ptr<bool[]> keep(new bool[group_size]);
+                dedupVersionGroup(vers.data(), group_size,
+                                     snapshot_versions, keep.get());
+
+                for (size_t k = 0; k < group_size; ++k) {
+                    if (keep[k]) {
+                        s = emit(bucket_entries[i + k]);
+                        if (!s.ok()) return {s, {}, 0};
+                    }
+                }
+            }
+            i = j;
         }
     }
 

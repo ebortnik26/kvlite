@@ -10,6 +10,7 @@
 #include "internal/entry_stream.h"
 #include "internal/gc_stream.h"
 #include "internal/log_entry.h"
+#include "internal/version_dedup.h"
 
 namespace kvlite {
 namespace internal {
@@ -102,25 +103,25 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// GCClassifyStream — writes EntryAction to ext[base + GCClassifyExt::kAction]
+// GCDedupStream — writes EntryAction to ext[base + GCDedupExt::kAction]
 //
 // Input must be in (hash asc, version asc) order. Buffers entries per hash
-// group, classifies the group when the hash changes (or stream exhausts),
-// then replays the classified entries one at a time.
+// group, deduplicates the group when the hash changes (or stream exhausts),
+// then replays the deduplicated entries one at a time.
 //
-// Classification: for each snapshot version, the latest entry version <=
+// Dedup: for each snapshot version, the latest entry version <=
 // snapshot is kept. All other entries are eliminated.
 // ---------------------------------------------------------------------------
 
-class GCClassifyStream : public EntryStream {
+class GCDedupStream : public EntryStream {
 public:
-    GCClassifyStream(std::unique_ptr<EntryStream> input,
+    GCDedupStream(std::unique_ptr<EntryStream> input,
                      std::vector<uint64_t> snapshot_versions,
                      size_t base)
         : input_(std::move(input)),
           snapshots_(std::move(snapshot_versions)),
           base_(base) {
-        assert(base_ + GCClassifyExt::kSize <= Entry::kMaxExt);
+        assert(base_ + GCDedupExt::kSize <= Entry::kMaxExt);
         std::sort(snapshots_.begin(), snapshots_.end());
         if (input_->valid()) {
             fillGroup();
@@ -184,41 +185,22 @@ private:
                 arena_.data() + meta_[i].value_offset, meta_[i].value_len);
         }
 
-        // Classify with two-pointer scan.
-        // Entries are in version-asc order; snapshots are sorted asc.
-        // For each snapshot, the latest version <= snapshot is kept.
-        // Walk entries and snapshots together in O(S + G).
-        for (auto& e : group_) {
-            e.ext[base_ + GCClassifyExt::kAction] =
-                static_cast<uint64_t>(EntryAction::kEliminate);
+        // Dedup using shared two-pointer algorithm.
+        size_t n = group_.size();
+        versions_.resize(n);
+        if (n > keep_cap_) {
+            keep_ = std::make_unique<bool[]>(n);
+            keep_cap_ = n;
         }
-
-        // keeper[si] tracks the best candidate index for snapshot si.
-        // Walk entries left-to-right (version asc). For each entry,
-        // advance through snapshots that this entry is still <= to.
-        size_t si = 0;
-        size_t num_snaps = snapshots_.size();
-        // keeper stores the index of the latest entry <= each snapshot.
-        keeper_.clear();
-        keeper_.resize(num_snaps, SIZE_MAX);
-
-        for (size_t gi = 0; gi < group_.size(); ++gi) {
-            uint64_t ver = group_[gi].version();
-            // Advance past snapshots that this entry exceeds.
-            while (si < num_snaps && ver > snapshots_[si]) {
-                ++si;
-            }
-            // Mark this entry as the best candidate for all snapshots >= ver.
-            for (size_t s = si; s < num_snaps && ver <= snapshots_[s]; ++s) {
-                keeper_[s] = gi;
-            }
+        for (size_t gi = 0; gi < n; ++gi) {
+            versions_[gi] = group_[gi].version();
         }
-
-        for (size_t s = 0; s < num_snaps; ++s) {
-            if (keeper_[s] != SIZE_MAX) {
-                group_[keeper_[s]].ext[base_ + GCClassifyExt::kAction] =
-                    static_cast<uint64_t>(EntryAction::kKeep);
-            }
+        dedupVersionGroup(versions_.data(), n,
+                             snapshots_, keep_.get());
+        for (size_t gi = 0; gi < n; ++gi) {
+            group_[gi].ext[base_ + GCDedupExt::kAction] =
+                static_cast<uint64_t>(keep_[gi] ? EntryAction::kKeep
+                                                : EntryAction::kEliminate);
         }
     }
 
@@ -228,7 +210,9 @@ private:
     std::vector<Entry> group_;
     std::string arena_;                  // contiguous key+value storage
     std::vector<EntryMeta> meta_;        // per-entry value offsets into arena
-    std::vector<size_t> keeper_;         // per-snapshot best candidate index
+    std::vector<uint64_t> versions_;     // scratch: per-entry versions for dedup
+    std::unique_ptr<bool[]> keep_;       // scratch: dedup output
+    size_t keep_cap_ = 0;
     size_t pos_ = 0;
 };
 
@@ -247,11 +231,11 @@ std::unique_ptr<EntryStream> gcTagSource(
     return std::make_unique<GCTagSourceStream>(std::move(input), segment_id, base);
 }
 
-std::unique_ptr<EntryStream> gcClassify(
+std::unique_ptr<EntryStream> gcDedup(
     std::unique_ptr<EntryStream> input,
     const std::vector<uint64_t>& snapshot_versions,
     size_t base) {
-    return std::make_unique<GCClassifyStream>(std::move(input), snapshot_versions, base);
+    return std::make_unique<GCDedupStream>(std::move(input), snapshot_versions, base);
 }
 
 }  // namespace stream
@@ -274,9 +258,9 @@ Status GC::merge(
     result.entries_written = 0;
     result.entries_eliminated = 0;
 
-    // Ext layout: [GCTagSourceExt | GCClassifyExt]
+    // Ext layout: [GCTagSourceExt | GCDedupExt]
     constexpr size_t kTagBase      = 0;
-    constexpr size_t kClassifyBase = kTagBase + GCTagSourceExt::kSize;
+    constexpr size_t kDedupBase = kTagBase + GCTagSourceExt::kSize;
 
     // 1. Build tagSource streams — one per input segment.
     std::vector<std::unique_ptr<EntryStream>> streams;
@@ -288,10 +272,10 @@ Status GC::merge(
             input->getId(), kTagBase));
     }
 
-    // 2. Merge all streams, then classify using snapshot versions.
-    auto pipeline = stream::gcClassify(
+    // 2. Merge all streams, then dedup using snapshot versions.
+    auto pipeline = stream::gcDedup(
         stream::gcMerge(std::move(streams)),
-        snapshot_versions, kClassifyBase);
+        snapshot_versions, kDedupBase);
 
     // 3. If empty, return OK.
     if (!pipeline->valid()) {
@@ -308,7 +292,7 @@ Status GC::merge(
     while (pipeline->valid()) {
         const auto& entry = pipeline->entry();
         auto action = static_cast<EntryAction>(
-            entry.ext[kClassifyBase + GCClassifyExt::kAction]);
+            entry.ext[kDedupBase + GCDedupExt::kAction]);
         auto old_seg_id = static_cast<uint32_t>(
             entry.ext[kTagBase + GCTagSourceExt::kSegmentId]);
 

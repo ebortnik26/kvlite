@@ -143,7 +143,7 @@ TEST_F(EntryStreamTest, GCMerge_TwoStreamsSameKey) {
 
     auto merged = stream::gcMerge(std::move(streams));
 
-    // Both versions should be emitted (merge doesn't dedup — classify does).
+    // Both versions should be emitted (merge doesn't dedup — gcDedup does).
     std::vector<std::string> keys;
     while (merged->valid()) {
         keys.push_back(std::string(merged->entry().key));
@@ -283,18 +283,18 @@ TEST_F(EntryStreamTest, TagSource_PropagatesThroughMerge) {
     EXPECT_EQ(seen_ids.count(2u), 1u);
 }
 
-// --- Classify Tests ---
+// --- Dedup Tests ---
 
-TEST_F(EntryStreamTest, Classify_KeepAndEliminate) {
+TEST_F(EntryStreamTest, Dedup_KeepAndEliminate) {
     // key1 v1 (seg1) + key1 v2 (seg2). Only snapshot at v2 → v1 eliminated.
     size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
     auto& seg1 = segments_[idx1];
     auto& seg2 = segments_[idx2];
 
-    // Ext layout: [GCTagSourceExt | GCClassifyExt]
+    // Ext layout: [GCTagSourceExt | GCDedupExt]
     constexpr size_t kTagBase      = 0;
-    constexpr size_t kClassifyBase = kTagBase + GCTagSourceExt::kSize;
+    constexpr size_t kDedupBase = kTagBase + GCTagSourceExt::kSize;
 
     std::vector<std::unique_ptr<EntryStream>> streams;
     streams.push_back(stream::gcTagSource(
@@ -305,29 +305,29 @@ TEST_F(EntryStreamTest, Classify_KeepAndEliminate) {
     auto merged = stream::gcMerge(std::move(streams));
 
     std::vector<uint64_t> snapshots = {2};
-    auto classified = stream::gcClassify(
-        std::move(merged), snapshots, kClassifyBase);
+    auto deduped = stream::gcDedup(
+        std::move(merged), snapshots, kDedupBase);
 
     // First entry: key1 v1 → kEliminate, segment_id=1 preserved
-    ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().version(), 1u);
-    EXPECT_EQ(classified->entry().ext[kClassifyBase + GCClassifyExt::kAction],
+    ASSERT_TRUE(deduped->valid());
+    EXPECT_EQ(deduped->entry().version(), 1u);
+    EXPECT_EQ(deduped->entry().ext[kDedupBase + GCDedupExt::kAction],
               static_cast<uint64_t>(EntryAction::kEliminate));
-    EXPECT_EQ(classified->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 1u);
+    EXPECT_EQ(deduped->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 1u);
 
-    ASSERT_TRUE(classified->next().ok());
+    ASSERT_TRUE(deduped->next().ok());
     // Second entry: key1 v2 → kKeep, segment_id=2 preserved
-    ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().version(), 2u);
-    EXPECT_EQ(classified->entry().ext[kClassifyBase + GCClassifyExt::kAction],
+    ASSERT_TRUE(deduped->valid());
+    EXPECT_EQ(deduped->entry().version(), 2u);
+    EXPECT_EQ(deduped->entry().ext[kDedupBase + GCDedupExt::kAction],
               static_cast<uint64_t>(EntryAction::kKeep));
-    EXPECT_EQ(classified->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 2u);
+    EXPECT_EQ(deduped->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 2u);
 
-    ASSERT_TRUE(classified->next().ok());
-    EXPECT_FALSE(classified->valid());
+    ASSERT_TRUE(deduped->next().ok());
+    EXPECT_FALSE(deduped->valid());
 }
 
-TEST_F(EntryStreamTest, Classify_AllKeep) {
+TEST_F(EntryStreamTest, Dedup_AllKeep) {
     size_t idx = createSegment(1, {
         {"key1", 1, "val1", false},
         {"key2", 2, "val2", false},
@@ -339,20 +339,20 @@ TEST_F(EntryStreamTest, Classify_AllKeep) {
 
     // Snapshot covers all versions → all kept.
     std::vector<uint64_t> snapshots = {2};
-    auto classified = stream::gcClassify(
+    auto deduped = stream::gcDedup(
         std::move(tagged), snapshots, kBase);
 
     size_t keep_count = 0;
-    while (classified->valid()) {
-        EXPECT_EQ(classified->entry().ext[kBase + GCClassifyExt::kAction],
+    while (deduped->valid()) {
+        EXPECT_EQ(deduped->entry().ext[kBase + GCDedupExt::kAction],
                   static_cast<uint64_t>(EntryAction::kKeep));
         keep_count++;
-        ASSERT_TRUE(classified->next().ok());
+        ASSERT_TRUE(deduped->next().ok());
     }
     EXPECT_EQ(keep_count, 2u);
 }
 
-TEST_F(EntryStreamTest, Classify_AllEliminate) {
+TEST_F(EntryStreamTest, Dedup_AllEliminate) {
     // key1 v1 + key1 v2 in same segment. Only snapshot at v2.
     // v2 is latest → kept, v1 eliminated.
     size_t idx = createSegment(1, {
@@ -364,25 +364,25 @@ TEST_F(EntryStreamTest, Classify_AllEliminate) {
     constexpr size_t kBase = 0;
 
     std::vector<uint64_t> snapshots = {2};
-    auto classified = stream::gcClassify(
+    auto deduped = stream::gcDedup(
         stream::scan(seg.logFile(), seg.dataSize()),
         snapshots, kBase);
 
     // v1 → kEliminate
-    ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().version(), 1u);
-    EXPECT_EQ(classified->entry().ext[kBase + GCClassifyExt::kAction],
+    ASSERT_TRUE(deduped->valid());
+    EXPECT_EQ(deduped->entry().version(), 1u);
+    EXPECT_EQ(deduped->entry().ext[kBase + GCDedupExt::kAction],
               static_cast<uint64_t>(EntryAction::kEliminate));
 
-    ASSERT_TRUE(classified->next().ok());
+    ASSERT_TRUE(deduped->next().ok());
     // v2 → kKeep
-    ASSERT_TRUE(classified->valid());
-    EXPECT_EQ(classified->entry().version(), 2u);
-    EXPECT_EQ(classified->entry().ext[kBase + GCClassifyExt::kAction],
+    ASSERT_TRUE(deduped->valid());
+    EXPECT_EQ(deduped->entry().version(), 2u);
+    EXPECT_EQ(deduped->entry().ext[kBase + GCDedupExt::kAction],
               static_cast<uint64_t>(EntryAction::kKeep));
 
-    ASSERT_TRUE(classified->next().ok());
-    EXPECT_FALSE(classified->valid());
+    ASSERT_TRUE(deduped->next().ok());
+    EXPECT_FALSE(deduped->valid());
 }
 
 // --- ScanMemtable Tests ---

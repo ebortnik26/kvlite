@@ -19,7 +19,7 @@ struct GCTagSourceExt {
     static constexpr size_t kSize = 1;
 };
 
-struct GCClassifyExt {
+struct GCDedupExt {
     enum Field : size_t { kAction = 0 };
     static constexpr size_t kSize = 1;
 };
@@ -37,11 +37,11 @@ std::unique_ptr<EntryStream> gcMerge(std::vector<std::unique_ptr<EntryStream>> i
 std::unique_ptr<EntryStream> gcTagSource(
     std::unique_ptr<EntryStream> input, uint32_t segment_id, size_t base);
 
-// Classify each entry as kKeep or kEliminate based on snapshot visibility.
+// Dedup: mark each entry as kKeep or kEliminate based on snapshot visibility.
 // Entries must arrive in (hash asc, version asc) order. For each hash group,
 // the latest version <= each snapshot is kept; all others are eliminated.
-// Writes EntryAction to ext[base + GCClassifyExt::kAction].
-std::unique_ptr<EntryStream> gcClassify(
+// Writes EntryAction to ext[base + GCDedupExt::kAction].
+std::unique_ptr<EntryStream> gcDedup(
     std::unique_ptr<EntryStream> input,
     const std::vector<uint64_t>& snapshot_versions,
     size_t base);

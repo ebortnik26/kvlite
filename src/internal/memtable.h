@@ -81,13 +81,17 @@ public:
         uint64_t max_version = 0;  // max logical version across all flushed entries
     };
 
-    // Flush all entries to a Segment that is already in Writing state.
-    // Writes entries sorted by (hash, version) ascending, records each
-    // in the Segment's SegmentIndex, and seals it.
-    // Returns a vector of (key, packed_ver) pairs ordered by
-    // (hash asc, packed_ver asc) — entries for the same key are adjacent.
-    // The caller uses this to register flushed entries in the GlobalIndex.
-    FlushResult flush(Segment& out);
+    // Flush entries to a Segment that is already in Writing state.
+    // Deduplicates per key using the same two-pointer dedup algorithm
+    // as GC: for each snapshot version, the latest entry version <=
+    // snapshot is kept. Entries are sorted by (hash, key) ascending.
+    // Returns (key, packed_ver) pairs for GlobalIndex staging.
+    //
+    // snapshot_versions: all observation points (active snapshots +
+    // latestVersion), sorted ascending. Empty = eliminate all redundant
+    // versions.
+    FlushResult flush(Segment& out,
+                      const std::vector<uint64_t>& snapshot_versions = {});
 
     // Create a stream of entries visible at snapshot_version.
     // Thread-safe: locks each bucket during collection.

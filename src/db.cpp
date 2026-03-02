@@ -111,7 +111,7 @@ Status DB::open(const std::string& path, const Options& options) {
         if (!s.ok()) return s;
 
         auto* seg = storage_->getSegment(seg_id);
-        auto result = mt.flush(*seg);
+        auto result = mt.flush(*seg, versions_->snapshotVersions());
         if (!result.status.ok()) return result.status;
 
         // Hold the savepoint lock for the entire GI batch (stage + commit).

@@ -581,7 +581,8 @@ TEST_F(FlushTest, TombstoneEntry) {
 
 TEST_F(FlushTest, SortOrderHashThenVersion) {
     Memtable wb;
-    // Insert multiple keys with multiple versions
+    // Insert multiple keys with multiple versions — flush deduplicates,
+    // keeping only the latest version per key.
     wb.put("aaa", 10, "v10", false);
     wb.put("bbb", 5, "v5", false);
     wb.put("aaa", 3, "v3", false);
@@ -603,13 +604,12 @@ TEST_F(FlushTest, SortOrderHashThenVersion) {
         offset += sz;
     }
 
-    ASSERT_EQ(order.size(), 5u);
+    // Only latest version per key survives: aaa@10, bbb@5, ccc@20.
+    ASSERT_EQ(order.size(), 3u);
 
-    // Verify sorted by (hash ascending, version ascending)
+    // Verify sorted by hash ascending.
     for (size_t i = 1; i < order.size(); ++i) {
-        EXPECT_TRUE(order[i - 1].first < order[i].first ||
-                    (order[i - 1].first == order[i].first &&
-                     order[i - 1].second <= order[i].second))
+        EXPECT_LT(order[i - 1].first, order[i].first)
             << "Entry " << i << " is out of order";
     }
 }
@@ -620,6 +620,7 @@ TEST_F(FlushTest, RoundTrip) {
     wb.put("key1", 2, "val2", false);
     wb.put("key2", 3, "val3", true);
 
+    // No snapshot versions → full dedup: only latest per key survives.
     auto result = wb.flush(seg_);
     ASSERT_TRUE(result.status.ok());
 
@@ -634,7 +635,8 @@ TEST_F(FlushTest, RoundTrip) {
         offset += sz;
     }
 
-    ASSERT_EQ(entries.size(), 3u);
+    // key1@1 eliminated (redundant), key1@2 kept, key2@3 kept.
+    ASSERT_EQ(entries.size(), 2u);
 
     // Collect into a map for verification (key -> list of versions)
     std::map<std::string, std::vector<uint64_t>> by_key;
@@ -643,9 +645,8 @@ TEST_F(FlushTest, RoundTrip) {
     }
 
     ASSERT_EQ(by_key.count("key1"), 1u);
-    ASSERT_EQ(by_key["key1"].size(), 2u);
-    // Versions should be sorted ascending within same key (same hash)
-    EXPECT_LT(by_key["key1"][0], by_key["key1"][1]);
+    ASSERT_EQ(by_key["key1"].size(), 1u);
+    EXPECT_EQ(by_key["key1"][0], 2u);
 
     ASSERT_EQ(by_key.count("key2"), 1u);
     ASSERT_EQ(by_key["key2"].size(), 1u);
@@ -659,25 +660,24 @@ TEST_F(FlushTest, RoundTrip) {
     }
 
     // Verify SegmentIndex was populated correctly
-    EXPECT_EQ(seg_.entryCount(), 3u);
+    EXPECT_EQ(seg_.entryCount(), 2u);
     EXPECT_EQ(seg_.keyCount(), 2u);
 
-    // key1 should have 2 entries; latest version is 2
+    // key1 latest version is 2
     LogEntry latest;
     ASSERT_TRUE(seg_.getLatest("key1", latest).ok());
     EXPECT_EQ(latest.version(), 2u);
 
-    // key2 should have 1 entry
+    // key2 latest version is 3
     ASSERT_TRUE(seg_.getLatest("key2", latest).ok());
     EXPECT_EQ(latest.version(), 3u);
 
-    // Verify all entries for key1 via get
+    // key1 has 1 entry after dedup
     std::vector<LogEntry> key1_entries;
     ASSERT_TRUE(seg_.get("key1", key1_entries).ok());
-    ASSERT_EQ(key1_entries.size(), 2u);
-    for (const auto& e : key1_entries) {
-        EXPECT_EQ(e.key, "key1");
-    }
+    ASSERT_EQ(key1_entries.size(), 1u);
+    EXPECT_EQ(key1_entries[0].key, "key1");
+    EXPECT_EQ(key1_entries[0].version(), 2u);
 }
 
 TEST_F(FlushTest, SealAndOpen) {
@@ -686,6 +686,7 @@ TEST_F(FlushTest, SealAndOpen) {
     wb.put("alpha", 2, "v2", false);
     wb.put("beta", 10, "vb", true);
 
+    // No snapshot versions → full dedup.
     auto result = wb.flush(seg_);
     ASSERT_TRUE(result.status.ok());
     uint64_t data_size = seg_.dataSize();
@@ -696,7 +697,7 @@ TEST_F(FlushTest, SealAndOpen) {
 
     // Verify data size matches (excludes index + footer).
     EXPECT_EQ(loaded.dataSize(), data_size);
-    EXPECT_EQ(loaded.entryCount(), 3u);
+    EXPECT_EQ(loaded.entryCount(), 2u);  // alpha@2, beta@10
     EXPECT_EQ(loaded.keyCount(), 2u);
 
     // Verify index lookups work.
@@ -710,15 +711,79 @@ TEST_F(FlushTest, SealAndOpen) {
     EXPECT_EQ(latest.key, "beta");
     EXPECT_TRUE(latest.tombstone());
 
-    // Verify round-trip through get.
+    // alpha has 1 entry after dedup.
     std::vector<LogEntry> alpha_entries;
     ASSERT_TRUE(loaded.get("alpha", alpha_entries).ok());
-    ASSERT_EQ(alpha_entries.size(), 2u);
-    for (const auto& e : alpha_entries) {
-        EXPECT_EQ(e.key, "alpha");
-    }
+    ASSERT_EQ(alpha_entries.size(), 1u);
+    EXPECT_EQ(alpha_entries[0].key, "alpha");
+    EXPECT_EQ(alpha_entries[0].version(), 2u);
 
     loaded.close();
+}
+
+TEST_F(FlushTest, MultiSnapshotPreservation) {
+    // Verify that flush preserves versions needed by multiple snapshots.
+    // Key "k" has versions 1, 5, 10, 15, 20.
+    // Snapshots at 3, 12, 25.
+    // Expected survivors: v1 (latest <= 3), v10 (latest <= 12), v20 (latest <= 25).
+    Memtable wb;
+    wb.put("k", 1, "v1", false);
+    wb.put("k", 5, "v5", false);
+    wb.put("k", 10, "v10", false);
+    wb.put("k", 15, "v15", false);
+    wb.put("k", 20, "v20", false);
+
+    std::vector<uint64_t> snapshots = {3, 12, 25};
+    auto result = wb.flush(seg_, snapshots);
+    ASSERT_TRUE(result.status.ok());
+
+    // Read all entries back.
+    std::vector<LogEntry> entries;
+    uint64_t offset = 0;
+    while (offset < seg_.dataSize()) {
+        LogEntry entry;
+        size_t sz = readEntry(path_, offset, entry);
+        verifyCrc(path_, offset, sz);
+        entries.push_back(std::move(entry));
+        offset += sz;
+    }
+
+    // v1 kept (snap@3), v10 kept (snap@12), v20 kept (snap@25).
+    // v5 and v15 are redundant — no snapshot needs them.
+    ASSERT_EQ(entries.size(), 3u);
+
+    std::vector<uint64_t> kept_versions;
+    for (const auto& e : entries) {
+        kept_versions.push_back(e.version());
+    }
+    std::sort(kept_versions.begin(), kept_versions.end());
+    EXPECT_EQ(kept_versions[0], 1u);
+    EXPECT_EQ(kept_versions[1], 10u);
+    EXPECT_EQ(kept_versions[2], 20u);
+}
+
+TEST_F(FlushTest, SnapshotPreservesOlderVersion) {
+    // Two versions of same key. Snapshot covers the older one.
+    Memtable wb;
+    wb.put("k", 5, "old", false);
+    wb.put("k", 10, "new", false);
+
+    // Snapshot at version 7 → must keep v5 (latest <= 7) and v10 (latest <= 15).
+    std::vector<uint64_t> snapshots = {7, 15};
+    auto result = wb.flush(seg_, snapshots);
+    ASSERT_TRUE(result.status.ok());
+
+    std::vector<LogEntry> entries;
+    uint64_t offset = 0;
+    while (offset < seg_.dataSize()) {
+        LogEntry entry;
+        size_t sz = readEntry(path_, offset, entry);
+        entries.push_back(std::move(entry));
+        offset += sz;
+    }
+
+    // Both versions kept: v5 for snap@7, v10 for snap@15.
+    ASSERT_EQ(entries.size(), 2u);
 }
 
 // ==========================================================================

@@ -16,7 +16,7 @@ namespace internal {
 // GC: K-way merge compaction of N input segments into M output segments.
 //
 // Merges visible entries from N input segments using composable EntryStream
-// operators (scan + tagSource + merge + classify). Output entries arrive in
+// operators (scan + tagSource + merge + dedup). Output entries arrive in
 // (hash asc, version asc) order. Output segments are split by a max size
 // limit and are hash-partitioned by construction.
 //
