@@ -1590,7 +1590,7 @@ TEST(BucketArena, ConcurrentAllocate) {
 // Binary savepoint tests
 // ============================================================
 
-class BinarySnapshotTest : public ::testing::Test {
+class SavepointTest : public ::testing::Test {
 protected:
     void SetUp() override {
         db_dir_ = ::testing::TempDir() + "/gi_snap_v9_" +
@@ -1614,7 +1614,7 @@ protected:
     std::unique_ptr<GlobalIndex> index_;
 };
 
-TEST_F(BinarySnapshotTest, RoundTripBasic) {
+TEST_F(SavepointTest, RoundTripBasic) {
     const int N = 1000;
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
@@ -1652,7 +1652,7 @@ TEST_F(BinarySnapshotTest, RoundTripBasic) {
     manifest2.close();
 }
 
-TEST_F(BinarySnapshotTest, RoundTripMultiVersion) {
+TEST_F(SavepointTest, RoundTripMultiVersion) {
     for (int i = 0; i < 100; ++i) {
         std::string key = "key_" + std::to_string(i);
         uint64_t hkey = H(key);
@@ -1690,7 +1690,7 @@ TEST_F(BinarySnapshotTest, RoundTripMultiVersion) {
     manifest2.close();
 }
 
-TEST_F(BinarySnapshotTest, SnapshotWithExtensions) {
+TEST_F(SavepointTest, SavepointWithExtensions) {
     const int N = 200;
     for (int i = 0; i < N; ++i) {
         std::string key = "extkey_" + std::to_string(i);
@@ -1729,29 +1729,29 @@ TEST_F(BinarySnapshotTest, SnapshotWithExtensions) {
     manifest2.close();
 }
 
-TEST_F(BinarySnapshotTest, SnapshotBlocksConcurrentPut) {
+TEST_F(SavepointTest, SavepointBlocksConcurrentPut) {
     for (int i = 0; i < 100; ++i) {
         std::string key = "key_" + std::to_string(i);
         ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
     }
 
-    std::atomic<bool> snapshot_started{false};
-    std::atomic<bool> snapshot_done{false};
+    std::atomic<bool> savepoint_started{false};
+    std::atomic<bool> savepoint_done{false};
     std::atomic<bool> put_started{false};
     std::atomic<bool> put_done{false};
 
     uint64_t hblocked = H("blocked_key");
     std::thread writer([&]() {
-        while (!snapshot_started.load(std::memory_order_acquire)) {
+        while (!savepoint_started.load(std::memory_order_acquire)) {
         }
         put_started.store(true, std::memory_order_release);
         index_->put(hblocked, 999, 42);
         put_done.store(true, std::memory_order_release);
     });
 
-    snapshot_started.store(true, std::memory_order_release);
+    savepoint_started.store(true, std::memory_order_release);
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
-    snapshot_done.store(true, std::memory_order_release);
+    savepoint_done.store(true, std::memory_order_release);
 
     writer.join();
 
@@ -1764,7 +1764,7 @@ TEST_F(BinarySnapshotTest, SnapshotBlocksConcurrentPut) {
     EXPECT_EQ(seg, 42u);
 }
 
-TEST_F(BinarySnapshotTest, AtomicSwapLeavesValidDir) {
+TEST_F(SavepointTest, AtomicSwapLeavesValidDir) {
     for (int i = 0; i < 10; ++i) {
         std::string key = "key_" + std::to_string(i);
         ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
@@ -1792,7 +1792,7 @@ TEST_F(BinarySnapshotTest, AtomicSwapLeavesValidDir) {
     EXPECT_FALSE(std::filesystem::exists(old_dir));
 }
 
-TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
+TEST_F(SavepointTest, WriteSavepointThenLoad) {
     for (int i = 0; i < 50; ++i) {
         std::string key = "key_" + std::to_string(i);
         ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
@@ -1804,7 +1804,7 @@ TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
     std::string valid_dir = db_dir_ + "/gi/savepoint";
     EXPECT_TRUE(std::filesystem::exists(valid_dir));
 
-    // Re-open and verify data is loaded from v9 snapshot.
+    // Re-open and verify data is loaded from savepoint.
     manifest_.close();
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
@@ -1826,8 +1826,8 @@ TEST_F(BinarySnapshotTest, WriteSnapshotThenLoad) {
     manifest2.close();
 }
 
-TEST_F(BinarySnapshotTest, EmptyIndexSnapshot) {
-    // Snapshot an empty index — should produce valid snapshot with 0 entries.
+TEST_F(SavepointTest, EmptyIndexSavepoint) {
+    // Savepoint an empty index — should produce valid savepoint with 0 entries.
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
     ASSERT_TRUE(index_->close().ok());

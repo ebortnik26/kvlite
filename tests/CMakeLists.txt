@@ -341,7 +341,6 @@ target_link_libraries(kvlite_wal_stream_test
 add_test(NAME entry_stream_tests COMMAND kvlite_entry_stream_test)
 add_test(NAME storage_manager_tests COMMAND kvlite_sm_test)
 add_test(NAME bitstream_tests COMMAND kvlite_bitstream_test)
-add_test(NAME dht_tests COMMAND kvlite_dht_test)
 add_test(NAME segment_index_tests COMMAND kvlite_segment_index_test)
 add_test(NAME write_buffer_tests COMMAND kvlite_wb_test)
 add_test(NAME segment_tests COMMAND kvlite_seg_test)
@@ -351,14 +350,26 @@ add_test(NAME manifest_tests COMMAND kvlite_manifest_test)
 add_test(NAME wal_tests COMMAND kvlite_wal_test)
 add_test(NAME wal_stream_tests COMMAND kvlite_wal_stream_test)
 
+# DHT tests — split into shards by suite for parallel runs.
+# RecoveryTest (~120s), SavepointTest (~100s), GlobalIndex+RW (~100s), rest (<1s)
+add_test(NAME dht_recovery     COMMAND kvlite_dht_test --gtest_filter=RecoveryTest.*)
+add_test(NAME dht_savepoint    COMMAND kvlite_dht_test --gtest_filter=SavepointTest.*)
+add_test(NAME dht_global_index COMMAND kvlite_dht_test --gtest_filter=GlobalIndexDHT.*:ReadWriteDHT.*)
+add_test(NAME dht_unit         COMMAND kvlite_dht_test --gtest_filter=-RecoveryTest.*:SavepointTest.*:GlobalIndexDHT.*:ReadWriteDHT.*)
+
 # Integration tests (one per suite)
 add_test(NAME basic_tests COMMAND kvlite_int_basic)
 add_test(NAME batch_tests COMMAND kvlite_int_batch)
 add_test(NAME versioning_tests COMMAND kvlite_int_versioning)
 add_test(NAME iterator_tests COMMAND kvlite_int_iterator)
-add_test(NAME concurrency_tests COMMAND kvlite_int_concurrency)
 add_test(NAME db_tests COMMAND kvlite_int_db)
 add_test(NAME gc_daemon_tests COMMAND kvlite_int_gc_daemon)
+
+# Concurrency tests — split into two halves for parallel runs (~50s each).
+add_test(NAME concurrency_1 COMMAND kvlite_int_concurrency
+    --gtest_filter=ConcurrencyTest.ConcurrentPuts:ConcurrencyTest.ConcurrentPutsSameKey:ConcurrencyTest.ConcurrentReads:ConcurrencyTest.ConcurrentReadWrite:ConcurrencyTest.WriteBatchAtomicity:ConcurrencyTest.SnapshotIsolation:ConcurrencyTest.ConcurrentSnapshots:ConcurrencyTest.IteratorConsistencyDuringWrites)
+add_test(NAME concurrency_2 COMMAND kvlite_int_concurrency
+    --gtest_filter=ConcurrencyTest.VersionOrderingUnderConcurrency:ConcurrencyTest.StressTest:ConcurrencyTest.ReadBatchAtomicity:ConcurrencyTest.WriteBatchAllOrNothingViaReadBatch:ConcurrencyTest.SnapshotDoesNotSeeUncommittedVersion:ConcurrencyTest.SnapshotGetWaitsForInFlightPuts:ConcurrencyTest.SnapshotExistsWaitsForInFlightPuts:ConcurrencyTest.WriteBatchSameVersionUnderConcurrency)
 
 # Default parallel level for ctest
 set(CTEST_PARALLEL_LEVEL 8 CACHE STRING "Number of tests to run in parallel")

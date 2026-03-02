@@ -576,8 +576,10 @@ TEST_F(WALStreamTest, ConcurrentWriteAndClose) {
         wal.commit(WalProducer::kWB);
     });
 
-    // Give writer a head start, then close.
-    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    // Wait until the writer has appended at least one record, then close.
+    while (successful_appends.load(std::memory_order_relaxed) == 0) {
+        std::this_thread::yield();
+    }
     ASSERT_TRUE(wal.close().ok());
 
     writer.join();
