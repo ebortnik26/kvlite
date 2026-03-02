@@ -397,21 +397,40 @@ double GlobalIndex::estimateDeadRatio() const {
 // --- Persistence ---
 
 static constexpr char kMagic[4] = {'L', '1', 'I', 'X'};
-static constexpr uint32_t kFormatVersion = 9;
+static constexpr uint32_t kFormatVersion = 10;
 static constexpr uint64_t kMaxFileSize = 1ULL << 30;  // 1 GB
+
+// RLE block tags for v10 savepoint arena encoding.
+static constexpr uint8_t kRleTagEmpty = 0x00;
+static constexpr uint8_t kRleTagPopulated = 0x01;
+
+// Check if a bucket in the raw arena is empty: N_k == 0 and no extension pointer.
+static bool isArenaBucketEmpty(const uint8_t* bucket_data, uint32_t bucket_bytes) {
+    uint16_t num_keys = 0;
+    std::memcpy(&num_keys, bucket_data, sizeof(uint16_t));
+    if (num_keys != 0) return false;
+    uint64_t ext_ptr = 0;
+    std::memcpy(&ext_ptr, bucket_data + bucket_bytes - 8, 8);
+    return ext_ptr == 0;
+}
 
 // --- Savepoint persistence (binary, multi-file) ---
 //
-// Multi-file binary savepoint format (v8):
+// Multi-file binary savepoint format (v10, RLE):
 //
-// Directory: <db_path>/gi/savepoint.v9/
+// Directory: <db_path>/gi/savepoint/
 // Files: 00000000.dat, 00000001.dat, ...
 //
 // Each file:
-//   Global header (29 bytes) + File header (12 bytes) +
-//   Main arena data (bucket_count × stride bytes) +
+//   Global header (33 bytes) + File header (12 bytes) +
+//   RLE-encoded arena data (sequence of blocks) +
 //   Extension data (last file only, ext_count × stride bytes) +
 //   CRC32 footer (4 bytes)
+//
+// RLE block:
+//   tag (uint8_t): 0x00 = empty range (no data), 0x01 = populated (raw data follows)
+//   bucket_count (uint32_t): number of consecutive buckets
+//   [if tag=0x01: bucket_count × stride bytes of raw data]
 
 std::vector<GlobalIndex::SavepointFileDesc> GlobalIndex::computeFileLayout() const {
     static constexpr size_t kOverhead = 33 + 12 + 4;  // headers + footer
@@ -473,11 +492,29 @@ Status GlobalIndex::writeSavepointFile(const std::string& dir,
     writer.writeVal(fd.bucket_start);
     writer.writeVal(fd.bucket_count);
 
-    // Main arena data
+    // Main arena data — RLE encoded.
     const uint8_t* arena = dht_.arenaData();
-    size_t arena_offset = static_cast<size_t>(fd.bucket_start) * stride;
-    size_t arena_len = static_cast<size_t>(fd.bucket_count) * stride;
-    writer.write(arena + arena_offset, arena_len);
+    uint32_t bucket_end = fd.bucket_start + fd.bucket_count;
+    uint32_t bi = fd.bucket_start;
+    while (bi < bucket_end) {
+        const uint8_t* bdata = arena + static_cast<size_t>(bi) * stride;
+        bool empty = isArenaBucketEmpty(bdata, cfg.bucket_bytes);
+        uint32_t run_start = bi;
+        ++bi;
+        while (bi < bucket_end) {
+            const uint8_t* next = arena + static_cast<size_t>(bi) * stride;
+            if (isArenaBucketEmpty(next, cfg.bucket_bytes) != empty) break;
+            ++bi;
+        }
+        uint32_t run_count = bi - run_start;
+        uint8_t tag = empty ? kRleTagEmpty : kRleTagPopulated;
+        writer.writeVal(tag);
+        writer.writeVal(run_count);
+        if (!empty) {
+            size_t offset = static_cast<size_t>(run_start) * stride;
+            writer.write(arena + offset, static_cast<size_t>(run_count) * stride);
+        }
+    }
 
     // Extension data (only in last file)
     if (fd.is_last && ext_count > 0) {
@@ -612,12 +649,29 @@ Status GlobalIndex::readSavepointFile(const std::string& fpath,
         return Status::Corruption("Failed to read file header in: " + fpath);
     }
 
-    // Read main arena data directly into the arena.
-    size_t arena_offset = static_cast<size_t>(bucket_start) * stride;
-    size_t arena_len = static_cast<size_t>(bucket_count) * stride;
-    uint8_t* arena_dst = const_cast<uint8_t*>(dht_.arenaData()) + arena_offset;
-    if (!reader.read(arena_dst, arena_len)) {
-        return Status::Corruption("Failed to read arena data in: " + fpath);
+    // Read RLE-encoded arena data.
+    uint8_t* arena_base = const_cast<uint8_t*>(dht_.arenaData());
+    uint32_t buckets_read = 0;
+    while (buckets_read < bucket_count) {
+        uint8_t tag;
+        uint32_t run_count;
+        if (!reader.readVal(tag) || !reader.readVal(run_count)) {
+            return Status::Corruption("Failed to read RLE block header in: " + fpath);
+        }
+        if (run_count == 0 || buckets_read + run_count > bucket_count) {
+            return Status::Corruption("Invalid RLE run count in: " + fpath);
+        }
+        if (tag == kRleTagPopulated) {
+            size_t offset = static_cast<size_t>(bucket_start + buckets_read) * stride;
+            size_t len = static_cast<size_t>(run_count) * stride;
+            if (!reader.read(arena_base + offset, len)) {
+                return Status::Corruption("Failed to read RLE populated data in: " + fpath);
+            }
+        } else if (tag != kRleTagEmpty) {
+            return Status::Corruption("Unknown RLE tag in: " + fpath);
+        }
+        // Empty blocks: arena is already zero-initialized, nothing to do.
+        buckets_read += run_count;
     }
 
     // Extension data (only in last file)
