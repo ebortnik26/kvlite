@@ -9,6 +9,7 @@
 
 #include "internal/bit_stream.h"
 #include "internal/bucket_arena.h"
+#include "internal/bucket_codec.h"
 
 namespace kvlite {
 namespace internal {
@@ -46,17 +47,10 @@ public:
         uint32_t bucket_bytes = 512;
     };
 
-    // Per-key entry within a decoded bucket.
-    struct KeyEntry {
-        uint64_t suffix;
-        std::vector<uint64_t> packed_versions;  // sorted desc
-        std::vector<uint32_t> ids;              // parallel with packed_versions
-    };
-
-    // Decoded contents of an entire bucket.
-    struct BucketContents {
-        std::vector<KeyEntry> keys;  // sorted by suffix ascending
-    };
+    // Type aliases forwarded from BucketCodec (preserves existing API).
+    using KeyEntry = BucketCodec::KeyEntry;
+    using BucketContents = BucketCodec::BucketContents;
+    using SuffixScanResult = BucketCodec::SuffixScanResult;
 
     // --- Public read API (no locking) ---
 
@@ -115,12 +109,6 @@ protected:
 
     uint64_t getExtensionPtr(const Bucket& bucket) const;
     void setExtensionPtr(Bucket& bucket, uint64_t ptr) const;
-    size_t bucketDataBits() const;
-
-    // --- Decode / Encode ---
-
-    BucketContents decodeBucket(const Bucket& bucket) const;
-    size_t encodeBucket(Bucket& bucket, const BucketContents& contents) const;
 
     // --- Extension chain ---
 
@@ -128,39 +116,8 @@ protected:
     Bucket* nextBucketMut(Bucket& bucket);
     Bucket* createExtension(Bucket& bucket);
 
-    // --- Targeted scan helpers ---
-
-    // Decode only the suffix array from a bucket. Returns suffixes and the
-    // bit position where per-key version data begins.
-    struct SuffixScanResult {
-        std::vector<uint64_t> suffixes;
-        size_t versions_start_bit;
-    };
-    SuffixScanResult decodeSuffixes(const Bucket& bucket) const;
-
-    // Skip one key's version/id data in the bitstream (advances reader past it).
-    static void skipKeyData(BitReader& reader);
-
-    // Decode one key's version/id data from current reader position.
-    static KeyEntry decodeKeyData(BitReader& reader, uint64_t suffix);
-
     // Check if a suffix exists in the chain at bucket bi (suffix-only scan).
     bool containsByHash(uint32_t bi, uint64_t suffix) const;
-
-    // --- Incremental bit budget helpers ---
-
-    // Returns the bit count the current bucket contents use.
-    size_t decodeBucketUsedBits(const Bucket& bucket) const;
-
-    // Extra bits for appending one version to an existing key.
-    static size_t bitsForAppendVersion(uint64_t prev_pv, uint64_t new_pv,
-                                       uint32_t prev_id, uint32_t new_id);
-
-    // Extra bits for inserting a new single-version key entry.
-    static size_t bitsForNewEntry(uint64_t suffix, uint64_t prev_suffix,
-                                  uint64_t next_suffix, bool has_prev,
-                                  bool has_next, uint8_t suffix_bits,
-                                  uint64_t packed_version, uint32_t id);
 
     // --- Protected read helpers (pre-hashed) ---
 
@@ -173,21 +130,13 @@ protected:
 
     // --- Protected write helpers ---
 
-    // Adds an entry to the chain at bucket bi for the given suffix.
-    // createExtFn is called when the current bucket overflows.
-    // Returns true if the suffix was newly created (key is new).
     bool addToChain(uint32_t bi, uint64_t suffix,
                     uint64_t packed_version, uint32_t id,
                     const std::function<Bucket*(Bucket&)>& createExtFn);
 
-    // Remove entry matching (suffix, packed_version, id) from chain at bi.
-    // Returns true if the suffix group is now empty (all entries removed).
     bool removeFromChain(uint32_t bi, uint64_t suffix,
                          uint64_t packed_version, uint32_t id);
 
-    // Update id for entry matching (suffix, packed_version, old_id) to new_id.
-    // createExtFn called if re-encoding overflows the current bucket.
-    // Returns true if the entry was found and updated.
     bool updateIdInChain(uint32_t bi, uint64_t suffix,
                          uint64_t packed_version, uint32_t old_id, uint32_t new_id,
                          const std::function<Bucket*(Bucket&)>& createExtFn);
@@ -201,6 +150,7 @@ protected:
 
     Config config_;
     uint8_t suffix_bits_;   // 64 - bucket_bits
+    BucketCodec codec_;     // bucket encode/decode
     std::unique_ptr<uint8_t[]> arena_;
     std::vector<Bucket> buckets_;
     BucketArena* ext_arena_;    // non-owning; set by derived class

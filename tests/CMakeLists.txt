@@ -48,11 +48,12 @@ target_link_libraries(kvlite_bitstream_test
 add_executable(kvlite_dht_test
     test_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
-
+    ${CMAKE_SOURCE_DIR}/src/internal/bucket_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/global_index_savepoint.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
@@ -78,12 +79,13 @@ target_link_libraries(kvlite_dht_test
 add_executable(kvlite_segment_index_test
     test_segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
-
+    ${CMAKE_SOURCE_DIR}/src/internal/bucket_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/global_index_savepoint.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
@@ -118,7 +120,7 @@ add_executable(kvlite_wb_test
     ${CMAKE_SOURCE_DIR}/src/internal/segment.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
-
+    ${CMAKE_SOURCE_DIR}/src/internal/bucket_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
@@ -145,7 +147,7 @@ add_executable(kvlite_seg_test
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
-
+    ${CMAKE_SOURCE_DIR}/src/internal/bucket_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/status.cpp
@@ -233,7 +235,7 @@ add_executable(kvlite_sm_test
     ${CMAKE_SOURCE_DIR}/src/internal/log_file.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
-
+    ${CMAKE_SOURCE_DIR}/src/internal/bucket_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/manifest.cpp
@@ -260,12 +262,13 @@ add_executable(kvlite_entry_stream_test
     ${CMAKE_SOURCE_DIR}/src/internal/gc.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/memtable.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
-
+    ${CMAKE_SOURCE_DIR}/src/internal/bucket_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/segment_index.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/global_index_savepoint.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp
@@ -375,11 +378,12 @@ add_test(NAME concurrency_2 COMMAND kvlite_int_concurrency
 add_executable(kvlite_bench_savepoint
     bench_savepoint.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/bucket_arena.cpp
-
+    ${CMAKE_SOURCE_DIR}/src/internal/bucket_codec.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_only_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/read_write_delta_hash_table.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/internal/global_index_savepoint.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/global_index_wal.cpp
     ${CMAKE_SOURCE_DIR}/src/internal/wal_stream.cpp

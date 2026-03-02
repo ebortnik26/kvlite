@@ -997,10 +997,10 @@ public:
     using DeltaHashTable::KeyEntry;
 
     BucketContents testDecodeBucket(uint32_t bi) const {
-        return decodeBucket(buckets_[bi]);
+        return codec_.decodeBucket(buckets_[bi]);
     }
     size_t testEncodeBucket(uint32_t bi, const BucketContents& contents) {
-        return encodeBucket(const_cast<Bucket&>(buckets_[bi]), contents);
+        return codec_.encodeBucket(const_cast<Bucket&>(buckets_[bi]), contents);
     }
     uint8_t testSuffixBits() const { return suffix_bits_; }
 };
@@ -2296,36 +2296,36 @@ public:
     using DeltaHashTable::SuffixScanResult;
 
     SuffixScanResult testDecodeSuffixes(uint32_t bi) const {
-        return decodeSuffixes(buckets_[bi]);
+        return codec_.decodeSuffixes(buckets_[bi]);
     }
     BucketContents testDecodeBucket(uint32_t bi) const {
-        return decodeBucket(buckets_[bi]);
+        return codec_.decodeBucket(buckets_[bi]);
     }
     size_t testEncodeBucket(uint32_t bi, const BucketContents& contents) {
-        return encodeBucket(const_cast<Bucket&>(buckets_[bi]), contents);
+        return codec_.encodeBucket(const_cast<Bucket&>(buckets_[bi]), contents);
     }
     size_t testDecodeBucketUsedBits(uint32_t bi) const {
-        return decodeBucketUsedBits(buckets_[bi]);
+        return codec_.decodeBucketUsedBits(buckets_[bi]);
     }
     uint8_t testSuffixBits() const { return suffix_bits_; }
     uint32_t testBucketIndex(uint64_t hash) const { return bucketIndex(hash); }
     uint64_t testSuffixFromHash(uint64_t hash) const { return suffixFromHash(hash); }
     const Bucket& testBucket(uint32_t bi) const { return buckets_[bi]; }
 
-    // Expose static protected helpers.
-    static void testSkipKeyData(BitReader& reader) { skipKeyData(reader); }
+    // Expose static helpers via BucketCodec.
+    static void testSkipKeyData(BitReader& reader) { BucketCodec::skipKeyData(reader); }
     static KeyEntry testDecodeKeyData(BitReader& reader, uint64_t suffix) {
-        return decodeKeyData(reader, suffix);
+        return BucketCodec::decodeKeyData(reader, suffix);
     }
     static size_t testBitsForAppendVersion(uint64_t prev_pv, uint64_t new_pv,
                                            uint32_t prev_id, uint32_t new_id) {
-        return bitsForAppendVersion(prev_pv, new_pv, prev_id, new_id);
+        return BucketCodec::bitsForAppendVersion(prev_pv, new_pv, prev_id, new_id);
     }
     static size_t testBitsForNewEntry(uint64_t suffix, uint64_t prev_suffix,
                                       uint64_t next_suffix, bool has_prev,
                                       bool has_next, uint8_t suffix_bits,
                                       uint64_t packed_version, uint32_t id) {
-        return bitsForNewEntry(suffix, prev_suffix, next_suffix, has_prev,
+        return BucketCodec::bitsForNewEntry(suffix, prev_suffix, next_suffix, has_prev,
                                has_next, suffix_bits, packed_version, id);
     }
 };
@@ -2336,10 +2336,10 @@ public:
     using DeltaHashTable::SuffixScanResult;
 
     SuffixScanResult testDecodeSuffixes(uint32_t bi) const {
-        return decodeSuffixes(buckets_[bi]);
+        return codec_.decodeSuffixes(buckets_[bi]);
     }
     size_t testDecodeBucketUsedBits(uint32_t bi) const {
-        return decodeBucketUsedBits(buckets_[bi]);
+        return codec_.decodeBucketUsedBits(buckets_[bi]);
     }
     uint32_t testBucketIndex(uint64_t hash) const { return bucketIndex(hash); }
     uint64_t testSuffixFromHash(uint64_t hash) const { return suffixFromHash(hash); }

@@ -149,30 +149,6 @@ private:
     Status recover();
     std::string savepointDir() const;
 
-    // Savepoint format (binary, multi-file):
-    // Directory at <db_path>/gi/savepoint/ with numbered .dat files.
-    // Each file contains a contiguous range of main arena buckets.
-    // The last file also contains all extension slot data.
-
-    struct SavepointFileDesc {
-        uint32_t file_index;
-        uint32_t bucket_start;
-        uint32_t bucket_count;
-        bool is_last;
-    };
-
-    Status writeSavepoint(const std::string& dir) const;
-    std::vector<SavepointFileDesc> computeFileLayout() const;
-    Status writeSavepointFile(const std::string& dir,
-                             const SavepointFileDesc& fd) const;
-
-    Status loadSavepoint(const std::string& dir);
-    Status loadSavepointFile(const std::string& fpath,
-                            uint32_t stride,
-                            uint64_t& out_entries,
-                            uint64_t& out_key_count,
-                            uint32_t& out_ext_count);
-
     // --- Data ---
     ReadWriteDeltaHashTable dht_;
     std::atomic<size_t> key_count_{0};

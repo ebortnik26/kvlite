@@ -10,6 +10,7 @@
 
 #include "kvlite/status.h"
 #include "internal/wal.h"
+#include "internal/wal_file_manager.h"
 
 namespace kvlite {
 namespace internal {
@@ -140,16 +141,18 @@ public:
     uint64_t size() const;
 
     // Number of WAL files tracked by the Manifest.
-    uint32_t fileCount() const { return static_cast<uint32_t>(file_ids_.size()); }
+    uint32_t fileCount() const { return static_cast<uint32_t>(files_.fileIds().size()); }
 
     // Check if WAL is open
     bool isOpen() const { return open_; }
 
     // WAL directory path: <db_path>/gi/wal/
-    std::string walDir() const;
+    std::string walDir() const { return files_.walDir(); }
 
     // Path for a specific WAL file: <db_path>/gi/wal/NNNNNNNN.log
-    static std::string walFilePath(const std::string& wal_dir, uint32_t file_id);
+    static std::string walFilePath(const std::string& wal_dir, uint32_t file_id) {
+        return WALFileManager::walFilePath(wal_dir, file_id);
+    }
 
 private:
     // Per-producer staging buffer (serialized domain records, no WAL framing).
@@ -171,20 +174,10 @@ private:
     // Caller must hold mu_.
     Status rollover();
 
-    // Compute the next file ID without persisting.
-    uint32_t nextFileId() const;
-
-    // Persist file_id to the Manifest and update in-memory state.
-    Status persistFileId(uint32_t file_id);
-
-    // Load file IDs and next_file_id from Manifest.
-    void loadManifestState();
-
     // Open the last existing WAL file, or create the first one.
     Status openActiveFile();
 
-    Manifest* manifest_ = nullptr;
-    std::string db_path_;
+    WALFileManager files_;
     Options options_;
 
     // Lifecycle lock: shared for append/commit, exclusive for close.
@@ -197,17 +190,6 @@ private:
     // Per-producer staging buffers (indexed by producer_id).
     // Protected by rw_mu_ (shared for owning producer, exclusive for close).
     ProducerBuf producers_[WalProducer::kMaxProducers];
-
-    // File ID of the currently open WAL file.
-    uint32_t current_file_id_ = 0;
-    // Min/max file IDs (persisted in Manifest).
-    uint32_t min_file_id_ = 0;
-    uint32_t max_file_id_ = 0;
-    bool has_files_ = false;
-    // Sum of sizes of all closed WAL files.
-    uint64_t total_size_ = 0;
-    // In-memory list of all live WAL file IDs, derived from [min, max] range.
-    std::vector<uint32_t> file_ids_;
 };
 
 } // namespace internal

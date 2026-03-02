@@ -20,65 +20,40 @@ GlobalIndexWAL::~GlobalIndexWAL() {
     }
 }
 
-void GlobalIndexWAL::loadManifestState() {
-    std::string val;
-    has_files_ = false;
-    file_ids_.clear();
-
-    if (manifest_->get(ManifestKey::kGiWalMinFileId, val)) {
-        min_file_id_ = static_cast<uint32_t>(std::stoul(val));
-        has_files_ = true;
-    }
-    if (manifest_->get(ManifestKey::kGiWalMaxFileId, val)) {
-        max_file_id_ = static_cast<uint32_t>(std::stoul(val));
-        has_files_ = true;
-    }
-
-    if (has_files_) {
-        for (uint32_t id = min_file_id_; id <= max_file_id_; ++id) {
-            file_ids_.push_back(id);
-        }
-    }
-}
-
 Status GlobalIndexWAL::openActiveFile() {
-    std::string dir = walDir();
-    total_size_ = 0;
+    std::string dir = files_.walDir();
 
-    if (!file_ids_.empty()) {
-        for (size_t i = 0; i + 1 < file_ids_.size(); ++i) {
+    const auto& fids = files_.fileIds();
+    if (!fids.empty()) {
+        for (size_t i = 0; i + 1 < fids.size(); ++i) {
             struct stat st;
-            if (::stat(walFilePath(dir, file_ids_[i]).c_str(), &st) == 0) {
-                total_size_ += static_cast<uint64_t>(st.st_size);
+            if (::stat(WALFileManager::walFilePath(dir, fids[i]).c_str(), &st) == 0) {
+                files_.addClosedFileSize(static_cast<uint64_t>(st.st_size));
             }
         }
-        current_file_id_ = file_ids_.back();
-        return wal_.open(walFilePath(dir, current_file_id_));
+        files_.setCurrentFileId(fids.back());
+        return wal_.open(WALFileManager::walFilePath(dir, files_.currentFileId()));
     }
 
     // Create file on disk before persisting to Manifest.
-    uint32_t id = nextFileId();
-    Status s = wal_.create(walFilePath(dir, id));
+    uint32_t id = files_.nextFileId();
+    Status s = wal_.create(WALFileManager::walFilePath(dir, id));
     if (!s.ok()) return s;
 
-    s = persistFileId(id);
+    s = files_.persistFileId(id);
     if (!s.ok()) return s;
 
-    current_file_id_ = id;
-    file_ids_.push_back(id);
+    files_.recordFileCreated(id);
     return Status::OK();
 }
 
 Status GlobalIndexWAL::open(const std::string& db_path, Manifest& manifest,
                              const Options& options) {
-    db_path_ = db_path;
-    manifest_ = &manifest;
     options_ = options;
+    files_.open(db_path, manifest);
 
     ::mkdir((db_path + "/gi").c_str(), 0755);
-    ::mkdir(walDir().c_str(), 0755);
-
-    loadManifestState();
+    ::mkdir(files_.walDir().c_str(), 0755);
 
     Status s = openActiveFile();
     if (!s.ok()) return s;
@@ -237,72 +212,48 @@ Status GlobalIndexWAL::flushProducer(uint8_t producer_id) {
 
 Status GlobalIndexWAL::rollover() {
     // Accumulate size of the file we're closing.
-    total_size_ += wal_.size();
+    files_.addClosedFileSize(wal_.size());
     uint64_t closing_max = wal_.maxVersion();
 
     Status s = wal_.close();
     if (!s.ok()) return s;
 
     // Create the file on disk BEFORE updating the Manifest.
-    // If we crash after create but before the Manifest write, the orphan
-    // file is harmless — next attempt reuses the same ID (O_TRUNC).
-    uint32_t new_id = nextFileId();
-    s = wal_.create(walFilePath(walDir(), new_id));
+    uint32_t new_id = files_.nextFileId();
+    s = wal_.create(WALFileManager::walFilePath(files_.walDir(), new_id));
     if (!s.ok()) return s;
 
-    s = persistFileId(new_id);
+    s = files_.persistFileId(new_id);
     if (!s.ok()) return s;
 
-    current_file_id_ = new_id;
-    file_ids_.push_back(new_id);
+    files_.recordFileCreated(new_id);
     wal_.updateMaxVersion(closing_max);
     return Status::OK();
 }
 
-uint32_t GlobalIndexWAL::nextFileId() const {
-    return has_files_ ? max_file_id_ + 1 : 0;
-}
-
-Status GlobalIndexWAL::persistFileId(uint32_t file_id) {
-    if (!has_files_) {
-        has_files_ = true;
-        min_file_id_ = file_id;
-        max_file_id_ = file_id;
-        Status s = manifest_->set(ManifestKey::kGiWalMinFileId,
-                                  std::to_string(file_id));
-        if (!s.ok()) return s;
-        return manifest_->set(ManifestKey::kGiWalMaxFileId,
-                              std::to_string(file_id));
-    }
-    max_file_id_ = file_id;
-    return manifest_->set(ManifestKey::kGiWalMaxFileId,
-                          std::to_string(file_id));
-}
-
 std::unique_ptr<WALStream> GlobalIndexWAL::replayStream() const {
-    return stream::walReplay(walDir(), file_ids_);
+    return stream::walReplay(files_.walDir(), files_.fileIds());
 }
 
 Status GlobalIndexWAL::startNewFile() {
     std::lock_guard<std::mutex> lock(mu_);
 
     // Accumulate size of the file we're closing.
-    total_size_ += wal_.size();
+    files_.addClosedFileSize(wal_.size());
     uint64_t closing_max = wal_.maxVersion();
 
     Status s = wal_.close();
     if (!s.ok()) return s;
 
     // Create the file on disk BEFORE updating the Manifest.
-    uint32_t new_id = nextFileId();
-    s = wal_.create(walFilePath(walDir(), new_id));
+    uint32_t new_id = files_.nextFileId();
+    s = wal_.create(WALFileManager::walFilePath(files_.walDir(), new_id));
     if (!s.ok()) return s;
 
-    s = persistFileId(new_id);
+    s = files_.persistFileId(new_id);
     if (!s.ok()) return s;
 
-    current_file_id_ = new_id;
-    file_ids_.push_back(new_id);
+    files_.recordFileCreated(new_id);
     wal_.updateMaxVersion(closing_max);
     return Status::OK();
 }
@@ -321,21 +272,7 @@ Status GlobalIndexWAL::truncate(uint64_t cutoff_version) {
     }
     wal_.abort();
 
-    // Delete all closed WAL files (all except the active file).
-    std::string dir = walDir();
-    for (uint32_t fid : file_ids_) {
-        if (fid == current_file_id_) continue;
-        std::string path = walFilePath(dir, fid);
-        std::remove(path.c_str());
-    }
-
-    // Update range: only the active file remains.
-    file_ids_.clear();
-    file_ids_.push_back(current_file_id_);
-    min_file_id_ = current_file_id_;
-    manifest_->set(ManifestKey::kGiWalMinFileId, std::to_string(min_file_id_));
-
-    total_size_ = 0;
+    files_.truncateToActive();
     return Status::OK();
 }
 
@@ -350,32 +287,12 @@ Status GlobalIndexWAL::truncateForSavepoint(uint64_t cutoff_version) {
     std::lock_guard<std::mutex> lock(mu_);  // serialize with flushProducer
     wal_.abort();
 
-    std::string dir = walDir();
-    for (uint32_t fid : file_ids_) {
-        if (fid == current_file_id_) continue;
-        std::remove(walFilePath(dir, fid).c_str());
-    }
-
-    file_ids_.clear();
-    file_ids_.push_back(current_file_id_);
-    min_file_id_ = current_file_id_;
-    manifest_->set(ManifestKey::kGiWalMinFileId, std::to_string(min_file_id_));
-    total_size_ = 0;
+    files_.truncateToActive();
     return Status::OK();
 }
 
 uint64_t GlobalIndexWAL::size() const {
-    return total_size_ + wal_.size();
-}
-
-std::string GlobalIndexWAL::walDir() const {
-    return db_path_ + "/gi/wal";
-}
-
-std::string GlobalIndexWAL::walFilePath(const std::string& wal_dir, uint32_t file_id) {
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "%08u", file_id);
-    return wal_dir + "/" + buf + ".log";
+    return files_.totalSize() + wal_.size();
 }
 
 }  // namespace internal
