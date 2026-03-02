@@ -89,7 +89,7 @@ public:
     uint8_t suffixBits() const;
 
 protected:
-    static constexpr uint32_t kBucketPadding = 8;
+    static constexpr uint32_t kBucketPadding = 0;
 
     explicit DeltaHashTable(const Config& config);
     ~DeltaHashTable();

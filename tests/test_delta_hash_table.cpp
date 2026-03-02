@@ -1188,7 +1188,7 @@ public:
 
 // Compute base memoryUsage for a config (no extensions).
 static size_t baseMemory(const DeltaHashTable::Config& cfg) {
-    size_t stride = cfg.bucket_bytes + 8;  // kBucketPadding = 8
+    size_t stride = cfg.bucket_bytes;  // no padding, stride == bucket_bytes
     return (1u << cfg.bucket_bits) * stride;
 }
 
@@ -1365,7 +1365,7 @@ TEST(BucketArena, SizeAndDataBytesTrackAllocations) {
     uint32_t ext_count = dht.arena().size();
     ASSERT_GT(ext_count, 0u);
 
-    size_t stride = cfg.bucket_bytes + 8;  // kBucketPadding
+    size_t stride = cfg.bucket_bytes;  // no padding, stride == bucket_bytes
     EXPECT_EQ(dht.arena().dataBytes(), static_cast<size_t>(ext_count) * stride);
 }
 
