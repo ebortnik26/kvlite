@@ -379,8 +379,8 @@ other operations depending on their exact values.
 
 ## Putting it together
 
-The DHT's design reflects kvlite's workload: point lookups and small
-batch writes, no range scans.
+The DHT's design reflects kvlite's workload: unordered point access —
+single and batch reads and writes, snapshot reads — but no range scans.
 
 The columnar bucket encoding packs data tightly through delta encoding,
 ZigZag mapping, and Elias-Gamma coding.  Cross-key deltas in the
