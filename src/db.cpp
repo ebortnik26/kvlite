@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -106,6 +107,8 @@ Status DB::open(const std::string& path, const Options& options) {
     wb_opts.flush_depth = options.flush_depth;
 
     auto flush_fn = [this](internal::Memtable& mt) -> Status {
+        auto t0 = std::chrono::steady_clock::now();
+
         uint32_t seg_id = storage_->allocateSegmentId();
 
         Status s = storage_->createSegment(seg_id, false);
@@ -125,6 +128,12 @@ Status DB::open(const std::string& path, const Options& options) {
 
         // Manifest update is the commit point — makes the flush visible.
         s = storage_->registerSegments({seg_id});
+
+        auto t1 = std::chrono::steady_clock::now();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        flush_count_.fetch_add(1, std::memory_order_relaxed);
+        flush_total_us_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+
         return s;
     };
 
@@ -145,7 +154,12 @@ Status DB::open(const std::string& path, const Options& options) {
     if (options_.savepoint_interval_sec > 0) {
         sp_daemon_ = std::make_unique<internal::PeriodicDaemon>();
         sp_daemon_->start(options_.savepoint_interval_sec, [this] {
+            auto t0 = std::chrono::steady_clock::now();
             global_index_->maybeSavepoint();
+            auto t1 = std::chrono::steady_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            savepoint_count_.fetch_add(1, std::memory_order_relaxed);
+            savepoint_total_us_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
         });
     }
 
@@ -474,6 +488,13 @@ Status DB::getStats(DBStats& stats) const {
     stats.num_live_entries = global_index_->keyCount();
     stats.num_historical_entries = global_index_->entryCount() - global_index_->keyCount();
 
+    stats.flush_count = flush_count_.load(std::memory_order_relaxed);
+    stats.flush_total_us = flush_total_us_.load(std::memory_order_relaxed);
+    stats.gc_count = gc_count_.load(std::memory_order_relaxed);
+    stats.gc_total_us = gc_total_us_.load(std::memory_order_relaxed);
+    stats.savepoint_count = savepoint_count_.load(std::memory_order_relaxed);
+    stats.savepoint_total_us = savepoint_total_us_.load(std::memory_order_relaxed);
+
     return Status::OK();
 }
 
@@ -563,6 +584,8 @@ Status DB::runGC() {
     auto input_ids = selectGCInputs();
     if (input_ids.empty()) return Status::OK();
 
+    auto t0 = std::chrono::steady_clock::now();
+
     Status s = mergeSegments(input_ids);
     if (!s.ok()) return s;
 
@@ -570,6 +593,12 @@ Status DB::runGC() {
         storage_->unpinSegment(id);
         storage_->removeSegment(id);
     }
+
+    auto t1 = std::chrono::steady_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    gc_count_.fetch_add(1, std::memory_order_relaxed);
+    gc_total_us_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+
     return Status::OK();
 }
 

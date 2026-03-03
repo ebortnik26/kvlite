@@ -15,6 +15,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(KVLITE_BUILD_TESTS "Build kvlite tests" OFF)
 option(KVLITE_BUILD_BENCHMARKS "Build kvlite benchmarks" OFF)
 option(KVLITE_BUILD_EXAMPLES "Build kvlite examples" OFF)
+option(KVLITE_BUILD_TOOLS "Build kvlite tools (kvbench)" OFF)
 
 # Compiler flags
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -82,6 +83,11 @@ endif()
 # Examples
 if(KVLITE_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+# Tools
+if(KVLITE_BUILD_TOOLS)
+    add_subdirectory(src/tools)
 endif()
 
 # Installation

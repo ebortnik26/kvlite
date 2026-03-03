@@ -1,6 +1,7 @@
 #ifndef KVLITE_DB_H
 #define KVLITE_DB_H
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -34,6 +35,14 @@ struct DBStats {
     uint64_t current_version = 0;
     uint64_t oldest_version = 0;
     uint64_t active_snapshots = 0;
+
+    // Background operation stats
+    uint64_t flush_count = 0;
+    uint64_t flush_total_us = 0;        // cumulative flush time in microseconds
+    uint64_t gc_count = 0;
+    uint64_t gc_total_us = 0;           // cumulative GC time in microseconds
+    uint64_t savepoint_count = 0;
+    uint64_t savepoint_total_us = 0;    // cumulative savepoint time in microseconds
 };
 
 class Snapshot {
@@ -154,6 +163,13 @@ private:
     std::unique_ptr<internal::PeriodicDaemon> gc_daemon_;
     std::unique_ptr<internal::PeriodicDaemon> sp_daemon_;
 
+    // Background operation counters (updated from bg threads)
+    std::atomic<uint64_t> flush_count_{0};
+    std::atomic<uint64_t> flush_total_us_{0};
+    std::atomic<uint64_t> gc_count_{0};
+    std::atomic<uint64_t> gc_total_us_{0};
+    std::atomic<uint64_t> savepoint_count_{0};
+    std::atomic<uint64_t> savepoint_total_us_{0};
 };
 
 }  // namespace kvlite
