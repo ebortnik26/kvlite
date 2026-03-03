@@ -21,6 +21,48 @@ the **suffix** — stored inside the bucket and used for key disambiguation.
 With 44 bits of suffix, false positives are essentially impossible: full
 suffix comparison eliminates collisions without touching the log file.
 
+## FNV-1a hashing
+
+Before any bucket logic runs, every key is hashed to a 64-bit value
+using [FNV-1a](http://www.isthe.com/chongo/tech/comp/fnv/) (Fowler–Noll–Vo,
+variant 1a).  FNV-1a processes the input byte-by-byte: starting from a
+fixed offset basis, it XORs each byte into the hash and then multiplies
+by a prime.
+
+```cpp
+uint64_t hash = 14695981039346656037ULL;   // FNV offset basis
+for (each byte b in key) {
+    hash ^= b;                             // xor
+    hash *= 1099511628211ULL;              // FNV prime
+}
+```
+
+The "1a" variant XORs before multiplying (the original FNV-1 multiplies
+first).  This reordering improves avalanche — small input changes
+propagate more uniformly across the output bits.
+
+kvlite follows the hash with a finalizer (bit mixing) to improve the
+distribution of the upper bits, which are used for bucket selection:
+
+```cpp
+hash ^= hash >> 33;
+hash *= 0xff51afd7ed558ccdULL;
+hash ^= hash >> 33;
+hash *= 0xc4ceb9fe1a85ec53ULL;
+hash ^= hash >> 33;
+```
+
+This finalizer is the same one used in
+[MurmurHash3](https://github.com/aappleby/smhasher/wiki/MurmurHash3)'s
+64-bit mixer (by Austin Appleby).  It is applied after FNV-1a to ensure
+the high bits — which select the bucket — have full entropy even when
+keys share common prefixes or suffixes.
+
+FNV-1a is chosen for its simplicity, zero setup cost (no seed table), and
+good distribution on short keys.  It is not cryptographic — it is trivial
+to craft collisions — but for a hash table index, collision resistance
+against adversarial inputs is not a requirement.
+
 ## Bucket structure
 
 Each bucket is a fixed-size byte array (default 512 bytes).  The last 8
@@ -65,8 +107,9 @@ All fields after `num_keys` are bit-packed with no byte alignment.
 ### Suffixes column
 
 The first suffix is stored raw (44 bits).  Subsequent suffixes are
-delta-encoded against the previous one (since they're sorted, deltas are
-always positive) and written as **Elias-Gamma codes**:
+[delta-encoded](https://en.wikipedia.org/wiki/Delta_encoding) against the
+previous one (since they're sorted, deltas are always positive) and
+written as **Elias-Gamma codes**:
 
 ```
 suffix[0]:  raw 44 bits
@@ -141,8 +184,10 @@ avoiding the cost of decoding all historical versions.
 
 Two bit-level primitives underpin the encoding:
 
-**Elias-Gamma coding.**  Encodes a positive integer `n` as a unary-coded
-length prefix followed by the binary representation:
+**[Elias-Gamma coding](https://en.wikipedia.org/wiki/Elias_gamma_coding).**
+Introduced by Peter Elias in 1975 as a universal code for positive
+integers.  It encodes `n` as a unary-coded length prefix followed by the
+binary representation:
 
 ```
 n=1:    "1"              (1 bit)
@@ -151,15 +196,24 @@ n=5:    "00101"          (5 bits)
 n=13:   "0001101"        (7 bits)
 ```
 
-Cost: `2*floor(log2(n)) + 1` bits.  Values 1-3 fit in 1-3 bits.
+Cost: `2*floor(log2(n)) + 1` bits.  Values 1-3 fit in 1-3 bits.  The
+code is prefix-free (no delimiter needed between consecutive values) and
+universal (it works for any positive integer without knowing the
+distribution in advance).  See Elias, P. (1975), "Universal codeword sets
+and representations of the integers", *IEEE Trans. Information Theory*.
 
-**ZigZag encoding.**  Maps signed integers to unsigned:
+**[ZigZag encoding](https://protobuf.dev/programming-guides/encoding/#signed-ints).**
+Maps signed integers to unsigned by interleaving positives and negatives:
 
 ```cpp
 uint64_t zigzag(int64_t v) { return (v << 1) ^ (v >> 63); }
 ```
 
-Preserves magnitude, making signed deltas compressible by Elias-Gamma.
+This is the same encoding used by
+[Protocol Buffers](https://protobuf.dev/programming-guides/encoding/#signed-ints)
+for `sint32`/`sint64` fields.  It preserves magnitude — small signed
+values become small unsigned values — making them compressible by
+Elias-Gamma or any other variable-length unsigned integer code.
 
 All bit I/O uses big-endian (MSB-first) ordering via `BitReader` /
 `BitWriter` classes that operate at arbitrary bit offsets with 64-bit
@@ -203,7 +257,8 @@ in-memory index updated on every put and queried on every get.  It uses
 #### Spinlock design
 
 Each of the 2^20 buckets gets its own spinlock — a single `atomic<uint8_t>`
-using a test-and-test-and-set (TTTS) strategy:
+using a [test-and-test-and-set](https://en.wikipedia.org/wiki/Test_and_test-and-set)
+(TTTS) strategy:
 
 ```cpp
 void lock() const {
@@ -333,3 +388,33 @@ for sealed segments, fine-grained spinlocks for the mutable global index,
 and a shared mutex for rare structural operations like savepoints.  With
 a million independent bucket locks, the global index scales to high
 thread counts with minimal contention.
+
+## References
+
+- **FNV-1a hash** — Fowler, Noll, Vo.  [FNV Hash](http://www.isthe.com/chongo/tech/comp/fnv/).
+  The authoritative reference for the FNV family of hash functions,
+  including offset basis and prime constants for 32/64/128-bit variants.
+
+- **MurmurHash3 finalizer** — Austin Appleby.
+  [SMHasher / MurmurHash3](https://github.com/aappleby/smhasher/wiki/MurmurHash3).
+  The 64-bit mix function used as a post-FNV avalanche step.
+
+- **Elias-Gamma coding** — Elias, P. (1975). "Universal codeword sets and
+  representations of the integers." *IEEE Transactions on Information
+  Theory*, 21(2), 194-203.
+  [Wikipedia](https://en.wikipedia.org/wiki/Elias_gamma_coding).
+
+- **ZigZag encoding** — Google Protocol Buffers.
+  [Signed Integers](https://protobuf.dev/programming-guides/encoding/#signed-ints).
+  Maps signed to unsigned by interleaving positive and negative values.
+
+- **Delta encoding** —
+  [Wikipedia](https://en.wikipedia.org/wiki/Delta_encoding).
+  Storing differences between consecutive values rather than absolute
+  values.  Combined with Elias-Gamma, small deltas compress to a few bits.
+
+- **Test-and-test-and-set (TTTS)** — Rudolph, L. and Segall, Z. (1984).
+  "Dynamic decentralized cache schemes for MIMD parallel processors."
+  *ISCA '84*.
+  [Wikipedia](https://en.wikipedia.org/wiki/Test_and_test-and-set).
+  The two-level spin strategy used in the per-bucket spinlocks.
