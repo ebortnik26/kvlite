@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -13,6 +14,7 @@
 #include "kvlite/db.h"
 #include "kvlite/options.h"
 #include "kvlite/status.h"
+#include "zipfian_generator.h"
 
 #include <kll_sketch.hpp>
 
@@ -31,6 +33,7 @@ struct Config {
     bool preload = true;
     int report_interval = 5;
     size_t write_buffer_size = 64 * 1024 * 1024;
+    std::string key_dist = "uniform";
     std::string db_path;
 };
 
@@ -52,6 +55,7 @@ static void printUsage(const char* prog) {
         "  --no-preload           Skip preload phase\n"
         "  --report-interval N    Seconds between reports (default: 5)\n"
         "  --write-buffer-size N  Write buffer size in bytes (default: 67108864)\n"
+        "  --key-dist NAME        Key distribution: uniform or zipf [YCSB] (default: uniform)\n"
         "  --help                 Show this message\n",
         prog);
 }
@@ -80,6 +84,13 @@ static bool parseArgs(int argc, char** argv, Config& cfg) {
         else if (arg("--no-preload"))        cfg.preload = false;
         else if (arg("--report-interval"))   cfg.report_interval = static_cast<int>(nextInt());
         else if (arg("--write-buffer-size")) cfg.write_buffer_size = static_cast<size_t>(nextInt());
+        else if (arg("--key-dist")) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Missing value for %s\n", argv[i]);
+                std::exit(1);
+            }
+            cfg.key_dist = argv[++i];
+        }
         else if (argv[i][0] == '-') {
             std::fprintf(stderr, "Unknown flag: %s\n", argv[i]);
             return false;
@@ -107,6 +118,12 @@ static bool validateConfig(const Config& cfg) {
     }
     if (cfg.key_size < 1) {
         std::fprintf(stderr, "Error: --key-size must be >= 1\n");
+        return false;
+    }
+    if (cfg.key_dist != "uniform" && cfg.key_dist != "zipf") {
+        std::fprintf(stderr,
+            "Error: --key-dist must be \"uniform\" or \"zipf\", got \"%s\"\n",
+            cfg.key_dist.c_str());
         return false;
     }
     // Check that key_size can represent num_keys distinct keys.
@@ -250,14 +267,27 @@ static void workerThread(kvlite::DB& db, const Config& cfg,
                          std::atomic<uint64_t>& global_ops_done,
                          uint64_t total_ops, int thread_id) {
     std::mt19937_64 rng(static_cast<uint64_t>(thread_id) * 7919 + 42);
-    std::uniform_int_distribution<uint64_t> key_dist(0, cfg.num_keys - 1);
+    std::uniform_int_distribution<uint64_t> uniform_key_dist(0, cfg.num_keys - 1);
     std::uniform_int_distribution<int> op_dist(0, 99);
+
+    // Optional Zipfian generator (constructed only when needed).
+    // ZipfianGenerator precomputes zeta_n which is O(num_keys), so we build
+    // it once per thread rather than per-operation.
+    std::unique_ptr<ZipfianGenerator> zipf_gen;
+    if (cfg.key_dist == "zipf") {
+        zipf_gen = std::make_unique<ZipfianGenerator>(cfg.num_keys);
+    }
+
+    auto nextKey = [&]() -> uint64_t {
+        if (zipf_gen) return (*zipf_gen)(rng);
+        return uniform_key_dist(rng);
+    };
 
     while (true) {
         uint64_t my_op = global_ops_done.fetch_add(1, std::memory_order_relaxed);
         if (my_op >= total_ops) break;
 
-        uint64_t key_id = key_dist(rng);
+        uint64_t key_id = nextKey();
         int roll = op_dist(rng);
 
         OpType op;
@@ -519,6 +549,7 @@ int main(int argc, char** argv) {
     std::printf("  get_pct:           %d%%\n", cfg.get_pct);
     std::printf("  key_size:          %d\n", cfg.key_size);
     std::printf("  value_size:        %d\n", cfg.value_size);
+    std::printf("  key_dist:          %s\n", cfg.key_dist.c_str());
     std::printf("  preload:           %s\n", cfg.preload ? "yes" : "no");
     std::printf("  report_interval:   %ds\n", cfg.report_interval);
     std::printf("  write_buffer_size: %llu\n",

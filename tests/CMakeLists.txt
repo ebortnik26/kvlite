@@ -436,5 +436,11 @@ set_tests_properties(savepoint_bench bucket_codec_bench
     PROPERTIES LABELS "perf"
 )
 
+# Zipfian generator tests (header-only, no library link)
+add_executable(kvlite_zipfian_test test_zipfian.cpp)
+target_include_directories(kvlite_zipfian_test PRIVATE ${CMAKE_SOURCE_DIR}/src/tools)
+target_link_libraries(kvlite_zipfian_test PRIVATE GTest::gtest GTest::gtest_main)
+add_test(NAME zipfian_tests COMMAND kvlite_zipfian_test)
+
 # Default parallel level for ctest
 set(CTEST_PARALLEL_LEVEL 8 CACHE STRING "Number of tests to run in parallel")
