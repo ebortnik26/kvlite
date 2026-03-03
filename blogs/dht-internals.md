@@ -333,23 +333,27 @@ The GlobalIndex layers a `shared_mutex` over the DHT's bucket spinlocks:
 ```
 GlobalIndex
   savepoint_mu_ (shared_mutex)
-    shared:    put / get / remove    (concurrent, non-blocking)
-    exclusive: storeSavepoint / GC   (blocks new mutations)
+    shared:    GC (relocate / eliminate)
+    exclusive: storeSavepoint          (blocks GC)
   ReadWriteDeltaHashTable
-    bucket_locks_[0..2^20]           (per-bucket spinlocks)
-    BucketArena mutex_               (extension allocation)
+    bucket_locks_[0..2^20]             (per-bucket spinlocks)
+    BucketArena mutex_                 (extension allocation)
 ```
 
-Normal operations (put, get, remove) take a **shared lock** on
-`savepoint_mu_` — they don't block each other.  Savepoint creation and
-GC take an **exclusive lock**, pausing new mutations while the DHT
-state is snapshotted or entries are relocated.
+Reads, puts, and flushes do **not** acquire `savepoint_mu_` — they go
+directly to the DHT's per-bucket spinlocks with zero overhead from the
+savepoint layer.  (A `DB::put` writes to the WriteBuffer; the
+GlobalIndex is updated later by the flush daemon via `stagePut` /
+`commitWB`, neither of which touches `savepoint_mu_`.)  GC operations
+(which relocate and eliminate entries) take a **shared lock**, allowing
+multiple GC batches to run concurrently.  Savepoint creation takes an
+**exclusive lock**, pausing GC while the DHT state is snapshotted to
+disk.
 
-This two-level scheme separates fast-path locking (bucket spinlocks,
-sub-microsecond hold times) from slow-path coordination (savepoint
-mutex, held for milliseconds during I/O).  In practice, the shared lock
-on `savepoint_mu_` is uncontended during normal operation, adding
-negligible overhead.
+This two-level scheme keeps the entire hot path — reads, puts, and
+flushes — within bucket spinlocks at sub-microsecond hold times, while
+the savepoint mutex coordinates only between the infrequent savepoint
+and GC operations.
 
 #### Lock-free counters
 

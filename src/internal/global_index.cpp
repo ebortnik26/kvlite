@@ -186,19 +186,6 @@ bool GlobalIndex::isOpen() const {
 
 // --- Index Operations ---
 
-Status GlobalIndex::put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
-    std::shared_lock<std::shared_mutex> lock(savepoint_mu_);
-    Status s = wal_->appendPut(hkey, packed_version, segment_id, WalProducer::kWB);
-    if (!s.ok()) return s;
-    applyPut(hkey, packed_version, segment_id);
-    uint64_t cur = max_version_.load(std::memory_order_relaxed);
-    while (packed_version > cur &&
-           !max_version_.compare_exchange_weak(cur, packed_version,
-               std::memory_order_relaxed)) {}
-    wal_->updateMaxVersion(packed_version);
-    return Status::OK();
-}
-
 Status GlobalIndex::stagePut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
     applyPut(hkey, packed_version, segment_id);  // DHT first
     Status s = wal_->stagePut(hkey, packed_version, segment_id, WalProducer::kWB);

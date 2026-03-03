@@ -76,10 +76,6 @@ public:
 
     // --- Index Operations ---
 
-    // Single-insert convenience (self-locking). For batch operations use
-    // BatchGuard + stagePut() + commitWB().
-    Status put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
-
     // Stage a put in the WAL buffer without auto-commit.
     // Caller does not need BatchGuard. Call commitWB() when done.
     Status stagePut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);

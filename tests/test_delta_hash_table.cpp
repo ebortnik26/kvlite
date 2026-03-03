@@ -47,6 +47,14 @@ protected:
         std::filesystem::remove_all(db_dir_);
     }
 
+    // Helpers that mirror the production flush path (stagePut + commitWB).
+    void put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
+        ASSERT_TRUE(index->stagePut(hkey, packed_version, segment_id).ok());
+    }
+    void commit(uint64_t max_version) {
+        ASSERT_TRUE(index->commitWB(max_version).ok());
+    }
+
     std::string db_dir_;
     kvlite::internal::Manifest manifest_;
     std::unique_ptr<GlobalIndex> index;
@@ -55,9 +63,10 @@ protected:
 TEST_F(GlobalIndexDHT, PutAndGetLatest) {
 
     uint64_t hkey1 = H("key1");
-    index->put(hkey1, 100, 1);
-    index->put(hkey1, 200, 2);
-    index->put(hkey1, 300, 3);
+    put(hkey1, 100, 1);
+    put(hkey1, 200, 2);
+    put(hkey1, 300, 3);
+    commit(300);
 
     uint64_t ver;
     uint32_t seg;
@@ -76,9 +85,10 @@ TEST_F(GlobalIndexDHT, PutAndGetLatest) {
 
 TEST_F(GlobalIndexDHT, PutMultipleVersions) {
     uint64_t hkey1 = H("key1");
-    index->put(hkey1, 100, 1);
-    index->put(hkey1, 200, 2);
-    index->put(hkey1, 300, 3);
+    put(hkey1, 100, 1);
+    put(hkey1, 200, 2);
+    put(hkey1, 300, 3);
+    commit(300);
 
     EXPECT_EQ(index->entryCount(), 3u);
     EXPECT_EQ(index->keyCount(), 1u);
@@ -86,8 +96,9 @@ TEST_F(GlobalIndexDHT, PutMultipleVersions) {
 
 TEST_F(GlobalIndexDHT, GetLatest) {
     uint64_t hkey1 = H("key1");
-    index->put(hkey1, 100, 1);
-    index->put(hkey1, 200, 2);
+    put(hkey1, 100, 1);
+    put(hkey1, 200, 2);
+    commit(200);
 
     uint64_t ver;
     uint32_t seg;
@@ -100,9 +111,10 @@ TEST_F(GlobalIndexDHT, GetLatest) {
 
 TEST_F(GlobalIndexDHT, GetWithUpperBound) {
     uint64_t hkey1 = H("key1");
-    index->put(hkey1, 100, 1);
-    index->put(hkey1, 200, 2);
-    index->put(hkey1, 300, 3);
+    put(hkey1, 100, 1);
+    put(hkey1, 200, 2);
+    put(hkey1, 300, 3);
+    commit(300);
 
     uint64_t ver;
     uint32_t seg;
@@ -120,7 +132,8 @@ TEST_F(GlobalIndexDHT, GetWithUpperBound) {
 TEST_F(GlobalIndexDHT, Contains) {
     uint64_t hkey1 = H("key1");
     EXPECT_FALSE(index->contains(hkey1));
-    index->put(hkey1, 100, 1);
+    put(hkey1, 100, 1);
+    commit(100);
     EXPECT_TRUE(index->contains(hkey1));
 }
 
@@ -133,9 +146,10 @@ TEST_F(GlobalIndexDHT, GetNonExistent) {
 TEST_F(GlobalIndexDHT, Savepoint) {
     uint64_t hkey1 = H("key1");
     uint64_t hkey2 = H("key2");
-    index->put(hkey1, 100, 1);
-    index->put(hkey1, 200, 2);
-    index->put(hkey2, 300, 3);
+    put(hkey1, 100, 1);
+    put(hkey1, 200, 2);
+    put(hkey2, 300, 3);
+    commit(300);
 
     ASSERT_TRUE(index->storeSavepoint(0).ok());
     ASSERT_TRUE(index->close().ok());
@@ -168,10 +182,11 @@ TEST_F(GlobalIndexDHT, Savepoint) {
 TEST_F(GlobalIndexDHT, SavepointWithManyEntries) {
     uint64_t hkey1 = H("key1");
     uint64_t hkey2 = H("key2");
-    index->put(hkey1, 100, 1);
-    index->put(hkey1, 200, 2);
-    index->put(hkey1, 300, 3);
-    index->put(hkey2, 400, 4);
+    put(hkey1, 100, 1);
+    put(hkey1, 200, 2);
+    put(hkey1, 300, 3);
+    put(hkey2, 400, 4);
+    commit(400);
 
     ASSERT_TRUE(index->storeSavepoint(0).ok());
     ASSERT_TRUE(index->close().ok());
@@ -208,9 +223,10 @@ TEST_F(GlobalIndexDHT, SavepointWithManyEntries) {
 TEST_F(GlobalIndexDHT, Clear) {
     for (int i = 0; i < 50; ++i) {
         std::string key = "key" + std::to_string(i);
-        index->put(H(key), static_cast<uint64_t>(i * 10),
-                  static_cast<uint32_t>(i));
+        put(H(key), static_cast<uint64_t>(i * 10),
+            static_cast<uint32_t>(i));
     }
+    commit(49 * 10);
     EXPECT_EQ(index->keyCount(), 50u);
 
     index->clear();
@@ -365,8 +381,9 @@ TEST(ReadOnlyDHTOverflow, ForEachGroupMergesChain) {
 TEST_F(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
     uint64_t hkey = H("key");
     for (int i = 1; i <= 200; ++i) {
-        index->put(hkey, static_cast<uint64_t>(i), /*segment_id=*/1);
+        put(hkey, static_cast<uint64_t>(i), /*segment_id=*/1);
     }
+    commit(200);
 
     EXPECT_EQ(index->entryCount(), 200u);
     EXPECT_EQ(index->keyCount(), 1u);
@@ -389,8 +406,9 @@ TEST_F(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
 TEST_F(GlobalIndexDHT, ManyVersionsDifferentSegments) {
     uint64_t hkey = H("key");
     for (int i = 1; i <= 200; ++i) {
-        index->put(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+        put(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
+    commit(200);
 
     uint64_t ver;
     uint32_t seg;
@@ -408,8 +426,9 @@ TEST_F(GlobalIndexDHT, LargeScale) {
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        index->put(H(key), static_cast<uint64_t>(i * 10), static_cast<uint32_t>(i));
+        put(H(key), static_cast<uint64_t>(i * 10), static_cast<uint32_t>(i));
     }
+    commit((N - 1) * 10);
 
     EXPECT_EQ(index->keyCount(), static_cast<size_t>(N));
 
@@ -466,11 +485,12 @@ TEST_F(GlobalIndexDHT, PutKeyCountWithAddEntryIsNew) {
         std::string key = "key" + std::to_string(k);
         uint64_t hkey = H(key);
         for (int v = 0; v < V; ++v) {
-            index->put(hkey,
-                      static_cast<uint64_t>(k * V + v),
-                      static_cast<uint32_t>(k));
+            put(hkey,
+                static_cast<uint64_t>(k * V + v),
+                static_cast<uint32_t>(k));
         }
     }
+    commit(K * V - 1);
     EXPECT_EQ(index->keyCount(), static_cast<size_t>(K));
     EXPECT_EQ(index->entryCount(), static_cast<size_t>(K * V));
 }
@@ -1609,6 +1629,13 @@ protected:
         std::filesystem::remove_all(db_dir_);
     }
 
+    void put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
+        ASSERT_TRUE(index_->stagePut(hkey, packed_version, segment_id).ok());
+    }
+    void commit(uint64_t max_version) {
+        ASSERT_TRUE(index_->commitWB(max_version).ok());
+    }
+
     std::string db_dir_;
     Manifest manifest_;
     std::unique_ptr<GlobalIndex> index_;
@@ -1618,8 +1645,9 @@ TEST_F(SavepointTest, RoundTripBasic) {
     const int N = 1000;
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i * 10 + 1, i + 1).ok());
+        put(H(key), i * 10 + 1, i + 1);
     }
+    commit((N - 1) * 10 + 1);
 
     ASSERT_EQ(index_->entryCount(), static_cast<size_t>(N));
     ASSERT_EQ(index_->keyCount(), static_cast<size_t>(N));
@@ -1657,9 +1685,10 @@ TEST_F(SavepointTest, RoundTripMultiVersion) {
         std::string key = "key_" + std::to_string(i);
         uint64_t hkey = H(key);
         for (int v = 0; v < 5; ++v) {
-            ASSERT_TRUE(index_->put(hkey, v * 100 + i + 1, v * 10 + i).ok());
+            put(hkey, v * 100 + i + 1, v * 10 + i);
         }
     }
+    commit(4 * 100 + 99 + 1);
 
     ASSERT_EQ(index_->entryCount(), 500u);
     ASSERT_EQ(index_->keyCount(), 100u);
@@ -1696,9 +1725,10 @@ TEST_F(SavepointTest, SavepointWithExtensions) {
         std::string key = "extkey_" + std::to_string(i);
         uint64_t hkey = H(key);
         for (int v = 0; v < 50; ++v) {
-            ASSERT_TRUE(index_->put(hkey, v * 1000 + i + 1, v).ok());
+            put(hkey, v * 1000 + i + 1, v);
         }
     }
+    commit(49 * 1000 + N);
 
     size_t entry_count = index_->entryCount();
     size_t key_count = index_->keyCount();
@@ -1732,8 +1762,9 @@ TEST_F(SavepointTest, SavepointWithExtensions) {
 TEST_F(SavepointTest, SavepointBlocksConcurrentPut) {
     for (int i = 0; i < 100; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
+        put(H(key), i + 1, i);
     }
+    commit(100);
 
     std::atomic<bool> savepoint_started{false};
     std::atomic<bool> savepoint_done{false};
@@ -1745,7 +1776,8 @@ TEST_F(SavepointTest, SavepointBlocksConcurrentPut) {
         while (!savepoint_started.load(std::memory_order_acquire)) {
         }
         put_started.store(true, std::memory_order_release);
-        index_->put(hblocked, 999, 42);
+        index_->stagePut(hblocked, 999, 42);
+        index_->commitWB(999);
         put_done.store(true, std::memory_order_release);
     });
 
@@ -1770,8 +1802,9 @@ TEST_F(SavepointTest, SavepointConcurrentWithFlush) {
     // Pre-populate so the savepoint has work to do.
     for (int i = 0; i < 200; ++i) {
         std::string key = "pre_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
+        put(H(key), i + 1, i);
     }
+    commit(200);
 
     std::atomic<bool> go{false};
     std::atomic<bool> flush_done{false};
@@ -1835,8 +1868,9 @@ TEST_F(SavepointTest, SavepointConcurrentWithFlush) {
 TEST_F(SavepointTest, AtomicSwapLeavesValidDir) {
     for (int i = 0; i < 10; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
+        put(H(key), i + 1, i);
     }
+    commit(10);
 
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
@@ -1851,8 +1885,9 @@ TEST_F(SavepointTest, AtomicSwapLeavesValidDir) {
 
     for (int i = 10; i < 20; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
+        put(H(key), i + 1, i);
     }
+    commit(20);
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
     EXPECT_TRUE(std::filesystem::exists(valid_dir));
@@ -1863,8 +1898,9 @@ TEST_F(SavepointTest, AtomicSwapLeavesValidDir) {
 TEST_F(SavepointTest, WriteSavepointThenLoad) {
     for (int i = 0; i < 50; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i + 1, i).ok());
+        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i).ok());
     }
+    commit(50);
 
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
     ASSERT_TRUE(index_->close().ok());
@@ -2021,12 +2057,21 @@ protected:
         std::filesystem::remove_all(db_dir_);
     }
 
+    // Stage a put and commit helpers (mirror production API).
+    void put(GlobalIndex& idx, uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
+        ASSERT_TRUE(idx.stagePut(hkey, packed_version, segment_id).ok());
+    }
+    void commit(GlobalIndex& idx, uint64_t max_version) {
+        ASSERT_TRUE(idx.commitWB(max_version).ok());
+    }
+
     // Populate index with N keys, each with packed_version = i+1, segment_id = i.
     void populate(GlobalIndex& idx, int N) {
         for (int i = 0; i < N; ++i) {
             std::string key = "key_" + std::to_string(i);
-            ASSERT_TRUE(idx.put(H(key), i + 1, i).ok());
+            ASSERT_TRUE(idx.stagePut(H(key), i + 1, i).ok());
         }
+        if (N > 0) commit(idx, N);
     }
 
     // Verify index contains N keys with expected packed_version = i+1, segment_id = i.
@@ -2115,8 +2160,9 @@ TEST_F(RecoveryTest, CrashLeavingTmpDir) {
     // Add more data (these go into WAL but not the savepoint).
     for (int i = 50; i < 80; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(idx->put(H(key), i + 1, i).ok());
+        put(*idx, H(key), i + 1, i);
     }
+    commit(*idx, 80);
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
 
@@ -2168,8 +2214,9 @@ TEST_F(RecoveryTest, CrashBeforeOldCleanup) {
     // Add more and savepoint again.
     for (int i = 50; i < 70; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(idx->put(H(key), i + 1, i).ok());
+        put(*idx, H(key), i + 1, i);
     }
+    commit(*idx, 70);
     ASSERT_TRUE(idx->storeSavepoint(0).ok());
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
@@ -2198,8 +2245,9 @@ TEST_F(RecoveryTest, IdempotentWALReplay) {
     // These go to WAL but the savepoint already has them.
     for (int i = 0; i < 100; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(idx->put(H(key), (i + 1) * 10, i + 100).ok());
+        put(*idx, H(key), (i + 1) * 10, i + 100);
     }
+    commit(*idx, 1000);
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
 
@@ -2234,9 +2282,9 @@ TEST_F(RecoveryTest, RecoveryFromWALOnly) {
     // Now add more data with committed WAL but no savepoint for them.
     for (int i = 30; i < 50; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(idx->put(H(key), i + 1, i).ok());
+        put(*idx, H(key), i + 1, i);
     }
-    ASSERT_TRUE(idx->commitWB(51).ok());
+    commit(*idx, 51);
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
 
@@ -2265,8 +2313,9 @@ TEST_F(RecoveryTest, MultipleReopenCycles) {
         int base = cycle * 20;
         for (int i = base; i < base + 20; ++i) {
             std::string key = "key_" + std::to_string(i);
-            ASSERT_TRUE(idx->put(H(key), i + 1, i).ok());
+            put(*idx, H(key), i + 1, i);
         }
+        commit(*idx, base + 20);
         ASSERT_TRUE(idx->close().ok());
     }
 
