@@ -430,5 +430,11 @@ target_link_libraries(kvlite_bench_bucket_codec
 
 add_test(NAME bucket_codec_bench COMMAND kvlite_bench_bucket_codec)
 
+# Performance benchmarks — excluded from default ctest, run with: ctest -L perf
+# Timing-sensitive tests that flake under parallel load.
+set_tests_properties(savepoint_bench bucket_codec_bench
+    PROPERTIES LABELS "perf"
+)
+
 # Default parallel level for ctest
 set(CTEST_PARALLEL_LEVEL 8 CACHE STRING "Number of tests to run in parallel")
