@@ -100,9 +100,9 @@ WriteBuffer (described later) flushes entries that must be preserved for
 active snapshots.
 
 Lookup is a hash probe followed by binary search on sorted key suffixes
-within the bucket.  The 44-bit suffix (the low bits of the hash not used
-for bucket selection) is long enough to eliminate false positives without
-reading the actual key from the log file.
+within the bucket.  The collision-resistant 64-bit hash makes collisions
+virtually impossible — and the 44-bit suffix disambiguates keys within
+a bucket without reading the actual key from the log file.
 
 The SegmentIndex is serialized as a header, an array of
 `(hash, offset, packed_version)` entries, and a CRC32 checksum, then
@@ -150,10 +150,10 @@ A point lookup follows two hops:
 1. **GlobalIndex**: key → segment_id (which file?)
 2. **SegmentIndex**: key → offset within that file (where in the file?)
 
-Neither index stores full keys.  Both use 44-bit hash suffixes for
-disambiguation, which is sufficient to avoid false positives in practice.
-The actual key is only read from the log file when returning data to the
-caller.
+Neither index stores full keys.  Both rely on the collision-resistant
+64-bit hash for key identity, with 44-bit suffixes for within-bucket
+disambiguation.  The actual key is only read from the log file when
+returning data to the caller.
 
 This separation keeps the GlobalIndex compact — it stores segment IDs
 (4 bytes each) rather than file offsets, and doesn't need to be updated

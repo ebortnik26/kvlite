@@ -18,8 +18,11 @@ A 64-bit hash is split into two parts:
 
 The top bits route to one of 2^20 (~1M) buckets.  The bottom 44 bits are
 the **suffix** — stored inside the bucket and used for key disambiguation.
-With 44 bits of suffix, false positives are essentially impossible: full
-suffix comparison eliminates collisions without touching the log file.
+Collisions over the full 64-bit hash are virtually impossible because
+kvlite uses a collision-resistant hash function — the risk with
+collisions is data loss (one key silently overwrites another), not
+false positives.  The suffix comparison uses all 44 remaining bits,
+so no log-file I/O is needed to distinguish keys within a bucket.
 
 ## FNV-1a hashing
 
