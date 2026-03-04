@@ -87,7 +87,8 @@ Status DB::open(const std::string& path, const Options& options) {
     }
 
     // Initialize storage manager
-    storage_ = std::make_unique<internal::SegmentStorageManager>(*manifest_);
+    storage_ = std::make_unique<internal::SegmentStorageManager>(
+        *manifest_, options_.buffered_writes);
 
     s = storage_->open(path);
     if (!s.ok()) {
@@ -561,7 +562,7 @@ Status DB::mergeSegments(const std::vector<uint32_t>& input_ids) {
             [this](uint64_t hkey, uint64_t pv, uint32_t old_id) {
                 global_index_->eliminate(hkey, pv, old_id);
             },
-            result);
+            result, options_.buffered_writes);
         if (!s.ok()) {
             for (uint32_t id : input_ids) storage_->unpinSegment(id);
             return s;

@@ -22,7 +22,8 @@ Status GC::merge(
     const std::function<uint32_t()>& id_fn,
     const RelocateFn& on_relocate,
     const EliminateFn& on_eliminate,
-    Result& result) {
+    Result& result,
+    bool buffered_writes) {
 
     result.outputs.clear();
     result.entries_written = 0;
@@ -55,7 +56,7 @@ Status GC::merge(
     // 4. Allocate first output segment.
     Segment output;
     uint32_t output_id = id_fn();
-    Status s = output.create(path_fn(output_id), output_id);
+    Status s = output.create(path_fn(output_id), output_id, buffered_writes);
     if (!s.ok()) return s;
 
     // 5. Drain pipeline — read action and segment_id from ext slots.
@@ -85,7 +86,7 @@ Status GC::merge(
 
             output = Segment();
             output_id = id_fn();
-            s = output.create(path_fn(output_id), output_id);
+            s = output.create(path_fn(output_id), output_id, buffered_writes);
             if (!s.ok()) return s;
         }
 

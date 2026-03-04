@@ -12,7 +12,8 @@ namespace internal {
 
 using MK = ManifestKey;
 
-SegmentStorageManager::SegmentStorageManager(Manifest& manifest) : manifest_(manifest) {}
+SegmentStorageManager::SegmentStorageManager(Manifest& manifest, bool buffered_writes)
+    : manifest_(manifest), buffered_writes_(buffered_writes) {}
 SegmentStorageManager::~SegmentStorageManager() = default;
 
 Status SegmentStorageManager::open(const std::string& db_path) {
@@ -107,7 +108,7 @@ bool SegmentStorageManager::isOpen() const {
 Status SegmentStorageManager::createSegment(uint32_t id, bool register_in_manifest) {
     std::string path = segmentPath(id);
     Segment seg;
-    Status s = seg.create(path, id);
+    Status s = seg.create(path, id, buffered_writes_);
     if (!s.ok()) return s;
 
     std::unique_lock lock(mutex_);

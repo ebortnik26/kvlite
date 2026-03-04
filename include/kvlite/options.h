@@ -68,6 +68,13 @@ struct Options {
     // Default: 10
     uint32_t gc_interval_sec = 10;
 
+    // --- I/O Options ---
+
+    // Buffer segment writes through a 1MB userspace buffer.
+    // Reduces syscall count per flush from ~N to ~N/60.
+    // Default: false
+    bool buffered_writes = false;
+
     // --- General Options ---
 
     // Create the database directory if it does not exist

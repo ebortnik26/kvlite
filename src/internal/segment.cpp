@@ -13,11 +13,11 @@ Segment& Segment::operator=(Segment&&) noexcept = default;
 
 // --- Lifecycle ---
 
-Status Segment::create(const std::string& path, uint32_t id) {
+Status Segment::create(const std::string& path, uint32_t id, bool buffered) {
     if (state_ != State::kClosed) {
         return Status::InvalidArgument("Segment: create requires Closed state");
     }
-    Status s = log_file_.create(path);
+    Status s = log_file_.create(path, /*sync=*/false, buffered);
     if (s.ok()) {
         id_ = id;
         data_size_ = 0;

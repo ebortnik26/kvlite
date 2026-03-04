@@ -20,12 +20,14 @@ LogFile::~LogFile() {
 LogFile::LogFile(LogFile&& other) noexcept
     : fd_(other.fd_),
       sync_(other.sync_),
+      buffered_(other.buffered_),
       path_(std::move(other.path_)),
       size_(other.size_),
       write_buf_(std::move(other.write_buf_)),
       buf_used_(other.buf_used_) {
     other.fd_ = -1;
     other.sync_ = false;
+    other.buffered_ = true;
     other.size_ = 0;
     other.buf_used_ = 0;
 }
@@ -37,19 +39,21 @@ LogFile& LogFile::operator=(LogFile&& other) noexcept {
         }
         fd_ = other.fd_;
         sync_ = other.sync_;
+        buffered_ = other.buffered_;
         path_ = std::move(other.path_);
         size_ = other.size_;
         write_buf_ = std::move(other.write_buf_);
         buf_used_ = other.buf_used_;
         other.fd_ = -1;
         other.sync_ = false;
+        other.buffered_ = true;
         other.size_ = 0;
         other.buf_used_ = 0;
     }
     return *this;
 }
 
-Status LogFile::open(const std::string& path, bool sync) {
+Status LogFile::open(const std::string& path, bool sync, bool buffered) {
     if (isOpen()) {
         return Status::IOError("file already open: " + path_);
     }
@@ -69,12 +73,13 @@ Status LogFile::open(const std::string& path, bool sync) {
 
     fd_ = fd;
     sync_ = sync;
+    buffered_ = buffered;
     path_ = path;
     size_ = static_cast<uint64_t>(end);
     return Status::OK();
 }
 
-Status LogFile::create(const std::string& path, bool sync) {
+Status LogFile::create(const std::string& path, bool sync, bool buffered) {
     if (isOpen()) {
         return Status::IOError("file already open: " + path_);
     }
@@ -88,6 +93,7 @@ Status LogFile::create(const std::string& path, bool sync) {
 
     fd_ = fd;
     sync_ = sync;
+    buffered_ = buffered;
     path_ = path;
     size_ = 0;
     return Status::OK();
@@ -121,6 +127,13 @@ Status LogFile::append(const void* data, size_t len, uint64_t& offset) {
     }
 
     offset = size_;
+
+    if (!buffered_) {
+        Status s = writeAll(data, len);
+        if (!s.ok()) return s;
+        size_ += len;
+        return Status::OK();
+    }
 
     // Lazy-allocate write buffer on first append.
     if (write_buf_.empty()) {

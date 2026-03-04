@@ -69,7 +69,8 @@ public:
         const std::function<uint32_t()>& id_fn,
         const RelocateFn& on_relocate,
         const EliminateFn& on_eliminate,
-        Result& result);
+        Result& result,
+        bool buffered_writes = true);
 };
 
 }  // namespace internal

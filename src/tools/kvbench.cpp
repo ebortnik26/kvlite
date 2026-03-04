@@ -33,6 +33,7 @@ struct Config {
     bool preload = true;
     int report_interval = 5;
     size_t write_buffer_size = 64 * 1024 * 1024;
+    bool buffered_writes = true;
     std::string key_dist = "uniform";
     std::string db_path;
 };
@@ -56,6 +57,7 @@ static void printUsage(const char* prog) {
         "  --report-interval N    Seconds between reports (default: 5)\n"
         "  --write-buffer-size N  Write buffer size in bytes (default: 67108864)\n"
         "  --key-dist NAME        Key distribution: uniform or zipf [YCSB] (default: uniform)\n"
+        "  --no-buffered-writes   Disable LogFile write buffering\n"
         "  --help                 Show this message\n",
         prog);
 }
@@ -82,6 +84,7 @@ static bool parseArgs(int argc, char** argv, Config& cfg) {
         else if (arg("--key-size"))          cfg.key_size = static_cast<int>(nextInt());
         else if (arg("--value-size"))        cfg.value_size = static_cast<int>(nextInt());
         else if (arg("--no-preload"))        cfg.preload = false;
+        else if (arg("--no-buffered-writes")) cfg.buffered_writes = false;
         else if (arg("--report-interval"))   cfg.report_interval = static_cast<int>(nextInt());
         else if (arg("--write-buffer-size")) cfg.write_buffer_size = static_cast<size_t>(nextInt());
         else if (arg("--key-dist")) {
@@ -576,6 +579,7 @@ int main(int argc, char** argv) {
     std::printf("  report_interval:   %ds\n", cfg.report_interval);
     std::printf("  write_buffer_size: %llu\n",
                 static_cast<unsigned long long>(cfg.write_buffer_size));
+    std::printf("  buffered_writes:   %s\n", cfg.buffered_writes ? "yes" : "no");
     std::printf("\n");
 
     // Open DB
@@ -584,6 +588,7 @@ int main(int argc, char** argv) {
     opts.gc_interval_sec = 0;
     opts.verify_checksums = false;
     opts.write_buffer_size = cfg.write_buffer_size;
+    opts.buffered_writes = cfg.buffered_writes;
 
     kvlite::DB db;
     auto s = db.open(cfg.db_path, opts);

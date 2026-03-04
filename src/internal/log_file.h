@@ -32,11 +32,15 @@ public:
     // Open an existing file for reading and writing.
     // When sync=true, the fd is opened with O_DSYNC so every write is
     // durable on return (no separate fdatasync needed).
-    Status open(const std::string& path, bool sync = false);
+    // When buffered=true, writes go through a 1MB userspace buffer.
+    Status open(const std::string& path, bool sync = false,
+                bool buffered = true);
 
     // Create a new file, truncating if it already exists.
     // When sync=true, the fd is opened with O_DSYNC.
-    Status create(const std::string& path, bool sync = false);
+    // When buffered=true, writes go through a 1MB userspace buffer.
+    Status create(const std::string& path, bool sync = false,
+                  bool buffered = true);
 
     // Close the file.
     Status close();
@@ -77,6 +81,7 @@ private:
 
     int fd_ = -1;
     bool sync_ = false;
+    bool buffered_ = true;
     std::string path_;
     uint64_t size_ = 0;
     std::vector<uint8_t> write_buf_;

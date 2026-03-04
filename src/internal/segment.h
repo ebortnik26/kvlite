@@ -47,7 +47,9 @@ public:
     // --- Lifecycle ---
 
     // Create a new segment file for writing. Closed -> Writing.
-    Status create(const std::string& path, uint32_t id);
+    // When buffered=true, writes go through a 1MB userspace buffer.
+    Status create(const std::string& path, uint32_t id,
+                  bool buffered = true);
 
     // Open an existing segment file. Closed -> Readable.
     Status open(const std::string& path);

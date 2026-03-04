@@ -28,7 +28,8 @@ class Manifest;
 // Thread-safety: All public methods are thread-safe.
 class SegmentStorageManager {
 public:
-    explicit SegmentStorageManager(Manifest& manifest);
+    explicit SegmentStorageManager(Manifest& manifest,
+                                   bool buffered_writes = true);
     ~SegmentStorageManager();
 
     // Non-copyable
@@ -90,6 +91,7 @@ private:
 
     std::string db_path_;
     Manifest& manifest_;
+    bool buffered_writes_;
     bool is_open_ = false;
     std::atomic<uint32_t> next_segment_id_{1};
 
