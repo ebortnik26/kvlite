@@ -43,6 +43,10 @@ struct DBStats {
     uint64_t gc_total_us = 0;           // cumulative GC time in microseconds
     uint64_t savepoint_count = 0;
     uint64_t savepoint_total_us = 0;    // cumulative savepoint time in microseconds
+
+    // Write stall stats (writer blocked waiting for flush to free a slot)
+    uint64_t stall_count = 0;
+    uint64_t stall_total_us = 0;        // cumulative stall time in microseconds
 };
 
 class Snapshot {

@@ -495,6 +495,9 @@ Status DB::getStats(DBStats& stats) const {
     stats.savepoint_count = savepoint_count_.load(std::memory_order_relaxed);
     stats.savepoint_total_us = savepoint_total_us_.load(std::memory_order_relaxed);
 
+    stats.stall_count = write_buffer_->stallCount();
+    stats.stall_total_us = write_buffer_->stallTotalUs();
+
     return Status::OK();
 }
 

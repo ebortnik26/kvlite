@@ -1,6 +1,7 @@
 #ifndef KVLITE_INTERNAL_WRITE_BUFFER_H
 #define KVLITE_INTERNAL_WRITE_BUFFER_H
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -60,6 +61,10 @@ public:
     size_t memoryUsage() const;
     bool empty() const;
 
+    // Stall statistics.
+    uint64_t stallCount() const { return stall_count_.load(std::memory_order_relaxed); }
+    uint64_t stallTotalUs() const { return stall_total_us_.load(std::memory_order_relaxed); }
+
     // --- Iterator support ---
     // Snapshot of pinned Memtables for iteration.
     struct PinnedSnapshot {
@@ -94,6 +99,10 @@ private:
 
     // Retired Memtables pinned by iterators (unpinned → deleted).
     std::vector<std::unique_ptr<Memtable>> retired_;
+
+    // Stall instrumentation.
+    std::atomic<uint64_t> stall_count_{0};
+    std::atomic<uint64_t> stall_total_us_{0};
 };
 
 } // namespace internal

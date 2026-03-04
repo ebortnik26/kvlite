@@ -522,6 +522,7 @@ static void printFinalReport(std::vector<ThreadState>& states,
         bgRow("flush", stats.flush_count, stats.flush_total_us);
         bgRow("gc", stats.gc_count, stats.gc_total_us);
         bgRow("savept", stats.savepoint_count, stats.savepoint_total_us);
+        bgRow("stall", stats.stall_count, stats.stall_total_us);
     }
 
     std::printf("==================================\n");
