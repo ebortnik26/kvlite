@@ -389,9 +389,13 @@ static void printReportRow(const char* name,
 
 static void reporterThread(std::vector<ThreadState>& states,
                            std::atomic<bool>& done,
-                           int interval_sec) {
+                           int interval_sec,
+                           kvlite::DB& db) {
     using namespace std::chrono;
     auto next_report = Clock::now() + seconds(interval_sec);
+
+    uint64_t prev_stall_count = 0;
+    uint64_t prev_stall_us = 0;
 
     while (!done.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_until(next_report);
@@ -428,6 +432,17 @@ static void reporterThread(std::vector<ThreadState>& states,
             }
         }
 
+        // Stall deltas
+        kvlite::DBStats stats;
+        uint64_t d_stall_count = 0;
+        double d_stall_ms = 0.0;
+        if (db.getStats(stats).ok()) {
+            d_stall_count = stats.stall_count - prev_stall_count;
+            d_stall_ms = static_cast<double>(stats.stall_total_us - prev_stall_us) / 1000.0;
+            prev_stall_count = stats.stall_count;
+            prev_stall_us = stats.stall_total_us;
+        }
+
         uint64_t total_get = total_found + total_miss;
         uint64_t total_ops = total_puts + total_get;
         double rate = static_cast<double>(total_ops) / interval_sec;
@@ -439,8 +454,14 @@ static void reporterThread(std::vector<ThreadState>& states,
                        static_cast<uint64_t>(-1),
                        merged[0]);
         printReportRow("get", total_get, total_found, total_miss, merged[1]);
-        std::printf("Total: %llu ops  (%.0f ops/sec)\n",
+        std::printf("Total: %llu ops  (%.0f ops/sec)",
                     static_cast<unsigned long long>(total_ops), rate);
+        if (d_stall_count > 0) {
+            std::printf("  |  stalls: %llu (%.1f ms)",
+                        static_cast<unsigned long long>(d_stall_count),
+                        d_stall_ms);
+        }
+        std::printf("\n");
         std::fflush(stdout);
     }
 }
@@ -588,7 +609,8 @@ int main(int argc, char** argv) {
     std::thread reporter(reporterThread,
                          std::ref(states),
                          std::ref(reporter_done),
-                         cfg.report_interval);
+                         cfg.report_interval,
+                         std::ref(db));
 
     // Start workers
     auto t0 = Clock::now();
