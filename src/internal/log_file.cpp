@@ -19,10 +19,15 @@ LogFile::~LogFile() {
 
 LogFile::LogFile(LogFile&& other) noexcept
     : fd_(other.fd_),
+      sync_(other.sync_),
       path_(std::move(other.path_)),
-      size_(other.size_) {
+      size_(other.size_),
+      write_buf_(std::move(other.write_buf_)),
+      buf_used_(other.buf_used_) {
     other.fd_ = -1;
+    other.sync_ = false;
     other.size_ = 0;
+    other.buf_used_ = 0;
 }
 
 LogFile& LogFile::operator=(LogFile&& other) noexcept {
@@ -31,10 +36,15 @@ LogFile& LogFile::operator=(LogFile&& other) noexcept {
             close();
         }
         fd_ = other.fd_;
+        sync_ = other.sync_;
         path_ = std::move(other.path_);
         size_ = other.size_;
+        write_buf_ = std::move(other.write_buf_);
+        buf_used_ = other.buf_used_;
         other.fd_ = -1;
+        other.sync_ = false;
         other.size_ = 0;
+        other.buf_used_ = 0;
     }
     return *this;
 }
@@ -58,6 +68,7 @@ Status LogFile::open(const std::string& path, bool sync) {
     }
 
     fd_ = fd;
+    sync_ = sync;
     path_ = path;
     size_ = static_cast<uint64_t>(end);
     return Status::OK();
@@ -76,6 +87,7 @@ Status LogFile::create(const std::string& path, bool sync) {
     }
 
     fd_ = fd;
+    sync_ = sync;
     path_ = path;
     size_ = 0;
     return Status::OK();
@@ -86,11 +98,17 @@ Status LogFile::close() {
         return Status::IOError("file not open");
     }
 
+    Status s = flushBuffer();
+    write_buf_ = std::vector<uint8_t>();  // release memory
+    buf_used_ = 0;
+
     int ret = ::close(fd_);
     fd_ = -1;
+    sync_ = false;
     path_.clear();
     size_ = 0;
 
+    if (!s.ok()) return s;
     if (ret < 0) {
         return Status::IOError("close failed: " + std::string(std::strerror(errno)));
     }
@@ -103,20 +121,37 @@ Status LogFile::append(const void* data, size_t len, uint64_t& offset) {
     }
 
     offset = size_;
-    const char* ptr = static_cast<const char*>(data);
+
+    // Lazy-allocate write buffer on first append.
+    if (write_buf_.empty()) {
+        write_buf_.resize(kWriteBufSize);
+    }
+
+    const uint8_t* src = static_cast<const uint8_t*>(data);
     size_t remaining = len;
 
     while (remaining > 0) {
-        ssize_t written = ::write(fd_, ptr, remaining);
-        if (written < 0) {
-            if (errno == EINTR) continue;
-            return Status::IOError("write failed: " + path_ + ": " + std::strerror(errno));
+        size_t space = kWriteBufSize - buf_used_;
+        size_t chunk = std::min(remaining, space);
+        std::memcpy(write_buf_.data() + buf_used_, src, chunk);
+        buf_used_ += chunk;
+        src += chunk;
+        remaining -= chunk;
+
+        if (buf_used_ == kWriteBufSize) {
+            Status s = flushBuffer();
+            if (!s.ok()) return s;
         }
-        ptr += written;
-        remaining -= static_cast<size_t>(written);
     }
 
     size_ += len;
+
+    // O_DSYNC files (WAL) need each append durable on return.
+    if (sync_ && buf_used_ > 0) {
+        Status s = flushBuffer();
+        if (!s.ok()) return s;
+    }
+
     return Status::OK();
 }
 
@@ -154,6 +189,8 @@ Status LogFile::truncateTo(uint64_t offset) {
     if (offset > size_) {
         return Status::InvalidArgument("truncateTo offset exceeds file size");
     }
+    Status s = flushBuffer();
+    if (!s.ok()) return s;
     if (::ftruncate(fd_, static_cast<off_t>(offset)) < 0) {
         return Status::IOError("ftruncate failed: " + path_ + ": " + std::strerror(errno));
     }
@@ -164,10 +201,36 @@ Status LogFile::truncateTo(uint64_t offset) {
     return Status::OK();
 }
 
+Status LogFile::flushBuffer() {
+    if (buf_used_ == 0) return Status::OK();
+    Status s = writeAll(write_buf_.data(), buf_used_);
+    if (!s.ok()) return s;
+    buf_used_ = 0;
+    return Status::OK();
+}
+
+Status LogFile::writeAll(const void* data, size_t len) {
+    const char* ptr = static_cast<const char*>(data);
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t written = ::write(fd_, ptr, remaining);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return Status::IOError("write failed: " + path_ + ": " + std::strerror(errno));
+        }
+        ptr += written;
+        remaining -= static_cast<size_t>(written);
+    }
+    return Status::OK();
+}
+
 Status LogFile::sync() {
     if (!isOpen()) {
         return Status::IOError("file not open");
     }
+
+    Status s = flushBuffer();
+    if (!s.ok()) return s;
 
     if (::fdatasync(fd_) < 0) {
         return Status::IOError("fdatasync failed: " + path_ + ": " + std::strerror(errno));

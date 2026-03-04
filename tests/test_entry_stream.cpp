@@ -57,8 +57,9 @@ protected:
         EXPECT_TRUE(seg.create(path, segment_id).ok());
         for (const auto& [key, version, value, tombstone] : entries) {
             EXPECT_TRUE(seg.put(key, version, value, tombstone).ok());
-            gi_->put(dhtHashBytes(key.data(), key.size()), version, segment_id);
+            gi_->stagePut(dhtHashBytes(key.data(), key.size()), version, segment_id);
         }
+        gi_->commitWB(0);
         EXPECT_TRUE(seg.seal().ok());
         return idx;
     }

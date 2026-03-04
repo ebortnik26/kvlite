@@ -22,8 +22,6 @@ using namespace kvlite::internal;
 using kvlite::Status;
 
 // Helper: hash a literal key for DHT calls.
-static uint64_t RH(const char* s) { return dhtHashBytes(s, std::strlen(s)); }
-static uint64_t RH(const std::string& s) { return dhtHashBytes(s.data(), s.size()); }
 
 // --- SegmentIndex Tests ---
 
@@ -682,8 +680,9 @@ static uint64_t H(const char* s) { return dhtHashBytes(s, std::strlen(s)); }
 TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
     // Put entries into GlobalIndex with specific segment_ids.
     auto& gi = createOpenGI();
-    gi.put(H("key1"), PackedVersion(1, false).data, 1);
-    gi.put(H("key2"), PackedVersion(2, false).data, 1);
+    gi.stagePut(H("key1"), PackedVersion(1, false).data, 1);
+    gi.stagePut(H("key2"), PackedVersion(2, false).data, 1);
+    gi.commitWB(2);
 
     // Create segment with those entries.
     size_t idx = createSegment(1, {
@@ -728,8 +727,9 @@ TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
 
 TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
     auto& gi = createOpenGI();
-    gi.put(H("key1"), PackedVersion(1, false).data, 1);
-    gi.put(H("key1"), PackedVersion(2, false).data, 2);
+    gi.stagePut(H("key1"), PackedVersion(1, false).data, 1);
+    gi.stagePut(H("key1"), PackedVersion(2, false).data, 2);
+    gi.commitWB(2);
 
     size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
@@ -772,8 +772,9 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
     // Two versions of "key1" in same segment — both will be compacted,
     // but only the latest survives the single-snapshot classification.
     // To eliminate ALL versions, we need a tombstone as latest.
-    gi.put(H("key1"), PackedVersion(1, false).data, 1);
-    gi.put(H("key1"), PackedVersion(2, true).data, 1);  // tombstone
+    gi.stagePut(H("key1"), PackedVersion(1, false).data, 1);
+    gi.stagePut(H("key1"), PackedVersion(2, true).data, 1);  // tombstone
+    gi.commitWB(2);
 
     size_t idx = createSegment(1, {
         {"key1", 1, "val1", false},
@@ -827,7 +828,8 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
     // in the output segment. A second GC pass eliminates it entirely.
     auto& gi = createOpenGI();
     uint32_t first_seg_id = 50;
-    gi.put(H("key1"), PackedVersion(2, true).data, first_seg_id);  // tombstone only
+    gi.stagePut(H("key1"), PackedVersion(2, true).data, first_seg_id);  // tombstone only
+    gi.commitWB(2);
 
     // Create a segment containing just the tombstone.
     size_t idx = createSegment(first_seg_id, {

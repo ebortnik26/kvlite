@@ -51,8 +51,9 @@ TEST_F(SavepointBench, SnapshotBucketChain) {
     const int kNumKeys = 100'000;
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "snapbk_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i + 1, i + 1).ok());
+        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i + 1).ok());
     }
+    ASSERT_TRUE(index_->commitWB(kNumKeys).ok());
 
     // Access the underlying DHT via a second instance that shares the same
     // bucket layout. We measure snapshotBucketChain on a standalone RW-DHT.
@@ -107,8 +108,9 @@ TEST_F(SavepointBench, SavepointWriteLatency) {
     const int kNumKeys = 100'000;
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "spwrite_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i + 1, i + 1).ok());
+        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i + 1).ok());
     }
+    ASSERT_TRUE(index_->commitWB(kNumKeys).ok());
 
     auto t0 = std::chrono::steady_clock::now();
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
@@ -129,8 +131,9 @@ TEST_F(SavepointBench, ConcurrentFlushAndSavepoint) {
     const int kNumKeys = 100'000;
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "conc_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i + 1, i + 1).ok());
+        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i + 1).ok());
     }
+    ASSERT_TRUE(index_->commitWB(kNumKeys).ok());
 
     // --- Baseline: savepoint with no concurrent writers ---
     auto t0 = std::chrono::steady_clock::now();
@@ -175,8 +178,9 @@ TEST_F(SavepointBench, MultiThreadedSavepointSpeedup) {
     const int kNumKeys = 100'000;
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "mtsp_" + std::to_string(i);
-        ASSERT_TRUE(index_->put(H(key), i + 1, i + 1).ok());
+        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i + 1).ok());
     }
+    ASSERT_TRUE(index_->commitWB(kNumKeys).ok());
 
     // --- 1-thread baseline: reopen with savepoint_threads=1 ---
     index_->close();

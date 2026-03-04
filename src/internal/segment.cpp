@@ -99,6 +99,9 @@ Status Segment::seal() {
     s = log_file_.append(footer, kFooterSize, footer_offset);
     if (!s.ok()) return s;
 
+    s = log_file_.flushBuffer();
+    if (!s.ok()) return s;
+
     state_ = State::kReadable;
     return Status::OK();
 }

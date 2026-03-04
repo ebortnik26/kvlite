@@ -40,6 +40,7 @@ TEST_F(LogFileTest, CreateAndAppendReadBack) {
     EXPECT_EQ(offset, 0u);
     EXPECT_EQ(lf.size(), len);
 
+    ASSERT_TRUE(lf.flushBuffer().ok());
     char buf[64] = {};
     ASSERT_TRUE(lf.readAt(0, buf, len).ok());
     EXPECT_EQ(std::string(buf, len), "hello world");
@@ -64,6 +65,7 @@ TEST_F(LogFileTest, MultipleAppendsSequentialOffsets) {
     EXPECT_EQ(lf.size(), 10u);
 
     // Read each segment back
+    ASSERT_TRUE(lf.flushBuffer().ok());
     char buf[16] = {};
     ASSERT_TRUE(lf.readAt(off1, buf, 3).ok());
     EXPECT_EQ(std::memcmp(buf, "AAA", 3), 0);
@@ -113,6 +115,7 @@ TEST_F(LogFileTest, ReadAtRandomOffsets) {
     ASSERT_TRUE(lf.append(pattern.data(), pattern.size(), offset).ok());
 
     // Read single bytes at various offsets
+    ASSERT_TRUE(lf.flushBuffer().ok());
     uint8_t val;
     for (uint64_t i = 0; i < 256; i += 17) {
         ASSERT_TRUE(lf.readAt(i, &val, 1).ok());
@@ -135,6 +138,7 @@ TEST_F(LogFileTest, ReadBeyondEOFReturnsError) {
     uint64_t offset;
     ASSERT_TRUE(lf.append(data, 5, offset).ok());
 
+    ASSERT_TRUE(lf.flushBuffer().ok());
     char buf[64];
     Status s = lf.readAt(3, buf, 10);  // only 2 bytes available from offset 3
     EXPECT_TRUE(s.isIOError());
@@ -164,6 +168,7 @@ TEST_F(LogFileTest, MoveConstruct) {
     EXPECT_EQ(lf2.size(), 5u);
     EXPECT_EQ(lf2.path(), test_path_);
 
+    ASSERT_TRUE(lf2.flushBuffer().ok());
     char buf[8] = {};
     ASSERT_TRUE(lf2.readAt(0, buf, 5).ok());
     EXPECT_EQ(std::string(buf, 5), "moved");
@@ -183,6 +188,7 @@ TEST_F(LogFileTest, MoveAssign) {
     EXPECT_TRUE(lf2.isOpen());
     EXPECT_EQ(lf2.size(), 6u);
 
+    ASSERT_TRUE(lf2.flushBuffer().ok());
     char buf[8] = {};
     ASSERT_TRUE(lf2.readAt(0, buf, 6).ok());
     EXPECT_EQ(std::string(buf, 6), "assign");
@@ -208,6 +214,27 @@ TEST_F(LogFileTest, PathAccessor) {
     LogFile lf;
     ASSERT_TRUE(lf.create(test_path_).ok());
     EXPECT_EQ(lf.path(), test_path_);
+}
+
+TEST_F(LogFileTest, ReadAtFailsWhileBufferUnflushed) {
+    LogFile lf;
+    ASSERT_TRUE(lf.create(test_path_).ok());
+
+    const char* data = "buffered data";
+    size_t len = std::strlen(data);
+    uint64_t offset;
+    ASSERT_TRUE(lf.append(data, len, offset).ok());
+    EXPECT_EQ(lf.size(), len);
+
+    // pread cannot see unflushed buffer contents — this must fail.
+    char buf[64] = {};
+    Status s = lf.readAt(0, buf, len);
+    EXPECT_TRUE(s.isIOError()) << "readAt must fail on unflushed data";
+
+    // After flushing, readAt succeeds.
+    ASSERT_TRUE(lf.flushBuffer().ok());
+    ASSERT_TRUE(lf.readAt(0, buf, len).ok());
+    EXPECT_EQ(std::string(buf, len), "buffered data");
 }
 
 // Static helpers

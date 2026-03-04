@@ -98,7 +98,11 @@ Status storeFile(const std::string& dir, const FileDesc& fd,
     std::snprintf(fname, sizeof(fname), "%08u.dat", fd.file_index);
     std::string fpath = dir + "/" + fname;
 
-    std::ofstream file(fpath, std::ios::binary);
+    std::ofstream file;
+    static constexpr size_t kWriteBufSize = 1u << 20;  // 1 MB
+    std::vector<char> stream_buf(kWriteBufSize);
+    file.rdbuf()->pubsetbuf(stream_buf.data(), stream_buf.size());
+    file.open(fpath, std::ios::binary);
     if (!file) {
         return Status::IOError("Failed to create savepoint file: " + fpath);
     }

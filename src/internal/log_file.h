@@ -2,7 +2,9 @@
 #define KVLITE_INTERNAL_LOG_FILE_H
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
+#include <vector>
 
 #include "kvlite/status.h"
 
@@ -49,6 +51,9 @@ public:
     // Truncate file to the given offset. offset must be <= size().
     Status truncateTo(uint64_t offset);
 
+    // Flush internal write buffer to the OS.
+    Status flushBuffer();
+
     // Sync data to disk (fdatasync).
     Status sync();
 
@@ -66,9 +71,16 @@ public:
     static uint32_t parseFileId(const std::string& filename);
 
 private:
+    static constexpr size_t kWriteBufSize = 1u << 20; // 1 MB
+
+    Status writeAll(const void* data, size_t len);
+
     int fd_ = -1;
+    bool sync_ = false;
     std::string path_;
     uint64_t size_ = 0;
+    std::vector<uint8_t> write_buf_;
+    size_t buf_used_ = 0;
 };
 
 } // namespace internal
