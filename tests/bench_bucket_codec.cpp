@@ -259,10 +259,11 @@ protected:
     }
 };
 
-// Latency bound: columnar should not be more than 4x slower than row.
+// Latency bound: columnar should not be more than 10x slower than row.
 // Generous threshold to avoid flaky failures from system jitter; empirically
 // the ratio is ~1.0-2.5x for encode/decode and ~1.0-3.0x for targeted decode.
-static constexpr double kMaxLatencyRatio = 4.0;
+// Under parallel ctest or heavy system load, 4x was insufficient.
+static constexpr double kMaxLatencyRatio = 10.0;
 
 static void checkLatency(const BenchResult& r, int nk, int nv) {
     if (r.encode_row_ns > 100) {  // skip noise for sub-100ns operations
