@@ -148,57 +148,32 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
             std::memory_order_relaxed);
 
         auto sit = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
-        size_t suffix_idx = sit - scan.suffixes.begin();
         bool suffix_found = (sit != scan.suffixes.end() && *sit == suffix);
 
         if (suffix_found) {
+            is_new = false;
+
+            // Single full decode replaces decodeKeyAt + decodeBucketUsedBits
+            // + bitsForAddVersion + decodeBucket.
             dt0 = std::chrono::steady_clock::now();
-            auto key = codec_.decodeKeyAt(*bucket, static_cast<uint16_t>(suffix_idx),
-                                          suffix, scan.data_start_bit);
+            auto contents = codec_.decodeBucket(*bucket);
             dt1 = std::chrono::steady_clock::now();
             decode_count_.fetch_add(1, std::memory_order_relaxed);
             decode_total_ns_.fetch_add(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(dt1 - dt0).count()),
                 std::memory_order_relaxed);
 
-            is_new = false;
+            auto cit = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
+                [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
+            auto vpos = std::lower_bound(cit->packed_versions.begin(),
+                                         cit->packed_versions.end(),
+                                         packed_version,
+                                         std::greater<uint64_t>());
+            size_t vi = vpos - cit->packed_versions.begin();
+            cit->packed_versions.insert(vpos, packed_version);
+            cit->ids.insert(cit->ids.begin() + vi, id);
 
-            auto pos = std::lower_bound(key.packed_versions.begin(),
-                                        key.packed_versions.end(),
-                                        packed_version,
-                                        std::greater<uint64_t>());
-            size_t vidx = pos - key.packed_versions.begin();
-
-            dt0 = std::chrono::steady_clock::now();
-            size_t current_bits = codec_.decodeBucketUsedBits(*bucket);
-            size_t extra_bits = codec_.bitsForAddVersion(
-                *bucket, static_cast<uint16_t>(suffix_idx),
-                packed_version, id, vidx);
-            dt1 = std::chrono::steady_clock::now();
-            decode_count_.fetch_add(2, std::memory_order_relaxed);
-            decode_total_ns_.fetch_add(
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(dt1 - dt0).count()),
-                std::memory_order_relaxed);
-
-            if (current_bits + extra_bits <= codec_.bucketDataBits()) {
-                dt0 = std::chrono::steady_clock::now();
-                auto contents = codec_.decodeBucket(*bucket);
-                dt1 = std::chrono::steady_clock::now();
-                decode_count_.fetch_add(1, std::memory_order_relaxed);
-                decode_total_ns_.fetch_add(
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(dt1 - dt0).count()),
-                    std::memory_order_relaxed);
-
-                auto cit = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
-                    [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
-                auto vpos = std::lower_bound(cit->packed_versions.begin(),
-                                             cit->packed_versions.end(),
-                                             packed_version,
-                                             std::greater<uint64_t>());
-                size_t vi = vpos - cit->packed_versions.begin();
-                cit->packed_versions.insert(vpos, packed_version);
-                cit->ids.insert(cit->ids.begin() + vi, id);
-
+            if (codec_.contentsBitsNeeded(contents) <= codec_.bucketDataBits()) {
                 auto et0 = std::chrono::steady_clock::now();
                 codec_.encodeBucket(*bucket, contents);
                 auto et1 = std::chrono::steady_clock::now();
@@ -209,6 +184,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
                 return is_new;
             }
 
+            // Doesn't fit — discard local contents, move to extension.
             Bucket* ext = nextBucketMut(*bucket);
             if (!ext) ext = createExtFn(*bucket);
             bucket = ext;
@@ -232,34 +208,25 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
                 }
             }
 
+            // Single full decode replaces decodeBucketUsedBits +
+            // bitsForNewEntry + decodeBucket.
             dt0 = std::chrono::steady_clock::now();
-            size_t current_bits = codec_.decodeBucketUsedBits(*bucket);
-            size_t extra_bits = codec_.bitsForNewEntry(
-                *bucket, static_cast<uint16_t>(suffix_idx),
-                suffix, packed_version, id);
+            auto contents = codec_.decodeBucket(*bucket);
             dt1 = std::chrono::steady_clock::now();
-            decode_count_.fetch_add(2, std::memory_order_relaxed);
+            decode_count_.fetch_add(1, std::memory_order_relaxed);
             decode_total_ns_.fetch_add(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(dt1 - dt0).count()),
                 std::memory_order_relaxed);
 
-            if (current_bits + extra_bits <= codec_.bucketDataBits()) {
-                dt0 = std::chrono::steady_clock::now();
-                auto contents = codec_.decodeBucket(*bucket);
-                dt1 = std::chrono::steady_clock::now();
-                decode_count_.fetch_add(1, std::memory_order_relaxed);
-                decode_total_ns_.fetch_add(
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(dt1 - dt0).count()),
-                    std::memory_order_relaxed);
+            auto cit = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
+                [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
+            KeyEntry new_entry;
+            new_entry.suffix = suffix;
+            new_entry.packed_versions.push_back(packed_version);
+            new_entry.ids.push_back(id);
+            contents.keys.insert(cit, std::move(new_entry));
 
-                auto cit = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
-                    [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
-                KeyEntry new_entry;
-                new_entry.suffix = suffix;
-                new_entry.packed_versions.push_back(packed_version);
-                new_entry.ids.push_back(id);
-                contents.keys.insert(cit, std::move(new_entry));
-
+            if (codec_.contentsBitsNeeded(contents) <= codec_.bucketDataBits()) {
                 auto et0 = std::chrono::steady_clock::now();
                 codec_.encodeBucket(*bucket, contents);
                 auto et1 = std::chrono::steady_clock::now();
@@ -270,6 +237,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
                 return is_new;
             }
 
+            // Doesn't fit — discard local contents, move to extension.
             Bucket* ext = nextBucketMut(*bucket);
             if (!ext) ext = createExtFn(*bucket);
             bucket = ext;
