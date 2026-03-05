@@ -98,6 +98,13 @@ void DB::initWriteBuffer(const Options& options) {
 
         s = storage_->registerSegments({seg_id});
 
+        // Accumulate SI codec stats from this flush's SegmentIndex.
+        const auto& si = storage_->getSegment(seg_id)->index();
+        si_encode_count_.fetch_add(si.encodeCount(), std::memory_order_relaxed);
+        si_encode_total_ns_.fetch_add(si.encodeTotalNs(), std::memory_order_relaxed);
+        si_decode_count_.fetch_add(si.decodeCount(), std::memory_order_relaxed);
+        si_decode_total_ns_.fetch_add(si.decodeTotalNs(), std::memory_order_relaxed);
+
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0).count();
         flush_count_.fetch_add(1, std::memory_order_relaxed);
@@ -455,6 +462,11 @@ Status DB::getStats(DBStats& stats) const {
     stats.dht_decode_total_ns = global_index_->dhtDecodeTotalNs();
     stats.dht_ext_count = global_index_->dhtExtCount();
     stats.dht_num_buckets = global_index_->dhtNumBuckets();
+
+    stats.si_encode_count = si_encode_count_.load(std::memory_order_relaxed);
+    stats.si_encode_total_ns = si_encode_total_ns_.load(std::memory_order_relaxed);
+    stats.si_decode_count = si_decode_count_.load(std::memory_order_relaxed);
+    stats.si_decode_total_ns = si_decode_total_ns_.load(std::memory_order_relaxed);
 
     stats.mt_ext_count = write_buffer_->extensionCount();
     stats.mt_num_buckets = internal::Memtable::numBuckets();

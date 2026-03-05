@@ -34,6 +34,14 @@ public:
     // Like addEntry, but returns true if the key's fingerprint group is new.
     bool addEntryIsNew(uint64_t hash, uint64_t packed_version, uint32_t id);
 
+    // --- Streaming batch build (single-threaded, entries in hash order) ---
+
+    // Feed one entry. Encodes the previous bucket when a boundary is crossed.
+    void addBatchEntry(uint64_t hash, uint64_t packed_version, uint32_t id);
+
+    // Encode the last pending bucket. Returns total distinct-key count.
+    size_t endBatch();
+
     // Transition to read-only state. After this, writes are forbidden.
     void seal();
 
@@ -43,9 +51,18 @@ public:
     void clear();
 
 private:
+    void flushPendingBucket();
+
     BucketArena ext_arena_owned_;
     bool sealed_ = false;
     size_t size_ = 0;
+
+    // Streaming batch state
+    uint32_t pending_bi_ = UINT32_MAX;
+    BucketContents pending_contents_;
+    size_t pending_keys_ = 0;
+    size_t pending_entries_ = 0;
+    size_t batch_key_count_ = 0;
 };
 
 }  // namespace internal

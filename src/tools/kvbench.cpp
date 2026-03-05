@@ -566,7 +566,7 @@ static void printFinalReport(std::vector<ThreadState>& states,
             bgRow("savept", stats.savepoint_count, stats.savepoint_total_us);
             bgRow("stall", stats.stall_count, stats.stall_total_us);
 
-            std::printf("\n--- DHT Codec Stats ---\n");
+            std::printf("\n--- GI Codec Stats ---\n");
             std::printf("%-7s %12s %12s %12s\n",
                         "Op", "Count", "Total(ms)", "Avg(us)");
             auto codecRow = [](const char* name, uint64_t count, uint64_t total_ns) {
@@ -581,6 +581,13 @@ static void printFinalReport(std::vector<ThreadState>& states,
             };
             codecRow("encode", stats.dht_encode_count, stats.dht_encode_total_ns);
             codecRow("decode", stats.dht_decode_count, stats.dht_decode_total_ns);
+
+            std::printf("\n--- SI Codec Stats ---\n");
+            std::printf("%-7s %12s %12s %12s\n",
+                        "Op", "Count", "Total(ms)", "Avg(us)");
+            codecRow("encode", stats.si_encode_count, stats.si_encode_total_ns);
+            codecRow("decode", stats.si_decode_count, stats.si_decode_total_ns);
+
             double ext_ratio = stats.dht_num_buckets > 0
                 ? static_cast<double>(stats.dht_ext_count) / stats.dht_num_buckets
                 : 0.0;

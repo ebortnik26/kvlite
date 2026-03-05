@@ -43,6 +43,14 @@ void SegmentIndex::put(uint64_t hash, uint32_t offset, uint64_t packed_version) 
     }
 }
 
+void SegmentIndex::addBatchEntry(uint64_t hash, uint64_t packed_version, uint32_t offset) {
+    dht_.addBatchEntry(hash, packed_version, offset);
+}
+
+void SegmentIndex::endBatch() {
+    key_count_ = dht_.endBatch();
+}
+
 bool SegmentIndex::get(uint64_t hash,
                   std::vector<uint32_t>& offsets,
                   std::vector<uint64_t>& packed_versions) const {

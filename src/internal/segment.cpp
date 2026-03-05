@@ -81,6 +81,12 @@ Status Segment::seal() {
         return Status::InvalidArgument("Segment: seal requires Writing state");
     }
 
+    // Finalize streaming index build if appendEntry was used.
+    if (batch_mode_) {
+        index_.endBatch();
+        batch_mode_ = false;
+    }
+
     // Record where the data region ends / index begins.
     data_size_ = log_file_.size();
 
@@ -117,17 +123,9 @@ Status Segment::close() {
 
 // --- Write ---
 
-Status Segment::put(std::string_view key, uint64_t version,
-                    std::string_view value, bool tombstone,
-                    uint64_t hash) {
-    if (state_ != State::kWriting) {
-        return Status::InvalidArgument("Segment: put requires Writing state");
-    }
-    if (key.size() > LogEntry::kMaxKeyLen) {
-        return Status::InvalidArgument("Segment: key too long");
-    }
-
-    // On-disk version is the packed form: (logical_version << 1) | tombstone.
+Status Segment::writeEntry(std::string_view key, uint64_t version,
+                            std::string_view value, bool tombstone,
+                            uint64_t& entry_offset) {
     PackedVersion pv(version, tombstone);
     uint64_t packed_ver = pv.data;
     uint16_t key_len = static_cast<uint16_t>(key.size());
@@ -159,9 +157,46 @@ Status Segment::put(std::string_view key, uint64_t version,
     Status s = log_file_.append(buf, entry_size, offset);
     if (!s.ok()) return s;
 
+    entry_offset = offset;
     data_size_ = offset + entry_size;
-    // Store packed version in index so tombstone info is preserved.
-    index_.put(hash, static_cast<uint32_t>(offset), packed_ver);
+    return Status::OK();
+}
+
+Status Segment::put(std::string_view key, uint64_t version,
+                    std::string_view value, bool tombstone,
+                    uint64_t hash) {
+    if (state_ != State::kWriting) {
+        return Status::InvalidArgument("Segment: put requires Writing state");
+    }
+    if (key.size() > LogEntry::kMaxKeyLen) {
+        return Status::InvalidArgument("Segment: key too long");
+    }
+
+    uint64_t offset;
+    Status s = writeEntry(key, version, value, tombstone, offset);
+    if (!s.ok()) return s;
+
+    PackedVersion pv(version, tombstone);
+    index_.put(hash, static_cast<uint32_t>(offset), pv.data);
+    return Status::OK();
+}
+
+Status Segment::appendEntry(std::string_view key, uint64_t version,
+                             std::string_view value, bool tombstone,
+                             uint64_t hash, uint64_t& entry_offset) {
+    if (state_ != State::kWriting) {
+        return Status::InvalidArgument("Segment: appendEntry requires Writing state");
+    }
+    if (key.size() > LogEntry::kMaxKeyLen) {
+        return Status::InvalidArgument("Segment: appendEntry key too long");
+    }
+
+    Status s = writeEntry(key, version, value, tombstone, entry_offset);
+    if (!s.ok()) return s;
+
+    PackedVersion pv(version, tombstone);
+    index_.addBatchEntry(hash, pv.data, static_cast<uint32_t>(entry_offset));
+    batch_mode_ = true;
     return Status::OK();
 }
 

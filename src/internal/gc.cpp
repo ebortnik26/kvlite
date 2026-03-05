@@ -90,7 +90,9 @@ Status GC::merge(
             if (!s.ok()) return s;
         }
 
-        s = output.put(entry.key, entry.version(), entry.value, entry.tombstone(), entry.hash);
+        uint64_t entry_offset;
+        s = output.appendEntry(entry.key, entry.version(), entry.value,
+                               entry.tombstone(), entry.hash, entry_offset);
         if (!s.ok()) return s;
 
         on_relocate(entry.hash, entry.pv.data, old_seg_id, output_id);

@@ -37,6 +37,10 @@ public:
     // Append (offset, packed_version) to hash's list.
     void put(uint64_t hash, uint32_t offset, uint64_t packed_version);
 
+    // Streaming batch build: feed entries in hash order, no decode overhead.
+    void addBatchEntry(uint64_t hash, uint64_t packed_version, uint32_t offset);
+    void endBatch();
+
     // Get all (offset, packed_version) pairs for a hash. Returns false if not found.
     // Pairs are ordered latest-first (highest packed_version first).
     bool get(uint64_t hash,
@@ -78,6 +82,12 @@ public:
     size_t entryCount() const;
     size_t memoryUsage() const;
     void clear();
+
+    // Codec instrumentation
+    uint64_t encodeCount() const { return dht_.encodeCount(); }
+    uint64_t encodeTotalNs() const { return dht_.encodeTotalNs(); }
+    uint64_t decodeCount() const { return dht_.decodeCount(); }
+    uint64_t decodeTotalNs() const { return dht_.decodeTotalNs(); }
 
 private:
     ReadOnlyDeltaHashTable dht_;

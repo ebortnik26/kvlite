@@ -72,6 +72,12 @@ public:
                std::string_view value, bool tombstone,
                uint64_t hash);
 
+    // Write entry and feed the streaming index builder (no per-entry
+    // decode/encode). Call seal() after all appendEntry calls to finalize.
+    Status appendEntry(std::string_view key, uint64_t version,
+                       std::string_view value, bool tombstone,
+                       uint64_t hash, uint64_t& entry_offset);
+
     // --- Read (Readable only) ---
 
     // Get the latest entry for a hash.
@@ -100,6 +106,11 @@ public:
     Status readEntry(uint64_t offset, LogEntry& entry) const;
 
 private:
+    // Serialize and append a LogEntry, return file offset.
+    Status writeEntry(std::string_view key, uint64_t version,
+                      std::string_view value, bool tombstone,
+                      uint64_t& entry_offset);
+
     static constexpr uint32_t kFooterMagic = 0x53454746;  // "SEGF"
     static constexpr size_t kFooterSize = 16;  // segment_id(4) + index_offset(8) + magic(4)
 
@@ -108,6 +119,7 @@ private:
     uint32_t id_ = 0;
     uint64_t data_size_ = 0;
     State state_ = State::kClosed;
+    bool batch_mode_ = false;
 };
 
 }  // namespace internal

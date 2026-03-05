@@ -478,7 +478,9 @@ Memtable::FlushResult Memtable::flush(Segment& out,
         std::memcpy(&vl, p + 2, 4);
         std::string_view key(reinterpret_cast<const char*>(p + kRecordHeaderSize), kl);
         std::string_view val(reinterpret_cast<const char*>(p + kRecordHeaderSize + kl), vl);
-        Status st = out.put(key, pv.version(), val, pv.tombstone(), e.hash);
+        uint64_t entry_offset;
+        Status st = out.appendEntry(key, pv.version(), val, pv.tombstone(),
+                                    e.hash, entry_offset);
         if (!st.ok()) return st;
         flushed.push_back({e.hash, e.packed_ver});
         uint64_t v = pv.version();

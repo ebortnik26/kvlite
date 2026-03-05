@@ -48,11 +48,17 @@ struct DBStats {
     uint64_t stall_count = 0;
     uint64_t stall_total_us = 0;        // cumulative stall time in microseconds
 
-    // DHT codec instrumentation
+    // GI (GlobalIndex) DHT codec instrumentation
     uint64_t dht_encode_count = 0;
     uint64_t dht_encode_total_ns = 0;
     uint64_t dht_decode_count = 0;
     uint64_t dht_decode_total_ns = 0;
+
+    // SI (SegmentIndex) DHT codec instrumentation (cumulative across flushes/GC)
+    uint64_t si_encode_count = 0;
+    uint64_t si_encode_total_ns = 0;
+    uint64_t si_decode_count = 0;
+    uint64_t si_decode_total_ns = 0;
 
     // DHT structure
     uint32_t dht_ext_count = 0;       // number of extension (overflow) buckets
@@ -193,6 +199,12 @@ private:
     std::atomic<uint64_t> gc_total_us_{0};
     std::atomic<uint64_t> savepoint_count_{0};
     std::atomic<uint64_t> savepoint_total_us_{0};
+
+    // SegmentIndex codec accumulators (from flush + GC)
+    std::atomic<uint64_t> si_encode_count_{0};
+    std::atomic<uint64_t> si_encode_total_ns_{0};
+    std::atomic<uint64_t> si_decode_count_{0};
+    std::atomic<uint64_t> si_decode_total_ns_{0};
 };
 
 }  // namespace kvlite

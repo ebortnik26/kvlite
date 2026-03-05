@@ -1,6 +1,8 @@
 #include "internal/read_only_delta_hash_table.h"
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 
 namespace kvlite {
 namespace internal {
@@ -64,6 +66,91 @@ bool ReadOnlyDeltaHashTable::addEntryIsNew(uint64_t hash,
         });
     ++size_;
     return is_new;
+}
+
+// --- Streaming batch build ---
+
+void ReadOnlyDeltaHashTable::flushPendingBucket() {
+    if (pending_bi_ == UINT32_MAX) return;
+
+    // Versions accumulated ascending; DHT stores descending — reverse each key.
+    for (auto& ke : pending_contents_.keys) {
+        std::reverse(ke.packed_versions.begin(), ke.packed_versions.end());
+        std::reverse(ke.ids.begin(), ke.ids.end());
+    }
+
+    if (codec_.contentsBitsNeeded(pending_contents_) <= codec_.bucketDataBits()) {
+        auto et0 = std::chrono::steady_clock::now();
+        codec_.encodeBucket(buckets_[pending_bi_], pending_contents_);
+        auto et1 = std::chrono::steady_clock::now();
+        encode_count_.fetch_add(1, std::memory_order_relaxed);
+        encode_total_ns_.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(et1 - et0).count()),
+            std::memory_order_relaxed);
+        size_ += pending_entries_;
+        batch_key_count_ += pending_keys_;
+    } else {
+        // Overflow — replay entries through per-entry addToChain.
+        for (auto& ke : pending_contents_.keys) {
+            // DHT stores versions descending; reverse back to ascending for
+            // addEntryIsNew which inserts in desc order internally.
+            bool is_new = true;
+            for (size_t i = ke.packed_versions.size(); i > 0; --i) {
+                uint64_t hash = (static_cast<uint64_t>(pending_bi_)
+                                 << (64 - config_.bucket_bits)) | ke.suffix;
+                if (addEntryIsNew(hash, ke.packed_versions[i - 1], ke.ids[i - 1])) {
+                    if (is_new) {
+                        ++batch_key_count_;
+                        is_new = false;
+                    }
+                }
+            }
+        }
+    }
+
+    pending_contents_.keys.clear();
+    pending_keys_ = 0;
+    pending_entries_ = 0;
+    pending_bi_ = UINT32_MAX;
+}
+
+void ReadOnlyDeltaHashTable::addBatchEntry(uint64_t hash,
+                                            uint64_t packed_version, uint32_t id) {
+    assert(!sealed_);
+
+    uint32_t bi = bucketIndex(hash);
+    if (bi != pending_bi_) {
+        flushPendingBucket();
+        pending_bi_ = bi;
+    }
+
+    uint64_t suffix = suffixFromHash(hash);
+
+    // Append to existing KeyEntry or create new one.
+    // Keys within a bucket arrive in suffix order (same hash order).
+    if (!pending_contents_.keys.empty() &&
+        pending_contents_.keys.back().suffix == suffix) {
+        // Same key — versions arrive ascending, store ascending for now;
+        // reversed to descending in flushPendingBucket.
+        pending_contents_.keys.back().packed_versions.push_back(packed_version);
+        pending_contents_.keys.back().ids.push_back(id);
+    } else {
+        KeyEntry ke;
+        ke.suffix = suffix;
+        ke.packed_versions.push_back(packed_version);
+        ke.ids.push_back(id);
+        pending_contents_.keys.push_back(std::move(ke));
+        ++pending_keys_;
+    }
+    ++pending_entries_;
+}
+
+size_t ReadOnlyDeltaHashTable::endBatch() {
+    flushPendingBucket();
+    size_t result = batch_key_count_;
+    batch_key_count_ = 0;
+    return result;
 }
 
 void ReadOnlyDeltaHashTable::seal() {
