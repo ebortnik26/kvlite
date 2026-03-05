@@ -72,8 +72,8 @@ struct Options {
 
     // Buffer segment writes through a 1MB userspace buffer.
     // Reduces syscall count per flush from ~N to ~N/60.
-    // Default: false
-    bool buffered_writes = false;
+    // Default: true
+    bool buffered_writes = true;
 
     // --- General Options ---
 
