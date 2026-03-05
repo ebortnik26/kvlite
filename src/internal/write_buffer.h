@@ -50,7 +50,7 @@ public:
     void putBatch(const std::vector<Memtable::BatchOp>& ops, uint64_t version);
 
     // --- Read operations (check active + flushing + immutable queue) ---
-    bool getByVersion(const std::string& key, uint64_t upper_bound,
+    bool getByVersion(uint64_t hash, uint64_t upper_bound,
                       std::string& value, uint64_t& version, bool& tombstone) const;
 
     // --- Lifecycle ---
@@ -59,6 +59,7 @@ public:
 
     // Memory usage of active Memtable.
     size_t memoryUsage() const;
+    uint32_t extensionCount() const;
     bool empty() const;
 
     // Stall statistics.

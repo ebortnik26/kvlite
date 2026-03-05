@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "internal/bucket_arena.h"
 #include "internal/entry_stream.h"
 #include "internal/spinlock.h"
 #include "log_entry.h"
@@ -22,11 +23,11 @@ class Segment;
 // In-memory buffer for pending writes before flush to log files.
 //
 // Layout:
-//   Data buffer  – contiguous, append-only byte array (1 GB default).
+//   Data buffer  – contiguous, append-only byte array (256 MB fixed).
 //                  Each record: [key_len:2][value_len:4][packed_version:8][key][value]
-//   Hash index   – contiguous array of 2^k buckets (k=13 → 8192 buckets).
-//                  Each bucket holds fixed-size slots of {fingerprint, offset}.
-//   Overflow     – block-allocated overflow buckets chained from full primaries.
+//   Hash index   – contiguous array of 64K primary buckets (256 bytes each).
+//                  Each bucket holds 12 packed Slots of {hash, pv, offset}.
+//   Extensions   – BucketArena-allocated overflow buckets chained from full primaries.
 //
 // Thread-safety: Per-bucket spinlocks protect concurrent put/get operations
 // while the Memtable is mutable. After seal(), the Memtable becomes read-only
@@ -43,7 +44,7 @@ public:
         bool operator<(const Entry& other) const { return pv < other.pv; }
     };
 
-    explicit Memtable(size_t capacity = 64 * 1024 * 1024);
+    Memtable();
     ~Memtable();
 
     Memtable(const Memtable&) = delete;
@@ -61,14 +62,14 @@ public:
     };
     void putBatch(const std::vector<BatchOp>& ops, uint64_t version);
 
-    bool get(const std::string& key,
+    bool get(uint64_t hash,
              std::string& value, uint64_t& version, bool& tombstone) const;
 
-    bool getByVersion(const std::string& key, uint64_t upper_bound,
+    bool getByVersion(uint64_t hash, uint64_t upper_bound,
                       std::string& value, uint64_t& version, bool& tombstone) const;
 
     // Called when writes are paused — no locking.
-    void forEach(const std::function<void(const std::string&,
+    void forEach(const std::function<void(uint64_t hash,
                                           const std::vector<Entry>&)>& fn) const;
 
     void clear();
@@ -113,47 +114,46 @@ public:
     size_t keyCount() const { return key_count_.load(std::memory_order_relaxed); }
     size_t entryCount() const { return size_.load(std::memory_order_relaxed); }
     size_t memoryUsage() const { return data_end_.load(std::memory_order_relaxed); }
+    uint32_t extensionCount() const { return ext_arena_.size(); }
+    static constexpr uint32_t numBuckets() { return kNumBuckets; }
     bool empty() const { return size_.load(std::memory_order_relaxed) == 0; }
 
 private:
     // --- Configuration ---
-    static constexpr uint32_t kBucketBits = 13;
-    static constexpr uint32_t kNumBuckets = 1u << kBucketBits;          // 8192
-    static constexpr uint32_t kSlotsPerBucket = 63;
-    static constexpr size_t kRecordHeaderSize = 14;  // key_len(2) + value_len(4) + pv(8)
+    static constexpr uint32_t kBucketBits = 16;
+    static constexpr uint32_t kNumBuckets = 1u << kBucketBits;            // 65536
+    static constexpr uint32_t kBucketBytes = 256;
+    static constexpr uint32_t kSlotsPerBucket = 12;  // (256 - 6) / 20
+    static constexpr size_t kDataCapacity = 1u << 28;                     // 256 MB
+    static constexpr size_t kRecordHeaderSize = 14;   // key_len(2) + value_len(4) + pv(8)
 
-    // Overflow pool block sizing
-    static constexpr uint32_t kOverflowBlockShift = 10;
-    static constexpr uint32_t kOverflowBlockSize = 1u << kOverflowBlockShift;  // 1024
-    static constexpr uint32_t kMaxOverflowBlocks = 256;  // up to 256K overflow buckets
-
-    // --- Hash index structures ---
-
-    struct Slot {
-        uint32_t fingerprint;  // lower 32 bits of hash (fast rejection)
-        uint32_t offset;       // byte offset into data buffer
+    // --- Slot: 20 bytes (packed) ---
+    //
+    // Full 64-bit hash stored so flush/createStream can pass it to
+    // Segment::put / GlobalIndex without recomputation.
+    struct __attribute__((packed)) Slot {
+        uint64_t hash;     // full 64-bit hash
+        uint64_t pv;       // PackedVersion raw data
+        uint32_t offset;   // byte offset into data buffer
     };
+    static_assert(sizeof(Slot) == 20, "Slot must be 20 bytes");
 
-    struct Bucket {
-        uint32_t count;     // used slots in this bucket
-        uint32_t overflow;  // 1-based overflow bucket index, 0 = none
-        Slot slots[kSlotsPerBucket];
-    };
-    // sizeof(Bucket) = 8 + 63*8 = 512
+    // Bucket layout (kBucketBytes = 256 bytes):
+    //   offset  0: uint16_t count     — used slots
+    //   offset  2: uint32_t ext_ptr   — 1-based BucketArena index (0 = none)
+    //   offset  6: Slot[12]           — 12 × 20 = 240 bytes
+    //   offset 246: uint8_t pad[10]
 
-    // --- Data buffer (append-only) ---
+    // --- Data buffer (append-only, fixed 256 MB) ---
     std::unique_ptr<uint8_t[]> data_;
-    size_t data_capacity_;
     std::atomic<size_t> data_end_{0};
 
-    // --- Hash index (contiguous) ---
-    std::unique_ptr<Bucket[]> buckets_;
+    // --- Primary buckets (contiguous, 16 MB) ---
+    std::unique_ptr<uint8_t[]> buckets_;
     std::unique_ptr<Spinlock[]> locks_;
 
-    // --- Overflow pool (block-allocated) ---
-    Bucket* overflow_blocks_[kMaxOverflowBlocks];
-    std::atomic<uint32_t> overflow_count_{0};
-    Spinlock overflow_alloc_lock_;
+    // --- Extension buckets ---
+    BucketArena ext_arena_;
 
     // --- Stats ---
     std::atomic<size_t> size_{0};
@@ -161,28 +161,51 @@ private:
     std::atomic<uint32_t> pin_count_{0};
     std::atomic<bool> sealed_{false};
 
-    // --- Helpers ---
+    // --- Bucket accessors ---
 
+    uint8_t* primaryBucket(uint32_t idx) {
+        return buckets_.get() + static_cast<size_t>(idx) * kBucketBytes;
+    }
+    const uint8_t* primaryBucket(uint32_t idx) const {
+        return buckets_.get() + static_cast<size_t>(idx) * kBucketBytes;
+    }
+
+    static uint16_t bucketCount(const uint8_t* b) {
+        uint16_t v; std::memcpy(&v, b, 2); return v;
+    }
+    static void setBucketCount(uint8_t* b, uint16_t c) {
+        std::memcpy(b, &c, 2);
+    }
+    static uint32_t bucketExtPtr(const uint8_t* b) {
+        uint32_t v; std::memcpy(&v, b + 2, 4); return v;
+    }
+    static void setBucketExtPtr(uint8_t* b, uint32_t e) {
+        std::memcpy(b + 2, &e, 4);
+    }
+    static Slot* bucketSlots(uint8_t* b) {
+        return reinterpret_cast<Slot*>(b + 6);
+    }
+    static const Slot* bucketSlots(const uint8_t* b) {
+        return reinterpret_cast<const Slot*>(b + 6);
+    }
+
+    uint8_t* extBucketData(uint32_t ext_ptr) {
+        return ext_arena_.get(ext_ptr)->data;
+    }
+    const uint8_t* extBucketData(uint32_t ext_ptr) const {
+        return ext_arena_.get(ext_ptr)->data;
+    }
+
+    // --- Hash decomposition ---
     uint32_t bucketIndex(uint64_t hash) const {
         return static_cast<uint32_t>(hash >> (64 - kBucketBits));
     }
 
-    uint32_t fingerprint(uint64_t hash) const {
-        return static_cast<uint32_t>(hash);
-    }
-
+    // --- Data buffer I/O ---
     uint32_t appendRecord(const std::string& key, PackedVersion pv,
                           const std::string& value);
-
-    bool keyMatches(uint32_t offset, const std::string& key) const;
-    PackedVersion readPackedVersion(uint32_t offset) const;
     void readValue(uint32_t offset, std::string& value) const;
     std::string readKey(uint32_t offset) const;
-
-    Bucket& getOverflowBucket(uint32_t idx);
-    const Bucket& getOverflowBucket(uint32_t idx) const;
-    uint32_t allocOverflowBucket();
-    void freeOverflow();
 };
 
 } // namespace internal

@@ -22,6 +22,7 @@ using kvlite::internal::Memtable;
 using kvlite::internal::dhtHashBytes;
 
 static uint64_t H(const char* s) { return dhtHashBytes(s, std::strlen(s)); }
+static uint64_t HS(const std::string& s) { return dhtHashBytes(s.data(), s.size()); }
 
 TEST(Memtable, PutAndGetSingleEntry) {
     Memtable wb;
@@ -30,7 +31,7 @@ TEST(Memtable, PutAndGetSingleEntry) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    ASSERT_TRUE(wb.get("key1", value, version, tombstone));
+    ASSERT_TRUE(wb.get(H("key1"), value, version, tombstone));
     EXPECT_EQ(value, "value1");
     EXPECT_EQ(version, 1u);
     EXPECT_FALSE(tombstone);
@@ -41,7 +42,7 @@ TEST(Memtable, GetMissing) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    EXPECT_FALSE(wb.get("missing", value, version, tombstone));
+    EXPECT_FALSE(wb.get(H("missing"), value, version, tombstone));
 }
 
 TEST(Memtable, GetReturnsLatestVersion) {
@@ -54,7 +55,7 @@ TEST(Memtable, GetReturnsLatestVersion) {
     uint64_t version;
     bool tombstone;
     // Latest = highest version (5), regardless of insertion order
-    ASSERT_TRUE(wb.get("key1", value, version, tombstone));
+    ASSERT_TRUE(wb.get(H("key1"), value, version, tombstone));
     EXPECT_EQ(value, "v5");
     EXPECT_EQ(version, 5u);
 }
@@ -66,7 +67,7 @@ TEST(Memtable, Tombstone) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    ASSERT_TRUE(wb.get("key1", value, version, tombstone));
+    ASSERT_TRUE(wb.get(H("key1"), value, version, tombstone));
     EXPECT_TRUE(tombstone);
     EXPECT_EQ(version, 1u);
 }
@@ -82,7 +83,7 @@ TEST(Memtable, GetByVersionExact) {
     bool tombstone;
 
     // Upper bound is packed: (logical_version << 1) | 1
-    ASSERT_TRUE(wb.getByVersion("key1", (3ULL << 1) | 1, value, version, tombstone));
+    ASSERT_TRUE(wb.getByVersion(H("key1"), (3ULL << 1) | 1, value, version, tombstone));
     EXPECT_EQ(value, "v3");
     EXPECT_EQ(version, 3u);
 }
@@ -97,7 +98,7 @@ TEST(Memtable, GetByVersionBetween) {
     uint64_t version;
     bool tombstone;
 
-    ASSERT_TRUE(wb.getByVersion("key1", (4ULL << 1) | 1, value, version, tombstone));
+    ASSERT_TRUE(wb.getByVersion(H("key1"), (4ULL << 1) | 1, value, version, tombstone));
     EXPECT_EQ(value, "v3");
     EXPECT_EQ(version, 3u);
 }
@@ -109,7 +110,7 @@ TEST(Memtable, GetByVersionTooLow) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    EXPECT_FALSE(wb.getByVersion("key1", (3ULL << 1) | 1, value, version, tombstone));
+    EXPECT_FALSE(wb.getByVersion(H("key1"), (3ULL << 1) | 1, value, version, tombstone));
 }
 
 TEST(Memtable, GetByVersionMissingKey) {
@@ -117,7 +118,7 @@ TEST(Memtable, GetByVersionMissingKey) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    EXPECT_FALSE(wb.getByVersion("missing", (100ULL << 1) | 1, value, version, tombstone));
+    EXPECT_FALSE(wb.getByVersion(H("missing"), (100ULL << 1) | 1, value, version, tombstone));
 }
 
 TEST(Memtable, ForEach) {
@@ -126,19 +127,19 @@ TEST(Memtable, ForEach) {
     wb.put("b", 2, "vb", false);
     wb.put("a", 3, "va2", false);
 
-    std::vector<std::pair<std::string, size_t>> collected;
-    wb.forEach([&](const std::string& key, const std::vector<Memtable::Entry>& entries) {
-        collected.push_back({key, entries.size()});
+    uint64_t ha = H("a"), hb = H("b");
+    std::vector<std::pair<uint64_t, size_t>> collected;
+    wb.forEach([&](uint64_t hash, const std::vector<Memtable::Entry>& entries) {
+        collected.push_back({hash, entries.size()});
     });
 
     ASSERT_EQ(collected.size(), 2u);
 
-    // Sort for deterministic comparison
-    std::sort(collected.begin(), collected.end());
-    EXPECT_EQ(collected[0].first, "a");
-    EXPECT_EQ(collected[0].second, 2u);
-    EXPECT_EQ(collected[1].first, "b");
-    EXPECT_EQ(collected[1].second, 1u);
+    // Check by hash
+    for (const auto& p : collected) {
+        if (p.first == ha) EXPECT_EQ(p.second, 2u);
+        else if (p.first == hb) EXPECT_EQ(p.second, 1u);
+    }
 }
 
 TEST(Memtable, ClearResetsEverything) {
@@ -161,7 +162,7 @@ TEST(Memtable, ClearResetsEverything) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    EXPECT_FALSE(wb.get("key1", value, version, tombstone));
+    EXPECT_FALSE(wb.get(H("key1"), value, version, tombstone));
 }
 
 TEST(Memtable, Statistics) {
@@ -197,7 +198,7 @@ TEST(Memtable, ManyKeys) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    ASSERT_TRUE(wb.get("key_42", value, version, tombstone));
+    ASSERT_TRUE(wb.get(H("key_42"), value, version, tombstone));
     EXPECT_EQ(value, "val_42");
     EXPECT_EQ(version, 42u);
 }
@@ -228,7 +229,7 @@ TEST(Memtable, ConcurrentPuts) {
     for (int t = 0; t < kThreads; ++t) {
         for (int i = 0; i < kPerThread; i += 500) {
             std::string key = "t" + std::to_string(t) + "_k" + std::to_string(i);
-            ASSERT_TRUE(wb.get(key, value, version, tombstone));
+            ASSERT_TRUE(wb.get(HS(key), value, version, tombstone));
         }
     }
 }
@@ -276,17 +277,17 @@ TEST(Memtable, PutBatchSameVersion) {
     uint64_t version;
     bool tombstone;
 
-    ASSERT_TRUE(wb.get("alpha", value, version, tombstone));
+    ASSERT_TRUE(wb.get(H("alpha"), value, version, tombstone));
     EXPECT_EQ(value, "a_val");
     EXPECT_EQ(version, 42u);
     EXPECT_FALSE(tombstone);
 
-    ASSERT_TRUE(wb.get("beta", value, version, tombstone));
+    ASSERT_TRUE(wb.get(H("beta"), value, version, tombstone));
     EXPECT_EQ(value, "b_val");
     EXPECT_EQ(version, 42u);
     EXPECT_FALSE(tombstone);
 
-    ASSERT_TRUE(wb.get("gamma", value, version, tombstone));
+    ASSERT_TRUE(wb.get(H("gamma"), value, version, tombstone));
     EXPECT_EQ(value, "g_val");
     EXPECT_EQ(version, 42u);
     EXPECT_TRUE(tombstone);
@@ -315,7 +316,7 @@ TEST(Memtable, PutBatchKeyCountWithExisting) {
     std::string value;
     uint64_t version;
     bool tombstone;
-    ASSERT_TRUE(wb.get("alpha", value, version, tombstone));
+    ASSERT_TRUE(wb.get(H("alpha"), value, version, tombstone));
     EXPECT_EQ(value, "new");
     EXPECT_EQ(version, 10u);
 }
@@ -376,7 +377,7 @@ TEST(Memtable, PutBatchConcurrentWritersSameVersion) {
                 std::string val;
                 uint64_t ver;
                 bool tomb;
-                ASSERT_TRUE(wb.get(key, val, ver, tomb))
+                ASSERT_TRUE(wb.get(HS(key), val, ver, tomb))
                     << "Missing key: " << key;
                 if (k == 0) {
                     expected_ver = ver;
@@ -423,9 +424,9 @@ TEST(Memtable, PutBatchMonotonicVisibility) {
             uint64_t ver1 = 0, ver2 = 0, ver3 = 0;
             bool t1, t2, t3;
 
-            bool f1 = wb.get("x1", v1, ver1, t1);
-            bool f2 = wb.get("x2", v2, ver2, t2);
-            bool f3 = wb.get("x3", v3, ver3, t3);
+            bool f1 = wb.get(H("x1"), v1, ver1, t1);
+            bool f2 = wb.get(H("x2"), v2, ver2, t2);
+            bool f3 = wb.get(H("x3"), v3, ver3, t3);
 
             if (!f1) continue;  // nothing written yet
 
@@ -882,7 +883,7 @@ TEST(WriteBufferOrchestrator, ReadFromActiveMemtable) {
     std::string val;
     uint64_t ver;
     bool tomb;
-    ASSERT_TRUE(wb.getByVersion("k1", UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("k1"), UINT64_MAX, val, ver, tomb));
     EXPECT_EQ(val, "v1");
     EXPECT_EQ(ver, 1u);
     EXPECT_FALSE(tomb);
@@ -903,7 +904,7 @@ TEST(WriteBufferOrchestrator, ReadFromFlushingMemtable) {
     std::string val;
     uint64_t ver;
     bool tomb;
-    ASSERT_TRUE(wb.getByVersion("k1", UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("k1"), UINT64_MAX, val, ver, tomb));
     EXPECT_EQ(ver, 1u);
 
     gf.releaseAll();
@@ -926,10 +927,10 @@ TEST(WriteBufferOrchestrator, ReadSpansActiveAndFlushing) {
     uint64_t ver;
     bool tomb;
 
-    ASSERT_TRUE(wb.getByVersion("old_1", UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("old_1"), UINT64_MAX, val, ver, tomb));
     EXPECT_EQ(ver, 1u);
 
-    ASSERT_TRUE(wb.getByVersion("new_key", UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("new_key"), UINT64_MAX, val, ver, tomb));
     EXPECT_EQ(val, "new_val");
     EXPECT_EQ(ver, 1000u);
 
@@ -958,14 +959,14 @@ TEST(WriteBufferOrchestrator, ReadSpansActiveImmutableAndFlushing) {
     bool tomb;
 
     // From flushing:
-    ASSERT_TRUE(wb.getByVersion("a_1", UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("a_1"), UINT64_MAX, val, ver, tomb));
     EXPECT_EQ(ver, 1u);
 
     // From immutables queue:
-    ASSERT_TRUE(wb.getByVersion("b_" + std::to_string(next - 1), UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(HS("b_" + std::to_string(next - 1)), UINT64_MAX, val, ver, tomb));
 
     // From active:
-    ASSERT_TRUE(wb.getByVersion("c_key", UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("c_key"), UINT64_MAX, val, ver, tomb));
     EXPECT_EQ(val, "c_val");
 
     gf.releaseAll();
@@ -989,7 +990,7 @@ TEST(WriteBufferOrchestrator, ActiveOverridesImmutable) {
     std::string val;
     uint64_t ver;
     bool tomb;
-    ASSERT_TRUE(wb.getByVersion("k1", UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("k1"), UINT64_MAX, val, ver, tomb));
     EXPECT_EQ(val, "new");
     EXPECT_EQ(ver, 50u);
 
@@ -1013,7 +1014,7 @@ TEST(WriteBufferOrchestrator, VersionBoundFallsThroughToImmutable) {
     uint64_t ver;
     bool tomb;
     // packed upper bound: (version << 1) | 1
-    ASSERT_TRUE(wb.getByVersion("k1", (5ULL << 1) | 1, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("k1"), (5ULL << 1) | 1, val, ver, tomb));
     EXPECT_EQ(val, "old");
     EXPECT_EQ(ver, 1u);
 
@@ -1034,7 +1035,7 @@ TEST(WriteBufferOrchestrator, TombstoneInActiveHidesImmutable) {
     std::string val;
     uint64_t ver;
     bool tomb;
-    ASSERT_TRUE(wb.getByVersion("k1", UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("k1"), UINT64_MAX, val, ver, tomb));
     EXPECT_TRUE(tomb);
     EXPECT_EQ(ver, 50u);
 
@@ -1054,7 +1055,7 @@ TEST(WriteBufferOrchestrator, ReadMissingKeyAcrossAll) {
     std::string val;
     uint64_t ver;
     bool tomb;
-    EXPECT_FALSE(wb.getByVersion("missing", UINT64_MAX, val, ver, tomb));
+    EXPECT_FALSE(wb.getByVersion(H("missing"), UINT64_MAX, val, ver, tomb));
 
     gf.releaseAll();
 }
@@ -1130,7 +1131,7 @@ TEST(WriteBufferOrchestrator, StallWhenQueueFull) {
     std::string val;
     uint64_t ver;
     bool tomb;
-    ASSERT_TRUE(wb.getByVersion("a_1", UINT64_MAX, val, ver, tomb));
+    ASSERT_TRUE(wb.getByVersion(H("a_1"), UINT64_MAX, val, ver, tomb));
 
     // Release gen 1.
     gf.releaseThrough(1);
@@ -1165,8 +1166,8 @@ TEST(WriteBufferOrchestrator, PinAllIncludesAllMemtables) {
         std::string val;
         uint64_t ver;
         bool tomb;
-        if (mt->getByVersion("old_1", UINT64_MAX, val, ver, tomb)) found_old = true;
-        if (mt->getByVersion("new_key", UINT64_MAX, val, ver, tomb)) found_new = true;
+        if (mt->getByVersion(H("old_1"), UINT64_MAX, val, ver, tomb)) found_old = true;
+        if (mt->getByVersion(H("new_key"), UINT64_MAX, val, ver, tomb)) found_new = true;
     }
     EXPECT_TRUE(found_old);
     EXPECT_TRUE(found_new);
@@ -1203,16 +1204,16 @@ TEST(WriteBufferOrchestrator, ConcurrentReadsWhileFlushing) {
             uint64_t ver;
             bool tomb;
             // Check flushing memtable data (key = "a_1").
-            if (!wb.getByVersion("a_1", UINT64_MAX, val, ver, tomb)) {
+            if (!wb.getByVersion(H("a_1"), UINT64_MAX, val, ver, tomb)) {
                 violation = true;
             }
             // Check immutable data (first key in second batch).
             std::string b_key = "b_" + std::to_string(next_a);
-            if (!wb.getByVersion(b_key, UINT64_MAX, val, ver, tomb)) {
+            if (!wb.getByVersion(HS(b_key), UINT64_MAX, val, ver, tomb)) {
                 violation = true;
             }
             // Check active data.
-            if (!wb.getByVersion("c_1", UINT64_MAX, val, ver, tomb)) {
+            if (!wb.getByVersion(H("c_1"), UINT64_MAX, val, ver, tomb)) {
                 violation = true;
             }
         });

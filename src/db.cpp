@@ -225,8 +225,11 @@ Status DB::resolve(const std::string& key, uint64_t upper_bound,
         return Status::InvalidArgument("Empty key");
     }
 
+    // Compute hash once, use for both WriteBuffer and GlobalIndex lookups.
+    uint64_t hkey = internal::dhtHashBytes(key.data(), key.size());
+
     // 1. Check WriteBuffer first (active + immutables).
-    if (write_buffer_->getByVersion(key, upper_bound,
+    if (write_buffer_->getByVersion(hkey, upper_bound,
                                     result.wb_value, result.wb_version,
                                     result.wb_tombstone)) {
         result.wb_hit = true;
@@ -236,7 +239,6 @@ Status DB::resolve(const std::string& key, uint64_t upper_bound,
     // 2. Fall through to GlobalIndex -> Segment.
     uint64_t gi_packed_version;
     uint32_t gi_segment_id;
-    uint64_t hkey = internal::dhtHashBytes(key.data(), key.size());
     if (!global_index_->get(hkey, upper_bound, gi_packed_version, gi_segment_id)) {
         return Status::NotFound(key);
     }
@@ -453,6 +455,9 @@ Status DB::getStats(DBStats& stats) const {
     stats.dht_decode_total_ns = global_index_->dhtDecodeTotalNs();
     stats.dht_ext_count = global_index_->dhtExtCount();
     stats.dht_num_buckets = global_index_->dhtNumBuckets();
+
+    stats.mt_ext_count = write_buffer_->extensionCount();
+    stats.mt_num_buckets = internal::Memtable::numBuckets();
 
     return Status::OK();
 }

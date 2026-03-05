@@ -9,7 +9,7 @@ namespace internal {
 WriteBuffer::WriteBuffer(const Options& opts, FlushFn flush_fn)
     : opts_(opts),
       flush_fn_(std::move(flush_fn)),
-      active_(std::make_unique<Memtable>(opts_.memtable_size)) {
+      active_(std::make_unique<Memtable>()) {
     flush_thread_ = std::thread(&WriteBuffer::flushLoop, this);
 }
 
@@ -69,26 +69,26 @@ void WriteBuffer::putBatch(const std::vector<Memtable::BatchOp>& ops,
 
 // --- Read operations -----------------------------------------------------
 
-bool WriteBuffer::getByVersion(const std::string& key, uint64_t upper_bound,
+bool WriteBuffer::getByVersion(uint64_t hash, uint64_t upper_bound,
                                std::string& value, uint64_t& version,
                                bool& tombstone) const {
     std::lock_guard<std::mutex> lock(mu_);
 
     // Check active first (newest data).
-    if (active_->getByVersion(key, upper_bound, value, version, tombstone)) {
+    if (active_->getByVersion(hash, upper_bound, value, version, tombstone)) {
         return true;
     }
 
     // Scan immutables back-to-front (newest to oldest).
     for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
-        if ((*it)->getByVersion(key, upper_bound, value, version, tombstone)) {
+        if ((*it)->getByVersion(hash, upper_bound, value, version, tombstone)) {
             return true;
         }
     }
 
     // Check the Memtable currently being flushed (oldest, still readable).
     if (flushing_ &&
-        flushing_->getByVersion(key, upper_bound, value, version, tombstone)) {
+        flushing_->getByVersion(hash, upper_bound, value, version, tombstone)) {
         return true;
     }
 
@@ -109,7 +109,7 @@ void WriteBuffer::sealActive() {
     if (active_->empty()) return;
     active_->seal();  // read-only from here — reads skip spinlocks
     immutables_.push_back(std::move(active_));
-    active_ = std::make_unique<Memtable>(opts_.memtable_size);
+    active_ = std::make_unique<Memtable>();
     flush_cv_.notify_one();
 }
 
@@ -130,6 +130,11 @@ void WriteBuffer::drainFlush() {
 size_t WriteBuffer::memoryUsage() const {
     std::lock_guard<std::mutex> lock(mu_);
     return active_->memoryUsage();
+}
+
+uint32_t WriteBuffer::extensionCount() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return active_->extensionCount();
 }
 
 bool WriteBuffer::empty() const {

@@ -57,6 +57,10 @@ struct DBStats {
     // DHT structure
     uint32_t dht_ext_count = 0;       // number of extension (overflow) buckets
     uint32_t dht_num_buckets = 0;     // number of primary buckets
+
+    // Memtable structure
+    uint32_t mt_ext_count = 0;        // extension buckets in active Memtable
+    uint32_t mt_num_buckets = 0;      // primary buckets (constant 65536)
 };
 
 class Snapshot {

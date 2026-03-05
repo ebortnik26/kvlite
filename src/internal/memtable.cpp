@@ -11,21 +11,17 @@
 namespace kvlite {
 namespace internal {
 
-Memtable::Memtable(size_t capacity)
-    : data_(new uint8_t[capacity * 2]),  // 2x headroom for in-flight entries past seal threshold
-      data_capacity_(capacity * 2),
-      buckets_(std::make_unique<Bucket[]>(kNumBuckets)),   // zero-initialized
-      locks_(std::make_unique<Spinlock[]>(kNumBuckets)) {
-    std::memset(overflow_blocks_, 0, sizeof(overflow_blocks_));
-}
+Memtable::Memtable()
+    : data_(new uint8_t[kDataCapacity]),
+      buckets_(new uint8_t[static_cast<size_t>(kNumBuckets) * kBucketBytes]()),
+      locks_(std::make_unique<Spinlock[]>(kNumBuckets)),
+      ext_arena_(sizeof(Bucket) + kBucketBytes, /*concurrent=*/true) {}
 
-Memtable::~Memtable() {
-    freeOverflow();
-}
+Memtable::~Memtable() = default;
 
-// --- Record I/O ----------------------------------------------------------
+// --- Data buffer I/O -----------------------------------------------------
 //
-// Data record layout (all little-endian on x86):
+// Record layout (all little-endian on x86):
 //   offset + 0:  uint16_t key_len
 //   offset + 2:  uint32_t value_len
 //   offset + 6:  uint64_t packed_version
@@ -33,7 +29,7 @@ Memtable::~Memtable() {
 //   offset + 14 + key_len: uint8_t value[value_len]
 
 uint32_t Memtable::appendRecord(const std::string& key, PackedVersion pv,
-                                   const std::string& value) {
+                                const std::string& value) {
     uint16_t key_len = static_cast<uint16_t>(key.size());
     uint32_t val_len = static_cast<uint32_t>(value.size());
     size_t record_size = kRecordHeaderSize + key_len + val_len;
@@ -48,20 +44,6 @@ uint32_t Memtable::appendRecord(const std::string& key, PackedVersion pv,
     std::memcpy(p, value.data(), val_len);
 
     return static_cast<uint32_t>(off);
-}
-
-bool Memtable::keyMatches(uint32_t off, const std::string& key) const {
-    const uint8_t* p = data_.get() + off;
-    uint16_t kl;
-    std::memcpy(&kl, p, 2);
-    if (kl != key.size()) return false;
-    return std::memcmp(p + kRecordHeaderSize, key.data(), kl) == 0;
-}
-
-PackedVersion Memtable::readPackedVersion(uint32_t off) const {
-    uint64_t d;
-    std::memcpy(&d, data_.get() + off + 6, 8);
-    return PackedVersion(d);
 }
 
 void Memtable::readValue(uint32_t off, std::string& value) const {
@@ -80,84 +62,66 @@ std::string Memtable::readKey(uint32_t off) const {
     return std::string(reinterpret_cast<const char*>(p + kRecordHeaderSize), kl);
 }
 
-// --- Overflow pool -------------------------------------------------------
-
-Memtable::Bucket& Memtable::getOverflowBucket(uint32_t idx) {
-    uint32_t i = idx - 1;  // 1-based → 0-based
-    return overflow_blocks_[i >> kOverflowBlockShift][i & (kOverflowBlockSize - 1)];
-}
-
-const Memtable::Bucket& Memtable::getOverflowBucket(uint32_t idx) const {
-    uint32_t i = idx - 1;
-    return overflow_blocks_[i >> kOverflowBlockShift][i & (kOverflowBlockSize - 1)];
-}
-
-uint32_t Memtable::allocOverflowBucket() {
-    overflow_alloc_lock_.lock();
-    uint32_t idx = overflow_count_.fetch_add(1, std::memory_order_relaxed);
-    uint32_t block = idx >> kOverflowBlockShift;
-    if (!overflow_blocks_[block]) {
-        overflow_blocks_[block] = new Bucket[kOverflowBlockSize]();
-    }
-    overflow_alloc_lock_.unlock();
-    return idx + 1;  // 1-based
-}
-
-void Memtable::freeOverflow() {
-    uint32_t count = overflow_count_.load(std::memory_order_relaxed);
-    if (count == 0) return;
-    uint32_t blocks = ((count - 1) >> kOverflowBlockShift) + 1;
-    for (uint32_t i = 0; i < blocks; ++i) {
-        delete[] overflow_blocks_[i];
-        overflow_blocks_[i] = nullptr;
-    }
-    overflow_count_.store(0, std::memory_order_relaxed);
-}
-
 // --- Public API ----------------------------------------------------------
 
 void Memtable::put(const std::string& key, uint64_t version,
-                      const std::string& value, bool tombstone) {
+                   const std::string& value, bool tombstone) {
     uint64_t hash = dhtHashBytes(key.data(), key.size());
     uint32_t bi = bucketIndex(hash);
-    uint32_t fp = fingerprint(hash);
     PackedVersion pv(version, tombstone);
 
-    // Append record to data buffer (lock-free, space reserved atomically)
+    // Append record to data buffer (lock-free, space reserved atomically).
     uint32_t offset = appendRecord(key, pv, value);
 
     locks_[bi].lock();
 
-    // Check if key already exists in this bucket chain
+    // Check if key already exists via binary search on hash.
     bool key_exists = false;
     {
-        const Bucket* scan = &buckets_[bi];
-        while (scan) {
-            for (uint32_t i = 0; i < scan->count; ++i) {
-                if (scan->slots[i].fingerprint == fp &&
-                    keyMatches(scan->slots[i].offset, key)) {
-                    key_exists = true;
-                    break;
-                }
+        const uint8_t* scan = primaryBucket(bi);
+        while (scan && !key_exists) {
+            uint16_t cnt = bucketCount(scan);
+            const Slot* s = bucketSlots(scan);
+            // Binary search for first slot with this hash.
+            uint16_t lo = 0, hi = cnt;
+            while (lo < hi) {
+                uint16_t mid = (lo + hi) / 2;
+                if (s[mid].hash < hash) lo = mid + 1;
+                else hi = mid;
             }
-            if (key_exists) break;
-            scan = scan->overflow ? &getOverflowBucket(scan->overflow) : nullptr;
+            if (lo < cnt && s[lo].hash == hash) key_exists = true;
+            uint32_t ext = bucketExtPtr(scan);
+            scan = ext ? extBucketData(ext) : nullptr;
         }
     }
 
-    // Find a bucket in the chain with a free slot
-    Bucket* b = &buckets_[bi];
-    while (b->count >= kSlotsPerBucket) {
-        if (b->overflow) {
-            b = &getOverflowBucket(b->overflow);
+    // Find a bucket in the chain with a free slot.
+    uint8_t* b = primaryBucket(bi);
+    while (bucketCount(b) >= kSlotsPerBucket) {
+        uint32_t ext = bucketExtPtr(b);
+        if (ext) {
+            b = extBucketData(ext);
         } else {
-            b->overflow = allocOverflowBucket();
-            b = &getOverflowBucket(b->overflow);
+            uint32_t new_ext = ext_arena_.allocate();
+            setBucketExtPtr(b, new_ext);
+            b = extBucketData(new_ext);
         }
     }
 
-    b->slots[b->count] = {fp, offset};
-    b->count++;
+    // Sorted insert: maintain (hash asc, pv asc) within each page.
+    Slot* s = bucketSlots(b);
+    uint16_t cnt = bucketCount(b);
+    Slot entry = {hash, pv.data, offset};
+    uint16_t pos = 0;
+    while (pos < cnt && (s[pos].hash < hash ||
+           (s[pos].hash == hash && s[pos].pv < pv.data))) {
+        ++pos;
+    }
+    if (pos < cnt) {
+        std::memmove(&s[pos + 1], &s[pos], (cnt - pos) * sizeof(Slot));
+    }
+    s[pos] = entry;
+    setBucketCount(b, cnt + 1);
 
     locks_[bi].unlock();
 
@@ -172,18 +136,17 @@ void Memtable::putBatch(const std::vector<BatchOp>& ops, uint64_t version) {
 
     // Pre-compute hashes and bucket indices for all operations.
     struct Prepared {
-        uint32_t op_idx;     // index into ops
+        uint32_t op_idx;
         uint64_t hash;
-        uint32_t bi;         // bucket index
-        uint32_t fp;         // fingerprint
-        uint32_t offset;     // data buffer offset (filled after appendRecord)
+        uint32_t bi;
+        uint32_t offset;  // filled after appendRecord
     };
 
     std::vector<Prepared> items;
     items.reserve(ops.size());
     for (uint32_t i = 0; i < ops.size(); ++i) {
         uint64_t h = dhtHashBytes(ops[i].key->data(), ops[i].key->size());
-        items.push_back({i, h, bucketIndex(h), fingerprint(h), 0});
+        items.push_back({i, h, bucketIndex(h), 0});
     }
 
     // Sort by bucket index to acquire locks in order (deadlock avoidance).
@@ -214,38 +177,54 @@ void Memtable::putBatch(const std::vector<BatchOp>& ops, uint64_t version) {
     size_t new_keys = 0;
 
     for (const auto& item : items) {
-        const auto& op = ops[item.op_idx];
+        PackedVersion pv(version, ops[item.op_idx].tombstone);
 
-        // Check if key already exists in this bucket chain.
+        // Check if key already exists via binary search on hash.
         bool key_exists = false;
         {
-            const Bucket* scan = &buckets_[item.bi];
-            while (scan) {
-                for (uint32_t i = 0; i < scan->count; ++i) {
-                    if (scan->slots[i].fingerprint == item.fp &&
-                        keyMatches(scan->slots[i].offset, *op.key)) {
-                        key_exists = true;
-                        break;
-                    }
+            const uint8_t* scan = primaryBucket(item.bi);
+            while (scan && !key_exists) {
+                uint16_t cnt = bucketCount(scan);
+                const Slot* s = bucketSlots(scan);
+                uint16_t lo = 0, hi = cnt;
+                while (lo < hi) {
+                    uint16_t mid = (lo + hi) / 2;
+                    if (s[mid].hash < item.hash) lo = mid + 1;
+                    else hi = mid;
                 }
-                if (key_exists) break;
-                scan = scan->overflow ? &getOverflowBucket(scan->overflow) : nullptr;
+                if (lo < cnt && s[lo].hash == item.hash) key_exists = true;
+                uint32_t ext = bucketExtPtr(scan);
+                scan = ext ? extBucketData(ext) : nullptr;
             }
         }
 
         // Find a bucket with a free slot.
-        Bucket* b = &buckets_[item.bi];
-        while (b->count >= kSlotsPerBucket) {
-            if (b->overflow) {
-                b = &getOverflowBucket(b->overflow);
+        uint8_t* b = primaryBucket(item.bi);
+        while (bucketCount(b) >= kSlotsPerBucket) {
+            uint32_t ext = bucketExtPtr(b);
+            if (ext) {
+                b = extBucketData(ext);
             } else {
-                b->overflow = allocOverflowBucket();
-                b = &getOverflowBucket(b->overflow);
+                uint32_t new_ext = ext_arena_.allocate();
+                setBucketExtPtr(b, new_ext);
+                b = extBucketData(new_ext);
             }
         }
 
-        b->slots[b->count] = {item.fp, item.offset};
-        b->count++;
+        // Sorted insert: maintain (hash asc, pv asc) within each page.
+        Slot* s = bucketSlots(b);
+        uint16_t cnt = bucketCount(b);
+        Slot entry = {item.hash, pv.data, item.offset};
+        uint16_t pos = 0;
+        while (pos < cnt && (s[pos].hash < item.hash ||
+               (s[pos].hash == item.hash && s[pos].pv < pv.data))) {
+            ++pos;
+        }
+        if (pos < cnt) {
+            std::memmove(&s[pos + 1], &s[pos], (cnt - pos) * sizeof(Slot));
+        }
+        s[pos] = entry;
+        setBucketCount(b, cnt + 1);
 
         new_entries++;
         if (!key_exists) new_keys++;
@@ -260,75 +239,77 @@ void Memtable::putBatch(const std::vector<BatchOp>& ops, uint64_t version) {
     key_count_.fetch_add(new_keys, std::memory_order_relaxed);
 }
 
-bool Memtable::get(const std::string& key,
-                      std::string& value, uint64_t& version, bool& tombstone) const {
-    return getByVersion(key, UINT64_MAX, value, version, tombstone);
+bool Memtable::get(uint64_t hash,
+                   std::string& value, uint64_t& version, bool& tombstone) const {
+    return getByVersion(hash, UINT64_MAX, value, version, tombstone);
 }
 
-bool Memtable::getByVersion(const std::string& key, uint64_t upper_bound,
-                               std::string& value, uint64_t& version,
-                               bool& tombstone) const {
-    uint64_t hash = dhtHashBytes(key.data(), key.size());
+bool Memtable::getByVersion(uint64_t hash, uint64_t upper_bound,
+                            std::string& value, uint64_t& version,
+                            bool& tombstone) const {
     uint32_t bi = bucketIndex(hash);
-    uint32_t fp = fingerprint(hash);
 
     bool sealed = sealed_.load(std::memory_order_acquire);
     if (!sealed) locks_[bi].lock();
 
     bool found = false;
-    uint64_t best_version = 0;
-    PackedVersion best_pv;
+    uint64_t best_pv = 0;
     uint32_t best_offset = 0;
 
-    const Bucket* b = &buckets_[bi];
+    const uint8_t* b = primaryBucket(bi);
     while (b) {
-        for (uint32_t i = 0; i < b->count; ++i) {
-            if (b->slots[i].fingerprint != fp) continue;
-            uint32_t off = b->slots[i].offset;
-            if (!keyMatches(off, key)) continue;
-
-            PackedVersion pv = readPackedVersion(off);
-            if (pv.data <= upper_bound &&
-                (!found || pv.data > best_version)) {
-                best_version = pv.data;
-                best_pv = pv;
-                best_offset = off;
+        uint16_t cnt = bucketCount(b);
+        const Slot* s = bucketSlots(b);
+        // Binary search for first slot with matching hash.
+        uint16_t lo = 0, hi = cnt;
+        while (lo < hi) {
+            uint16_t mid = (lo + hi) / 2;
+            if (s[mid].hash < hash) lo = mid + 1;
+            else hi = mid;
+        }
+        // Scan contiguous same-hash entries starting at lo.
+        for (uint16_t i = lo; i < cnt && s[i].hash == hash; ++i) {
+            if (s[i].pv <= upper_bound && (!found || s[i].pv > best_pv)) {
+                best_pv = s[i].pv;
+                best_offset = s[i].offset;
                 found = true;
             }
         }
-        b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
+        uint32_t ext = bucketExtPtr(b);
+        b = ext ? extBucketData(ext) : nullptr;
     }
 
     if (found) {
         readValue(best_offset, value);
-        version = best_pv.version();
-        tombstone = best_pv.tombstone();
+        PackedVersion pv(best_pv);
+        version = pv.version();
+        tombstone = pv.tombstone();
     }
 
     if (!sealed) locks_[bi].unlock();
     return found;
 }
 
-void Memtable::forEach(const std::function<void(const std::string&,
-                                                    const std::vector<Entry>&)>& fn) const {
+void Memtable::forEach(const std::function<void(uint64_t,
+                                                const std::vector<Entry>&)>& fn) const {
     for (uint32_t bi = 0; bi < kNumBuckets; ++bi) {
-        const Bucket* b = &buckets_[bi];
-        if (b->count == 0 && b->overflow == 0) continue;
+        const uint8_t* b = primaryBucket(bi);
+        if (bucketCount(b) == 0 && bucketExtPtr(b) == 0) continue;
 
-        // Group entries by key within this bucket chain.
-        // All entries for a given key hash to the same chain.
-        std::unordered_map<std::string, std::vector<Entry>> groups;
+        // Group entries by hash within this bucket chain.
+        std::unordered_map<uint64_t, std::vector<Entry>> groups;
 
         while (b) {
-            for (uint32_t i = 0; i < b->count; ++i) {
-                uint32_t off = b->slots[i].offset;
-                std::string key = readKey(off);
-                PackedVersion pv = readPackedVersion(off);
+            uint16_t cnt = bucketCount(b);
+            const Slot* s = bucketSlots(b);
+            for (uint16_t i = 0; i < cnt; ++i) {
+                PackedVersion pv(s[i].pv);
                 std::string val;
-                readValue(off, val);
-                groups[key].push_back({pv, std::move(val)});
+                readValue(s[i].offset, val);
+                groups[s[i].hash].push_back({pv, std::move(val)});
             }
-            b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
+            uint32_t ext = bucketExtPtr(b);
+            b = ext ? extBucketData(ext) : nullptr;
         }
 
         for (auto& kv : groups) {
@@ -339,11 +320,8 @@ void Memtable::forEach(const std::function<void(const std::string&,
 
 void Memtable::clear() {
     data_end_.store(0, std::memory_order_relaxed);
-    for (uint32_t i = 0; i < kNumBuckets; ++i) {
-        buckets_[i].count = 0;
-        buckets_[i].overflow = 0;
-    }
-    freeOverflow();
+    std::memset(buckets_.get(), 0, static_cast<size_t>(kNumBuckets) * kBucketBytes);
+    ext_arena_.clear();
     size_.store(0, std::memory_order_relaxed);
     key_count_.store(0, std::memory_order_relaxed);
 }
@@ -411,77 +389,64 @@ private:
 // ---------------------------------------------------------------------------
 
 std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) const {
-    std::vector<MemtableStream::Record> all;
+    std::vector<MemtableStream::Record> deduped;
     bool sealed = sealed_.load(std::memory_order_acquire);
+    const uint8_t* data_ptr = data_.get();
+
+    // Per-bucket collection + dedup. Slots are sorted (hash asc, pv asc)
+    // within each page; bucket iteration 0→65535 gives global hash order.
+    // Both global sorts are eliminated.
+    std::vector<MemtableStream::Record> bucket_recs;
 
     for (uint32_t bi = 0; bi < kNumBuckets; ++bi) {
         if (!sealed) locks_[bi].lock();
 
-        const Bucket* b = &buckets_[bi];
-        while (b) {
-            for (uint32_t i = 0; i < b->count; ++i) {
-                uint32_t off = b->slots[i].offset;
-                PackedVersion pv = readPackedVersion(off);
-                if (pv.data > snapshot_version) continue;
+        const uint8_t* b = primaryBucket(bi);
+        if (bucketCount(b) == 0 && bucketExtPtr(b) == 0) {
+            if (!sealed) locks_[bi].unlock();
+            continue;
+        }
 
-                const uint8_t* p = data_.get() + off;
+        bucket_recs.clear();
+
+        // Collect from chain: pages are concatenated, each internally sorted.
+        while (b) {
+            uint16_t cnt = bucketCount(b);
+            const Slot* s = bucketSlots(b);
+            for (uint16_t i = 0; i < cnt; ++i) {
+                if (s[i].pv > snapshot_version) continue;
+
+                const uint8_t* p = data_ptr + s[i].offset;
                 uint16_t kl;
                 uint32_t vl;
                 std::memcpy(&kl, p, 2);
                 std::memcpy(&vl, p + 2, 4);
 
-                uint64_t h = dhtHashBytes(p + kRecordHeaderSize, kl);
-
-                all.push_back({h, off, kl, vl, pv});
+                bucket_recs.push_back({s[i].hash, s[i].offset, kl, vl,
+                                       PackedVersion(s[i].pv)});
             }
-            b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
+            uint32_t ext = bucketExtPtr(b);
+            b = ext ? extBucketData(ext) : nullptr;
         }
 
         if (!sealed) locks_[bi].unlock();
-    }
 
-    const uint8_t* data_ptr = data_.get();
-
-    // Deduplicate: keep only the latest version per key (by hash+key bytes).
-    // Sort by (hash, key bytes, version desc) to group duplicates together.
-    std::sort(all.begin(), all.end(),
-              [data_ptr](const MemtableStream::Record& a,
-                         const MemtableStream::Record& b) {
-                  if (a.hash != b.hash) return a.hash < b.hash;
-                  // Compare key bytes directly in data_
-                  const uint8_t* ka = data_ptr + a.offset + 14;
-                  const uint8_t* kb = data_ptr + b.offset + 14;
-                  uint16_t min_len = a.key_len < b.key_len ? a.key_len : b.key_len;
-                  int cmp = std::memcmp(ka, kb, min_len);
-                  if (cmp != 0) return cmp < 0;
-                  if (a.key_len != b.key_len) return a.key_len < b.key_len;
-                  return a.pv.version() > b.pv.version();  // desc for dedup
-              });
-
-    // Build output: one record per key (first in each group = latest).
-    std::vector<MemtableStream::Record> deduped;
-    for (size_t i = 0; i < all.size(); ) {
-        deduped.push_back(all[i]);
-
-        // Skip remaining entries with same hash+key.
-        uint64_t h = all[i].hash;
-        const uint8_t* key_i = data_ptr + all[i].offset + 14;
-        uint16_t kl_i = all[i].key_len;
-        ++i;
-        while (i < all.size() && all[i].hash == h &&
-               all[i].key_len == kl_i &&
-               std::memcmp(data_ptr + all[i].offset + 14, key_i, kl_i) == 0) {
-            ++i;
+        // Dedup per bucket: entries are in (hash asc, pv asc) order.
+        // For each hash group, keep only the latest version <= snapshot
+        // (last entry in each group, since pv is ascending).
+        size_t i = 0;
+        while (i < bucket_recs.size()) {
+            // Find end of this hash group.
+            size_t j = i + 1;
+            while (j < bucket_recs.size() &&
+                   bucket_recs[j].hash == bucket_recs[i].hash) {
+                ++j;
+            }
+            // Last entry in ascending pv order = latest version.
+            deduped.push_back(bucket_recs[j - 1]);
+            i = j;
         }
     }
-
-    // Re-sort into merge order: (hash asc, version asc).
-    std::sort(deduped.begin(), deduped.end(),
-              [](const MemtableStream::Record& a,
-                 const MemtableStream::Record& b) {
-                  if (a.hash != b.hash) return a.hash < b.hash;
-                  return a.pv.version() < b.pv.version();
-              });
 
     return std::make_unique<MemtableStream>(data_ptr, std::move(deduped));
 }
@@ -490,65 +455,61 @@ Memtable::FlushResult Memtable::flush(Segment& out,
                                       const std::vector<uint64_t>& snapshot_versions) {
     Status s;
 
-    struct FlatEntry {
+    // SlimEntry: 20 bytes, no string copies. Key/value read via string_view
+    // from data buffer at emit time (zero-copy).
+    struct SlimEntry {
         uint64_t hash;
-        uint64_t packed_ver;  // (logical_version << 1) | tombstone
-        std::string key;
-        PackedVersion pv;
-        std::string value;
+        uint64_t packed_ver;
+        uint32_t offset;
     };
 
     std::vector<FlushedEntry> flushed;
     flushed.reserve(key_count_.load(std::memory_order_relaxed));
     uint64_t max_ver = 0;
 
-    // Process one bucket at a time. Iterating buckets 0..N gives hash-prefix
-    // order; we only need to sort within each bucket by (hash, key).
-    std::vector<FlatEntry> bucket_entries;
+    const uint8_t* data_base = data_.get();
 
-    auto emit = [&](const FlatEntry& e) -> Status {
-        Status st = out.put(e.key, e.pv.version(), e.value, e.pv.tombstone(), e.hash);
+    auto emit = [&](const SlimEntry& e) -> Status {
+        PackedVersion pv(e.packed_ver);
+        const uint8_t* p = data_base + e.offset;
+        uint16_t kl;
+        uint32_t vl;
+        std::memcpy(&kl, p, 2);
+        std::memcpy(&vl, p + 2, 4);
+        std::string_view key(reinterpret_cast<const char*>(p + kRecordHeaderSize), kl);
+        std::string_view val(reinterpret_cast<const char*>(p + kRecordHeaderSize + kl), vl);
+        Status st = out.put(key, pv.version(), val, pv.tombstone(), e.hash);
         if (!st.ok()) return st;
         flushed.push_back({e.hash, e.packed_ver});
-        uint64_t v = e.pv.version();
+        uint64_t v = pv.version();
         if (v > max_ver) max_ver = v;
         return Status::OK();
     };
 
+    // Slots are sorted by (hash asc, pv asc) within each page.
+    // Iterate buckets 0→65535 for global hash order; concatenate pages
+    // per bucket chain — no sort needed.
+    std::vector<SlimEntry> bucket_entries;
+
     for (uint32_t bi = 0; bi < kNumBuckets; ++bi) {
-        const Bucket* b = &buckets_[bi];
-        if (b->count == 0 && b->overflow == 0) continue;
+        const uint8_t* b = primaryBucket(bi);
+        if (bucketCount(b) == 0 && bucketExtPtr(b) == 0) continue;
 
         bucket_entries.clear();
 
         while (b) {
-            for (uint32_t i = 0; i < b->count; ++i) {
-                uint32_t off = b->slots[i].offset;
-                std::string key = readKey(off);
-                uint64_t h = dhtHashBytes(key.data(), key.size());
-                PackedVersion pv = readPackedVersion(off);
-                std::string val;
-                readValue(off, val);
-                bucket_entries.push_back({h, pv.data, std::move(key),
-                                          pv, std::move(val)});
+            uint16_t cnt = bucketCount(b);
+            const Slot* sl = bucketSlots(b);
+            for (uint16_t i = 0; i < cnt; ++i) {
+                bucket_entries.push_back({sl[i].hash, sl[i].pv, sl[i].offset});
             }
-            b = b->overflow ? &getOverflowBucket(b->overflow) : nullptr;
+            uint32_t ext = bucketExtPtr(b);
+            b = ext ? extBucketData(ext) : nullptr;
         }
 
-        // Sort by (hash asc, version asc) to group entries per hash
-        // in version order for the dedup algorithm — same as GC.
-        std::sort(bucket_entries.begin(), bucket_entries.end(),
-                  [](const FlatEntry& a, const FlatEntry& b) {
-                      if (a.hash != b.hash) return a.hash < b.hash;
-                      return a.pv.version() < b.pv.version();  // asc
-                  });
-
-        // Dedup: for each hash group, use the two-pointer scan to
-        // decide which versions to keep based on snapshot visibility.
-        // Same grouping as GC — by hash, not by full key.
+        // Dedup: entries are already in (hash asc, pv asc) order.
         size_t i = 0;
         while (i < bucket_entries.size()) {
-            // Find the end of this hash group.
             size_t j = i + 1;
             while (j < bucket_entries.size() &&
                    bucket_entries[j].hash == bucket_entries[i].hash) {
@@ -557,14 +518,12 @@ Memtable::FlushResult Memtable::flush(Segment& out,
             size_t group_size = j - i;
 
             if (snapshot_versions.empty() || group_size == 1) {
-                // No snapshots or single entry: keep only latest (last in asc order).
                 s = emit(bucket_entries[j - 1]);
                 if (!s.ok()) return {s, {}, 0};
             } else {
-                // Extract versions for dedup.
                 std::vector<uint64_t> vers(group_size);
                 for (size_t k = 0; k < group_size; ++k) {
-                    vers[k] = bucket_entries[i + k].pv.version();
+                    vers[k] = PackedVersion(bucket_entries[i + k].packed_ver).version();
                 }
                 std::unique_ptr<bool[]> keep(new bool[group_size]);
                 dedupVersionGroup(vers.data(), group_size,

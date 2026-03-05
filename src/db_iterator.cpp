@@ -104,6 +104,8 @@ private:
             scan_value_.assign(e.value.data(), e.value.size());
             seg_stream_->next();
 
+            uint64_t scan_hkey = internal::dhtHashBytes(scan_key_.data(), scan_key_.size());
+
             // WB precedence: if any pinned Memtable has a version for this key
             // at snapshot, skip — it will be emitted in Phase 2.
             {
@@ -111,7 +113,7 @@ private:
                 uint64_t wver;
                 bool wtomb;
                 for (auto* mt : pinned_snap_.memtables) {
-                    if (mt->getByVersion(scan_key_, packed_bound,
+                    if (mt->getByVersion(scan_hkey, packed_bound,
                                          wb_probe_, wver, wtomb)) {
                         wb_has_key = true;
                         break;
@@ -124,7 +126,6 @@ private:
             // pertinent entry for the key in the GlobalIndex.
             uint64_t gi_packed_version;
             uint32_t gi_segment_id;
-            uint64_t scan_hkey = internal::dhtHashBytes(scan_key_.data(), scan_key_.size());
             if (!db_->global_index_->get(scan_hkey, packed_bound,
                                          gi_packed_version, gi_segment_id)) {
                 continue;
