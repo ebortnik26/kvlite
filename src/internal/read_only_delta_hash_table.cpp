@@ -153,6 +153,35 @@ size_t ReadOnlyDeltaHashTable::endBatch() {
     return result;
 }
 
+// --- Binary snapshot ---
+
+void ReadOnlyDeltaHashTable::writeExtData(uint8_t* dst) const {
+    uint32_t stride = bucketStride();
+    for (uint32_t i = 1; i <= ext_arena_owned_.size(); ++i) {
+        const Bucket* b = ext_arena_owned_.get(i);
+        std::memcpy(dst, b->data, stride);
+        dst += stride;
+    }
+}
+
+void ReadOnlyDeltaHashTable::loadBinary(const uint8_t* arena_data, size_t arena_len,
+                                         const uint8_t* ext_data, uint32_t ext_count,
+                                         size_t entry_count) {
+    assert(!sealed_);
+    loadArenaData(arena_data, arena_len);
+
+    // Reconstruct extension buckets in the same 1-based index order.
+    uint32_t stride = bucketStride();
+    for (uint32_t i = 0; i < ext_count; ++i) {
+        uint32_t idx = ext_arena_owned_.allocate();
+        Bucket* b = ext_arena_owned_.get(idx);
+        std::memcpy(b->data, ext_data + static_cast<size_t>(i) * stride, stride);
+    }
+
+    size_ = entry_count;
+    sealed_ = true;
+}
+
 void ReadOnlyDeltaHashTable::seal() {
     assert(!sealed_);
     sealed_ = true;

@@ -11,8 +11,9 @@
 namespace kvlite {
 namespace internal {
 
-Memtable::Memtable()
-    : data_(new uint8_t[kDataCapacity]),
+Memtable::Memtable(size_t data_capacity)
+    : data_capacity_(std::max(data_capacity, kMinDataCapacity)),
+      data_(new uint8_t[data_capacity_]),
       buckets_(new uint8_t[static_cast<size_t>(kNumBuckets) * kBucketBytes]()),
       locks_(std::make_unique<Spinlock[]>(kNumBuckets)),
       ext_arena_(sizeof(Bucket) + kBucketBytes, /*concurrent=*/true) {}
@@ -22,11 +23,11 @@ Memtable::~Memtable() = default;
 // --- Data buffer I/O -----------------------------------------------------
 //
 // Record layout (all little-endian on x86):
-//   offset + 0:  uint16_t key_len
-//   offset + 2:  uint32_t value_len
-//   offset + 6:  uint64_t packed_version
-//   offset + 14: uint8_t  key[key_len]
-//   offset + 14 + key_len: uint8_t value[value_len]
+//   offset + 0:               uint16_t key_len        (kKeyLenSize)
+//   offset + kValueLenOffset: uint32_t value_len      (kValueLenSize)
+//   offset + kPackedVerOffset:uint64_t packed_version  (kPackedVerSize)
+//   offset + kRecordHeaderSize:         key[key_len]
+//   offset + kRecordHeaderSize + key_len: value[value_len]
 
 uint32_t Memtable::appendRecord(const std::string& key, PackedVersion pv,
                                 const std::string& value) {
@@ -37,10 +38,10 @@ uint32_t Memtable::appendRecord(const std::string& key, PackedVersion pv,
     size_t off = data_end_.fetch_add(record_size, std::memory_order_relaxed);
 
     uint8_t* p = data_.get() + off;
-    std::memcpy(p, &key_len, 2);  p += 2;
-    std::memcpy(p, &val_len, 4);  p += 4;
-    std::memcpy(p, &pv.data, 8);  p += 8;
-    std::memcpy(p, key.data(), key_len);  p += key_len;
+    std::memcpy(p, &key_len, kKeyLenSize);    p += kKeyLenSize;
+    std::memcpy(p, &val_len, kValueLenSize);  p += kValueLenSize;
+    std::memcpy(p, &pv.data, kPackedVerSize); p += kPackedVerSize;
+    std::memcpy(p, key.data(), key_len);      p += key_len;
     std::memcpy(p, value.data(), val_len);
 
     return static_cast<uint32_t>(off);
@@ -50,15 +51,15 @@ void Memtable::readValue(uint32_t off, std::string& value) const {
     const uint8_t* p = data_.get() + off;
     uint16_t kl;
     uint32_t vl;
-    std::memcpy(&kl, p, 2);
-    std::memcpy(&vl, p + 2, 4);
+    std::memcpy(&kl, p, kKeyLenSize);
+    std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
     value.assign(reinterpret_cast<const char*>(p + kRecordHeaderSize + kl), vl);
 }
 
 std::string Memtable::readKey(uint32_t off) const {
     const uint8_t* p = data_.get() + off;
     uint16_t kl;
-    std::memcpy(&kl, p, 2);
+    std::memcpy(&kl, p, kKeyLenSize);
     return std::string(reinterpret_cast<const char*>(p + kRecordHeaderSize), kl);
 }
 
@@ -367,7 +368,7 @@ private:
     void materialize() {
         const auto& r = records_[idx_];
         const char* key_ptr = reinterpret_cast<const char*>(
-            data_ + r.offset + 14);  // kRecordHeaderSize = 14
+            data_ + r.offset + Memtable::kRecordHeaderSize);
         const char* val_ptr = key_ptr + r.key_len;
 
         current_.hash = r.hash;
@@ -419,8 +420,8 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
                 const uint8_t* p = data_ptr + s[i].offset;
                 uint16_t kl;
                 uint32_t vl;
-                std::memcpy(&kl, p, 2);
-                std::memcpy(&vl, p + 2, 4);
+                std::memcpy(&kl, p, kKeyLenSize);
+                std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
 
                 bucket_recs.push_back({s[i].hash, s[i].offset, kl, vl,
                                        PackedVersion(s[i].pv)});
@@ -474,8 +475,8 @@ Memtable::FlushResult Memtable::flush(Segment& out,
         const uint8_t* p = data_base + e.offset;
         uint16_t kl;
         uint32_t vl;
-        std::memcpy(&kl, p, 2);
-        std::memcpy(&vl, p + 2, 4);
+        std::memcpy(&kl, p, kKeyLenSize);
+        std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
         std::string_view key(reinterpret_cast<const char*>(p + kRecordHeaderSize), kl);
         std::string_view val(reinterpret_cast<const char*>(p + kRecordHeaderSize + kl), vl);
         uint64_t entry_offset;

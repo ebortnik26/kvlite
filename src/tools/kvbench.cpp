@@ -36,7 +36,7 @@ struct Config {
     int value_size = 100;
     bool preload = true;
     int report_interval = 5;
-    size_t memtable_size = 64 * 1024 * 1024;
+    size_t memtable_size = kvlite::Options{}.memtable_size;
     bool buffered_writes = true;
     std::string key_dist = "uniform";
     bool extended = false;

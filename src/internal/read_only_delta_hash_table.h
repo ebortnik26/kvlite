@@ -45,6 +45,18 @@ public:
     // Transition to read-only state. After this, writes are forbidden.
     void seal();
 
+    // --- Binary snapshot (raw arena write/load, zero codec ops) ---
+
+    uint32_t extCount() const { return ext_arena_owned_.size(); }
+
+    // Write extension bucket data contiguously (extCount() × bucketStride() bytes).
+    void writeExtData(uint8_t* dst) const;
+
+    // Load primary arena + extensions from raw data. Sets size and seals.
+    void loadBinary(const uint8_t* arena_data, size_t arena_bytes,
+                    const uint8_t* ext_data, uint32_t ext_count,
+                    size_t entry_count);
+
     // --- Stats ---
 
     size_t size() const;

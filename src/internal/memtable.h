@@ -23,7 +23,7 @@ class Segment;
 // In-memory buffer for pending writes before flush to log files.
 //
 // Layout:
-//   Data buffer  – contiguous, append-only byte array (256 MB fixed).
+//   Data buffer  – contiguous, append-only byte array (sized to memtable_size).
 //                  Each record: [key_len:2][value_len:4][packed_version:8][key][value]
 //   Hash index   – contiguous array of 64K primary buckets (256 bytes each).
 //                  Each bucket holds 12 packed Slots of {hash, pv, offset}.
@@ -44,7 +44,9 @@ public:
         bool operator<(const Entry& other) const { return pv < other.pv; }
     };
 
-    Memtable();
+    static constexpr size_t kDefaultDataCapacity = 256 * 1024 * 1024;  // 256 MB
+
+    explicit Memtable(size_t data_capacity = kDefaultDataCapacity);
     ~Memtable();
 
     Memtable(const Memtable&) = delete;
@@ -118,15 +120,15 @@ public:
     static constexpr uint32_t numBuckets() { return kNumBuckets; }
     bool empty() const { return size_.load(std::memory_order_relaxed) == 0; }
 
-private:
-    // --- Configuration ---
-    static constexpr uint32_t kBucketBits = 16;
-    static constexpr uint32_t kNumBuckets = 1u << kBucketBits;            // 65536
-    static constexpr uint32_t kBucketBytes = 256;
-    static constexpr uint32_t kSlotsPerBucket = 12;  // (256 - 6) / 20
-    static constexpr size_t kDataCapacity = 1u << 28;                     // 256 MB
-    static constexpr size_t kRecordHeaderSize = 14;   // key_len(2) + value_len(4) + pv(8)
+    // --- Record layout (data buffer) ---
+    static constexpr size_t kKeyLenSize    = sizeof(uint16_t);  // 2
+    static constexpr size_t kValueLenSize  = sizeof(uint32_t);  // 4
+    static constexpr size_t kPackedVerSize = sizeof(uint64_t);  // 8
+    static constexpr size_t kRecordHeaderSize = kKeyLenSize + kValueLenSize + kPackedVerSize;
+    static constexpr size_t kValueLenOffset  = kKeyLenSize;
+    static constexpr size_t kPackedVerOffset = kKeyLenSize + kValueLenSize;
 
+private:
     // --- Slot: 20 bytes (packed) ---
     //
     // Full 64-bit hash stored so flush/createStream can pass it to
@@ -138,13 +140,21 @@ private:
     };
     static_assert(sizeof(Slot) == 20, "Slot must be 20 bytes");
 
-    // Bucket layout (kBucketBytes = 256 bytes):
-    //   offset  0: uint16_t count     — used slots
-    //   offset  2: uint32_t ext_ptr   — 1-based BucketArena index (0 = none)
-    //   offset  6: Slot[12]           — 12 × 20 = 240 bytes
-    //   offset 246: uint8_t pad[10]
+    // --- Bucket layout ---
+    static constexpr uint32_t kBucketCountSize  = sizeof(uint16_t);  // 2
+    static constexpr uint32_t kBucketExtPtrSize = sizeof(uint32_t);  // 4
+    static constexpr uint32_t kBucketHeaderSize = kBucketCountSize + kBucketExtPtrSize;  // 6
 
-    // --- Data buffer (append-only, fixed 256 MB) ---
+    // --- Configuration ---
+    static constexpr uint32_t kBucketBits = 16;
+    static constexpr uint32_t kNumBuckets = 1u << kBucketBits;            // 65536
+    static constexpr uint32_t kBucketBytes = 256;
+    static constexpr uint32_t kSlotsPerBucket =
+        (kBucketBytes - kBucketHeaderSize) / sizeof(Slot);                // 12
+    static constexpr size_t kMinDataCapacity = 64 * 1024;                   // 64 KB floor
+
+    // --- Data buffer (append-only) ---
+    size_t data_capacity_;
     std::unique_ptr<uint8_t[]> data_;
     std::atomic<size_t> data_end_{0};
 
@@ -171,22 +181,22 @@ private:
     }
 
     static uint16_t bucketCount(const uint8_t* b) {
-        uint16_t v; std::memcpy(&v, b, 2); return v;
+        uint16_t v; std::memcpy(&v, b, kBucketCountSize); return v;
     }
     static void setBucketCount(uint8_t* b, uint16_t c) {
-        std::memcpy(b, &c, 2);
+        std::memcpy(b, &c, kBucketCountSize);
     }
     static uint32_t bucketExtPtr(const uint8_t* b) {
-        uint32_t v; std::memcpy(&v, b + 2, 4); return v;
+        uint32_t v; std::memcpy(&v, b + kBucketCountSize, kBucketExtPtrSize); return v;
     }
     static void setBucketExtPtr(uint8_t* b, uint32_t e) {
-        std::memcpy(b + 2, &e, 4);
+        std::memcpy(b + kBucketCountSize, &e, kBucketExtPtrSize);
     }
     static Slot* bucketSlots(uint8_t* b) {
-        return reinterpret_cast<Slot*>(b + 6);
+        return reinterpret_cast<Slot*>(b + kBucketHeaderSize);
     }
     static const Slot* bucketSlots(const uint8_t* b) {
-        return reinterpret_cast<const Slot*>(b + 6);
+        return reinterpret_cast<const Slot*>(b + kBucketHeaderSize);
     }
 
     uint8_t* extBucketData(uint32_t ext_ptr) {

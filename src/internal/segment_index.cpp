@@ -9,19 +9,15 @@
 namespace kvlite {
 namespace internal {
 
-static const uint32_t kSegmentIndexMagic = 0x4C324958;  // "L2IX" (legacy)
+static constexpr uint32_t kMagic = 0x53494232;  // "SIB2"
 
-struct SegmentIndexHeader {
+// On-disk header — followed by raw arena + extension data + CRC32.
+struct IndexHeader {
     uint32_t magic;
-    uint32_t entry_count;
     uint32_t key_count;
-    uint32_t reserved;
-};
-
-struct SegmentIndexEntry {
-    uint64_t hash;
-    uint32_t offset;
-    uint64_t packed_version;
+    uint32_t entry_count;
+    uint32_t ext_count;
+    uint64_t arena_bytes;
 };
 
 static ReadOnlyDeltaHashTable::Config defaultDHTConfig() {
@@ -93,36 +89,32 @@ bool SegmentIndex::contains(uint64_t hash) const {
 }
 
 Status SegmentIndex::writeTo(LogFile& file) {
-    // Seal the DHT — no more writes after serialization.
     dht_.seal();
 
-    // Single-buffer serialization: header + entries + crc32.
-    // No intermediate vector — forEach writes directly into the output buffer.
-    const size_t num_entries = dht_.size();
-    const size_t header_size = sizeof(SegmentIndexHeader);
-    const size_t entries_size = num_entries * sizeof(SegmentIndexEntry);
-    const size_t payload_size = header_size + entries_size;
+    const size_t arena_bytes = dht_.arenaBytes();
+    const uint32_t ext_count = dht_.extCount();
+    const uint32_t stride = dht_.bucketStride();
+    const size_t ext_bytes = static_cast<size_t>(ext_count) * stride;
+
+    const size_t payload_size = sizeof(IndexHeader) + arena_bytes + ext_bytes;
     const size_t total_size = payload_size + sizeof(uint32_t);
 
     std::vector<uint8_t> buf(total_size);
 
-    // Write header.
-    SegmentIndexHeader header;
-    header.magic = kSegmentIndexMagic;
-    header.entry_count = static_cast<uint32_t>(num_entries);
-    header.key_count = static_cast<uint32_t>(key_count_);
-    header.reserved = 0;
-    std::memcpy(buf.data(), &header, header_size);
+    IndexHeader hdr{};
+    hdr.magic = kMagic;
+    hdr.key_count = static_cast<uint32_t>(key_count_);
+    hdr.entry_count = static_cast<uint32_t>(dht_.size());
+    hdr.ext_count = ext_count;
+    hdr.arena_bytes = arena_bytes;
+    std::memcpy(buf.data(), &hdr, sizeof(hdr));
 
-    // Write entries directly into buffer.
-    size_t entry_offset = header_size;
-    dht_.forEach([&buf, &entry_offset](uint64_t hash, uint64_t packed_version, uint32_t id) {
-        SegmentIndexEntry entry{hash, id, packed_version};
-        std::memcpy(buf.data() + entry_offset, &entry, sizeof(entry));
-        entry_offset += sizeof(entry);
-    });
+    std::memcpy(buf.data() + sizeof(hdr), dht_.arenaData(), arena_bytes);
 
-    // Compute and write CRC32 over header + entries.
+    if (ext_count > 0) {
+        dht_.writeExtData(buf.data() + sizeof(hdr) + arena_bytes);
+    }
+
     uint32_t checksum = crc32(buf.data(), payload_size);
     std::memcpy(buf.data() + payload_size, &checksum, sizeof(uint32_t));
 
@@ -131,44 +123,38 @@ Status SegmentIndex::writeTo(LogFile& file) {
 }
 
 Status SegmentIndex::readFrom(const LogFile& file, uint64_t offset) {
-    // Read header.
-    SegmentIndexHeader header;
-    Status s = file.readAt(offset, &header, sizeof(header));
+    IndexHeader hdr;
+    Status s = file.readAt(offset, &hdr, sizeof(hdr));
     if (!s.ok()) return s;
 
-    if (header.magic != kSegmentIndexMagic) {
+    if (hdr.magic != kMagic) {
         return Status::Corruption("SegmentIndex: bad magic");
     }
 
-    // Read entries.
-    const size_t entries_size = header.entry_count * sizeof(SegmentIndexEntry);
-    const size_t payload_size = sizeof(SegmentIndexHeader) + entries_size;
+    const uint32_t stride = dht_.bucketStride();
+    const size_t ext_bytes = static_cast<size_t>(hdr.ext_count) * stride;
+    const size_t payload_size = sizeof(IndexHeader) + hdr.arena_bytes + ext_bytes;
     const size_t total_size = payload_size + sizeof(uint32_t);
 
     std::vector<uint8_t> buf(total_size);
     s = file.readAt(offset, buf.data(), total_size);
     if (!s.ok()) return s;
 
-    // Verify CRC32.
     uint32_t stored_crc;
     std::memcpy(&stored_crc, buf.data() + payload_size, sizeof(uint32_t));
-    uint32_t computed_crc = crc32(buf.data(), payload_size);
-    if (stored_crc != computed_crc) {
+    if (crc32(buf.data(), payload_size) != stored_crc) {
         return Status::ChecksumMismatch("SegmentIndex: checksum mismatch");
     }
 
-    // Rebuild the index.
     clear();
-    const SegmentIndexEntry* entries = reinterpret_cast<const SegmentIndexEntry*>(
-        buf.data() + sizeof(SegmentIndexHeader));
-    for (uint32_t i = 0; i < header.entry_count; ++i) {
-        // DHT stores (packed_version, id=offset)
-        dht_.addEntry(entries[i].hash, entries[i].packed_version, entries[i].offset);
-    }
-    key_count_ = header.key_count;
 
-    // Seal the DHT — deserialized indexes are immutable.
-    dht_.seal();
+    const uint8_t* arena_data = buf.data() + sizeof(IndexHeader);
+    const uint8_t* ext_data = arena_data + hdr.arena_bytes;
+
+    dht_.loadBinary(arena_data, hdr.arena_bytes,
+                    ext_data, hdr.ext_count,
+                    hdr.entry_count);
+    key_count_ = hdr.key_count;
 
     return Status::OK();
 }
@@ -183,7 +169,6 @@ void SegmentIndex::forEachGroup(
     const std::function<void(uint64_t hash,
                              const std::vector<uint32_t>& offsets,
                              const std::vector<uint64_t>& packed_versions)>& fn) const {
-    // DHT stores (packed_versions, ids=offsets) — swap for caller
     dht_.forEachGroup([&fn](uint64_t hash,
                             const std::vector<uint64_t>& pvs,
                             const std::vector<uint32_t>& ids) {

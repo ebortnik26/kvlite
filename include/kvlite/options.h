@@ -34,8 +34,8 @@ struct Options {
 
     // Capacity of each Memtable in bytes
     // When exceeded, the Memtable is sealed and flushed to a new log file
-    // Default: 64MB
-    size_t memtable_size = 64 * 1024 * 1024;
+    // Default: 256MB
+    size_t memtable_size = 256 * 1024 * 1024;
 
     // Number of Memtables in the write buffer pipeline (default 3).
     // 1 mutable + up to (flush_depth - 1) immutable in the flush queue.

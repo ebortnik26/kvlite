@@ -247,13 +247,12 @@ TEST_F(SegmentIndexSerializationTest, BadMagic) {
     {
         LogFile f;
         ASSERT_TRUE(f.create(path_).ok());
+        // Write a fake header with bad magic (must be >= IndexHeader size).
+        uint8_t bad[32] = {};
         uint32_t bad_magic = 0xDEADBEEF;
-        uint32_t zeros[3] = {0, 0, 0};
+        std::memcpy(bad, &bad_magic, sizeof(bad_magic));
         uint64_t dummy;
-        f.append(&bad_magic, sizeof(bad_magic), dummy);
-        f.append(zeros, sizeof(zeros), dummy);
-        uint32_t crc = 0;
-        f.append(&crc, sizeof(crc), dummy);
+        f.append(bad, sizeof(bad), dummy);
         f.close();
     }
 
