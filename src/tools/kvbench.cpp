@@ -11,6 +11,10 @@
 #include <thread>
 #include <vector>
 
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include "kvlite/db.h"
 #include "kvlite/options.h"
 #include "kvlite/status.h"
@@ -35,6 +39,8 @@ struct Config {
     size_t write_buffer_size = 64 * 1024 * 1024;
     bool buffered_writes = true;
     std::string key_dist = "uniform";
+    bool extended = false;
+    std::string flame_output;  // empty = disabled
     std::string db_path;
 };
 
@@ -58,6 +64,8 @@ static void printUsage(const char* prog) {
         "  --write-buffer-size N  Write buffer size in bytes (default: 67108864)\n"
         "  --key-dist NAME        Key distribution: uniform or zipf [YCSB] (default: uniform)\n"
         "  --no-buffered-writes   Disable LogFile write buffering\n"
+        "  -x, --extended         Print extended report (DB stats, DHT codec stats)\n"
+        "  -f, --flame [PATH]     Generate flame graph SVG (default: flamegraph.svg)\n"
         "  --help                 Show this message\n",
         prog);
 }
@@ -93,6 +101,15 @@ static bool parseArgs(int argc, char** argv, Config& cfg) {
                 std::exit(1);
             }
             cfg.key_dist = argv[++i];
+        }
+        else if (arg("-x") || arg("--extended")) cfg.extended = true;
+        else if (arg("-f") || arg("--flame")) {
+            // Optional path argument: next arg that doesn't start with '-'
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                cfg.flame_output = argv[++i];
+            } else {
+                cfg.flame_output = "flamegraph.svg";
+            }
         }
         else if (argv[i][0] == '-') {
             std::fprintf(stderr, "Unknown flag: %s\n", argv[i]);
@@ -475,7 +492,8 @@ static void reporterThread(std::vector<ThreadState>& states,
 
 static void printFinalReport(std::vector<ThreadState>& states,
                              double elapsed_sec,
-                             kvlite::DB& db) {
+                             kvlite::DB& db,
+                             bool extended = false) {
     // Merge cumulative sketches
     datasketches::kll_sketch<double> merged[kNumOpTypes] = {
         datasketches::kll_sketch<double>(200),
@@ -517,36 +535,53 @@ static void printFinalReport(std::vector<ThreadState>& states,
                    merged[0]);
     printReportRow("get", total_get, total_found, total_miss, merged[1]);
 
-    // DB stats
-    kvlite::DBStats stats;
-    auto s = db.getStats(stats);
-    if (s.ok()) {
-        std::printf("\n--- DB Stats ---\n");
-        std::printf("Log files:    %llu\n",
-                    static_cast<unsigned long long>(stats.num_log_files));
-        std::printf("Total size:   %llu bytes (%.1f MB)\n",
-                    static_cast<unsigned long long>(stats.total_log_size),
-                    static_cast<double>(stats.total_log_size) / (1024.0 * 1024.0));
-        std::printf("Live entries: %llu\n",
-                    static_cast<unsigned long long>(stats.num_live_entries));
-        std::printf("Version:      %llu\n",
-                    static_cast<unsigned long long>(stats.current_version));
+    if (extended) {
+        kvlite::DBStats stats;
+        auto s = db.getStats(stats);
+        if (s.ok()) {
+            std::printf("\n--- DB Stats ---\n");
+            std::printf("Log files:    %llu\n",
+                        static_cast<unsigned long long>(stats.num_log_files));
+            std::printf("Total size:   %llu bytes (%.1f MB)\n",
+                        static_cast<unsigned long long>(stats.total_log_size),
+                        static_cast<double>(stats.total_log_size) / (1024.0 * 1024.0));
+            std::printf("Live entries: %llu\n",
+                        static_cast<unsigned long long>(stats.num_live_entries));
+            std::printf("Version:      %llu\n",
+                        static_cast<unsigned long long>(stats.current_version));
 
-        std::printf("\n--- Background Stats ---\n");
-        std::printf("%-7s %8s %12s %12s\n",
-                    "Task", "Count", "Total(ms)", "Avg(ms)");
-        auto bgRow = [](const char* name, uint64_t count, uint64_t total_us) {
-            double total_ms = static_cast<double>(total_us) / 1000.0;
-            double avg_ms = count > 0 ? total_ms / static_cast<double>(count) : 0.0;
-            std::printf("%-7s %8llu %12.1f %12.1f\n",
-                        name,
-                        static_cast<unsigned long long>(count),
-                        total_ms, avg_ms);
-        };
-        bgRow("flush", stats.flush_count, stats.flush_total_us);
-        bgRow("gc", stats.gc_count, stats.gc_total_us);
-        bgRow("savept", stats.savepoint_count, stats.savepoint_total_us);
-        bgRow("stall", stats.stall_count, stats.stall_total_us);
+            std::printf("\n--- Background Stats ---\n");
+            std::printf("%-7s %8s %12s %12s\n",
+                        "Task", "Count", "Total(ms)", "Avg(ms)");
+            auto bgRow = [](const char* name, uint64_t count, uint64_t total_us) {
+                double total_ms = static_cast<double>(total_us) / 1000.0;
+                double avg_ms = count > 0 ? total_ms / static_cast<double>(count) : 0.0;
+                std::printf("%-7s %8llu %12.1f %12.1f\n",
+                            name,
+                            static_cast<unsigned long long>(count),
+                            total_ms, avg_ms);
+            };
+            bgRow("flush", stats.flush_count, stats.flush_total_us);
+            bgRow("gc", stats.gc_count, stats.gc_total_us);
+            bgRow("savept", stats.savepoint_count, stats.savepoint_total_us);
+            bgRow("stall", stats.stall_count, stats.stall_total_us);
+
+            std::printf("\n--- DHT Codec Stats ---\n");
+            std::printf("%-7s %12s %12s %12s\n",
+                        "Op", "Count", "Total(ms)", "Avg(us)");
+            auto codecRow = [](const char* name, uint64_t count, uint64_t total_ns) {
+                double total_ms = static_cast<double>(total_ns) / 1e6;
+                double avg_us = count > 0
+                    ? static_cast<double>(total_ns) / (static_cast<double>(count) * 1e3)
+                    : 0.0;
+                std::printf("%-7s %12llu %12.1f %12.3f\n",
+                            name,
+                            static_cast<unsigned long long>(count),
+                            total_ms, avg_us);
+            };
+            codecRow("encode", stats.dht_encode_count, stats.dht_encode_total_ns);
+            codecRow("decode", stats.dht_decode_count, stats.dht_decode_total_ns);
+        }
     }
 
     std::printf("==================================\n");
@@ -561,6 +596,105 @@ int main(int argc, char** argv) {
     if (!parseArgs(argc, argv, cfg) || !validateConfig(cfg)) {
         printUsage(argv[0]);
         return 1;
+    }
+
+    // --- Flame graph: re-exec under perf, then post-process ---
+    if (!cfg.flame_output.empty()) {
+        // Check for perf
+        if (std::system("command -v perf >/dev/null 2>&1") != 0) {
+            std::fprintf(stderr,
+                "Error: 'perf' not found. Install linux-tools-generic or "
+                "the perf binary for your kernel.\n");
+            return 1;
+        }
+        // Check for FlameGraph scripts
+        const char* fg_dir = std::getenv("FLAMEGRAPH_DIR");
+        std::string stackcollapse = fg_dir
+            ? std::string(fg_dir) + "/stackcollapse-perf.pl"
+            : "stackcollapse-perf.pl";
+        std::string flamegraph_pl = fg_dir
+            ? std::string(fg_dir) + "/flamegraph.pl"
+            : "flamegraph.pl";
+
+        std::string check_cmd = "command -v " + stackcollapse + " >/dev/null 2>&1";
+        if (std::system(check_cmd.c_str()) != 0) {
+            std::fprintf(stderr,
+                "Error: '%s' not found. Clone FlameGraph repo and add to PATH "
+                "or set FLAMEGRAPH_DIR.\n", stackcollapse.c_str());
+            return 1;
+        }
+
+        std::string perf_data = "/tmp/kvbench_perf_" + std::to_string(getpid()) + ".data";
+        std::string output_svg = cfg.flame_output;
+
+        // Build child argv: same args minus -f/--flame (and its optional path)
+        std::vector<std::string> child_args;
+        child_args.push_back(argv[0]);
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "-f") == 0 || std::strcmp(argv[i], "--flame") == 0) {
+                // Skip the flag and its optional path argument
+                if (i + 1 < argc && argv[i + 1][0] != '-') ++i;
+                continue;
+            }
+            child_args.push_back(argv[i]);
+        }
+
+        // Build perf record command
+        std::vector<std::string> perf_args;
+        perf_args.push_back("perf");
+        perf_args.push_back("record");
+        perf_args.push_back("-g");
+        perf_args.push_back("--call-graph");
+        perf_args.push_back("dwarf");
+        perf_args.push_back("-o");
+        perf_args.push_back(perf_data);
+        perf_args.push_back("--");
+        for (auto& a : child_args) perf_args.push_back(a);
+
+        // Convert to char*[]
+        std::vector<char*> exec_argv;
+        for (auto& s : perf_args) exec_argv.push_back(&s[0]);
+        exec_argv.push_back(nullptr);
+
+        std::printf("Flame graph: recording with perf...\n");
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            std::perror("fork");
+            return 1;
+        }
+        if (pid == 0) {
+            // Child: exec perf record
+            execvp(exec_argv[0], exec_argv.data());
+            std::perror("execvp perf");
+            _exit(127);
+        }
+
+        // Parent: wait for child
+        int wstatus = 0;
+        waitpid(pid, &wstatus, 0);
+        if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
+            std::fprintf(stderr, "Warning: perf record exited with status %d\n",
+                         WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
+        }
+
+        // Post-process: perf script | stackcollapse | flamegraph > svg
+        std::string post_cmd =
+            "perf script -i " + perf_data +
+            " | " + stackcollapse +
+            " | " + flamegraph_pl +
+            " > " + output_svg;
+        std::printf("Flame graph: generating %s...\n", output_svg.c_str());
+        int rc = std::system(post_cmd.c_str());
+        if (rc != 0) {
+            std::fprintf(stderr, "Warning: flame graph generation failed (exit %d)\n", rc);
+        } else {
+            std::printf("Flame graph written to %s\n", output_svg.c_str());
+        }
+
+        // Cleanup
+        std::remove(perf_data.c_str());
+        return (rc == 0) ? 0 : 1;
     }
 
     std::printf("kvbench — kvlite benchmark tool\n");
@@ -638,7 +772,7 @@ int main(int argc, char** argv) {
     reporter.join();
 
     double elapsed = elapsedSec(t0, t1);
-    printFinalReport(states, elapsed, db);
+    printFinalReport(states, elapsed, db, cfg.extended);
 
     s = db.close();
     if (!s.ok()) {

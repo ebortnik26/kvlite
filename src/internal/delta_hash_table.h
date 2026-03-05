@@ -1,6 +1,7 @@
 #ifndef KVLITE_INTERNAL_DELTA_HASH_TABLE_H
 #define KVLITE_INTERNAL_DELTA_HASH_TABLE_H
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -75,6 +76,13 @@ public:
                                                const std::vector<uint32_t>& ids)>& fn) const;
 
     size_t memoryUsage() const;
+
+    // --- Codec instrumentation ---
+
+    uint64_t encodeCount() const { return encode_count_.load(std::memory_order_relaxed); }
+    uint64_t encodeTotalNs() const { return encode_total_ns_.load(std::memory_order_relaxed); }
+    uint64_t decodeCount() const { return decode_count_.load(std::memory_order_relaxed); }
+    uint64_t decodeTotalNs() const { return decode_total_ns_.load(std::memory_order_relaxed); }
 
     // --- Public accessors for binary snapshot ---
 
@@ -157,6 +165,12 @@ protected:
     std::unique_ptr<uint8_t[]> arena_;
     std::vector<Bucket> buckets_;
     BucketArena* ext_arena_;    // non-owning; set by derived class
+
+    // Codec timing instrumentation
+    mutable std::atomic<uint64_t> encode_count_{0};
+    mutable std::atomic<uint64_t> encode_total_ns_{0};
+    mutable std::atomic<uint64_t> decode_count_{0};
+    mutable std::atomic<uint64_t> decode_total_ns_{0};
 
 private:
     void initBucket(Bucket& bucket);

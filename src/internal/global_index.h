@@ -133,6 +133,12 @@ public:
     // Fraction of key groups with more than one version (0.0–1.0).
     double estimateDeadRatio() const;
 
+    // DHT codec instrumentation
+    uint64_t dhtEncodeCount() const { return dht_.encodeCount(); }
+    uint64_t dhtEncodeTotalNs() const { return dht_.encodeTotalNs(); }
+    uint64_t dhtDecodeCount() const { return dht_.decodeCount(); }
+    uint64_t dhtDecodeTotalNs() const { return dht_.decodeTotalNs(); }
+
 private:
     // --- Core DHT mutations (no WAL, no savepoint counter) ---
     // Used by both the public API (which also writes to WAL) and WAL replay.

@@ -499,6 +499,11 @@ Status DB::getStats(DBStats& stats) const {
     stats.stall_count = write_buffer_->stallCount();
     stats.stall_total_us = write_buffer_->stallTotalUs();
 
+    stats.dht_encode_count = global_index_->dhtEncodeCount();
+    stats.dht_encode_total_ns = global_index_->dhtEncodeTotalNs();
+    stats.dht_decode_count = global_index_->dhtDecodeCount();
+    stats.dht_decode_total_ns = global_index_->dhtDecodeTotalNs();
+
     return Status::OK();
 }
 

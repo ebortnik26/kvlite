@@ -47,6 +47,12 @@ struct DBStats {
     // Write stall stats (writer blocked waiting for flush to free a slot)
     uint64_t stall_count = 0;
     uint64_t stall_total_us = 0;        // cumulative stall time in microseconds
+
+    // DHT codec instrumentation
+    uint64_t dht_encode_count = 0;
+    uint64_t dht_encode_total_ns = 0;
+    uint64_t dht_decode_count = 0;
+    uint64_t dht_decode_total_ns = 0;
 };
 
 class Snapshot {
