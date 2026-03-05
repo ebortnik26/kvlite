@@ -43,7 +43,7 @@ public:
         bool operator<(const Entry& other) const { return pv < other.pv; }
     };
 
-    Memtable();
+    explicit Memtable(size_t capacity = 64 * 1024 * 1024);
     ~Memtable();
 
     Memtable(const Memtable&) = delete;
@@ -119,7 +119,6 @@ private:
     // --- Configuration ---
     static constexpr uint32_t kBucketBits = 13;
     static constexpr uint32_t kNumBuckets = 1u << kBucketBits;          // 8192
-    static constexpr size_t kDefaultDataCapacity = 1ULL << 30;          // 1 GB
     static constexpr uint32_t kSlotsPerBucket = 63;
     static constexpr size_t kRecordHeaderSize = 14;  // key_len(2) + value_len(4) + pv(8)
 

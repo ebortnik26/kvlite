@@ -36,7 +36,7 @@ protected:
 TEST_F(GCDaemonTest, AutoGCCompactsSegments) {
     kvlite::Options opts;
     opts.create_if_missing = true;
-    opts.write_buffer_size = 256;   // tiny buffer -> many segments
+    opts.memtable_size = 256;   // tiny buffer -> many segments
     opts.gc_threshold = 0.1;        // very low threshold to trigger easily
     opts.gc_interval_sec = 1;       // fast wake-up
     opts.gc_max_segments = 10;
@@ -86,7 +86,7 @@ TEST_F(GCDaemonTest, AutoGCCompactsSegments) {
 TEST_F(GCDaemonTest, ManualPolicyNoAutoGC) {
     kvlite::Options opts;
     opts.create_if_missing = true;
-    opts.write_buffer_size = 256;
+    opts.memtable_size = 256;
     opts.gc_policy = kvlite::GCPolicy::MANUAL;
     opts.gc_threshold = 0.0;        // would always trigger if daemon ran
     opts.gc_interval_sec = 1;
@@ -115,7 +115,7 @@ TEST_F(GCDaemonTest, ManualPolicyNoAutoGC) {
 TEST_F(GCDaemonTest, DisabledByZeroInterval) {
     kvlite::Options opts;
     opts.create_if_missing = true;
-    opts.write_buffer_size = 256;
+    opts.memtable_size = 256;
     opts.gc_threshold = 0.0;
     opts.gc_interval_sec = 0;       // explicitly disabled
     ASSERT_TRUE(db_.open(test_dir_.string(), opts).ok());

@@ -193,7 +193,7 @@ kvlite::Options options;
 
 // Storage
 options.log_file_size = 1ULL * 1024 * 1024 * 1024;  // 1GB per segment file
-options.write_buffer_size = 64 * 1024 * 1024;        // 64MB write buffer
+options.memtable_size = 64 * 1024 * 1024;             // 64MB memtable capacity
 options.flush_depth = 3;                              // Pipeline depth (mutable + immutable)
 
 // GlobalIndex Persistence

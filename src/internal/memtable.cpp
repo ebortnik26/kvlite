@@ -11,9 +11,9 @@
 namespace kvlite {
 namespace internal {
 
-Memtable::Memtable()
-    : data_(new uint8_t[kDefaultDataCapacity]),  // uninitialized — pages allocated lazily
-      data_capacity_(kDefaultDataCapacity),
+Memtable::Memtable(size_t capacity)
+    : data_(new uint8_t[capacity * 2]),  // 2x headroom for in-flight entries past seal threshold
+      data_capacity_(capacity * 2),
       buckets_(std::make_unique<Bucket[]>(kNumBuckets)),   // zero-initialized
       locks_(std::make_unique<Spinlock[]>(kNumBuckets)) {
     std::memset(overflow_blocks_, 0, sizeof(overflow_blocks_));

@@ -157,7 +157,7 @@ TEST_F(DBTest, OverwriteAcrossFlush) {
 
 TEST_F(DBTest, AutoFlushTriggersOnLargeWrite) {
     kvlite::Options opts;
-    opts.write_buffer_size = 256;  // tiny buffer -> auto-flush quickly
+    opts.memtable_size = 256;  // tiny buffer -> auto-flush quickly
     ASSERT_TRUE(openDB(opts).ok());
 
     // Write enough data to exceed the tiny buffer

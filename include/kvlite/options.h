@@ -32,10 +32,10 @@ struct Options {
     // Default: 1GB
     size_t log_file_size = 1ULL * 1024 * 1024 * 1024;
 
-    // Size of the write buffer in bytes
-    // Writes accumulate here before flushing to a new log file
+    // Capacity of each Memtable in bytes
+    // When exceeded, the Memtable is sealed and flushed to a new log file
     // Default: 64MB
-    size_t write_buffer_size = 64 * 1024 * 1024;
+    size_t memtable_size = 64 * 1024 * 1024;
 
     // Number of Memtables in the write buffer pipeline (default 3).
     // 1 mutable + up to (flush_depth - 1) immutable in the flush queue.

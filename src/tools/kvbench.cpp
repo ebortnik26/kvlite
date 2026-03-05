@@ -36,7 +36,7 @@ struct Config {
     int value_size = 100;
     bool preload = true;
     int report_interval = 5;
-    size_t write_buffer_size = 64 * 1024 * 1024;
+    size_t memtable_size = 64 * 1024 * 1024;
     bool buffered_writes = true;
     std::string key_dist = "uniform";
     bool extended = false;
@@ -61,7 +61,7 @@ static void printUsage(const char* prog) {
         "  --value-size N         Value size in bytes (default: 100)\n"
         "  --no-preload           Skip preload phase\n"
         "  --report-interval N    Seconds between reports (default: 5)\n"
-        "  --write-buffer-size N  Write buffer size in bytes (default: 67108864)\n"
+        "  --memtable-size N      Memtable capacity in bytes (default: 67108864)\n"
         "  --key-dist NAME        Key distribution: uniform or zipf [YCSB] (default: uniform)\n"
         "  --no-buffered-writes   Disable LogFile write buffering\n"
         "  -x, --extended         Print extended report (DB stats, DHT codec stats)\n"
@@ -94,7 +94,7 @@ static bool parseArgs(int argc, char** argv, Config& cfg) {
         else if (arg("--no-preload"))        cfg.preload = false;
         else if (arg("--no-buffered-writes")) cfg.buffered_writes = false;
         else if (arg("--report-interval"))   cfg.report_interval = static_cast<int>(nextInt());
-        else if (arg("--write-buffer-size")) cfg.write_buffer_size = static_cast<size_t>(nextInt());
+        else if (arg("--memtable-size")) cfg.memtable_size = static_cast<size_t>(nextInt());
         else if (arg("--key-dist")) {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "Missing value for %s\n", argv[i]);
@@ -716,8 +716,8 @@ int main(int argc, char** argv) {
     std::printf("  key_dist:          %s\n", cfg.key_dist.c_str());
     std::printf("  preload:           %s\n", cfg.preload ? "yes" : "no");
     std::printf("  report_interval:   %ds\n", cfg.report_interval);
-    std::printf("  write_buffer_size: %llu\n",
-                static_cast<unsigned long long>(cfg.write_buffer_size));
+    std::printf("  memtable_size: %llu\n",
+                static_cast<unsigned long long>(cfg.memtable_size));
     std::printf("  buffered_writes:   %s\n", cfg.buffered_writes ? "yes" : "no");
     std::printf("\n");
 
@@ -726,7 +726,7 @@ int main(int argc, char** argv) {
     opts.create_if_missing = true;
     opts.gc_interval_sec = 0;
     opts.verify_checksums = false;
-    opts.write_buffer_size = cfg.write_buffer_size;
+    opts.memtable_size = cfg.memtable_size;
     opts.buffered_writes = cfg.buffered_writes;
 
     kvlite::DB db;

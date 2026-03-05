@@ -9,7 +9,7 @@ namespace internal {
 WriteBuffer::WriteBuffer(const Options& opts, FlushFn flush_fn)
     : opts_(opts),
       flush_fn_(std::move(flush_fn)),
-      active_(std::make_unique<Memtable>()) {
+      active_(std::make_unique<Memtable>(opts_.memtable_size)) {
     flush_thread_ = std::thread(&WriteBuffer::flushLoop, this);
 }
 
@@ -109,7 +109,7 @@ void WriteBuffer::sealActive() {
     if (active_->empty()) return;
     active_->seal();  // read-only from here — reads skip spinlocks
     immutables_.push_back(std::move(active_));
-    active_ = std::make_unique<Memtable>();
+    active_ = std::make_unique<Memtable>(opts_.memtable_size);
     flush_cv_.notify_one();
 }
 
