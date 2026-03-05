@@ -109,13 +109,13 @@ void Memtable::put(const std::string& key, uint64_t version,
         }
     }
 
-    // Sorted insert: maintain (hash asc, pv asc) within each page.
+    // Sorted insert: maintain (hash asc, pv desc) within each page.
     Slot* s = bucketSlots(b);
     uint16_t cnt = bucketCount(b);
     Slot entry = {hash, pv.data, offset};
     uint16_t pos = 0;
     while (pos < cnt && (s[pos].hash < hash ||
-           (s[pos].hash == hash && s[pos].pv < pv.data))) {
+           (s[pos].hash == hash && s[pos].pv > pv.data))) {
         ++pos;
     }
     if (pos < cnt) {
@@ -212,13 +212,13 @@ void Memtable::putBatch(const std::vector<BatchOp>& ops, uint64_t version) {
             }
         }
 
-        // Sorted insert: maintain (hash asc, pv asc) within each page.
+        // Sorted insert: maintain (hash asc, pv desc) within each page.
         Slot* s = bucketSlots(b);
         uint16_t cnt = bucketCount(b);
         Slot entry = {item.hash, pv.data, item.offset};
         uint16_t pos = 0;
         while (pos < cnt && (s[pos].hash < item.hash ||
-               (s[pos].hash == item.hash && s[pos].pv < pv.data))) {
+               (s[pos].hash == item.hash && s[pos].pv > pv.data))) {
             ++pos;
         }
         if (pos < cnt) {
@@ -394,9 +394,8 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
     bool sealed = sealed_.load(std::memory_order_acquire);
     const uint8_t* data_ptr = data_.get();
 
-    // Per-bucket collection + dedup. Slots are sorted (hash asc, pv asc)
+    // Per-bucket collection + dedup. Slots are sorted (hash asc, pv desc)
     // within each page; bucket iteration 0→65535 gives global hash order.
-    // Both global sorts are eliminated.
     std::vector<MemtableStream::Record> bucket_recs;
 
     for (uint32_t bi = 0; bi < kNumBuckets; ++bi) {
@@ -432,9 +431,9 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
 
         if (!sealed) locks_[bi].unlock();
 
-        // Dedup per bucket: entries are in (hash asc, pv asc) order.
+        // Dedup per bucket: entries are in (hash asc, pv desc) order.
         // For each hash group, keep only the latest version <= snapshot
-        // (last entry in each group, since pv is ascending).
+        // (first entry in each group, since pv is descending).
         size_t i = 0;
         while (i < bucket_recs.size()) {
             // Find end of this hash group.
@@ -443,8 +442,8 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
                    bucket_recs[j].hash == bucket_recs[i].hash) {
                 ++j;
             }
-            // Last entry in ascending pv order = latest version.
-            deduped.push_back(bucket_recs[j - 1]);
+            // First entry in descending pv order = latest version.
+            deduped.push_back(bucket_recs[i]);
             i = j;
         }
     }
@@ -489,7 +488,7 @@ Memtable::FlushResult Memtable::flush(Segment& out,
         return Status::OK();
     };
 
-    // Slots are sorted by (hash asc, pv asc) within each page.
+    // Slots are sorted by (hash asc, pv desc) within each page.
     // Iterate buckets 0→65535 for global hash order; concatenate pages
     // per bucket chain — no sort needed.
     std::vector<SlimEntry> bucket_entries;
@@ -510,7 +509,7 @@ Memtable::FlushResult Memtable::flush(Segment& out,
             b = ext ? extBucketData(ext) : nullptr;
         }
 
-        // Dedup: entries are already in (hash asc, pv asc) order.
+        // Dedup: entries are in (hash asc, pv desc) order — latest first.
         size_t i = 0;
         while (i < bucket_entries.size()) {
             size_t j = i + 1;
@@ -521,19 +520,23 @@ Memtable::FlushResult Memtable::flush(Segment& out,
             size_t group_size = j - i;
 
             if (snapshot_versions.empty() || group_size == 1) {
-                s = emit(bucket_entries[j - 1]);
+                s = emit(bucket_entries[i]);
                 if (!s.ok()) return {s, {}, 0};
             } else {
+                // Build ascending vers for dedupVersionGroup (reads group backward).
                 std::vector<uint64_t> vers(group_size);
                 for (size_t k = 0; k < group_size; ++k) {
-                    vers[k] = PackedVersion(bucket_entries[i + k].packed_ver).version();
+                    vers[k] = PackedVersion(
+                        bucket_entries[i + group_size - 1 - k].packed_ver).version();
                 }
                 std::unique_ptr<bool[]> keep(new bool[group_size]);
                 dedupVersionGroup(vers.data(), group_size,
                                      snapshot_versions, keep.get());
 
+                // Emit in descending order (original group order).
+                // keep[k] corresponds to ascending index, map back.
                 for (size_t k = 0; k < group_size; ++k) {
-                    if (keep[k]) {
+                    if (keep[group_size - 1 - k]) {
                         s = emit(bucket_entries[i + k]);
                         if (!s.ok()) return {s, {}, 0};
                     }

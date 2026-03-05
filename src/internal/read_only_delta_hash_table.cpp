@@ -73,12 +73,6 @@ bool ReadOnlyDeltaHashTable::addEntryIsNew(uint64_t hash,
 void ReadOnlyDeltaHashTable::flushPendingBucket() {
     if (pending_bi_ == UINT32_MAX) return;
 
-    // Versions accumulated ascending; DHT stores descending — reverse each key.
-    for (auto& ke : pending_contents_.keys) {
-        std::reverse(ke.packed_versions.begin(), ke.packed_versions.end());
-        std::reverse(ke.ids.begin(), ke.ids.end());
-    }
-
     if (codec_.contentsBitsNeeded(pending_contents_) <= codec_.bucketDataBits()) {
         auto et0 = std::chrono::steady_clock::now();
         codec_.encodeBucket(buckets_[pending_bi_], pending_contents_);
@@ -93,8 +87,8 @@ void ReadOnlyDeltaHashTable::flushPendingBucket() {
     } else {
         // Overflow — replay entries through per-entry addToChain.
         for (auto& ke : pending_contents_.keys) {
-            // DHT stores versions descending; reverse back to ascending for
-            // addEntryIsNew which inserts in desc order internally.
+            // Versions are descending; iterate backward to feed ascending
+            // to addEntryIsNew which inserts in desc order internally.
             bool is_new = true;
             for (size_t i = ke.packed_versions.size(); i > 0; --i) {
                 uint64_t hash = (static_cast<uint64_t>(pending_bi_)
@@ -131,8 +125,7 @@ void ReadOnlyDeltaHashTable::addBatchEntry(uint64_t hash,
     // Keys within a bucket arrive in suffix order (same hash order).
     if (!pending_contents_.keys.empty() &&
         pending_contents_.keys.back().suffix == suffix) {
-        // Same key — versions arrive ascending, store ascending for now;
-        // reversed to descending in flushPendingBucket.
+        // Same key — versions arrive descending (matching DHT convention).
         pending_contents_.keys.back().packed_versions.push_back(packed_version);
         pending_contents_.keys.back().ids.push_back(id);
     } else {

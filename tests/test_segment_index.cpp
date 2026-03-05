@@ -776,8 +776,8 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
     gi.commitWB(2);
 
     size_t idx = createSegment(1, {
+        {"key1", 2, "", true},  // tombstone (latest first)
         {"key1", 1, "val1", false},
-        {"key1", 2, "", true},  // tombstone
     });
     auto& seg = segments_[idx];
 

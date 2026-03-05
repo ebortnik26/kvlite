@@ -1,6 +1,5 @@
 #include "internal/gc_stream.h"
 
-#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <queue>
@@ -16,7 +15,7 @@ namespace internal {
 namespace {
 
 // ---------------------------------------------------------------------------
-// GCMergeStream — K-way merge over N EntryStreams in (hash asc, version asc)
+// GCMergeStream — K-way merge over N EntryStreams in (hash asc, version desc)
 // ---------------------------------------------------------------------------
 
 class GCMergeStream : public EntryStream {
@@ -56,7 +55,7 @@ private:
         bool operator()(EntryStream* a, EntryStream* b) const {
             if (a->entry().hash != b->entry().hash)
                 return a->entry().hash > b->entry().hash;
-            return a->entry().version() > b->entry().version();
+            return a->entry().version() < b->entry().version();
         }
     };
 
@@ -105,7 +104,7 @@ private:
 // ---------------------------------------------------------------------------
 // GCDedupStream — writes EntryAction to ext[base + GCDedupExt::kAction]
 //
-// Input must be in (hash asc, version asc) order. Buffers entries per hash
+// Input must be in (hash asc, version desc) order. Buffers entries per hash
 // group, deduplicates the group when the hash changes (or stream exhausts),
 // then replays the deduplicated entries one at a time.
 //
@@ -122,7 +121,7 @@ public:
           snapshots_(std::move(snapshot_versions)),
           base_(base) {
         assert(base_ + GCDedupExt::kSize <= Entry::kMaxExt);
-        std::sort(snapshots_.begin(), snapshots_.end());
+        // snapshots_ arrives pre-sorted from VersionManager.
         if (input_->valid()) {
             fillGroup();
         }
@@ -186,6 +185,7 @@ private:
         }
 
         // Dedup using shared two-pointer algorithm.
+        // Group is descending; build ascending vers for dedupVersionGroup.
         size_t n = group_.size();
         versions_.resize(n);
         if (n > keep_cap_) {
@@ -193,14 +193,15 @@ private:
             keep_cap_ = n;
         }
         for (size_t gi = 0; gi < n; ++gi) {
-            versions_[gi] = group_[gi].version();
+            versions_[gi] = group_[n - 1 - gi].version();
         }
         dedupVersionGroup(versions_.data(), n,
                              snapshots_, keep_.get());
+        // Map keep[] (ascending index) back to group_ (descending index).
         for (size_t gi = 0; gi < n; ++gi) {
             group_[gi].ext[base_ + GCDedupExt::kAction] =
-                static_cast<uint64_t>(keep_[gi] ? EntryAction::kKeep
-                                                : EntryAction::kEliminate);
+                static_cast<uint64_t>(keep_[n - 1 - gi] ? EntryAction::kKeep
+                                                        : EntryAction::kEliminate);
         }
     }
 

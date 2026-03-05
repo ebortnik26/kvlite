@@ -87,7 +87,8 @@ public:
     // Flush entries to a Segment that is already in Writing state.
     // Deduplicates per key using the same two-pointer dedup algorithm
     // as GC: for each snapshot version, the latest entry version <=
-    // snapshot is kept. Entries are sorted by (hash, key) ascending.
+    // snapshot is kept. Entries are emitted in (hash asc, pv desc) order,
+    // matching the DHT convention directly.
     // Returns (key, packed_ver) pairs for GlobalIndex staging.
     //
     // snapshot_versions: all observation points (active snapshots +
@@ -98,7 +99,7 @@ public:
 
     // Create a stream of entries visible at snapshot_version.
     // Thread-safe: locks each bucket during collection.
-    // Returns entries sorted by (hash asc, version asc), deduplicated
+    // Returns entries sorted by hash ascending, deduplicated
     // per key (only the latest version <= snapshot_version).
     std::unique_ptr<EntryStream> createStream(uint64_t snapshot_version) const;
 

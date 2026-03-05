@@ -310,20 +310,20 @@ TEST_F(EntryStreamTest, Dedup_KeepAndEliminate) {
     auto deduped = stream::gcDedup(
         std::move(merged), snapshots, kDedupBase);
 
-    // First entry: key1 v1 → kEliminate, segment_id=1 preserved
-    ASSERT_TRUE(deduped->valid());
-    EXPECT_EQ(deduped->entry().version(), 1u);
-    EXPECT_EQ(deduped->entry().ext[kDedupBase + GCDedupExt::kAction],
-              static_cast<uint64_t>(EntryAction::kEliminate));
-    EXPECT_EQ(deduped->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 1u);
-
-    ASSERT_TRUE(deduped->next().ok());
-    // Second entry: key1 v2 → kKeep, segment_id=2 preserved
+    // First entry: key1 v2 → kKeep, segment_id=2 preserved (descending order)
     ASSERT_TRUE(deduped->valid());
     EXPECT_EQ(deduped->entry().version(), 2u);
     EXPECT_EQ(deduped->entry().ext[kDedupBase + GCDedupExt::kAction],
               static_cast<uint64_t>(EntryAction::kKeep));
     EXPECT_EQ(deduped->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 2u);
+
+    ASSERT_TRUE(deduped->next().ok());
+    // Second entry: key1 v1 → kEliminate, segment_id=1 preserved
+    ASSERT_TRUE(deduped->valid());
+    EXPECT_EQ(deduped->entry().version(), 1u);
+    EXPECT_EQ(deduped->entry().ext[kDedupBase + GCDedupExt::kAction],
+              static_cast<uint64_t>(EntryAction::kEliminate));
+    EXPECT_EQ(deduped->entry().ext[kTagBase + GCTagSourceExt::kSegmentId], 1u);
 
     ASSERT_TRUE(deduped->next().ok());
     EXPECT_FALSE(deduped->valid());
@@ -355,11 +355,11 @@ TEST_F(EntryStreamTest, Dedup_AllKeep) {
 }
 
 TEST_F(EntryStreamTest, Dedup_AllEliminate) {
-    // key1 v1 + key1 v2 in same segment. Only snapshot at v2.
+    // key1 v2 + key1 v1 in same segment (descending). Only snapshot at v2.
     // v2 is latest → kept, v1 eliminated.
     size_t idx = createSegment(1, {
-        {"key1", 1, "val1", false},
         {"key1", 2, "val2", false},
+        {"key1", 1, "val1", false},
     });
     auto& seg = segments_[idx];
 
@@ -370,18 +370,18 @@ TEST_F(EntryStreamTest, Dedup_AllEliminate) {
         stream::scan(seg.logFile(), seg.dataSize()),
         snapshots, kBase);
 
+    // v2 → kKeep (descending order)
+    ASSERT_TRUE(deduped->valid());
+    EXPECT_EQ(deduped->entry().version(), 2u);
+    EXPECT_EQ(deduped->entry().ext[kBase + GCDedupExt::kAction],
+              static_cast<uint64_t>(EntryAction::kKeep));
+
+    ASSERT_TRUE(deduped->next().ok());
     // v1 → kEliminate
     ASSERT_TRUE(deduped->valid());
     EXPECT_EQ(deduped->entry().version(), 1u);
     EXPECT_EQ(deduped->entry().ext[kBase + GCDedupExt::kAction],
               static_cast<uint64_t>(EntryAction::kEliminate));
-
-    ASSERT_TRUE(deduped->next().ok());
-    // v2 → kKeep
-    ASSERT_TRUE(deduped->valid());
-    EXPECT_EQ(deduped->entry().version(), 2u);
-    EXPECT_EQ(deduped->entry().ext[kBase + GCDedupExt::kAction],
-              static_cast<uint64_t>(EntryAction::kKeep));
 
     ASSERT_TRUE(deduped->next().ok());
     EXPECT_FALSE(deduped->valid());
