@@ -503,6 +503,8 @@ Status DB::getStats(DBStats& stats) const {
     stats.dht_encode_total_ns = global_index_->dhtEncodeTotalNs();
     stats.dht_decode_count = global_index_->dhtDecodeCount();
     stats.dht_decode_total_ns = global_index_->dhtDecodeTotalNs();
+    stats.dht_ext_count = global_index_->dhtExtCount();
+    stats.dht_num_buckets = global_index_->dhtNumBuckets();
 
     return Status::OK();
 }

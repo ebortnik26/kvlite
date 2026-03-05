@@ -53,6 +53,10 @@ struct DBStats {
     uint64_t dht_encode_total_ns = 0;
     uint64_t dht_decode_count = 0;
     uint64_t dht_decode_total_ns = 0;
+
+    // DHT structure
+    uint32_t dht_ext_count = 0;       // number of extension (overflow) buckets
+    uint32_t dht_num_buckets = 0;     // number of primary buckets
 };
 
 class Snapshot {

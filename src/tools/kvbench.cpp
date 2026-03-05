@@ -581,6 +581,11 @@ static void printFinalReport(std::vector<ThreadState>& states,
             };
             codecRow("encode", stats.dht_encode_count, stats.dht_encode_total_ns);
             codecRow("decode", stats.dht_decode_count, stats.dht_decode_total_ns);
+            double ext_ratio = stats.dht_num_buckets > 0
+                ? static_cast<double>(stats.dht_ext_count) / stats.dht_num_buckets
+                : 0.0;
+            std::printf("Ext/bucket ratio: %u / %u (%.4f)\n",
+                        stats.dht_ext_count, stats.dht_num_buckets, ext_ratio);
         }
     }
 

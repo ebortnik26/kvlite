@@ -138,6 +138,8 @@ public:
     uint64_t dhtEncodeTotalNs() const { return dht_.encodeTotalNs(); }
     uint64_t dhtDecodeCount() const { return dht_.decodeCount(); }
     uint64_t dhtDecodeTotalNs() const { return dht_.decodeTotalNs(); }
+    uint32_t dhtExtCount() const { return dht_.extCount(); }
+    uint32_t dhtNumBuckets() const { return dht_.numBuckets(); }
 
 private:
     // --- Core DHT mutations (no WAL, no savepoint counter) ---
