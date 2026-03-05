@@ -22,25 +22,27 @@ using namespace kvlite::internal;
 using kvlite::Status;
 
 // Helper: hash a literal key for DHT calls.
+static uint64_t H(const char* s) { return dhtHashBytes(s, std::strlen(s)); }
+static uint64_t HS(const std::string& s) { return dhtHashBytes(s.data(), s.size()); }
 
 // --- SegmentIndex Tests ---
 
 TEST(SegmentIndex, PutAndGetLatest) {
     SegmentIndex index;
 
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
-    index.put("key1", 300, 3);
+    index.put(H("key1"), 100, 1);
+    index.put(H("key1"), 200, 2);
+    index.put(H("key1"), 300, 3);
 
     uint32_t off;
     uint64_t ver;
-    EXPECT_TRUE(index.getLatest("key1", off, ver));
+    EXPECT_TRUE(index.getLatest(H("key1"), off, ver));
     EXPECT_EQ(off, 300u);
     EXPECT_EQ(ver, 3u);
 
     std::vector<uint32_t> offsets;
     std::vector<uint64_t> versions;
-    ASSERT_TRUE(index.get("key1", offsets, versions));
+    ASSERT_TRUE(index.get(H("key1"), offsets, versions));
     ASSERT_EQ(offsets.size(), 3u);
     EXPECT_EQ(offsets[0], 300u);
     EXPECT_EQ(offsets[1], 200u);
@@ -52,36 +54,36 @@ TEST(SegmentIndex, PutAndGetLatest) {
 
 TEST(SegmentIndex, GetLatest) {
     SegmentIndex index;
-    index.put("key1", 100, 1);
-    index.put("key1", 200, 2);
+    index.put(H("key1"), 100, 1);
+    index.put(H("key1"), 200, 2);
 
     uint32_t off;
     uint64_t ver;
-    EXPECT_TRUE(index.getLatest("key1", off, ver));
+    EXPECT_TRUE(index.getLatest(H("key1"), off, ver));
     EXPECT_EQ(off, 200u);
     EXPECT_EQ(ver, 2u);
 
-    EXPECT_FALSE(index.getLatest("missing", off, ver));
+    EXPECT_FALSE(index.getLatest(H("missing"), off, ver));
 }
 
 TEST(SegmentIndex, Contains) {
     SegmentIndex index;
-    EXPECT_FALSE(index.contains("key1"));
-    index.put("key1", 100, 1);
-    EXPECT_TRUE(index.contains("key1"));
+    EXPECT_FALSE(index.contains(H("key1")));
+    index.put(H("key1"), 100, 1);
+    EXPECT_TRUE(index.contains(H("key1")));
 }
 
 TEST(SegmentIndex, GetNonExistent) {
     SegmentIndex index;
     std::vector<uint32_t> offsets;
     std::vector<uint64_t> versions;
-    EXPECT_FALSE(index.get("missing", offsets, versions));
+    EXPECT_FALSE(index.get(H("missing"), offsets, versions));
 }
 
 TEST(SegmentIndex, Clear) {
     SegmentIndex index;
     for (int i = 0; i < 50; ++i) {
-        index.put("key" + std::to_string(i), i * 100, i);
+        index.put(HS("key" + std::to_string(i)), i * 100, i);
     }
     EXPECT_EQ(index.keyCount(), 50u);
 
@@ -96,7 +98,7 @@ TEST(SegmentIndex, LargeScale) {
 
     for (int i = 0; i < N; ++i) {
         std::string key = "key_" + std::to_string(i);
-        index.put(key, static_cast<uint32_t>(i * 100),
+        index.put(HS(key), static_cast<uint32_t>(i * 100),
                   static_cast<uint64_t>(i + 1));
     }
 
@@ -106,7 +108,7 @@ TEST(SegmentIndex, LargeScale) {
         std::string key = "key_" + std::to_string(i);
         uint32_t off;
         uint64_t ver;
-        ASSERT_TRUE(index.getLatest(key, off, ver));
+        ASSERT_TRUE(index.getLatest(HS(key), off, ver));
         EXPECT_EQ(off, static_cast<uint32_t>(i * 100));
         EXPECT_EQ(ver, static_cast<uint64_t>(i + 1));
     }
@@ -145,7 +147,7 @@ TEST_F(SegmentIndexSerializationTest, EmptyRoundTrip) {
 
 TEST_F(SegmentIndexSerializationTest, SingleEntryRoundTrip) {
     SegmentIndex src;
-    src.put("hello", 100, 1);
+    src.put(H("hello"), 100, 1);
 
     LogFile wf;
     ASSERT_TRUE(wf.create(path_).ok());
@@ -163,19 +165,19 @@ TEST_F(SegmentIndexSerializationTest, SingleEntryRoundTrip) {
 
     uint32_t off;
     uint64_t ver;
-    ASSERT_TRUE(dst.getLatest("hello", off, ver));
+    ASSERT_TRUE(dst.getLatest(H("hello"), off, ver));
     EXPECT_EQ(off, 100u);
     EXPECT_EQ(ver, 1u);
 }
 
 TEST_F(SegmentIndexSerializationTest, MultiEntryRoundTrip) {
     SegmentIndex src;
-    src.put("a", 100, 1);
-    src.put("a", 200, 2);
-    src.put("b", 300, 3);
-    src.put("c", 400, 4);
-    src.put("c", 500, 5);
-    src.put("c", 600, 6);
+    src.put(H("a"), 100, 1);
+    src.put(H("a"), 200, 2);
+    src.put(H("b"), 300, 3);
+    src.put(H("c"), 400, 4);
+    src.put(H("c"), 500, 5);
+    src.put(H("c"), 600, 6);
 
     LogFile wf;
     ASSERT_TRUE(wf.create(path_).ok());
@@ -194,22 +196,22 @@ TEST_F(SegmentIndexSerializationTest, MultiEntryRoundTrip) {
     // Verify all entries preserved via getLatest.
     uint32_t off;
     uint64_t ver;
-    ASSERT_TRUE(dst.getLatest("a", off, ver));
+    ASSERT_TRUE(dst.getLatest(H("a"), off, ver));
     EXPECT_EQ(off, 200u);
     EXPECT_EQ(ver, 2u);
 
-    ASSERT_TRUE(dst.getLatest("b", off, ver));
+    ASSERT_TRUE(dst.getLatest(H("b"), off, ver));
     EXPECT_EQ(off, 300u);
     EXPECT_EQ(ver, 3u);
 
-    ASSERT_TRUE(dst.getLatest("c", off, ver));
+    ASSERT_TRUE(dst.getLatest(H("c"), off, ver));
     EXPECT_EQ(off, 600u);
     EXPECT_EQ(ver, 6u);
 }
 
 TEST_F(SegmentIndexSerializationTest, CorruptedChecksum) {
     SegmentIndex src;
-    src.put("key", 100, 1);
+    src.put(H("key"), 100, 1);
 
     LogFile wf;
     ASSERT_TRUE(wf.create(path_).ok());
@@ -324,7 +326,8 @@ protected:
 
         EXPECT_TRUE(seg.create(path, segment_id).ok());
         for (const auto& [key, version, value, tombstone] : entries) {
-            EXPECT_TRUE(seg.put(key, version, value, tombstone).ok());
+            EXPECT_TRUE(seg.put(key, version, value, tombstone,
+                                dhtHashBytes(key.data(), key.size())).ok());
         }
         EXPECT_TRUE(seg.seal().ok());
         return idx;
@@ -391,15 +394,15 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
     ASSERT_EQ(out.state(), Segment::State::kReadable);
 
     LogEntry entry;
-    ASSERT_TRUE(out.getLatest("key1", entry).ok());
+    ASSERT_TRUE(out.getLatest(H("key1"), entry).ok());
     EXPECT_EQ(entry.value, "val1");
     EXPECT_EQ(entry.version(), 1u);
 
-    ASSERT_TRUE(out.getLatest("key2", entry).ok());
+    ASSERT_TRUE(out.getLatest(H("key2"), entry).ok());
     EXPECT_EQ(entry.value, "val2");
     EXPECT_EQ(entry.version(), 2u);
 
-    ASSERT_TRUE(out.getLatest("key3", entry).ok());
+    ASSERT_TRUE(out.getLatest(H("key3"), entry).ok());
     EXPECT_EQ(entry.value, "val3");
     EXPECT_EQ(entry.version(), 3u);
 }
@@ -444,7 +447,7 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     EXPECT_EQ(relocations[0].old_segment_id, 2u);
 
     LogEntry entry;
-    ASSERT_TRUE(last_result_.outputs[0].getLatest("key1", entry).ok());
+    ASSERT_TRUE(last_result_.outputs[0].getLatest(H("key1"), entry).ok());
     EXPECT_EQ(entry.value, "new");
     EXPECT_EQ(entry.version(), 2u);
 }
@@ -483,9 +486,9 @@ TEST_F(GCMergeTest, MergePreservesOrder) {
 
     auto& out = last_result_.outputs[0];
     LogEntry entry;
-    ASSERT_TRUE(out.getLatest(keyA, entry).ok());
+    ASSERT_TRUE(out.getLatest(hashA, entry).ok());
     EXPECT_EQ(entry.value, "A_v2");
-    ASSERT_TRUE(out.getLatest(keyB, entry).ok());
+    ASSERT_TRUE(out.getLatest(hashB, entry).ok());
     EXPECT_EQ(entry.value, "B_v1");
 }
 
@@ -520,10 +523,10 @@ TEST_F(GCMergeTest, MergeSplitsOnSize) {
     for (auto& out : last_result_.outputs) {
         ASSERT_EQ(out.state(), Segment::State::kReadable);
         LogEntry entry;
-        if (out.getLatest("k1", entry).ok()) found++;
-        if (out.getLatest("k2", entry).ok()) found++;
-        if (out.getLatest("k3", entry).ok()) found++;
-        if (out.getLatest("k4", entry).ok()) found++;
+        if (out.getLatest(H("k1"), entry).ok()) found++;
+        if (out.getLatest(H("k2"), entry).ok()) found++;
+        if (out.getLatest(H("k3"), entry).ok()) found++;
+        if (out.getLatest(H("k4"), entry).ok()) found++;
     }
     EXPECT_EQ(found, 4u);
 }
@@ -572,7 +575,7 @@ TEST_F(GCMergeTest, MergeSnapshotPins) {
 
     auto& out = last_result_.outputs[0];
     std::vector<LogEntry> entries;
-    ASSERT_TRUE(out.get("key1", entries).ok());
+    ASSERT_TRUE(out.get(H("key1"), entries).ok());
     ASSERT_EQ(entries.size(), 2u);
     std::set<uint64_t> versions;
     std::set<std::string> values;
@@ -626,7 +629,7 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
 
     auto& out = last_result_.outputs[0];
     std::vector<LogEntry> entries;
-    ASSERT_TRUE(out.get("key1", entries).ok());
+    ASSERT_TRUE(out.get(H("key1"), entries).ok());
     ASSERT_EQ(entries.size(), 2u);
 
     std::set<uint64_t> versions;
@@ -663,19 +666,16 @@ TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
 
     auto& out = last_result_.outputs[0];
     LogEntry entry;
-    ASSERT_TRUE(out.getLatest("key1", entry).ok());
+    ASSERT_TRUE(out.getLatest(H("key1"), entry).ok());
     EXPECT_EQ(entry.value, "v2");
     EXPECT_EQ(entry.version(), 2u);
 
     std::vector<LogEntry> entries;
-    ASSERT_TRUE(out.get("key1", entries).ok());
+    ASSERT_TRUE(out.get(H("key1"), entries).ok());
     ASSERT_EQ(entries.size(), 1u);
 }
 
 // --- GC + GlobalIndex integration tests ---
-
-// Helper: hash a string literal for GI/DHT calls.
-static uint64_t H(const char* s) { return dhtHashBytes(s, std::strlen(s)); }
 
 TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
     // Put entries into GlobalIndex with specific segment_ids.

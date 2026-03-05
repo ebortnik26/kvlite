@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "internal/delta_hash_table.h"
 #include "internal/segment.h"
 #include "internal/log_entry.h"
 
@@ -14,6 +15,10 @@ using kvlite::Status;
 using kvlite::internal::LogEntry;
 using kvlite::internal::PackedVersion;
 using kvlite::internal::Segment;
+using kvlite::internal::dhtHashBytes;
+
+static uint64_t H(const char* s) { return dhtHashBytes(s, std::strlen(s)); }
+static uint64_t HS(const std::string& s) { return dhtHashBytes(s.data(), s.size()); }
 
 namespace {
 
@@ -32,7 +37,7 @@ protected:
     // Write a LogEntry into the segment via the high-level put API.
     void writeEntry(const std::string& key, uint64_t version,
                     const std::string& value, bool tombstone) {
-        ASSERT_TRUE(seg_.put(key, version, value, tombstone).ok());
+        ASSERT_TRUE(seg_.put(key, version, value, tombstone, HS(key)).ok());
     }
 
     std::string path_;
@@ -120,25 +125,25 @@ TEST_F(SegmentTest, SealWhileReadableFails) {
 }
 
 TEST_F(SegmentTest, PutWhileClosedFails) {
-    EXPECT_FALSE(seg_.put("x", 1, "", false).ok());
+    EXPECT_FALSE(seg_.put("x", 1, "", false, H("x")).ok());
 }
 
 TEST_F(SegmentTest, PutWhileReadableFails) {
     ASSERT_TRUE(seg_.create(path_, 1).ok());
     ASSERT_TRUE(seg_.seal().ok());
-    EXPECT_FALSE(seg_.put("k", 1, "", false).ok());
+    EXPECT_FALSE(seg_.put("k", 1, "", false, H("k")).ok());
 }
 
 TEST_F(SegmentTest, GetLatestWhileWritingFails) {
     ASSERT_TRUE(seg_.create(path_, 1).ok());
     writeEntry("k", 1, "v", false);
     LogEntry entry;
-    EXPECT_FALSE(seg_.getLatest("k", entry).ok());
+    EXPECT_FALSE(seg_.getLatest(H("k"), entry).ok());
 }
 
 TEST_F(SegmentTest, GetLatestWhileClosedFails) {
     LogEntry entry;
-    EXPECT_FALSE(seg_.getLatest("k", entry).ok());
+    EXPECT_FALSE(seg_.getLatest(H("k"), entry).ok());
 }
 
 TEST_F(SegmentTest, QueriesWhileWritingFail) {
@@ -146,13 +151,13 @@ TEST_F(SegmentTest, QueriesWhileWritingFail) {
     writeEntry("k", 1, "v", false);
 
     LogEntry entry;
-    EXPECT_FALSE(seg_.getLatest("k", entry).ok());
-    EXPECT_FALSE(seg_.contains("k"));
+    EXPECT_FALSE(seg_.getLatest(H("k"), entry).ok());
+    EXPECT_FALSE(seg_.contains(H("k")));
 
     std::vector<LogEntry> entries;
-    EXPECT_FALSE(seg_.get("k", entries).ok());
+    EXPECT_FALSE(seg_.get(H("k"), entries).ok());
 
-    EXPECT_FALSE(seg_.get("k", (100ULL << 1) | 1, entry).ok());
+    EXPECT_FALSE(seg_.get(H("k"), (100ULL << 1) | 1, entry).ok());
 }
 
 // --- Create error ---
@@ -167,16 +172,16 @@ TEST_F(SegmentTest, CreateNonExistentDir) {
 
 TEST_F(SegmentTest, PutAndDataSize) {
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(seg_.put("hello", 1, "world", false).ok());
+    ASSERT_TRUE(seg_.put("hello", 1, "world", false, H("hello")).ok());
     EXPECT_GT(seg_.dataSize(), 0u);
 }
 
 TEST_F(SegmentTest, MultiplePuts) {
     ASSERT_TRUE(seg_.create(path_, 1).ok());
 
-    ASSERT_TRUE(seg_.put("aaa", 1, "v1", false).ok());
+    ASSERT_TRUE(seg_.put("aaa", 1, "v1", false, H("aaa")).ok());
     uint64_t size1 = seg_.dataSize();
-    ASSERT_TRUE(seg_.put("bbb", 2, "v2", false).ok());
+    ASSERT_TRUE(seg_.put("bbb", 2, "v2", false, H("bbb")).ok());
     EXPECT_GT(seg_.dataSize(), size1);
 }
 
@@ -188,7 +193,7 @@ TEST_F(SegmentTest, SealThenGetLatest) {
     ASSERT_TRUE(seg_.seal().ok());
 
     LogEntry entry;
-    ASSERT_TRUE(seg_.getLatest("hello", entry).ok());
+    ASSERT_TRUE(seg_.getLatest(H("hello"), entry).ok());
     EXPECT_EQ(entry.key, "hello");
     EXPECT_EQ(entry.value, "world");
     EXPECT_EQ(entry.version(), 1u);
@@ -207,16 +212,16 @@ TEST_F(SegmentTest, SealThenQueryIndex) {
     ASSERT_TRUE(seg_.seal().ok());
 
     // Queries work after seal.
-    EXPECT_TRUE(seg_.contains("key1"));
-    EXPECT_TRUE(seg_.contains("key2"));
-    EXPECT_FALSE(seg_.contains("key3"));
+    EXPECT_TRUE(seg_.contains(H("key1")));
+    EXPECT_TRUE(seg_.contains(H("key2")));
+    EXPECT_FALSE(seg_.contains(H("key3")));
 
     LogEntry entry;
-    ASSERT_TRUE(seg_.getLatest("key1", entry).ok());
+    ASSERT_TRUE(seg_.getLatest(H("key1"), entry).ok());
     EXPECT_EQ(entry.version(), 2u);
     EXPECT_EQ(entry.value, "val2");
 
-    ASSERT_TRUE(seg_.getLatest("key2", entry).ok());
+    ASSERT_TRUE(seg_.getLatest(H("key2"), entry).ok());
     EXPECT_EQ(entry.version(), 5u);
     EXPECT_TRUE(entry.tombstone());
 }
@@ -229,7 +234,7 @@ TEST_F(SegmentTest, GetAllVersionsAfterSeal) {
     ASSERT_TRUE(seg_.seal().ok());
 
     std::vector<LogEntry> entries;
-    ASSERT_TRUE(seg_.get("k", entries).ok());
+    ASSERT_TRUE(seg_.get(H("k"), entries).ok());
     ASSERT_EQ(entries.size(), 3u);
 
     for (const auto& e : entries) {
@@ -246,14 +251,14 @@ TEST_F(SegmentTest, GetByUpperBoundAfterSeal) {
 
     // Upper bound is packed: (logical_version << 1) | 1
     LogEntry entry;
-    ASSERT_TRUE(seg_.get("k", (25ULL << 1) | 1, entry).ok());
+    ASSERT_TRUE(seg_.get(H("k"), (25ULL << 1) | 1, entry).ok());
     EXPECT_EQ(entry.version(), 20u);
     EXPECT_EQ(entry.value, "b");
 
-    ASSERT_TRUE(seg_.get("k", (10ULL << 1) | 1, entry).ok());
+    ASSERT_TRUE(seg_.get(H("k"), (10ULL << 1) | 1, entry).ok());
     EXPECT_EQ(entry.version(), 10u);
 
-    EXPECT_FALSE(seg_.get("k", (5ULL << 1) | 1, entry).ok());
+    EXPECT_FALSE(seg_.get(H("k"), (5ULL << 1) | 1, entry).ok());
 }
 
 // --- Seal + open round-trip ---
@@ -288,17 +293,17 @@ TEST_F(SegmentTest, SealAndOpenRoundTrip) {
     EXPECT_EQ(loaded.keyCount(), 2u);
 
     LogEntry entry;
-    ASSERT_TRUE(loaded.getLatest("alpha", entry).ok());
+    ASSERT_TRUE(loaded.getLatest(H("alpha"), entry).ok());
     EXPECT_EQ(entry.version(), 2u);
     EXPECT_EQ(entry.value, "v2");
 
-    ASSERT_TRUE(loaded.getLatest("beta", entry).ok());
+    ASSERT_TRUE(loaded.getLatest(H("beta"), entry).ok());
     EXPECT_EQ(entry.version(), 10u);
     EXPECT_EQ(entry.key, "beta");
     EXPECT_TRUE(entry.tombstone());
 
     std::vector<LogEntry> entries;
-    ASSERT_TRUE(loaded.get("alpha", entries).ok());
+    ASSERT_TRUE(loaded.get(H("alpha"), entries).ok());
     ASSERT_EQ(entries.size(), 2u);
     for (const auto& e : entries) {
         EXPECT_EQ(e.key, "alpha");
@@ -332,7 +337,7 @@ TEST_F(SegmentTest, OpenMissingFile) {
 
 TEST_F(SegmentTest, OpenTruncatedFile) {
     ASSERT_TRUE(seg_.create(path_, 1).ok());
-    ASSERT_TRUE(seg_.put("x", 1, "v", false).ok());
+    ASSERT_TRUE(seg_.put("x", 1, "v", false, H("x")).ok());
     seg_.close();
 
     Segment loaded;
@@ -463,7 +468,7 @@ TEST_F(SegmentTest, MoveConstructReadable) {
     EXPECT_EQ(moved.state(), Segment::State::kReadable);
 
     LogEntry entry;
-    ASSERT_TRUE(moved.getLatest("k", entry).ok());
+    ASSERT_TRUE(moved.getLatest(H("k"), entry).ok());
     EXPECT_EQ(entry.version(), 1u);
     moved.close();
 }
@@ -478,7 +483,7 @@ TEST_F(SegmentTest, MoveAssign) {
     EXPECT_EQ(other.state(), Segment::State::kReadable);
 
     LogEntry entry;
-    ASSERT_TRUE(other.getLatest("k", entry).ok());
+    ASSERT_TRUE(other.getLatest(H("k"), entry).ok());
     EXPECT_EQ(entry.version(), 1u);
     other.close();
 }

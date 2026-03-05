@@ -69,22 +69,23 @@ public:
     // Serialize a LogEntry (header + key + value + CRC), append to file,
     // and update the SegmentIndex.
     Status put(std::string_view key, uint64_t version,
-               std::string_view value, bool tombstone);
+               std::string_view value, bool tombstone,
+               uint64_t hash);
 
     // --- Read (Readable only) ---
 
-    // Get the latest entry for a key.
-    Status getLatest(const std::string& key, LogEntry& entry) const;
+    // Get the latest entry for a hash.
+    Status getLatest(uint64_t hash, LogEntry& entry) const;
 
-    // Get all entries for a key.
-    Status get(const std::string& key, std::vector<LogEntry>& entries) const;
+    // Get all entries for a hash.
+    Status get(uint64_t hash, std::vector<LogEntry>& entries) const;
 
-    // Get the entry for a key with the highest version <= upper_bound.
-    Status get(const std::string& key, uint64_t upper_bound,
+    // Get the entry for a hash with the highest version <= upper_bound.
+    Status get(uint64_t hash, uint64_t upper_bound,
                LogEntry& entry) const;
 
-    // Check if a key exists (any version).
-    bool contains(const std::string& key) const;
+    // Check if a hash exists (any version).
+    bool contains(uint64_t hash) const;
 
     // --- Stats (any state) ---
 

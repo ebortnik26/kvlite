@@ -4,7 +4,6 @@
 #include <vector>
 
 #include "internal/crc32.h"
-#include "internal/delta_hash_table.h"
 #include "internal/log_file.h"
 
 namespace kvlite {
@@ -38,33 +37,29 @@ SegmentIndex::~SegmentIndex() = default;
 SegmentIndex::SegmentIndex(SegmentIndex&&) noexcept = default;
 SegmentIndex& SegmentIndex::operator=(SegmentIndex&&) noexcept = default;
 
-void SegmentIndex::put(std::string_view key, uint32_t offset, uint64_t packed_version) {
-    uint64_t h = dhtHashBytes(key.data(), key.size());
-    if (dht_.addEntryIsNew(h, packed_version, offset)) {
+void SegmentIndex::put(uint64_t hash, uint32_t offset, uint64_t packed_version) {
+    if (dht_.addEntryIsNew(hash, packed_version, offset)) {
         ++key_count_;
     }
 }
 
-bool SegmentIndex::get(const std::string& key,
+bool SegmentIndex::get(uint64_t hash,
                   std::vector<uint32_t>& offsets,
                   std::vector<uint64_t>& packed_versions) const {
-    // DHT stores (packed_version, id=offset)
     std::vector<uint64_t> pvs;
     std::vector<uint32_t> ids;
-    uint64_t h = dhtHashBytes(key.data(), key.size());
-    if (!dht_.findAll(h, pvs, ids)) return false;
+    if (!dht_.findAll(hash, pvs, ids)) return false;
     packed_versions = std::move(pvs);
     offsets = std::move(ids);
     return true;
 }
 
-bool SegmentIndex::get(const std::string& key, uint64_t upper_bound,
+bool SegmentIndex::get(uint64_t hash, uint64_t upper_bound,
                   uint64_t& offset, uint64_t& packed_version) const {
     std::vector<uint32_t> offsets;
     std::vector<uint64_t> packed_versions;
-    if (!get(key, offsets, packed_versions)) return false;
+    if (!get(hash, offsets, packed_versions)) return false;
 
-    // Pairs are sorted desc by packed_version. Find first with packed_version <= upper_bound.
     for (size_t i = 0; i < packed_versions.size(); ++i) {
         if (packed_versions[i] <= upper_bound) {
             offset = offsets[i];
@@ -75,21 +70,18 @@ bool SegmentIndex::get(const std::string& key, uint64_t upper_bound,
     return false;
 }
 
-bool SegmentIndex::getLatest(const std::string& key,
+bool SegmentIndex::getLatest(uint64_t hash,
                         uint32_t& offset, uint64_t& packed_version) const {
-    // DHT stores (packed_version, id=offset)
     uint64_t pv;
     uint32_t id;
-    uint64_t h = dhtHashBytes(key.data(), key.size());
-    if (!dht_.findFirst(h, pv, id)) return false;
+    if (!dht_.findFirst(hash, pv, id)) return false;
     packed_version = pv;
     offset = id;
     return true;
 }
 
-bool SegmentIndex::contains(const std::string& key) const {
-    uint64_t h = dhtHashBytes(key.data(), key.size());
-    return dht_.contains(h);
+bool SegmentIndex::contains(uint64_t hash) const {
+    return dht_.contains(hash);
 }
 
 Status SegmentIndex::writeTo(LogFile& file) {

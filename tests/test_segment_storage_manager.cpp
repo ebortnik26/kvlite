@@ -4,6 +4,7 @@
 #include <fstream>
 #include <string>
 
+#include "internal/delta_hash_table.h"
 #include "internal/manifest.h"
 #include "internal/segment.h"
 #include "internal/segment_storage_manager.h"
@@ -43,7 +44,8 @@ protected:
 
         Segment* seg = sm_->getSegment(id);
         EXPECT_NE(seg, nullptr);
-        EXPECT_TRUE(seg->put(key, 1, value, false).ok());
+        EXPECT_TRUE(seg->put(key, 1, value, false,
+                            dhtHashBytes(key.data(), key.size())).ok());
         EXPECT_TRUE(seg->seal().ok());
 
         return id;

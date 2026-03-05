@@ -19,6 +19,9 @@
 #include "internal/write_buffer.h"
 
 using kvlite::internal::Memtable;
+using kvlite::internal::dhtHashBytes;
+
+static uint64_t H(const char* s) { return dhtHashBytes(s, std::strlen(s)); }
 
 TEST(Memtable, PutAndGetSingleEntry) {
     Memtable wb;
@@ -560,7 +563,7 @@ TEST_F(FlushTest, SingleEntry) {
     // Verify SegmentIndex
     EXPECT_EQ(seg_.entryCount(), 1u);
     LogEntry latest;
-    ASSERT_TRUE(seg_.getLatest("hello", latest).ok());
+    ASSERT_TRUE(seg_.getLatest(H("hello"), latest).ok());
     EXPECT_EQ(latest.version(), 42u);
 }
 
@@ -665,16 +668,16 @@ TEST_F(FlushTest, RoundTrip) {
 
     // key1 latest version is 2
     LogEntry latest;
-    ASSERT_TRUE(seg_.getLatest("key1", latest).ok());
+    ASSERT_TRUE(seg_.getLatest(H("key1"), latest).ok());
     EXPECT_EQ(latest.version(), 2u);
 
     // key2 latest version is 3
-    ASSERT_TRUE(seg_.getLatest("key2", latest).ok());
+    ASSERT_TRUE(seg_.getLatest(H("key2"), latest).ok());
     EXPECT_EQ(latest.version(), 3u);
 
     // key1 has 1 entry after dedup
     std::vector<LogEntry> key1_entries;
-    ASSERT_TRUE(seg_.get("key1", key1_entries).ok());
+    ASSERT_TRUE(seg_.get(H("key1"), key1_entries).ok());
     ASSERT_EQ(key1_entries.size(), 1u);
     EXPECT_EQ(key1_entries[0].key, "key1");
     EXPECT_EQ(key1_entries[0].version(), 2u);
@@ -702,18 +705,18 @@ TEST_F(FlushTest, SealAndOpen) {
 
     // Verify index lookups work.
     LogEntry latest;
-    ASSERT_TRUE(loaded.getLatest("alpha", latest).ok());
+    ASSERT_TRUE(loaded.getLatest(H("alpha"), latest).ok());
     EXPECT_EQ(latest.version(), 2u);
     EXPECT_EQ(latest.value, "v2");
 
-    ASSERT_TRUE(loaded.getLatest("beta", latest).ok());
+    ASSERT_TRUE(loaded.getLatest(H("beta"), latest).ok());
     EXPECT_EQ(latest.version(), 10u);
     EXPECT_EQ(latest.key, "beta");
     EXPECT_TRUE(latest.tombstone());
 
     // alpha has 1 entry after dedup.
     std::vector<LogEntry> alpha_entries;
-    ASSERT_TRUE(loaded.get("alpha", alpha_entries).ok());
+    ASSERT_TRUE(loaded.get(H("alpha"), alpha_entries).ok());
     ASSERT_EQ(alpha_entries.size(), 1u);
     EXPECT_EQ(alpha_entries[0].key, "alpha");
     EXPECT_EQ(alpha_entries[0].version(), 2u);

@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <functional>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "kvlite/status.h"
@@ -35,27 +34,27 @@ public:
     SegmentIndex(SegmentIndex&&) noexcept;
     SegmentIndex& operator=(SegmentIndex&&) noexcept;
 
-    // Append (offset, packed_version) to key's list.
-    void put(std::string_view key, uint32_t offset, uint64_t packed_version);
+    // Append (offset, packed_version) to hash's list.
+    void put(uint64_t hash, uint32_t offset, uint64_t packed_version);
 
-    // Get all (offset, packed_version) pairs for a key. Returns false if key doesn't exist.
+    // Get all (offset, packed_version) pairs for a hash. Returns false if not found.
     // Pairs are ordered latest-first (highest packed_version first).
-    bool get(const std::string& key,
+    bool get(uint64_t hash,
              std::vector<uint32_t>& offsets,
              std::vector<uint64_t>& packed_versions) const;
 
-    // Get the latest entry for a key with packed_version <= upper_bound.
+    // Get the latest entry for a hash with packed_version <= upper_bound.
     // Returns false if no matching entry exists.
-    bool get(const std::string& key, uint64_t upper_bound,
+    bool get(uint64_t hash, uint64_t upper_bound,
              uint64_t& offset, uint64_t& packed_version) const;
 
-    // Get the latest (highest packed_version) entry for a key.
-    // Returns false if key doesn't exist.
-    bool getLatest(const std::string& key,
+    // Get the latest (highest packed_version) entry for a hash.
+    // Returns false if not found.
+    bool getLatest(uint64_t hash,
                    uint32_t& offset, uint64_t& packed_version) const;
 
-    // Check if a key exists.
-    bool contains(const std::string& key) const;
+    // Check if a hash exists.
+    bool contains(uint64_t hash) const;
 
     // Serialize to a LogFile.
     Status writeTo(LogFile& file);

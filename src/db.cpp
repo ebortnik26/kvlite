@@ -296,6 +296,7 @@ Status DB::resolve(const std::string& key, uint64_t upper_bound,
 
     result.wb_hit = false;
     result.gi_packed_version = gi_packed_version;
+    result.hkey = hkey;
     result.segment = storage_->getSegment(gi_segment_id);
     assert(result.segment && "GlobalIndex references non-existent segment");
     return Status::OK();
@@ -321,7 +322,7 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
 
     // Read the value from segment.
     internal::LogEntry entry;
-    s = r.segment->get(key, upper_bound, entry);
+    s = r.segment->get(r.hkey, upper_bound, entry);
     if (!s.ok()) return s;
 
     value = std::move(entry.value);

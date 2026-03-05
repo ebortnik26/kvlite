@@ -507,7 +507,7 @@ Memtable::FlushResult Memtable::flush(Segment& out,
     std::vector<FlatEntry> bucket_entries;
 
     auto emit = [&](const FlatEntry& e) -> Status {
-        Status st = out.put(e.key, e.pv.version(), e.value, e.pv.tombstone());
+        Status st = out.put(e.key, e.pv.version(), e.value, e.pv.tombstone(), e.hash);
         if (!st.ok()) return st;
         flushed.push_back({e.hash, e.packed_ver});
         uint64_t v = e.pv.version();

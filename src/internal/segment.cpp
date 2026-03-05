@@ -118,7 +118,8 @@ Status Segment::close() {
 // --- Write ---
 
 Status Segment::put(std::string_view key, uint64_t version,
-                    std::string_view value, bool tombstone) {
+                    std::string_view value, bool tombstone,
+                    uint64_t hash) {
     if (state_ != State::kWriting) {
         return Status::InvalidArgument("Segment: put requires Writing state");
     }
@@ -160,7 +161,7 @@ Status Segment::put(std::string_view key, uint64_t version,
 
     data_size_ = offset + entry_size;
     // Store packed version in index so tombstone info is preserved.
-    index_.put(key, static_cast<uint32_t>(offset), packed_ver);
+    index_.put(hash, static_cast<uint32_t>(offset), packed_ver);
     return Status::OK();
 }
 
@@ -219,26 +220,26 @@ Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {
     return Status::OK();
 }
 
-Status Segment::getLatest(const std::string& key, LogEntry& entry) const {
+Status Segment::getLatest(uint64_t hash, LogEntry& entry) const {
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: getLatest requires Readable state");
     }
     uint32_t offset;
     uint64_t packed_version;
-    if (!index_.getLatest(key, offset, packed_version)) {
+    if (!index_.getLatest(hash, offset, packed_version)) {
         return Status::NotFound("key not found");
     }
     return readEntry(offset, entry);
 }
 
-Status Segment::get(const std::string& key,
+Status Segment::get(uint64_t hash,
                     std::vector<LogEntry>& entries) const {
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: get requires Readable state");
     }
     std::vector<uint32_t> offsets;
     std::vector<uint64_t> packed_versions;
-    if (!index_.get(key, offsets, packed_versions)) {
+    if (!index_.get(hash, offsets, packed_versions)) {
         return Status::NotFound("key not found");
     }
     entries.clear();
@@ -252,21 +253,21 @@ Status Segment::get(const std::string& key,
     return Status::OK();
 }
 
-Status Segment::get(const std::string& key, uint64_t upper_bound,
+Status Segment::get(uint64_t hash, uint64_t upper_bound,
                     LogEntry& entry) const {
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: get requires Readable state");
     }
     uint64_t offset, packed_version;
-    if (!index_.get(key, upper_bound, offset, packed_version)) {
+    if (!index_.get(hash, upper_bound, offset, packed_version)) {
         return Status::NotFound("key not found");
     }
     return readEntry(offset, entry);
 }
 
-bool Segment::contains(const std::string& key) const {
+bool Segment::contains(uint64_t hash) const {
     if (state_ != State::kReadable) return false;
-    return index_.contains(key);
+    return index_.contains(hash);
 }
 
 // --- Stats ---

@@ -154,6 +154,7 @@ private:
         uint64_t wb_version = 0;
         internal::Segment* segment = nullptr;
         uint64_t gi_packed_version = 0;  // packed version from GI (has tombstone in LSB)
+        uint64_t hkey = 0;
     };
     Status resolve(const std::string& key, uint64_t upper_bound,
                    ResolveResult& result);
