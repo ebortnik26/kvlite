@@ -22,10 +22,10 @@ Memtable::~Memtable() = default;
 
 // --- Data buffer I/O -----------------------------------------------------
 //
-// Record layout (all little-endian on x86):
-//   offset + 0:               uint16_t key_len        (kKeyLenSize)
-//   offset + kValueLenOffset: uint32_t value_len      (kValueLenSize)
-//   offset + kPackedVerOffset:uint64_t packed_version  (kPackedVerSize)
+// Record layout (all little-endian on x86, matches LogEntry on-disk):
+//   offset + 0:               uint64_t packed_version  (kPackedVerSize)
+//   offset + kKeyLenOffset:   uint16_t key_len         (kKeyLenSize)
+//   offset + kValueLenOffset: uint32_t value_len       (kValueLenSize)
 //   offset + kRecordHeaderSize:         key[key_len]
 //   offset + kRecordHeaderSize + key_len: value[value_len]
 
@@ -38,9 +38,9 @@ uint32_t Memtable::appendRecord(const std::string& key, PackedVersion pv,
     size_t off = data_end_.fetch_add(record_size, std::memory_order_relaxed);
 
     uint8_t* p = data_.get() + off;
+    std::memcpy(p, &pv.data, kPackedVerSize); p += kPackedVerSize;
     std::memcpy(p, &key_len, kKeyLenSize);    p += kKeyLenSize;
     std::memcpy(p, &val_len, kValueLenSize);  p += kValueLenSize;
-    std::memcpy(p, &pv.data, kPackedVerSize); p += kPackedVerSize;
     std::memcpy(p, key.data(), key_len);      p += key_len;
     std::memcpy(p, value.data(), val_len);
 
@@ -51,7 +51,7 @@ void Memtable::readValue(uint32_t off, std::string& value) const {
     const uint8_t* p = data_.get() + off;
     uint16_t kl;
     uint32_t vl;
-    std::memcpy(&kl, p, kKeyLenSize);
+    std::memcpy(&kl, p + kKeyLenOffset, kKeyLenSize);
     std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
     value.assign(reinterpret_cast<const char*>(p + kRecordHeaderSize + kl), vl);
 }
@@ -59,7 +59,7 @@ void Memtable::readValue(uint32_t off, std::string& value) const {
 std::string Memtable::readKey(uint32_t off) const {
     const uint8_t* p = data_.get() + off;
     uint16_t kl;
-    std::memcpy(&kl, p, kKeyLenSize);
+    std::memcpy(&kl, p + kKeyLenOffset, kKeyLenSize);
     return std::string(reinterpret_cast<const char*>(p + kRecordHeaderSize), kl);
 }
 
@@ -419,7 +419,7 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
                 const uint8_t* p = data_ptr + s[i].offset;
                 uint16_t kl;
                 uint32_t vl;
-                std::memcpy(&kl, p, kKeyLenSize);
+                std::memcpy(&kl, p + kKeyLenOffset, kKeyLenSize);
                 std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
 
                 bucket_recs.push_back({s[i].hash, s[i].offset, kl, vl,
@@ -470,20 +470,17 @@ Memtable::FlushResult Memtable::flush(Segment& out,
     const uint8_t* data_base = data_.get();
 
     auto emit = [&](const SlimEntry& e) -> Status {
-        PackedVersion pv(e.packed_ver);
         const uint8_t* p = data_base + e.offset;
         uint16_t kl;
         uint32_t vl;
-        std::memcpy(&kl, p, kKeyLenSize);
+        std::memcpy(&kl, p + kKeyLenOffset, kKeyLenSize);
         std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
-        std::string_view key(reinterpret_cast<const char*>(p + kRecordHeaderSize), kl);
-        std::string_view val(reinterpret_cast<const char*>(p + kRecordHeaderSize + kl), vl);
+        size_t payload_len = kRecordHeaderSize + kl + vl;
         uint64_t entry_offset;
-        Status st = out.appendEntry(key, pv.version(), val, pv.tombstone(),
-                                    e.hash, entry_offset);
+        Status st = out.appendRawEntry(p, payload_len, e.hash, entry_offset);
         if (!st.ok()) return st;
         flushed.push_back({e.hash, e.packed_ver});
-        uint64_t v = pv.version();
+        uint64_t v = PackedVersion(e.packed_ver).version();
         if (v > max_ver) max_ver = v;
         return Status::OK();
     };

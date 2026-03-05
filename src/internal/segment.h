@@ -78,6 +78,12 @@ public:
                        std::string_view value, bool tombstone,
                        uint64_t hash, uint64_t& entry_offset);
 
+    // Append a pre-formatted LogEntry payload (header + key + value) directly.
+    // Computes and appends CRC32. Used by Memtable::flush for zero-copy writes
+    // when the Memtable record layout matches the LogEntry on-disk format.
+    Status appendRawEntry(const void* payload, size_t payload_len,
+                          uint64_t hash, uint64_t& entry_offset);
+
     // --- Read (Readable only) ---
 
     // Get the latest entry for a hash.

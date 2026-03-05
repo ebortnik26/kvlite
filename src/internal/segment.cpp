@@ -200,6 +200,32 @@ Status Segment::appendEntry(std::string_view key, uint64_t version,
     return Status::OK();
 }
 
+Status Segment::appendRawEntry(const void* payload, size_t payload_len,
+                                uint64_t hash, uint64_t& entry_offset) {
+    if (state_ != State::kWriting) {
+        return Status::InvalidArgument("Segment: appendRawEntry requires Writing state");
+    }
+
+    uint32_t checksum = crc32(payload, payload_len);
+
+    uint64_t offset;
+    Status s = log_file_.append(payload, payload_len, offset);
+    if (!s.ok()) return s;
+
+    uint64_t crc_offset;
+    s = log_file_.append(&checksum, sizeof(checksum), crc_offset);
+    if (!s.ok()) return s;
+
+    entry_offset = offset;
+    data_size_ = offset + payload_len + sizeof(checksum);
+
+    uint64_t packed_ver;
+    std::memcpy(&packed_ver, payload, 8);
+    index_.addBatchEntry(hash, packed_ver, static_cast<uint32_t>(offset));
+    batch_mode_ = true;
+    return Status::OK();
+}
+
 // --- Read ---
 
 Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {

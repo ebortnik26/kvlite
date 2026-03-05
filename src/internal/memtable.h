@@ -24,7 +24,8 @@ class Segment;
 //
 // Layout:
 //   Data buffer  – contiguous, append-only byte array (sized to memtable_size).
-//                  Each record: [key_len:2][value_len:4][packed_version:8][key][value]
+//                  Each record: [packed_version:8][key_len:2][value_len:4][key][value]
+//                  (matches LogEntry on-disk format, enabling zero-copy flush)
 //   Hash index   – contiguous array of 64K primary buckets (256 bytes each).
 //                  Each bucket holds 12 packed Slots of {hash, pv, offset}.
 //   Extensions   – BucketArena-allocated overflow buckets chained from full primaries.
@@ -125,9 +126,9 @@ public:
     static constexpr size_t kKeyLenSize    = sizeof(uint16_t);  // 2
     static constexpr size_t kValueLenSize  = sizeof(uint32_t);  // 4
     static constexpr size_t kPackedVerSize = sizeof(uint64_t);  // 8
-    static constexpr size_t kRecordHeaderSize = kKeyLenSize + kValueLenSize + kPackedVerSize;
-    static constexpr size_t kValueLenOffset  = kKeyLenSize;
-    static constexpr size_t kPackedVerOffset = kKeyLenSize + kValueLenSize;
+    static constexpr size_t kRecordHeaderSize = kPackedVerSize + kKeyLenSize + kValueLenSize;
+    static constexpr size_t kKeyLenOffset   = kPackedVerSize;                 // 8
+    static constexpr size_t kValueLenOffset = kPackedVerSize + kKeyLenSize;   // 10
 
 private:
     // --- Slot: 20 bytes (packed) ---
