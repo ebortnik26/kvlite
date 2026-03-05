@@ -37,86 +37,55 @@ Status DB::open(const std::string& path, const Options& options) {
     db_path_ = path;
     options_ = options;
 
-    // Initialize manifest
+    // Each subsystem is initialized in dependency order. On any failure,
+    // teardown() closes everything opened so far.
+
     manifest_ = std::make_unique<internal::Manifest>();
     Status s = manifest_->open(path);
-    if (!s.ok()) {
-        if (s.isNotFound() && options.create_if_missing) {
-            s = manifest_->create(path);
-        }
-        if (!s.ok()) {
-            manifest_.reset();
-            return s;
-        }
+    if (!s.ok() && s.isNotFound() && options.create_if_missing) {
+        s = manifest_->create(path);
     }
+    if (!s.ok()) { teardown(); return s; }
 
-    // Initialize version manager
     versions_ = std::make_unique<internal::VersionManager>(*manifest_);
-    internal::VersionManager::Options ver_opts;
-
-    s = versions_->open(ver_opts);
-    if (!s.ok()) {
-        manifest_->close();
-        manifest_.reset();
-        versions_.reset();
-        return s;
-    }
+    s = versions_->open(internal::VersionManager::Options());
+    if (!s.ok()) { teardown(); return s; }
 
     s = versions_->recover();
-    if (!s.ok()) {
-        versions_->close();
-        versions_.reset();
-        manifest_->close();
-        manifest_.reset();
-        return s;
-    }
+    if (!s.ok()) { teardown(); return s; }
 
-    // Initialize GlobalIndex
     global_index_ = std::make_unique<internal::GlobalIndex>(*manifest_);
-    internal::GlobalIndex::Options global_index_opts;
-    global_index_opts.sync_writes = options.sync_writes;
+    internal::GlobalIndex::Options gi_opts;
+    gi_opts.sync_writes = options.sync_writes;
+    s = global_index_->open(path, gi_opts);
+    if (!s.ok()) { teardown(); return s; }
 
-    s = global_index_->open(path, global_index_opts);
-    if (!s.ok()) {
-        versions_->close();
-        versions_.reset();
-        manifest_->close();
-        manifest_.reset();
-        global_index_.reset();
-        return s;
-    }
-
-    // Initialize storage manager
     storage_ = std::make_unique<internal::SegmentStorageManager>(
-        *manifest_, options_.buffered_writes);
-
+        *manifest_, options.buffered_writes);
     s = storage_->open(path);
-    if (!s.ok()) {
-        versions_->close();
-        global_index_->close();
-        versions_.reset();
-        global_index_.reset();
-        storage_.reset();
-        manifest_->close();
-        manifest_.reset();
-        return s;
-    }
+    if (!s.ok()) { teardown(); return s; }
 
-    // Initialize write buffer with flush callback.
+    initWriteBuffer(options);
+    is_open_ = true;
+    startDaemons(options);
+
+    return Status::OK();
+}
+
+void DB::initWriteBuffer(const Options& options) {
     internal::WriteBuffer::Options wb_opts;
-    wb_opts.memtable_size = options.write_buffer_size;
+    wb_opts.memtable_size = options.memtable_size;
     wb_opts.flush_depth = options.flush_depth;
 
     auto flush_fn = [this](internal::Memtable& mt) -> Status {
         auto t0 = std::chrono::steady_clock::now();
 
         uint32_t seg_id = storage_->allocateSegmentId();
-
         Status s = storage_->createSegment(seg_id, false);
         if (!s.ok()) return s;
 
-        auto* seg = storage_->getSegment(seg_id);
-        auto result = mt.flush(*seg, versions_->snapshotVersions());
+        auto result = mt.flush(*storage_->getSegment(seg_id),
+                               versions_->snapshotVersions());
         if (!result.status.ok()) return result.status;
 
         for (const auto& e : result.entries) {
@@ -127,44 +96,52 @@ Status DB::open(const std::string& path, const Options& options) {
         s = global_index_->commitWB(result.max_version);
         if (!s.ok()) return s;
 
-        // Manifest update is the commit point — makes the flush visible.
         s = storage_->registerSegments({seg_id});
 
-        auto t1 = std::chrono::steady_clock::now();
-        auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
         flush_count_.fetch_add(1, std::memory_order_relaxed);
         flush_total_us_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
-
         return s;
     };
 
     write_buffer_ = std::make_unique<internal::WriteBuffer>(wb_opts, flush_fn);
+}
 
-    is_open_ = true;
-
-    if (options_.gc_interval_sec > 0 && options_.gc_policy != GCPolicy::MANUAL) {
+void DB::startDaemons(const Options& options) {
+    if (options.gc_interval_sec > 0 && options.gc_policy != GCPolicy::MANUAL) {
         gc_daemon_ = std::make_unique<internal::PeriodicDaemon>();
-        gc_daemon_->start(options_.gc_interval_sec, [this] {
-            double ratio = global_index_->estimateDeadRatio();
-            if (ratio > options_.gc_threshold) {
+        gc_daemon_->start(options.gc_interval_sec, [this] {
+            if (global_index_->estimateDeadRatio() > options_.gc_threshold) {
                 runGC();
             }
         });
     }
 
-    if (options_.savepoint_interval_sec > 0) {
+    if (options.savepoint_interval_sec > 0) {
         sp_daemon_ = std::make_unique<internal::PeriodicDaemon>();
-        sp_daemon_->start(options_.savepoint_interval_sec, [this] {
+        sp_daemon_->start(options.savepoint_interval_sec, [this] {
             auto t0 = std::chrono::steady_clock::now();
             global_index_->maybeSavepoint();
-            auto t1 = std::chrono::steady_clock::now();
-            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
             savepoint_count_.fetch_add(1, std::memory_order_relaxed);
-            savepoint_total_us_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+            savepoint_total_us_.fetch_add(static_cast<uint64_t>(us),
+                                          std::memory_order_relaxed);
         });
     }
+}
 
-    return Status::OK();
+void DB::teardown() {
+    // Safe to call at any point — each subsystem null-checks before acting.
+    write_buffer_.reset();
+    gc_daemon_.reset();
+    sp_daemon_.reset();
+    if (storage_)      { storage_->close(); storage_.reset(); }
+    if (global_index_) { global_index_->close(); global_index_.reset(); }
+    if (versions_)     { versions_->close(); versions_.reset(); }
+    if (manifest_)     { manifest_->close(); manifest_.reset(); }
+    is_open_ = false;
 }
 
 Status DB::close() {
@@ -172,49 +149,19 @@ Status DB::close() {
         return Status::OK();
     }
 
-    Status s1;
-
     // Drain all pending flushes before closing.
     if (write_buffer_ && !write_buffer_->empty()) {
         write_buffer_->drainFlush();
     }
-    write_buffer_.reset();
 
-    gc_daemon_.reset();
-    sp_daemon_.reset();
-
-    is_open_ = false;
-
-    Status s2;
-    if (storage_) {
-        s2 = storage_->close();
-        storage_.reset();
-    }
-
-    Status s3;
-    if (global_index_) {
-        s3 = global_index_->close();
-        global_index_.reset();
-    }
-
-    Status s4;
-    if (versions_) {
-        s4 = versions_->close();
-        versions_.reset();
-    }
-
-    // Compact manifest for fast recovery, then close.
-    Status s5;
+    // Compact manifest for fast recovery before teardown closes it.
+    Status s;
     if (manifest_) {
-        s5 = manifest_->compact();
-        manifest_->close();
-        manifest_.reset();
+        s = manifest_->compact();
     }
 
-    if (!s2.ok()) return s2;
-    if (!s3.ok()) return s3;
-    if (!s4.ok()) return s4;
-    return s5;
+    teardown();
+    return s;
 }
 
 bool DB::isOpen() const {

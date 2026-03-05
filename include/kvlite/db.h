@@ -161,6 +161,10 @@ private:
 
     Status flush();
 
+    void initWriteBuffer(const Options& options);
+    void startDaemons(const Options& options);
+    void teardown();
+
     Status runGC();
     std::vector<uint32_t> selectGCInputs();
     Status mergeSegments(const std::vector<uint32_t>& input_ids);
