@@ -165,7 +165,7 @@ protected:
     kvlite::DB db_;
 };
 
-TEST_F(SavepointDaemonTest, PeriodicSavepointTruncatesWAL) {
+TEST_F(SavepointDaemonTest, PeriodicSavepointCreated) {
     kvlite::Options opts;
     opts.create_if_missing = true;
     opts.savepoint_interval_sec = 1;            // fast wake-up
@@ -210,9 +210,8 @@ TEST_F(SavepointDaemonTest, DisabledByZeroInterval) {
 
     // No savepoint daemon → savepoint directory should not exist yet
     // (only created on close or explicit storeSavepoint).
-    // Note: recovery on open() writes a convergence savepoint, so we check
-    // that the WAL was NOT truncated (savepoint dir exists from open, but
-    // WAL still has records). Instead, just verify data is readable.
+    // Recovery on open() writes a convergence savepoint, so the savepoint
+    // dir exists regardless. Just verify data is readable.
     for (int i = 0; i < 20; ++i) {
         std::string val;
         ASSERT_TRUE(db_.get("key" + std::to_string(i), val).ok());

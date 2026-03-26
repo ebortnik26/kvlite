@@ -14,12 +14,10 @@ namespace internal {
 
 const char* manifestKeyStr(ManifestKey key) {
     switch (key) {
-        case ManifestKey::kVmNextVersionBlock:   return "vm.next_version_block";
-        case ManifestKey::kSegmentsMinSegId:     return "segments.min_seg_id";
-        case ManifestKey::kSegmentsMaxSegId:     return "segments.max_seg_id";
-        case ManifestKey::kGiWalMinFileId:       return "gi.wal.min_file_id";
-        case ManifestKey::kGiWalMaxFileId:       return "gi.wal.max_file_id";
-        case ManifestKey::kGiSavepointMaxVersion: return "gi.savepoint.max_version";
+        case ManifestKey::kVmNextVersionBlock:      return "vm.next_version_block";
+        case ManifestKey::kSegmentsMinSegId:        return "segments.min_seg_id";
+        case ManifestKey::kSegmentsMaxSegId:        return "segments.max_seg_id";
+        case ManifestKey::kGiSavepointMaxSegmentId: return "gi.savepoint.max_segment_id";
     }
     return "";
 }

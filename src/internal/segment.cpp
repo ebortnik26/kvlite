@@ -39,7 +39,7 @@ Status Segment::open(const std::string& path) {
         return Status::Corruption("Segment: file too small for footer");
     }
 
-    // Read footer: [segment_id:4][index_offset:8][magic:4]
+    // Read footer: [segment_id:4][index_offset:8][lineage_offset:8][magic:4]
     uint8_t footer[kFooterSize];
     s = log_file_.readAt(file_size - kFooterSize, footer, kFooterSize);
     if (!s.ok()) {
@@ -49,10 +49,12 @@ Status Segment::open(const std::string& path) {
 
     uint32_t id;
     uint64_t index_offset;
+    uint64_t lin_offset;
     uint32_t magic;
     std::memcpy(&id, footer, 4);
     std::memcpy(&index_offset, footer + 4, 8);
-    std::memcpy(&magic, footer + 12, 4);
+    std::memcpy(&lin_offset, footer + 12, 8);
+    std::memcpy(&magic, footer + 20, 4);
 
     if (magic != kFooterMagic) {
         log_file_.close();
@@ -72,6 +74,7 @@ Status Segment::open(const std::string& path) {
 
     id_ = id;
     data_size_ = index_offset;
+    lineage_offset_ = lin_offset;
     state_ = State::kReadable;
     return Status::OK();
 }
@@ -94,12 +97,17 @@ Status Segment::seal() {
     Status s = index_.writeTo(log_file_);
     if (!s.ok()) return s;
 
-    // Append footer: [segment_id:4][index_offset:8][magic:4]
+    // Append lineage section.
+    s = writeLineage();
+    if (!s.ok()) return s;
+
+    // Append footer: [segment_id:4][index_offset:8][lineage_offset:8][magic:4]
     uint8_t footer[kFooterSize];
     std::memcpy(footer, &id_, 4);
     std::memcpy(footer + 4, &data_size_, 8);
+    std::memcpy(footer + 12, &lineage_offset_, 8);
     uint32_t magic = kFooterMagic;
-    std::memcpy(footer + 12, &magic, 4);
+    std::memcpy(footer + 20, &magic, 4);
 
     uint64_t footer_offset;
     s = log_file_.append(footer, kFooterSize, footer_offset);
@@ -178,6 +186,7 @@ Status Segment::put(std::string_view key, uint64_t version,
 
     PackedVersion pv(version, tombstone);
     index_.put(hash, static_cast<uint32_t>(offset), pv.data);
+    addLineageEntry(hash, pv.data);
     return Status::OK();
 }
 
@@ -197,6 +206,7 @@ Status Segment::appendEntry(std::string_view key, uint64_t version,
     PackedVersion pv(version, tombstone);
     index_.addBatchEntry(hash, pv.data, static_cast<uint32_t>(entry_offset));
     batch_mode_ = true;
+    addLineageEntry(hash, pv.data);
     return Status::OK();
 }
 
@@ -223,6 +233,7 @@ Status Segment::appendRawEntry(const void* payload, size_t payload_len,
     std::memcpy(&packed_ver, payload, 8);
     index_.addBatchEntry(hash, packed_ver, static_cast<uint32_t>(offset));
     batch_mode_ = true;
+    addLineageEntry(hash, packed_ver);
     return Status::OK();
 }
 
@@ -329,6 +340,132 @@ Status Segment::get(uint64_t hash, uint64_t upper_bound,
 bool Segment::contains(uint64_t hash) const {
     if (state_ != State::kReadable) return false;
     return index_.contains(hash);
+}
+
+// --- Lineage ---
+
+void Segment::addLineageEntry(uint64_t hkey, uint64_t packed_version) {
+    size_t off = lineage_buf_.size();
+    lineage_buf_.resize(off + 16);
+    uint8_t* p = lineage_buf_.data() + off;
+    std::memcpy(p, &hkey, 8);
+    std::memcpy(p + 8, &packed_version, 8);
+    ++lineage_entry_count_;
+}
+
+void Segment::addLineageElimination(uint64_t hkey, uint64_t packed_version,
+                                     uint32_t old_segment_id) {
+    size_t off = lineage_buf_.size();
+    lineage_buf_.resize(off + 20);
+    uint8_t* p = lineage_buf_.data() + off;
+    std::memcpy(p, &hkey, 8);
+    std::memcpy(p + 8, &packed_version, 8);
+    std::memcpy(p + 16, &old_segment_id, 4);
+    ++lineage_elimination_count_;
+}
+
+Status Segment::writeLineage() {
+    lineage_offset_ = log_file_.size();
+
+    // Layout: [header:13][entries][eliminations][crc32:4]
+    // Header: [magic:4][type:1][entry_count:4][elimination_count:4]
+    // All appends go through the 1MB write buffer, so separate calls are fine.
+
+    constexpr size_t kHdrSize = 13;
+    uint8_t hdr[kHdrSize];
+    uint32_t magic = kLineageMagic;
+    std::memcpy(hdr, &magic, 4);
+    hdr[4] = static_cast<uint8_t>(lineage_type_);
+    std::memcpy(hdr + 5, &lineage_entry_count_, 4);
+    std::memcpy(hdr + 9, &lineage_elimination_count_, 4);
+
+    // Compute CRC over header + body incrementally.
+    uint32_t crc_state = updateCrc32(0xFFFFFFFFu, hdr, kHdrSize);
+    if (!lineage_buf_.empty()) {
+        crc_state = updateCrc32(crc_state, lineage_buf_.data(), lineage_buf_.size());
+    }
+    uint32_t checksum = finalizeCrc32(crc_state);
+
+    uint64_t off;
+    Status s = log_file_.append(hdr, kHdrSize, off);
+    if (!s.ok()) return s;
+
+    if (!lineage_buf_.empty()) {
+        s = log_file_.append(lineage_buf_.data(), lineage_buf_.size(), off);
+        if (!s.ok()) return s;
+    }
+
+    return log_file_.append(&checksum, sizeof(checksum), off);
+}
+
+Status Segment::readLineage(Lineage& lineage) const {
+    if (state_ != State::kReadable) {
+        return Status::InvalidArgument("Segment: readLineage requires Readable state");
+    }
+
+    if (lineage_offset_ == 0) {
+        // No lineage section (legacy segment or empty).
+        lineage.type = LineageType::kFlush;
+        lineage.entries.clear();
+        lineage.eliminations.clear();
+        return Status::OK();
+    }
+
+    // Read header first: [magic:4][type:1][entry_count:4][elimination_count:4]
+    constexpr size_t kHeaderSize = 13;
+    uint8_t hdr[kHeaderSize];
+    Status s = log_file_.readAt(lineage_offset_, hdr, kHeaderSize);
+    if (!s.ok()) return s;
+
+    uint32_t magic;
+    std::memcpy(&magic, hdr, 4);
+    if (magic != kLineageMagic) {
+        return Status::Corruption("Segment: bad lineage magic");
+    }
+
+    auto type = static_cast<LineageType>(hdr[4]);
+    uint32_t entry_count, elim_count;
+    std::memcpy(&entry_count, hdr + 5, 4);
+    std::memcpy(&elim_count, hdr + 9, 4);
+
+    size_t entries_bytes = static_cast<size_t>(entry_count) * 16;
+    size_t elim_bytes = static_cast<size_t>(elim_count) * 20;
+    size_t payload_size = kHeaderSize + entries_bytes + elim_bytes;
+    size_t total_size = payload_size + 4;
+
+    std::vector<uint8_t> buf(total_size);
+    s = log_file_.readAt(lineage_offset_, buf.data(), total_size);
+    if (!s.ok()) return s;
+
+    uint32_t stored_crc;
+    std::memcpy(&stored_crc, buf.data() + payload_size, 4);
+    if (crc32(buf.data(), payload_size) != stored_crc) {
+        return Status::ChecksumMismatch("Segment: lineage checksum mismatch");
+    }
+
+    lineage.type = type;
+
+    const uint8_t* p = buf.data() + kHeaderSize;
+
+    lineage.entries.resize(entry_count);
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        auto& e = lineage.entries[i];
+        std::memcpy(&e.hkey, p, 8);
+        std::memcpy(&e.packed_version, p + 8, 8);
+        e.old_segment_id = 0;
+        p += 16;
+    }
+
+    lineage.eliminations.resize(elim_count);
+    for (uint32_t i = 0; i < elim_count; ++i) {
+        auto& e = lineage.eliminations[i];
+        std::memcpy(&e.hkey, p, 8);
+        std::memcpy(&e.packed_version, p + 8, 8);
+        std::memcpy(&e.old_segment_id, p + 16, 4);
+        p += 20;
+    }
+
+    return Status::OK();
 }
 
 // --- Stats ---

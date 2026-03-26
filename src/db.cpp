@@ -54,15 +54,16 @@ Status DB::open(const std::string& path, const Options& options) {
     s = versions_->recover();
     if (!s.ok()) { teardown(); return s; }
 
-    global_index_ = std::make_unique<internal::GlobalIndex>(*manifest_);
-    internal::GlobalIndex::Options gi_opts;
-    gi_opts.sync_writes = options.sync_writes;
-    s = global_index_->open(path, gi_opts);
-    if (!s.ok()) { teardown(); return s; }
-
+    // Storage must open before GlobalIndex — recovery reads segment lineages.
     storage_ = std::make_unique<internal::SegmentStorageManager>(
         *manifest_, options.buffered_writes);
     s = storage_->open(path);
+    if (!s.ok()) { teardown(); return s; }
+
+    global_index_ = std::make_unique<internal::GlobalIndex>(*manifest_);
+    internal::GlobalIndex::Options gi_opts;
+    gi_opts.savepoint_threads = 4;
+    s = global_index_->open(path, gi_opts, *storage_);
     if (!s.ok()) { teardown(); return s; }
 
     initWriteBuffer(options);
@@ -81,25 +82,23 @@ void DB::initWriteBuffer(const Options& options) {
         auto t0 = std::chrono::steady_clock::now();
 
         uint32_t seg_id = storage_->allocateSegmentId();
-        Status s = storage_->createSegment(seg_id, false);
+        Status s = storage_->createSegment(seg_id);
         if (!s.ok()) return s;
 
-        auto result = mt.flush(*storage_->getSegment(seg_id),
-                               versions_->snapshotVersions());
+        auto* seg = storage_->getSegment(seg_id);
+        seg->setLineageType(internal::LineageType::kFlush);
+
+        auto result = mt.flush(*seg, versions_->snapshotVersions());
         if (!result.status.ok()) return result.status;
 
+        // Segment is now sealed (data + index + lineage + footer on disk).
+        // Apply to in-memory GlobalIndex.
         for (const auto& e : result.entries) {
-            s = global_index_->stagePut(e.hkey, e.packed_ver, seg_id);
-            if (!s.ok()) return s;
+            global_index_->applyPut(e.hkey, e.packed_ver, seg_id);
         }
 
-        s = global_index_->commitWB(result.max_version);
-        if (!s.ok()) return s;
-
-        s = storage_->registerSegments({seg_id});
-
-        // Accumulate SI codec stats from this flush's SegmentIndex.
-        const auto& si = storage_->getSegment(seg_id)->index();
+        // Accumulate SI codec stats.
+        const auto& si = seg->index();
         si_encode_count_.fetch_add(si.encodeCount(), std::memory_order_relaxed);
         si_encode_total_ns_.fetch_add(si.encodeTotalNs(), std::memory_order_relaxed);
         si_decode_count_.fetch_add(si.decodeCount(), std::memory_order_relaxed);
@@ -129,7 +128,9 @@ void DB::startDaemons(const Options& options) {
         sp_daemon_ = std::make_unique<internal::PeriodicDaemon>();
         sp_daemon_->start(options.savepoint_interval_sec, [this] {
             auto t0 = std::chrono::steady_clock::now();
-            global_index_->maybeSavepoint();
+            auto seg_ids = storage_->getSegmentIds();
+            uint32_t max_seg_id = seg_ids.empty() ? 0 : seg_ids.back();
+            global_index_->maybeSavepoint(max_seg_id);
             auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             savepoint_count_.fetch_add(1, std::memory_order_relaxed);
@@ -140,12 +141,11 @@ void DB::startDaemons(const Options& options) {
 }
 
 void DB::teardown() {
-    // Safe to call at any point — each subsystem null-checks before acting.
     write_buffer_.reset();
     gc_daemon_.reset();
     sp_daemon_.reset();
-    if (storage_)      { storage_->close(); storage_.reset(); }
     if (global_index_) { global_index_->close(); global_index_.reset(); }
+    if (storage_)      { storage_->close(); storage_.reset(); }
     if (versions_)     { versions_->close(); versions_.reset(); }
     if (manifest_)     { manifest_->close(); manifest_.reset(); }
     is_open_ = false;
@@ -159,6 +159,13 @@ Status DB::close() {
     // Drain all pending flushes before closing.
     if (write_buffer_ && !write_buffer_->empty()) {
         write_buffer_->drainFlush();
+    }
+
+    // Store final savepoint with current max segment ID.
+    if (global_index_ && storage_) {
+        auto seg_ids = storage_->getSegmentIds();
+        uint32_t max_seg_id = seg_ids.empty() ? 0 : seg_ids.back();
+        global_index_->storeSavepoint(max_seg_id);
     }
 
     // Compact manifest for fast recovery before teardown closes it.
@@ -205,7 +212,6 @@ Status DB::get(const std::string& key, std::string& value,
 
 Status DB::get(const std::string& key, std::string& value,
                uint64_t& version, const ReadOptions& options) {
-    // Pack the snapshot version as an upper bound: include tombstones at that version.
     uint64_t upper_bound;
     if (options.snapshot) {
         versions_->waitForCommitted(options.snapshot->version());
@@ -232,10 +238,8 @@ Status DB::resolve(const std::string& key, uint64_t upper_bound,
         return Status::InvalidArgument("Empty key");
     }
 
-    // Compute hash once, use for both WriteBuffer and GlobalIndex lookups.
     uint64_t hkey = internal::dhtHashBytes(key.data(), key.size());
 
-    // 1. Check WriteBuffer first (active + immutables).
     if (write_buffer_->getByVersion(hkey, upper_bound,
                                     result.wb_value, result.wb_version,
                                     result.wb_tombstone)) {
@@ -243,7 +247,6 @@ Status DB::resolve(const std::string& key, uint64_t upper_bound,
         return Status::OK();
     }
 
-    // 2. Fall through to GlobalIndex -> Segment.
     uint64_t gi_packed_version;
     uint32_t gi_segment_id;
     if (!global_index_->get(hkey, upper_bound, gi_packed_version, gi_segment_id)) {
@@ -272,11 +275,9 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
         return Status::OK();
     }
 
-    // Check tombstone from the packed version in GI — no segment I/O needed.
     internal::PackedVersion gi_pv(r.gi_packed_version);
     if (gi_pv.tombstone()) return Status::NotFound(key);
 
-    // Read the value from segment.
     internal::LogEntry entry;
     s = r.segment->get(r.hkey, upper_bound, entry);
     if (!s.ok()) return s;
@@ -328,7 +329,6 @@ Status DB::exists(const std::string& key, bool& exists,
         return Status::OK();
     }
 
-    // GI stores packed version — check tombstone from LSB, no segment I/O.
     exists = !(r.gi_packed_version & internal::PackedVersion::kTombstoneMask);
     return Status::OK();
 }
@@ -344,10 +344,6 @@ Status DB::write(const WriteBatch& batch, const WriteOptions& options) {
         return Status::OK();
     }
 
-    // All operations in batch get the same version.
-    // committed_version_ fence ensures snapshots see all-or-nothing.
-    // Two-phase bucket locking inside putBatch() guarantees atomicity
-    // at the Memtable level.
     uint64_t version = versions_->allocateVersion();
 
     std::vector<internal::Memtable::BatchOp> ops;
@@ -376,7 +372,6 @@ Status DB::read(ReadBatch& batch, const ReadOptions& options) {
         return Status::OK();
     }
 
-    // Use caller's snapshot if provided, otherwise create one.
     Snapshot owned_snap(0);
     bool owns_snapshot = false;
     if (!options.snapshot) {
@@ -442,7 +437,6 @@ Status DB::getStats(DBStats& stats) const {
 
     stats.active_snapshots = versions_->activeSnapshotCount();
 
-    // These would need GlobalIndex iteration to compute accurately
     stats.num_live_entries = global_index_->keyCount();
     stats.num_historical_entries = global_index_->entryCount() - global_index_->keyCount();
 
@@ -518,7 +512,9 @@ Status DB::mergeSegments(const std::vector<uint32_t>& input_ids) {
 
     auto snapshot_versions = versions_->snapshotVersions();
 
-    // Merge under BatchGuard.
+    // Merge under BatchGuard (prevents savepoint during GC).
+    // GC::merge creates output segments directly, records lineage on them,
+    // and calls on_relocate/on_eliminate to update the in-memory GlobalIndex.
     internal::GC::Result result;
     Status s;
     {
@@ -526,34 +522,33 @@ Status DB::mergeSegments(const std::vector<uint32_t>& input_ids) {
         s = internal::GC::merge(
             snapshot_versions, inputs, options_.log_file_size,
             [this](uint32_t id) { return storage_->segmentPath(id); },
-            [this]() { return storage_->allocateSegmentId(); },
+            [this]() {
+                uint32_t id = storage_->allocateSegmentId();
+                // Register in manifest immediately for crash recovery.
+                storage_->registerSegmentId(id);
+                return id;
+            },
             [this](uint64_t hkey, uint64_t pv, uint32_t old_id,
                    uint32_t new_id) {
-                global_index_->relocate(hkey, pv, old_id, new_id);
+                global_index_->applyRelocate(hkey, pv, old_id, new_id);
             },
             [this](uint64_t hkey, uint64_t pv, uint32_t old_id) {
-                global_index_->eliminate(hkey, pv, old_id);
+                global_index_->applyEliminate(hkey, pv, old_id);
             },
             result, options_.buffered_writes);
         if (!s.ok()) {
             for (uint32_t id : input_ids) storage_->unpinSegment(id);
             return s;
         }
-        s = global_index_->commitGC();
-    }
-    if (!s.ok()) {
-        for (uint32_t id : input_ids) storage_->unpinSegment(id);
-        return s;
     }
 
-    // Adopt output segments and register in Manifest.
-    std::vector<uint32_t> output_ids;
+    // Adopt output segments into storage's in-memory registry.
     for (auto& seg : result.outputs) {
         uint32_t oid = seg.getId();
-        output_ids.push_back(oid);
         storage_->adoptSegment(oid, std::move(seg));
     }
-    return storage_->registerSegments(output_ids);
+
+    return Status::OK();
 }
 
 Status DB::runGC() {

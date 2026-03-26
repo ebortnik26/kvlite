@@ -11,6 +11,7 @@
 #include "internal/bit_stream.h"
 #include "internal/global_index.h"
 #include "internal/manifest.h"
+#include "internal/segment_storage_manager.h"
 #include "internal/read_only_delta_hash_table.h"
 #include "internal/read_write_delta_hash_table.h"
 
@@ -35,28 +36,29 @@ protected:
                   std::to_string(reinterpret_cast<uintptr_t>(this));
         std::filesystem::create_directories(db_dir_);
         ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        storage_ = std::make_unique<SegmentStorageManager>(manifest_);
+        ASSERT_TRUE(storage_->open(db_dir_).ok());
         index = std::make_unique<GlobalIndex>(manifest_);
         GlobalIndex::Options opts;
-        ASSERT_TRUE(index->open(db_dir_, opts).ok());
+        ASSERT_TRUE(index->open(db_dir_, opts, *storage_).ok());
     }
 
     void TearDown() override {
         if (index && index->isOpen()) index->close();
         index.reset();
+        if (storage_) storage_->close();
+        storage_.reset();
         manifest_.close();
         std::filesystem::remove_all(db_dir_);
     }
 
-    // Helpers that mirror the production flush path (stagePut + commitWB).
     void put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
-        ASSERT_TRUE(index->stagePut(hkey, packed_version, segment_id).ok());
-    }
-    void commit(uint64_t max_version) {
-        ASSERT_TRUE(index->commitWB(max_version).ok());
+        index->applyPut(hkey, packed_version, segment_id);
     }
 
     std::string db_dir_;
     kvlite::internal::Manifest manifest_;
+    std::unique_ptr<SegmentStorageManager> storage_;
     std::unique_ptr<GlobalIndex> index;
 };
 
@@ -66,7 +68,6 @@ TEST_F(GlobalIndexDHT, PutAndGetLatest) {
     put(hkey1, 100, 1);
     put(hkey1, 200, 2);
     put(hkey1, 300, 3);
-    commit(300);
 
     uint64_t ver;
     uint32_t seg;
@@ -88,7 +89,6 @@ TEST_F(GlobalIndexDHT, PutMultipleVersions) {
     put(hkey1, 100, 1);
     put(hkey1, 200, 2);
     put(hkey1, 300, 3);
-    commit(300);
 
     EXPECT_EQ(index->entryCount(), 3u);
     EXPECT_EQ(index->keyCount(), 1u);
@@ -98,7 +98,6 @@ TEST_F(GlobalIndexDHT, GetLatest) {
     uint64_t hkey1 = H("key1");
     put(hkey1, 100, 1);
     put(hkey1, 200, 2);
-    commit(200);
 
     uint64_t ver;
     uint32_t seg;
@@ -114,7 +113,6 @@ TEST_F(GlobalIndexDHT, GetWithUpperBound) {
     put(hkey1, 100, 1);
     put(hkey1, 200, 2);
     put(hkey1, 300, 3);
-    commit(300);
 
     uint64_t ver;
     uint32_t seg;
@@ -133,7 +131,6 @@ TEST_F(GlobalIndexDHT, Contains) {
     uint64_t hkey1 = H("key1");
     EXPECT_FALSE(index->contains(hkey1));
     put(hkey1, 100, 1);
-    commit(100);
     EXPECT_TRUE(index->contains(hkey1));
 }
 
@@ -149,18 +146,20 @@ TEST_F(GlobalIndexDHT, Savepoint) {
     put(hkey1, 100, 1);
     put(hkey1, 200, 2);
     put(hkey2, 300, 3);
-    commit(300);
 
     ASSERT_TRUE(index->storeSavepoint(0).ok());
     ASSERT_TRUE(index->close().ok());
 
     // Re-open and verify data is loaded from savepoint.
+    storage_->close();
     manifest_.close();
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    SegmentStorageManager storage2(manifest2);
+    ASSERT_TRUE(storage2.open(db_dir_).ok());
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
-    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.open(db_dir_, opts, storage2).ok());
 
     EXPECT_EQ(index2.keyCount(), 2u);
     EXPECT_EQ(index2.entryCount(), 3u);
@@ -176,6 +175,7 @@ TEST_F(GlobalIndexDHT, Savepoint) {
     EXPECT_EQ(seg, 3u);
 
     index2.close();
+    storage2.close();
     manifest2.close();
 }
 
@@ -186,18 +186,20 @@ TEST_F(GlobalIndexDHT, SavepointWithManyEntries) {
     put(hkey1, 200, 2);
     put(hkey1, 300, 3);
     put(hkey2, 400, 4);
-    commit(400);
 
     ASSERT_TRUE(index->storeSavepoint(0).ok());
     ASSERT_TRUE(index->close().ok());
 
     // Re-open and verify data is loaded from savepoint.
+    storage_->close();
     manifest_.close();
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    SegmentStorageManager storage2(manifest2);
+    ASSERT_TRUE(storage2.open(db_dir_).ok());
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
-    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.open(db_dir_, opts, storage2).ok());
 
     EXPECT_EQ(index2.keyCount(), 2u);
     EXPECT_EQ(index2.entryCount(), 4u);
@@ -217,6 +219,7 @@ TEST_F(GlobalIndexDHT, SavepointWithManyEntries) {
     EXPECT_EQ(seg, 4u);
 
     index2.close();
+    storage2.close();
     manifest2.close();
 }
 
@@ -226,7 +229,6 @@ TEST_F(GlobalIndexDHT, Clear) {
         put(H(key), static_cast<uint64_t>(i * 10),
             static_cast<uint32_t>(i));
     }
-    commit(49 * 10);
     EXPECT_EQ(index->keyCount(), 50u);
 
     index->clear();
@@ -383,7 +385,6 @@ TEST_F(GlobalIndexDHT, ManyVersionsSameKeyAndSegment) {
     for (int i = 1; i <= 200; ++i) {
         put(hkey, static_cast<uint64_t>(i), /*segment_id=*/1);
     }
-    commit(200);
 
     EXPECT_EQ(index->entryCount(), 200u);
     EXPECT_EQ(index->keyCount(), 1u);
@@ -408,7 +409,6 @@ TEST_F(GlobalIndexDHT, ManyVersionsDifferentSegments) {
     for (int i = 1; i <= 200; ++i) {
         put(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
     }
-    commit(200);
 
     uint64_t ver;
     uint32_t seg;
@@ -428,7 +428,6 @@ TEST_F(GlobalIndexDHT, LargeScale) {
         std::string key = "key_" + std::to_string(i);
         put(H(key), static_cast<uint64_t>(i * 10), static_cast<uint32_t>(i));
     }
-    commit((N - 1) * 10);
 
     EXPECT_EQ(index->keyCount(), static_cast<size_t>(N));
 
@@ -490,7 +489,6 @@ TEST_F(GlobalIndexDHT, PutKeyCountWithAddEntryIsNew) {
                 static_cast<uint32_t>(k));
         }
     }
-    commit(K * V - 1);
     EXPECT_EQ(index->keyCount(), static_cast<size_t>(K));
     EXPECT_EQ(index->entryCount(), static_cast<size_t>(K * V));
 }
@@ -1617,27 +1615,29 @@ protected:
                   std::to_string(reinterpret_cast<uintptr_t>(this));
         std::filesystem::create_directories(db_dir_);
         ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        storage_ = std::make_unique<SegmentStorageManager>(manifest_);
+        ASSERT_TRUE(storage_->open(db_dir_).ok());
         index_ = std::make_unique<GlobalIndex>(manifest_);
         GlobalIndex::Options opts;
-        ASSERT_TRUE(index_->open(db_dir_, opts).ok());
+        ASSERT_TRUE(index_->open(db_dir_, opts, *storage_).ok());
     }
 
     void TearDown() override {
         if (index_ && index_->isOpen()) index_->close();
         index_.reset();
+        if (storage_) storage_->close();
+        storage_.reset();
         manifest_.close();
         std::filesystem::remove_all(db_dir_);
     }
 
     void put(uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
-        ASSERT_TRUE(index_->stagePut(hkey, packed_version, segment_id).ok());
-    }
-    void commit(uint64_t max_version) {
-        ASSERT_TRUE(index_->commitWB(max_version).ok());
+        index_->applyPut(hkey, packed_version, segment_id);
     }
 
     std::string db_dir_;
     Manifest manifest_;
+    std::unique_ptr<SegmentStorageManager> storage_;
     std::unique_ptr<GlobalIndex> index_;
 };
 
@@ -1647,7 +1647,6 @@ TEST_F(SavepointTest, RoundTripBasic) {
         std::string key = "key_" + std::to_string(i);
         put(H(key), i * 10 + 1, i + 1);
     }
-    commit((N - 1) * 10 + 1);
 
     ASSERT_EQ(index_->entryCount(), static_cast<size_t>(N));
     ASSERT_EQ(index_->keyCount(), static_cast<size_t>(N));
@@ -1655,13 +1654,16 @@ TEST_F(SavepointTest, RoundTripBasic) {
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
     ASSERT_TRUE(index_->close().ok());
+    storage_->close();
     manifest_.close();
 
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    SegmentStorageManager storage2(manifest2);
+    ASSERT_TRUE(storage2.open(db_dir_).ok());
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
-    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.open(db_dir_, opts, storage2).ok());
     // Savepoint is loaded automatically during open()/recover()
 
     EXPECT_EQ(index2.entryCount(), static_cast<size_t>(N));
@@ -1677,6 +1679,7 @@ TEST_F(SavepointTest, RoundTripBasic) {
     }
 
     index2.close();
+    storage2.close();
     manifest2.close();
 }
 
@@ -1688,20 +1691,22 @@ TEST_F(SavepointTest, RoundTripMultiVersion) {
             put(hkey, v * 100 + i + 1, v * 10 + i);
         }
     }
-    commit(4 * 100 + 99 + 1);
 
     ASSERT_EQ(index_->entryCount(), 500u);
     ASSERT_EQ(index_->keyCount(), 100u);
 
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
     ASSERT_TRUE(index_->close().ok());
+    storage_->close();
     manifest_.close();
 
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    SegmentStorageManager storage2(manifest2);
+    ASSERT_TRUE(storage2.open(db_dir_).ok());
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
-    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.open(db_dir_, opts, storage2).ok());
     // Savepoint is loaded automatically during open()/recover()
 
     EXPECT_EQ(index2.entryCount(), 500u);
@@ -1716,6 +1721,7 @@ TEST_F(SavepointTest, RoundTripMultiVersion) {
     }
 
     index2.close();
+    storage2.close();
     manifest2.close();
 }
 
@@ -1728,7 +1734,6 @@ TEST_F(SavepointTest, SavepointWithExtensions) {
             put(hkey, v * 1000 + i + 1, v);
         }
     }
-    commit(49 * 1000 + N);
 
     size_t entry_count = index_->entryCount();
     size_t key_count = index_->keyCount();
@@ -1736,13 +1741,16 @@ TEST_F(SavepointTest, SavepointWithExtensions) {
 
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
     ASSERT_TRUE(index_->close().ok());
+    storage_->close();
     manifest_.close();
 
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    SegmentStorageManager storage2(manifest2);
+    ASSERT_TRUE(storage2.open(db_dir_).ok());
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
-    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.open(db_dir_, opts, storage2).ok());
     // Savepoint is loaded automatically during open()/recover()
 
     EXPECT_EQ(index2.entryCount(), entry_count);
@@ -1756,6 +1764,7 @@ TEST_F(SavepointTest, SavepointWithExtensions) {
     }
 
     index2.close();
+    storage2.close();
     manifest2.close();
 }
 
@@ -1764,7 +1773,6 @@ TEST_F(SavepointTest, SavepointBlocksConcurrentPut) {
         std::string key = "key_" + std::to_string(i);
         put(H(key), i + 1, i);
     }
-    commit(100);
 
     std::atomic<bool> savepoint_started{false};
     std::atomic<bool> savepoint_done{false};
@@ -1776,8 +1784,7 @@ TEST_F(SavepointTest, SavepointBlocksConcurrentPut) {
         while (!savepoint_started.load(std::memory_order_acquire)) {
         }
         put_started.store(true, std::memory_order_release);
-        index_->stagePut(hblocked, 999, 42);
-        index_->commitWB(999);
+        index_->applyPut(hblocked, 999, 42);
         put_done.store(true, std::memory_order_release);
     });
 
@@ -1796,7 +1803,7 @@ TEST_F(SavepointTest, SavepointBlocksConcurrentPut) {
     EXPECT_EQ(seg, 42u);
 }
 
-// stagePut/commitWB (flush path) runs concurrently with savepoint.
+// applyPut (flush path) runs concurrently with savepoint.
 // After both complete, the flushed entries should be visible.
 TEST_F(SavepointTest, SavepointConcurrentWithFlush) {
     // Pre-populate so the savepoint has work to do.
@@ -1804,12 +1811,11 @@ TEST_F(SavepointTest, SavepointConcurrentWithFlush) {
         std::string key = "pre_" + std::to_string(i);
         put(H(key), i + 1, i);
     }
-    commit(200);
 
     std::atomic<bool> go{false};
     std::atomic<bool> flush_done{false};
 
-    // Flush thread: stages entries via stagePut + commitWB (no BatchGuard).
+    // Flush thread: applies entries via applyPut (no BatchGuard needed).
     const int flush_count = 100;
     std::thread flusher([&]() {
         while (!go.load(std::memory_order_acquire)) {}
@@ -1817,11 +1823,8 @@ TEST_F(SavepointTest, SavepointConcurrentWithFlush) {
             std::string key = "flush_" + std::to_string(i);
             uint64_t hkey = H(key);
             uint64_t pv = static_cast<uint64_t>(1000 + i);
-            Status s = index_->stagePut(hkey, pv, 99);
-            EXPECT_TRUE(s.ok()) << s.toString();
+            index_->applyPut(hkey, pv, 99);
         }
-        Status s = index_->commitWB(1000 + flush_count - 1);
-        EXPECT_TRUE(s.ok()) << s.toString();
         flush_done.store(true, std::memory_order_release);
     });
 
@@ -1841,15 +1844,18 @@ TEST_F(SavepointTest, SavepointConcurrentWithFlush) {
         EXPECT_EQ(seg, 99u);
     }
 
-    // Reopen and verify entries survived (savepoint or WAL replay).
+    // Reopen and verify entries survived.
     ASSERT_TRUE(index_->close().ok());
+    storage_->close();
     manifest_.close();
 
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    SegmentStorageManager storage2(manifest2);
+    ASSERT_TRUE(storage2.open(db_dir_).ok());
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
-    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.open(db_dir_, opts, storage2).ok());
 
     for (int i = 0; i < flush_count; ++i) {
         std::string key = "flush_" + std::to_string(i);
@@ -1862,6 +1868,7 @@ TEST_F(SavepointTest, SavepointConcurrentWithFlush) {
     EXPECT_GE(index2.keyCount(), 200u);
 
     index2.close();
+    storage2.close();
     manifest2.close();
 }
 
@@ -1870,7 +1877,6 @@ TEST_F(SavepointTest, AtomicSwapLeavesValidDir) {
         std::string key = "key_" + std::to_string(i);
         put(H(key), i + 1, i);
     }
-    commit(10);
 
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
@@ -1887,7 +1893,6 @@ TEST_F(SavepointTest, AtomicSwapLeavesValidDir) {
         std::string key = "key_" + std::to_string(i);
         put(H(key), i + 1, i);
     }
-    commit(20);
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
     EXPECT_TRUE(std::filesystem::exists(valid_dir));
@@ -1898,9 +1903,8 @@ TEST_F(SavepointTest, AtomicSwapLeavesValidDir) {
 TEST_F(SavepointTest, WriteSavepointThenLoad) {
     for (int i = 0; i < 50; ++i) {
         std::string key = "key_" + std::to_string(i);
-        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i).ok());
+        index_->applyPut(H(key), i + 1, i);
     }
-    commit(50);
 
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
     ASSERT_TRUE(index_->close().ok());
@@ -1909,12 +1913,15 @@ TEST_F(SavepointTest, WriteSavepointThenLoad) {
     EXPECT_TRUE(std::filesystem::exists(valid_dir));
 
     // Re-open and verify data is loaded from savepoint.
+    storage_->close();
     manifest_.close();
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    SegmentStorageManager storage2(manifest2);
+    ASSERT_TRUE(storage2.open(db_dir_).ok());
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
-    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.open(db_dir_, opts, storage2).ok());
 
     EXPECT_EQ(index2.entryCount(), 50u);
     EXPECT_EQ(index2.keyCount(), 50u);
@@ -1927,6 +1934,7 @@ TEST_F(SavepointTest, WriteSavepointThenLoad) {
     }
 
     index2.close();
+    storage2.close();
     manifest2.close();
 }
 
@@ -1935,18 +1943,22 @@ TEST_F(SavepointTest, EmptyIndexSavepoint) {
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
 
     ASSERT_TRUE(index_->close().ok());
+    storage_->close();
     manifest_.close();
 
     Manifest manifest2;
     ASSERT_TRUE(manifest2.open(db_dir_).ok());
+    SegmentStorageManager storage2(manifest2);
+    ASSERT_TRUE(storage2.open(db_dir_).ok());
     GlobalIndex index2(manifest2);
     GlobalIndex::Options opts;
-    ASSERT_TRUE(index2.open(db_dir_, opts).ok());
+    ASSERT_TRUE(index2.open(db_dir_, opts, storage2).ok());
 
     EXPECT_EQ(index2.entryCount(), 0u);
     EXPECT_EQ(index2.keyCount(), 0u);
 
     index2.close();
+    storage2.close();
     manifest2.close();
 }
 
@@ -2050,28 +2062,27 @@ protected:
                   std::to_string(reinterpret_cast<uintptr_t>(this));
         std::filesystem::create_directories(db_dir_);
         ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        storage_ = std::make_unique<SegmentStorageManager>(manifest_);
+        ASSERT_TRUE(storage_->open(db_dir_).ok());
     }
 
     void TearDown() override {
+        if (storage_) storage_->close();
+        storage_.reset();
         manifest_.close();
         std::filesystem::remove_all(db_dir_);
     }
 
-    // Stage a put and commit helpers (mirror production API).
     void put(GlobalIndex& idx, uint64_t hkey, uint64_t packed_version, uint32_t segment_id) {
-        ASSERT_TRUE(idx.stagePut(hkey, packed_version, segment_id).ok());
-    }
-    void commit(GlobalIndex& idx, uint64_t max_version) {
-        ASSERT_TRUE(idx.commitWB(max_version).ok());
+        idx.applyPut(hkey, packed_version, segment_id);
     }
 
     // Populate index with N keys, each with packed_version = i+1, segment_id = i.
     void populate(GlobalIndex& idx, int N) {
         for (int i = 0; i < N; ++i) {
             std::string key = "key_" + std::to_string(i);
-            ASSERT_TRUE(idx.stagePut(H(key), i + 1, i).ok());
+            idx.applyPut(H(key), i + 1, i);
         }
-        if (N > 0) commit(idx, N);
     }
 
     // Verify index contains N keys with expected packed_version = i+1, segment_id = i.
@@ -2092,15 +2103,18 @@ protected:
     std::unique_ptr<GlobalIndex> openIndex() {
         auto idx = std::make_unique<GlobalIndex>(manifest_);
         GlobalIndex::Options opts;
-        Status s = idx->open(db_dir_, opts);
+        Status s = idx->open(db_dir_, opts, *storage_);
         EXPECT_TRUE(s.ok()) << s.toString();
         return idx;
     }
 
-    // Reopen manifest (close + open).
+    // Reopen manifest and storage (close + open).
     void reopenManifest() {
+        if (storage_) storage_->close();
         manifest_.close();
         ASSERT_TRUE(manifest_.open(db_dir_).ok());
+        storage_ = std::make_unique<SegmentStorageManager>(manifest_);
+        ASSERT_TRUE(storage_->open(db_dir_).ok());
     }
 
     std::string savepointDir() { return db_dir_ + "/gi/savepoint"; }
@@ -2109,6 +2123,7 @@ protected:
 
     std::string db_dir_;
     Manifest manifest_;
+    std::unique_ptr<SegmentStorageManager> storage_;
 };
 
 // Clean close and reopen: savepoint is written on close, loaded on open.
@@ -2123,9 +2138,8 @@ TEST_F(RecoveryTest, CleanCloseAndReopen) {
     idx2->close();
 }
 
-// Recovery converges: after open(), no WAL files should remain
-// (all data is in the savepoint).
-TEST_F(RecoveryTest, RecoveryConvergesNoWAL) {
+// Recovery converges: close + reopen produces consistent state.
+TEST_F(RecoveryTest, RecoveryConverges) {
     auto idx = openIndex();
     populate(*idx, 100);
     ASSERT_TRUE(idx->close().ok());
@@ -2133,20 +2147,6 @@ TEST_F(RecoveryTest, RecoveryConvergesNoWAL) {
 
     auto idx2 = openIndex();
     verify(*idx2, 100);
-
-    // After recovery converges, the WAL should be minimal:
-    // only the fresh active file (possibly plus one just-closed file).
-    std::string wal_dir = db_dir_ + "/gi/wal";
-    int wal_file_count = 0;
-    uint64_t total_wal_size = 0;
-    for (auto& entry : std::filesystem::directory_iterator(wal_dir)) {
-        if (entry.path().extension() == ".log") {
-            wal_file_count++;
-            total_wal_size += entry.file_size();
-        }
-    }
-    EXPECT_LE(wal_file_count, 2);
-
     idx2->close();
 }
 
@@ -2157,12 +2157,11 @@ TEST_F(RecoveryTest, CrashLeavingTmpDir) {
     populate(*idx, 50);
     ASSERT_TRUE(idx->storeSavepoint(0).ok());
 
-    // Add more data (these go into WAL but not the savepoint).
+    // Add more data.
     for (int i = 50; i < 80; ++i) {
         std::string key = "key_" + std::to_string(i);
         put(*idx, H(key), i + 1, i);
     }
-    commit(*idx, 80);
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
 
@@ -2172,8 +2171,7 @@ TEST_F(RecoveryTest, CrashLeavingTmpDir) {
     std::ofstream(savepointTmp() + "/garbage.dat") << "corrupt";
 
     auto idx2 = openIndex();
-    // Should have all 80 keys (50 from savepoint + 30 from WAL replay,
-    // but close() wrote a savepoint with all 80, so recovery loads that).
+    // Should have all 80 keys (close() wrote a savepoint with all 80).
     verify(*idx2, 80);
     // .tmp should be cleaned up.
     EXPECT_FALSE(std::filesystem::exists(savepointTmp()));
@@ -2216,7 +2214,6 @@ TEST_F(RecoveryTest, CrashBeforeOldCleanup) {
         std::string key = "key_" + std::to_string(i);
         put(*idx, H(key), i + 1, i);
     }
-    commit(*idx, 70);
     ASSERT_TRUE(idx->storeSavepoint(0).ok());
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
@@ -2232,22 +2229,18 @@ TEST_F(RecoveryTest, CrashBeforeOldCleanup) {
     idx2->close();
 }
 
-// WAL replay is idempotent: duplicate puts don't corrupt the index.
-// Populate, savepoint, add more (WAL only), then re-open.
-// The WAL records overlap with the savepoint written on close().
-TEST_F(RecoveryTest, IdempotentWALReplay) {
+// Recovery is idempotent: close + reopen doesn't corrupt the index.
+TEST_F(RecoveryTest, IdempotentRecovery) {
     auto idx = openIndex();
     populate(*idx, 100);
     // Explicit savepoint captures all 100 keys.
     ASSERT_TRUE(idx->storeSavepoint(0).ok());
 
     // Write the same keys again with different values.
-    // These go to WAL but the savepoint already has them.
     for (int i = 0; i < 100; ++i) {
         std::string key = "key_" + std::to_string(i);
         put(*idx, H(key), (i + 1) * 10, i + 100);
     }
-    commit(*idx, 1000);
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
 
@@ -2267,41 +2260,21 @@ TEST_F(RecoveryTest, IdempotentWALReplay) {
     idx2->close();
 }
 
-// Recovery with no savepoint — only WAL.
-// Simulate by writing data, committing WAL, then closing normally
-// and deleting the savepoint dir + resetting manifest max_version.
-// This forces recovery to rely entirely on WAL replay.
-TEST_F(RecoveryTest, RecoveryFromWALOnly) {
+// Recovery with no savepoint — delete savepoint and reopen.
+// Should recover empty (no lineage to replay).
+TEST_F(RecoveryTest, RecoveryWithoutSavepoint) {
     auto idx = openIndex();
     populate(*idx, 30);
-    // Commit WAL explicitly so records are durable on disk.
-    ASSERT_TRUE(idx->commitWB(31).ok());
-    // storeSavepoint + close to get committed WAL files on disk.
     ASSERT_TRUE(idx->storeSavepoint(0).ok());
-
-    // Now add more data with committed WAL but no savepoint for them.
-    for (int i = 30; i < 50; ++i) {
-        std::string key = "key_" + std::to_string(i);
-        put(*idx, H(key), i + 1, i);
-    }
-    commit(*idx, 51);
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
 
-    // Delete the savepoint to force recovery from WAL only.
-    // The WAL should still have the records from i=30..49.
-    // (The savepoint from storeSavepoint had 0..29, and close() wrote 0..49.)
-    // By deleting both and resetting max_version, we lose everything.
-    // Instead, just test that recovery handles missing savepoint gracefully.
+    // Delete the savepoint to force recovery without it.
     std::filesystem::remove_all(savepointDir());
 
     auto idx2 = openIndex();
-    // Without savepoint, recovery still succeeds (loads empty, replays WAL).
-    // But since close() truncated WAL after writing savepoint, WAL may be empty.
     // The key test is that open() doesn't fail.
     EXPECT_TRUE(idx2->isOpen());
-    // Recovery should have written a fresh savepoint.
-    EXPECT_TRUE(std::filesystem::exists(savepointDir()));
     idx2->close();
 }
 
@@ -2315,7 +2288,6 @@ TEST_F(RecoveryTest, MultipleReopenCycles) {
             std::string key = "key_" + std::to_string(i);
             put(*idx, H(key), i + 1, i);
         }
-        commit(*idx, base + 20);
         ASSERT_TRUE(idx->close().ok());
     }
 

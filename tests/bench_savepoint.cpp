@@ -8,6 +8,7 @@
 
 #include "internal/global_index.h"
 #include "internal/manifest.h"
+#include "internal/segment_storage_manager.h"
 #include "internal/read_write_delta_hash_table.h"
 
 using namespace kvlite::internal;
@@ -18,7 +19,7 @@ static uint64_t H(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixture: creates a temp dir + Manifest + GlobalIndex per test.
+// Fixture: creates a temp dir + Manifest + SegmentStorageManager + GlobalIndex per test.
 // ---------------------------------------------------------------------------
 class SavepointBench : public ::testing::Test {
 protected:
@@ -27,20 +28,25 @@ protected:
                   std::to_string(reinterpret_cast<uintptr_t>(this));
         std::filesystem::create_directories(db_dir_);
         ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        storage_ = std::make_unique<SegmentStorageManager>(manifest_);
+        ASSERT_TRUE(storage_->open(db_dir_).ok());
         index_ = std::make_unique<GlobalIndex>(manifest_);
         GlobalIndex::Options opts;
-        ASSERT_TRUE(index_->open(db_dir_, opts).ok());
+        ASSERT_TRUE(index_->open(db_dir_, opts, *storage_).ok());
     }
 
     void TearDown() override {
         if (index_ && index_->isOpen()) index_->close();
         index_.reset();
+        if (storage_) storage_->close();
+        storage_.reset();
         manifest_.close();
         std::filesystem::remove_all(db_dir_);
     }
 
     std::string db_dir_;
     Manifest manifest_;
+    std::unique_ptr<SegmentStorageManager> storage_;
     std::unique_ptr<GlobalIndex> index_;
 };
 
@@ -51,16 +57,12 @@ TEST_F(SavepointBench, SnapshotBucketChain) {
     const int kNumKeys = 100'000;
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "snapbk_" + std::to_string(i);
-        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i + 1).ok());
+        index_->applyPut(H(key), i + 1, i + 1);
     }
-    ASSERT_TRUE(index_->commitWB(kNumKeys).ok());
 
-    // Access the underlying DHT via a second instance that shares the same
-    // bucket layout. We measure snapshotBucketChain on a standalone RW-DHT.
     ReadWriteDeltaHashTable dht;
     const uint32_t nBuckets = dht.numBuckets();
 
-    // Populate the DHT directly.
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "snapbk_" + std::to_string(i);
         dht.addEntry(H(key), i + 1, i + 1);
@@ -80,25 +82,22 @@ TEST_F(SavepointBench, SnapshotBucketChain) {
 }
 
 // ---------------------------------------------------------------------------
-// StagePutThroughput: atomic CAS + DHT insert via stagePut (100K ops)
+// ApplyPutThroughput: DHT insert via applyPut (100K ops)
 // ---------------------------------------------------------------------------
-TEST_F(SavepointBench, StagePutThroughput) {
+TEST_F(SavepointBench, ApplyPutThroughput) {
     const int kNumOps = 100'000;
 
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kNumOps; ++i) {
-        std::string key = "stageput_" + std::to_string(i);
-        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i + 1).ok());
+        std::string key = "applyput_" + std::to_string(i);
+        index_->applyPut(H(key), i + 1, i + 1);
     }
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    // Commit to keep WAL state consistent.
-    ASSERT_TRUE(index_->commitWB(kNumOps).ok());
-
-    std::cout << "[BENCH] StagePutThroughput: " << ms << " ms ("
+    std::cout << "[BENCH] ApplyPutThroughput: " << ms << " ms ("
               << kNumOps << " ops)\n";
-    EXPECT_LT(ms, 500.0) << "Regression: stagePut too slow";
+    EXPECT_LT(ms, 500.0) << "Regression: applyPut too slow";
 }
 
 // ---------------------------------------------------------------------------
@@ -108,9 +107,8 @@ TEST_F(SavepointBench, SavepointWriteLatency) {
     const int kNumKeys = 100'000;
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "spwrite_" + std::to_string(i);
-        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i + 1).ok());
+        index_->applyPut(H(key), i + 1, i + 1);
     }
-    ASSERT_TRUE(index_->commitWB(kNumKeys).ok());
 
     auto t0 = std::chrono::steady_clock::now();
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
@@ -124,31 +122,25 @@ TEST_F(SavepointBench, SavepointWriteLatency) {
 
 // ---------------------------------------------------------------------------
 // ConcurrentFlushAndSavepoint: ratio of concurrent vs baseline savepoint time.
-// This is the key regression detector — if exclusive locking is accidentally
-// re-introduced, the ratio will blow up.
 // ---------------------------------------------------------------------------
 TEST_F(SavepointBench, ConcurrentFlushAndSavepoint) {
     const int kNumKeys = 100'000;
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "conc_" + std::to_string(i);
-        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i + 1).ok());
+        index_->applyPut(H(key), i + 1, i + 1);
     }
-    ASSERT_TRUE(index_->commitWB(kNumKeys).ok());
 
-    // --- Baseline: savepoint with no concurrent writers ---
     auto t0 = std::chrono::steady_clock::now();
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
     auto t1 = std::chrono::steady_clock::now();
     double baseline_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-    // --- Concurrent: savepoint while flush (stagePut) runs in parallel ---
     const int kFlushOps = 50'000;
     std::atomic<bool> flush_done{false};
     std::thread flush_thread([&]() {
         for (int i = 0; i < kFlushOps; ++i) {
             std::string key = "flush_" + std::to_string(i);
-            auto s = index_->stagePut(H(key), kNumKeys + i + 1, kNumKeys + i + 1);
-            if (!s.ok()) break;
+            index_->applyPut(H(key), kNumKeys + i + 1, kNumKeys + i + 1);
         }
         flush_done.store(true);
     });
@@ -159,8 +151,6 @@ TEST_F(SavepointBench, ConcurrentFlushAndSavepoint) {
     double concurrent_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
     flush_thread.join();
-    // Commit the staged entries.
-    ASSERT_TRUE(index_->commitWB(kNumKeys + kFlushOps).ok());
 
     double ratio = concurrent_ms / std::max(baseline_ms, 1.0);
     std::cout << "[BENCH] ConcurrentFlushAndSavepoint: baseline=" << baseline_ms
@@ -172,28 +162,29 @@ TEST_F(SavepointBench, ConcurrentFlushAndSavepoint) {
 
 // ---------------------------------------------------------------------------
 // MultiThreadedSavepointSpeedup: compare 1-thread vs 4-thread savepoint write.
-// Informational — prints the speedup ratio but does not enforce a hard bound.
 // ---------------------------------------------------------------------------
 TEST_F(SavepointBench, MultiThreadedSavepointSpeedup) {
     const int kNumKeys = 100'000;
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "mtsp_" + std::to_string(i);
-        ASSERT_TRUE(index_->stagePut(H(key), i + 1, i + 1).ok());
+        index_->applyPut(H(key), i + 1, i + 1);
     }
-    ASSERT_TRUE(index_->commitWB(kNumKeys).ok());
 
     // --- 1-thread baseline: reopen with savepoint_threads=1 ---
     index_->close();
     index_.reset();
+    storage_->close();
+    storage_.reset();
     manifest_.close();
 
     ASSERT_TRUE(manifest_.open(db_dir_).ok());
+    storage_ = std::make_unique<SegmentStorageManager>(manifest_);
+    ASSERT_TRUE(storage_->open(db_dir_).ok());
     index_ = std::make_unique<GlobalIndex>(manifest_);
     GlobalIndex::Options opts1;
     opts1.savepoint_threads = 1;
-    ASSERT_TRUE(index_->open(db_dir_, opts1).ok());
+    ASSERT_TRUE(index_->open(db_dir_, opts1, *storage_).ok());
 
-    // Re-populate (open loaded the savepoint, so data is present).
     auto t0 = std::chrono::steady_clock::now();
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
     auto t1 = std::chrono::steady_clock::now();
@@ -202,13 +193,17 @@ TEST_F(SavepointBench, MultiThreadedSavepointSpeedup) {
     // --- 4-thread: reopen with savepoint_threads=4 ---
     index_->close();
     index_.reset();
+    storage_->close();
+    storage_.reset();
     manifest_.close();
 
     ASSERT_TRUE(manifest_.open(db_dir_).ok());
+    storage_ = std::make_unique<SegmentStorageManager>(manifest_);
+    ASSERT_TRUE(storage_->open(db_dir_).ok());
     index_ = std::make_unique<GlobalIndex>(manifest_);
     GlobalIndex::Options opts4;
     opts4.savepoint_threads = 4;
-    ASSERT_TRUE(index_->open(db_dir_, opts4).ok());
+    ASSERT_TRUE(index_->open(db_dir_, opts4, *storage_).ok());
 
     auto t2 = std::chrono::steady_clock::now();
     ASSERT_TRUE(index_->storeSavepoint(0).ok());
@@ -234,7 +229,6 @@ TEST_F(SavepointBench, LoadBucketChain) {
 
     const uint32_t nBuckets = src.numBuckets();
 
-    // Snapshot all chains.
     struct ChainData {
         std::vector<uint8_t> data;
         uint8_t chain_len;
@@ -245,7 +239,6 @@ TEST_F(SavepointBench, LoadBucketChain) {
             src.snapshotBucketChain(bi, chains[bi].data));
     }
 
-    // Load into a fresh DHT and time it.
     ReadWriteDeltaHashTable dst;
 
     auto t0 = std::chrono::steady_clock::now();

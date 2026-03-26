@@ -13,6 +13,7 @@
 #include "internal/manifest.h"
 #include "internal/read_only_delta_hash_table.h"
 #include "internal/segment_index.h"
+#include "internal/segment_storage_manager.h"
 #include "internal/gc.h"
 #include "internal/log_file.h"
 #include "internal/segment.h"
@@ -289,6 +290,7 @@ protected:
         }
         for (auto& gi : gi_instances_) {
             if (gi.index && gi.index->isOpen()) gi.index->close();
+            if (gi.storage) gi.storage->close();
             gi.manifest.close();
             std::filesystem::remove_all(gi.dir);
         }
@@ -297,6 +299,7 @@ protected:
     struct OpenedGI {
         std::string dir;
         kvlite::internal::Manifest manifest;
+        std::unique_ptr<SegmentStorageManager> storage;
         std::unique_ptr<GlobalIndex> index;
     };
 
@@ -307,9 +310,12 @@ protected:
         std::filesystem::create_directories(gi.dir);
         auto s = gi.manifest.create(gi.dir);
         EXPECT_TRUE(s.ok()) << s.toString();
+        gi.storage = std::make_unique<SegmentStorageManager>(gi.manifest);
+        s = gi.storage->open(gi.dir);
+        EXPECT_TRUE(s.ok()) << s.toString();
         gi.index = std::make_unique<GlobalIndex>(gi.manifest);
         GlobalIndex::Options opts;
-        s = gi.index->open(gi.dir, opts);
+        s = gi.index->open(gi.dir, opts, *gi.storage);
         EXPECT_TRUE(s.ok()) << s.toString();
         return *gi.index;
     }
@@ -679,9 +685,9 @@ TEST_F(GCMergeTest, MergeReleasesAllOldVersionsWhenNoSnapshot) {
 TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
     // Put entries into GlobalIndex with specific segment_ids.
     auto& gi = createOpenGI();
-    gi.stagePut(H("key1"), PackedVersion(1, false).data, 1);
-    gi.stagePut(H("key2"), PackedVersion(2, false).data, 1);
-    gi.commitWB(2);
+    gi.applyPut(H("key1"), PackedVersion(1, false).data, 1);
+    gi.applyPut(H("key2"), PackedVersion(2, false).data, 1);
+    // No commit needed — applyPut updates in-memory index directly.
 
     // Create segment with those entries.
     size_t idx = createSegment(1, {
@@ -701,10 +707,10 @@ TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
         [this]() { return allocateId(); },
         [&](uint64_t hkey, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
-            gi.relocate(hkey, packed_version, old_id, new_id);
+            gi.applyRelocate(hkey, packed_version, old_id, new_id);
         },
         [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
-            gi.eliminate(hkey, packed_version, old_id);
+            gi.applyEliminate(hkey, packed_version, old_id);
         },
         last_result_);
 
@@ -726,9 +732,9 @@ TEST_F(GCMergeTest, RelocateUpdatesGlobalIndex) {
 
 TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
     auto& gi = createOpenGI();
-    gi.stagePut(H("key1"), PackedVersion(1, false).data, 1);
-    gi.stagePut(H("key1"), PackedVersion(2, false).data, 2);
-    gi.commitWB(2);
+    gi.applyPut(H("key1"), PackedVersion(1, false).data, 1);
+    gi.applyPut(H("key1"), PackedVersion(2, false).data, 2);
+    // No commit needed — applyPut updates in-memory index directly.
 
     size_t idx1 = createSegment(1, {{"key1", 1, "old", false}});
     size_t idx2 = createSegment(2, {{"key1", 2, "new", false}});
@@ -745,10 +751,10 @@ TEST_F(GCMergeTest, EliminateRemovesFromGlobalIndex) {
         [this]() { return allocateId(); },
         [&](uint64_t hkey, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
-            gi.relocate(hkey, packed_version, old_id, new_id);
+            gi.applyRelocate(hkey, packed_version, old_id, new_id);
         },
         [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
-            gi.eliminate(hkey, packed_version, old_id);
+            gi.applyEliminate(hkey, packed_version, old_id);
         },
         last_result_);
 
@@ -771,9 +777,9 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
     // Two versions of "key1" in same segment — both will be compacted,
     // but only the latest survives the single-snapshot classification.
     // To eliminate ALL versions, we need a tombstone as latest.
-    gi.stagePut(H("key1"), PackedVersion(1, false).data, 1);
-    gi.stagePut(H("key1"), PackedVersion(2, true).data, 1);  // tombstone
-    gi.commitWB(2);
+    gi.applyPut(H("key1"), PackedVersion(1, false).data, 1);
+    gi.applyPut(H("key1"), PackedVersion(2, true).data, 1);  // tombstone
+    // No commit needed — applyPut updates in-memory index directly.
 
     size_t idx = createSegment(1, {
         {"key1", 2, "", true},  // tombstone (latest first)
@@ -794,10 +800,10 @@ TEST_F(GCMergeTest, EliminateAllVersionsRemovesKey) {
         [this]() { return allocateId(); },
         [&](uint64_t hkey, uint64_t packed_version,
               uint32_t old_id, uint32_t new_id) {
-            gi.relocate(hkey, packed_version, old_id, new_id);
+            gi.applyRelocate(hkey, packed_version, old_id, new_id);
         },
         [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
-            gi.eliminate(hkey, packed_version, old_id);
+            gi.applyEliminate(hkey, packed_version, old_id);
         },
         last_result_);
 
@@ -827,8 +833,8 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
     // in the output segment. A second GC pass eliminates it entirely.
     auto& gi = createOpenGI();
     uint32_t first_seg_id = 50;
-    gi.stagePut(H("key1"), PackedVersion(2, true).data, first_seg_id);  // tombstone only
-    gi.commitWB(2);
+    gi.applyPut(H("key1"), PackedVersion(2, true).data, first_seg_id);  // tombstone only
+    // No commit needed — applyPut updates in-memory index directly.
 
     // Create a segment containing just the tombstone.
     size_t idx = createSegment(first_seg_id, {
@@ -854,10 +860,10 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
             [this]() { return allocateId(); },
             [&](uint64_t hkey, uint64_t packed_version,
                   uint32_t old_id, uint32_t new_id) {
-                gi.relocate(hkey, packed_version, old_id, new_id);
+                gi.applyRelocate(hkey, packed_version, old_id, new_id);
             },
             [&](uint64_t hkey, uint64_t packed_version, uint32_t old_id) {
-                gi.eliminate(hkey, packed_version, old_id);
+                gi.applyEliminate(hkey, packed_version, old_id);
             },
             last_result_);
 
@@ -877,7 +883,7 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
     uint32_t new_seg_id = last_result_.outputs[0].getId();
     {
         GlobalIndex::BatchGuard guard(gi);
-        gi.eliminate(H("key1"), tomb_pv, new_seg_id);
+        gi.applyEliminate(H("key1"), tomb_pv, new_seg_id);
     }
 
     // Now the key is fully gone from GlobalIndex.

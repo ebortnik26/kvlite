@@ -105,7 +105,7 @@ bool SegmentStorageManager::isOpen() const {
     return is_open_;
 }
 
-Status SegmentStorageManager::createSegment(uint32_t id, bool register_in_manifest) {
+Status SegmentStorageManager::createSegment(uint32_t id) {
     std::string path = segmentPath(id);
     Segment seg;
     Status s = seg.create(path, id, buffered_writes_);
@@ -115,26 +115,11 @@ Status SegmentStorageManager::createSegment(uint32_t id, bool register_in_manife
     segments_.emplace(id, std::move(seg));
     lock.unlock();
 
-    if (register_in_manifest) {
-        manifest_.set(MK::kSegmentsMaxSegId, std::to_string(id));
-        // Set min if this is the first segment.
-        std::string val;
-        if (!manifest_.get(MK::kSegmentsMinSegId, val)) {
-            manifest_.set(MK::kSegmentsMinSegId, std::to_string(id));
-        }
-    }
-    return Status::OK();
-}
-
-Status SegmentStorageManager::registerSegments(const std::vector<uint32_t>& ids) {
-    if (ids.empty()) return Status::OK();
-    uint32_t max_id = *std::max_element(ids.begin(), ids.end());
-    manifest_.set(MK::kSegmentsMaxSegId, std::to_string(max_id));
-    // Set min if not already set.
+    manifest_.set(MK::kSegmentsMaxSegId, std::to_string(id));
+    // Set min if this is the first segment.
     std::string val;
     if (!manifest_.get(MK::kSegmentsMinSegId, val)) {
-        uint32_t min_id = *std::min_element(ids.begin(), ids.end());
-        manifest_.set(MK::kSegmentsMinSegId, std::to_string(min_id));
+        manifest_.set(MK::kSegmentsMinSegId, std::to_string(id));
     }
     return Status::OK();
 }
@@ -177,6 +162,19 @@ Status SegmentStorageManager::removeSegment(uint32_t id) {
     return Status::OK();
 }
 
+void SegmentStorageManager::registerSegmentId(uint32_t id) {
+    manifest_.set(MK::kSegmentsMaxSegId, std::to_string(id));
+    std::string val;
+    if (!manifest_.get(MK::kSegmentsMinSegId, val)) {
+        manifest_.set(MK::kSegmentsMinSegId, std::to_string(id));
+    }
+}
+
+void SegmentStorageManager::adoptSegment(uint32_t id, Segment seg) {
+    std::unique_lock lock(mutex_);
+    segments_.emplace(id, std::move(seg));
+}
+
 void SegmentStorageManager::pinSegment(uint32_t id) {
     std::unique_lock lock(mutex_);
     pin_counts_[id]++;
@@ -193,11 +191,6 @@ void SegmentStorageManager::unpinSegment(uint32_t id) {
             removeSegment(id);
         }
     }
-}
-
-void SegmentStorageManager::adoptSegment(uint32_t id, Segment seg) {
-    std::unique_lock lock(mutex_);
-    segments_.emplace(id, std::move(seg));
 }
 
 Segment* SegmentStorageManager::getSegment(uint32_t id) {

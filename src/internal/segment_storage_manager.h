@@ -48,19 +48,18 @@ public:
 
     // --- Segment Registry ---
 
-    // Create a new segment file in Writing state and register it.
-    // When register_in_manifest is false, the segment is created on disk
-    // but not persisted to the manifest (for deferred GC registration).
-    Status createSegment(uint32_t id, bool register_in_manifest = true);
+    // Create a new segment file in Writing state and register it in the manifest.
+    Status createSegment(uint32_t id);
 
-    // Batch-register previously deferred segments in the manifest.
-    Status registerSegments(const std::vector<uint32_t>& ids);
-
-    // Close and unregister a segment, deleting its file from disk.
-    Status removeSegment(uint32_t id);
+    // Register a segment ID in the manifest without creating a Segment object.
+    // Used by GC to make output segment IDs crash-recoverable before merge.
+    void registerSegmentId(uint32_t id);
 
     // Move a sealed segment into the registry (used by GC to register outputs).
     void adoptSegment(uint32_t id, Segment seg);
+
+    // Close and unregister a segment, deleting its file from disk.
+    Status removeSegment(uint32_t id);
 
     Segment* getSegment(uint32_t id);
     const Segment* getSegment(uint32_t id) const;

@@ -159,7 +159,7 @@ Status LogFile::append(const void* data, size_t len, uint64_t& offset) {
 
     size_ += len;
 
-    // O_DSYNC files (WAL) need each append durable on return.
+    // O_DSYNC files need each append durable on return.
     if (sync_ && buf_used_ > 0) {
         Status s = flushBuffer();
         if (!s.ok()) return s;

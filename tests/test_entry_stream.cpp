@@ -13,6 +13,7 @@
 #include "internal/log_file.h"
 #include "internal/manifest.h"
 #include "internal/segment.h"
+#include "internal/segment_storage_manager.h"
 #include "internal/memtable.h"
 
 using namespace kvlite::internal;
@@ -27,9 +28,11 @@ protected:
         db_dir_ = base_ + "db";
         std::filesystem::create_directories(db_dir_);
         ASSERT_TRUE(manifest_.create(db_dir_).ok());
+        storage_ = std::make_unique<SegmentStorageManager>(manifest_);
+        ASSERT_TRUE(storage_->open(db_dir_).ok());
         gi_ = std::make_unique<GlobalIndex>(manifest_);
         GlobalIndex::Options opts;
-        ASSERT_TRUE(gi_->open(db_dir_, opts).ok());
+        ASSERT_TRUE(gi_->open(db_dir_, opts, *storage_).ok());
     }
     void TearDown() override {
         for (auto& seg : segments_) {
@@ -40,6 +43,8 @@ protected:
         }
         if (gi_ && gi_->isOpen()) gi_->close();
         gi_.reset();
+        if (storage_) storage_->close();
+        storage_.reset();
         manifest_.close();
         std::filesystem::remove_all(db_dir_);
     }
@@ -58,15 +63,15 @@ protected:
         for (const auto& [key, version, value, tombstone] : entries) {
             uint64_t h = dhtHashBytes(key.data(), key.size());
             EXPECT_TRUE(seg.put(key, version, value, tombstone, h).ok());
-            gi_->stagePut(h, version, segment_id);
+            gi_->applyPut(h, version, segment_id);
         }
-        gi_->commitWB(0);
         EXPECT_TRUE(seg.seal().ok());
         return idx;
     }
 
     std::string db_dir_;
     Manifest manifest_;
+    std::unique_ptr<SegmentStorageManager> storage_;
     std::unique_ptr<GlobalIndex> gi_;
     std::vector<Segment> segments_;
     std::string base_;

@@ -13,12 +13,10 @@ namespace internal {
 
 // All manifest keys, centralized for discoverability.
 enum class ManifestKey {
-    kVmNextVersionBlock,   // "vm.next_version_block"
-    kSegmentsMinSegId,     // "segments.min_seg_id"
-    kSegmentsMaxSegId,     // "segments.max_seg_id"
-    kGiWalMinFileId,       // "gi.wal.min_file_id"
-    kGiWalMaxFileId,       // "gi.wal.max_file_id"
-    kGiSavepointMaxVersion, // "gi.savepoint.max_version"
+    kVmNextVersionBlock,      // "vm.next_version_block"
+    kSegmentsMinSegId,        // "segments.min_seg_id"
+    kSegmentsMaxSegId,        // "segments.max_seg_id"
+    kGiSavepointMaxSegmentId, // "gi.savepoint.max_segment_id"
 };
 
 const char* manifestKeyStr(ManifestKey key);

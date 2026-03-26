@@ -58,6 +58,7 @@ Status GC::merge(
     uint32_t output_id = id_fn();
     Status s = output.create(path_fn(output_id), output_id, buffered_writes);
     if (!s.ok()) return s;
+    output.setLineageType(LineageType::kGC);
 
     // 5. Drain pipeline — read action and segment_id from ext slots.
     while (pipeline->valid()) {
@@ -69,6 +70,8 @@ Status GC::merge(
 
         if (action == EntryAction::kEliminate) {
             on_eliminate(entry.hash, entry.pv.data, old_seg_id);
+            // Record elimination in current output segment's lineage.
+            output.addLineageElimination(entry.hash, entry.pv.data, old_seg_id);
             result.entries_eliminated++;
             s = pipeline->next();
             if (!s.ok()) return s;
@@ -88,6 +91,7 @@ Status GC::merge(
             output_id = id_fn();
             s = output.create(path_fn(output_id), output_id, buffered_writes);
             if (!s.ok()) return s;
+            output.setLineageType(LineageType::kGC);
         }
 
         uint64_t entry_offset;
@@ -95,6 +99,7 @@ Status GC::merge(
                                entry.tombstone(), entry.hash, entry_offset);
         if (!s.ok()) return s;
 
+        // Lineage entry recorded automatically by appendEntry.
         on_relocate(entry.hash, entry.pv.data, old_seg_id, output_id);
         result.entries_written++;
 

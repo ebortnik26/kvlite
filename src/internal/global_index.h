@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -15,8 +14,8 @@
 namespace kvlite {
 namespace internal {
 
-class GlobalIndexWAL;
 class Manifest;
+class SegmentStorageManager;
 
 // GlobalIndex: In-memory index mapping keys to (segment_id, packed_version) lists,
 // with built-in concurrency control and persistence.
@@ -29,29 +28,29 @@ class Manifest;
 // Backed by ReadWriteDeltaHashTable which stores (packed_version, id=segment_id) pairs.
 //
 // The GlobalIndex is always fully loaded in memory. It is persisted via:
-// 1. WAL (append-only delta log for crash recovery)
-// 2. Periodic savepoints (full dump every N updates + on shutdown)
+// 1. Segment lineage sections (embedded in each segment file)
+// 2. Periodic savepoints (full dump every N seconds + on shutdown)
+//
+// Recovery: load last savepoint, then replay lineage sections from all
+// segments with ID > savepoint's max_segment_id watermark.
 //
 // Thread-safety: Index operations are thread-safe via per-bucket spinlocks
 // in the underlying DeltaHashTable. Lifecycle methods (open/recover/close)
 // must be called from a single thread.
 //
 // Savepoint locking: savepoint_mu_ blocks only GC (which removes/relocates
-// entries). Flush (stagePut/commitWB) runs concurrently with savepoints —
+// entries). Flush (applyPut) runs concurrently with savepoints —
 // per-bucket spinlocks ensure consistent bucket snapshots. BatchGuard is
 // only needed for GC operations. Reads don't acquire savepoint_mu_.
 class GlobalIndex {
 public:
     struct Options {
-        // Sync WAL to disk on every write (slower but more durable)
-        bool sync_writes = false;
         // Number of threads for savepoint write/load (1 = sequential)
         uint8_t savepoint_threads = 4;
     };
 
     // RAII guard that holds a shared lock on savepoint_mu_.
     // Only needed for GC merges (which remove/relocate entries).
-    // Flush (stagePut/commitWB) no longer requires BatchGuard.
     class BatchGuard {
     public:
         explicit BatchGuard(GlobalIndex& gi) : lock_(gi.savepoint_mu_) {}
@@ -70,15 +69,17 @@ public:
 
     // --- Lifecycle ---
 
-    Status open(const std::string& db_path, const Options& options);
+    // Open and recover. SegmentStorageManager must already be open
+    // (recovery reads lineage from segment files).
+    Status open(const std::string& db_path, const Options& options,
+                SegmentStorageManager& storage);
     Status close();
     bool isOpen() const;
 
     // --- Index Operations ---
 
-    // Stage a put in the WAL buffer without auto-commit.
-    // Caller does not need BatchGuard. Call commitWB() when done.
-    Status stagePut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
+    // Apply a put to the in-memory index. Thread-safe (per-bucket spinlocks).
+    void applyPut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
 
     bool get(uint64_t hkey,
              std::vector<uint32_t>& segment_ids,
@@ -93,12 +94,12 @@ public:
     bool contains(uint64_t hkey) const;
 
     // Update segment_id for an existing entry. Caller must hold a BatchGuard.
-    Status relocate(uint64_t hkey, uint64_t packed_version,
-                    uint32_t old_segment_id, uint32_t new_segment_id);
+    void applyRelocate(uint64_t hkey, uint64_t packed_version,
+                       uint32_t old_segment_id, uint32_t new_segment_id);
 
     // Remove an entry. Caller must hold a BatchGuard.
-    Status eliminate(uint64_t hkey, uint64_t packed_version,
-                     uint32_t segment_id);
+    void applyEliminate(uint64_t hkey, uint64_t packed_version,
+                        uint32_t segment_id);
 
     // --- Iteration ---
 
@@ -109,20 +110,14 @@ public:
 
     void clear();
 
-    // --- WAL commit ---
-
-    // Commit staged WB entries. Caller does not need BatchGuard.
-    Status commitWB(uint64_t max_version);
-    Status commitGC();
-
     // --- Savepoint ---
 
     // Takes exclusive lock on savepoint_mu_, writes savepoint to disk,
-    // persists max_version to Manifest, truncates WAL.
-    Status storeSavepoint(uint64_t snapshot_version);
+    // persists max_segment_id to Manifest.
+    Status storeSavepoint(uint32_t max_segment_id);
 
-    // Create a savepoint if the WAL has accumulated any changes.
-    Status maybeSavepoint();
+    // Create a savepoint if new segments have been processed since the last one.
+    Status maybeSavepoint(uint32_t current_max_segment_id);
 
     // --- Statistics ---
 
@@ -142,18 +137,10 @@ public:
     uint32_t dhtNumBuckets() const { return dht_.numBuckets(); }
 
 private:
-    // --- Core DHT mutations (no WAL, no savepoint counter) ---
-    // Used by both the public API (which also writes to WAL) and WAL replay.
-    void applyPut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
-    void applyRelocate(uint64_t hkey, uint64_t packed_version,
-                       uint32_t old_segment_id, uint32_t new_segment_id);
-    void applyEliminate(uint64_t hkey, uint64_t packed_version,
-                        uint32_t segment_id);
-
-    Status recover();
+    Status recover(SegmentStorageManager& storage);
     Status recoverPartialSwap(const std::string& valid_dir);
-    Status replayWAL();
-    Status writeConvergenceSavepoint(const std::string& valid_dir);
+    Status replaySegmentLineages(SegmentStorageManager& storage, uint32_t after_segment_id);
+    Status writeConvergenceSavepoint(const std::string& valid_dir, uint32_t max_seg_id);
     std::string savepointDir() const;
 
     // --- Data ---
@@ -161,8 +148,6 @@ private:
     std::atomic<size_t> key_count_{0};
 
     // --- Concurrency ---
-    // Savepoint mutex: exclusive for storeSavepoint() and GC (BatchGuard).
-    // Flush (stagePut/commitWB) and reads don't acquire this lock.
     mutable std::shared_mutex savepoint_mu_;
 
     // --- Lifecycle / persistence ---
@@ -170,8 +155,7 @@ private:
     std::string db_path_;
     Options options_;
     bool is_open_ = false;
-    std::unique_ptr<GlobalIndexWAL> wal_;
-    std::atomic<uint64_t> max_version_{0};
+    uint32_t savepoint_max_segment_id_ = 0;
 };
 
 } // namespace internal

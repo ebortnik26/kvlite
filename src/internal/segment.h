@@ -14,13 +14,35 @@
 namespace kvlite {
 namespace internal {
 
+// Lineage entry types.
+enum class LineageType : uint8_t {
+    kFlush = 1,  // New-write segment (from memtable flush)
+    kGC    = 2,  // GC output segment (compaction)
+};
+
+// A single lineage record for GlobalIndex recovery.
+struct LineageEntry {
+    uint64_t hkey;
+    uint64_t packed_version;
+    uint32_t old_segment_id;  // Only set for GC eliminations.
+};
+
+// Lineage section read from a sealed segment.
+struct Lineage {
+    LineageType type;
+    std::vector<LineageEntry> entries;        // Put/relocated entries.
+    std::vector<LineageEntry> eliminations;   // GC eliminations only.
+};
+
 // A Segment stores log entries and their SegmentIndex in a single file.
 //
 // File layout:
 //   [LogEntry 0] ... [LogEntry N-1]  (data region)
 //   [SegmentIndex: magic + entries + crc]
+//   [Lineage: magic + type + entries + crc]
 //   [segment_id: 4 bytes]
 //   [index_offset: 8 bytes]
+//   [lineage_offset: 8 bytes]
 //   [footer_magic: 4 bytes]
 //
 // State machine:
@@ -54,7 +76,7 @@ public:
     // Open an existing segment file. Closed -> Readable.
     Status open(const std::string& path);
 
-    // Append the SegmentIndex and footer. Writing -> Readable.
+    // Append SegmentIndex, lineage, and footer. Writing -> Readable.
     Status seal();
 
     // Close the file. Writing|Readable -> Closed.
@@ -63,6 +85,19 @@ public:
     State state() const { return state_; }
     bool isOpen() const { return state_ != State::kClosed; }
     uint32_t getId() const { return id_; }
+
+    // --- Lineage ---
+
+    // Set the lineage type before writing entries. Must be called before put/appendEntry.
+    void setLineageType(LineageType type) { lineage_type_ = type; }
+
+    // Record a GC elimination (entry removed, not relocated).
+    // Must be called during Writing state before seal.
+    void addLineageElimination(uint64_t hkey, uint64_t packed_version,
+                               uint32_t old_segment_id);
+
+    // Read the lineage section from a sealed (Readable) segment.
+    Status readLineage(Lineage& lineage) const;
 
     // --- Write (Writing only) ---
 
@@ -117,15 +152,30 @@ private:
                       std::string_view value, bool tombstone,
                       uint64_t& entry_offset);
 
+    // Record a lineage entry (put or relocation into this segment).
+    void addLineageEntry(uint64_t hkey, uint64_t packed_version);
+
+    // Write the lineage section to the log file.
+    Status writeLineage();
+
     static constexpr uint32_t kFooterMagic = 0x53454746;  // "SEGF"
-    static constexpr size_t kFooterSize = 16;  // segment_id(4) + index_offset(8) + magic(4)
+    static constexpr uint32_t kLineageMagic = 0x4C494E47; // "LING"
+    // segment_id(4) + index_offset(8) + lineage_offset(8) + magic(4)
+    static constexpr size_t kFooterSize = 24;
 
     LogFile log_file_;
     SegmentIndex index_;
     uint32_t id_ = 0;
     uint64_t data_size_ = 0;
+    uint64_t lineage_offset_ = 0;
     State state_ = State::kClosed;
     bool batch_mode_ = false;
+
+    // Lineage accumulation (Writing state only).
+    LineageType lineage_type_ = LineageType::kFlush;
+    std::vector<uint8_t> lineage_buf_;
+    uint32_t lineage_entry_count_ = 0;
+    uint32_t lineage_elimination_count_ = 0;
 };
 
 }  // namespace internal

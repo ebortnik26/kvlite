@@ -45,7 +45,8 @@ struct Options {
     // --- GlobalIndex Options ---
 
     // Seconds between savepoint daemon wake-ups (0 = disable daemon).
-    // The daemon creates a savepoint whenever the WAL has accumulated changes.
+    // The daemon creates a savepoint whenever new segments have been flushed
+    // since the last savepoint, accelerating future recovery.
     // Default: 10
     uint32_t savepoint_interval_sec = 10;
 
@@ -82,9 +83,6 @@ struct Options {
 
     // Raise an error if the database already exists
     bool error_if_exists = false;
-
-    // Sync writes to disk immediately (slower but more durable)
-    bool sync_writes = false;
 
     // Enable checksums for data integrity verification
     bool verify_checksums = true;
