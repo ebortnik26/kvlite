@@ -175,15 +175,23 @@ private:
 
     bool openNextSegment() {
         seg_stream_.reset();
+        // Each segment may have K partitions; try each partition in turn.
         while (seg_idx_ < segment_ids_.size()) {
-            uint32_t id = segment_ids_[seg_idx_++];
+            uint32_t id = segment_ids_[seg_idx_];
             auto* seg = db_->storage_->getSegment(id);
-            if (!seg) continue;
-            current_segment_id_ = id;
-            seg_stream_ = internal::stream::scan(
-                seg->logFile(), seg->dataSize());
-            if (seg_stream_->valid()) return true;
-            seg_stream_.reset();
+            if (!seg) { seg_idx_++; partition_idx_ = 0; continue; }
+
+            while (partition_idx_ < seg->numPartitions()) {
+                uint16_t pi = partition_idx_++;
+                if (seg->dataSize(pi) == 0) continue;
+                current_segment_id_ = id;
+                seg_stream_ = internal::stream::scan(
+                    seg->logFile(pi), seg->dataSize(pi));
+                if (seg_stream_->valid()) return true;
+                seg_stream_.reset();
+            }
+            seg_idx_++;
+            partition_idx_ = 0;
         }
         return false;
     }
@@ -213,6 +221,7 @@ private:
     // Phase 1: segments
     int phase_ = 0;
     size_t seg_idx_ = 0;
+    uint16_t partition_idx_ = 0;
     uint32_t current_segment_id_ = 0;
     std::unique_ptr<internal::EntryStream> seg_stream_;
 

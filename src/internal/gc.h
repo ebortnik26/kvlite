@@ -70,7 +70,8 @@ public:
         const RelocateFn& on_relocate,
         const EliminateFn& on_eliminate,
         Result& result,
-        bool buffered_writes = true);
+        bool buffered_writes = true,
+        uint16_t num_partitions = 1);
 };
 
 }  // namespace internal

@@ -2,81 +2,187 @@
 
 #include <cstring>
 #include <memory>
+#include <thread>
 
 namespace kvlite {
 namespace internal {
+
+namespace {
+// log2 for power-of-2 values (C++17 compatible).
+uint16_t log2_pow2(uint16_t v) {
+    uint16_t r = 0;
+    while (v > 1) { v >>= 1; ++r; }
+    return r;
+}
+}  // namespace
 
 Segment::Segment() = default;
 Segment::~Segment() = default;
 Segment::Segment(Segment&&) noexcept = default;
 Segment& Segment::operator=(Segment&&) noexcept = default;
 
+// --- Helpers ---
+
+std::string Segment::partitionPath(const std::string& base_path, uint16_t partition) {
+    return base_path + "_" + std::to_string(partition) + ".data";
+}
+
+uint16_t Segment::partitionFor(uint64_t hash) const {
+    if (num_partitions_ == 1) return 0;
+    return static_cast<uint16_t>(hash >> (64 - partition_bits_));
+}
+
 // --- Lifecycle ---
 
-Status Segment::create(const std::string& path, uint32_t id, bool buffered) {
+Status Segment::create(const std::string& path, uint32_t id,
+                        uint16_t num_partitions, bool buffered) {
     if (state_ != State::kClosed) {
         return Status::InvalidArgument("Segment: create requires Closed state");
     }
-    Status s = log_file_.create(path, /*sync=*/false, buffered);
-    if (s.ok()) {
-        id_ = id;
-        data_size_ = 0;
-        state_ = State::kWriting;
+    if (num_partitions == 0 || (num_partitions & (num_partitions - 1)) != 0) {
+        return Status::InvalidArgument("Segment: num_partitions must be a power of 2");
     }
-    return s;
+
+    id_ = id;
+    num_partitions_ = num_partitions;
+    partition_bits_ = (num_partitions == 1) ? 0 : log2_pow2(num_partitions);
+    base_path_ = path;
+    partitions_.resize(num_partitions);
+
+    for (uint16_t i = 0; i < num_partitions; ++i) {
+        Status s = partitions_[i].log_file.create(partitionPath(path, i),
+                                                    /*sync=*/false, buffered);
+        if (!s.ok()) {
+            // Clean up already-created files.
+            for (uint16_t j = 0; j < i; ++j) {
+                partitions_[j].log_file.close();
+            }
+            partitions_.clear();
+            return s;
+        }
+    }
+
+    state_ = State::kWriting;
+    return Status::OK();
 }
 
 Status Segment::open(const std::string& path) {
     if (state_ != State::kClosed) {
         return Status::InvalidArgument("Segment: open requires Closed state");
     }
-    Status s = log_file_.open(path);
+
+    // Read partition 0's footer to discover num_partitions.
+    LogFile probe;
+    Status s = probe.open(partitionPath(path, 0));
     if (!s.ok()) return s;
 
-    uint64_t file_size = log_file_.size();
+    uint64_t file_size = probe.size();
     if (file_size < kFooterSize) {
-        log_file_.close();
+        probe.close();
         return Status::Corruption("Segment: file too small for footer");
     }
 
-    // Read footer: [segment_id:4][index_offset:8][lineage_offset:8][magic:4]
     uint8_t footer[kFooterSize];
-    s = log_file_.readAt(file_size - kFooterSize, footer, kFooterSize);
-    if (!s.ok()) {
-        log_file_.close();
-        return s;
-    }
+    s = probe.readAt(file_size - kFooterSize, footer, kFooterSize);
+    if (!s.ok()) { probe.close(); return s; }
 
     uint32_t id;
-    uint64_t index_offset;
-    uint64_t lin_offset;
+    uint16_t num_parts;
     uint32_t magic;
     std::memcpy(&id, footer, 4);
-    std::memcpy(&index_offset, footer + 4, 8);
-    std::memcpy(&lin_offset, footer + 12, 8);
-    std::memcpy(&magic, footer + 20, 4);
+    std::memcpy(&num_parts, footer + 4, 2);
+    std::memcpy(&magic, footer + kFooterSize - 4, 4);
 
     if (magic != kFooterMagic) {
-        log_file_.close();
+        probe.close();
         return Status::Corruption("Segment: bad footer magic");
     }
-
-    if (index_offset > file_size - kFooterSize) {
-        log_file_.close();
-        return Status::Corruption("Segment: invalid index offset");
+    if (num_parts == 0 || (num_parts & (num_parts - 1)) != 0) {
+        probe.close();
+        return Status::Corruption("Segment: invalid num_partitions in footer");
     }
 
-    s = index_.readFrom(log_file_, index_offset);
-    if (!s.ok()) {
-        log_file_.close();
-        return s;
-    }
+    probe.close();
 
+    // Now open all partitions.
     id_ = id;
-    data_size_ = index_offset;
-    lineage_offset_ = lin_offset;
+    num_partitions_ = num_parts;
+    partition_bits_ = (num_parts == 1) ? 0 : log2_pow2(num_parts);
+    base_path_ = path;
+    partitions_.resize(num_parts);
+
+    for (uint16_t i = 0; i < num_parts; ++i) {
+        auto& p = partitions_[i];
+        s = p.log_file.open(partitionPath(path, i));
+        if (!s.ok()) {
+            for (uint16_t j = 0; j < i; ++j) partitions_[j].log_file.close();
+            partitions_.clear();
+            return Status::IOError("Failed to open partition " + std::to_string(i) +
+                                   ": " + s.message());
+        }
+
+        uint64_t psize = p.log_file.size();
+        if (psize < kFooterSize) {
+            close();
+            return Status::Corruption("Segment: partition too small for footer");
+        }
+
+        uint8_t pfooter[kFooterSize];
+        s = p.log_file.readAt(psize - kFooterSize, pfooter, kFooterSize);
+        if (!s.ok()) { close(); return s; }
+
+        uint64_t index_offset, lineage_offset;
+        std::memcpy(&index_offset, pfooter + 6, 8);
+        std::memcpy(&lineage_offset, pfooter + 14, 8);
+
+        s = p.index.readFrom(p.log_file, index_offset);
+        if (!s.ok()) { close(); return s; }
+
+        p.data_size = index_offset;
+        p.lineage_offset = lineage_offset;
+    }
+
     state_ = State::kReadable;
     return Status::OK();
+}
+
+Status Segment::sealPartition(uint16_t pi) {
+    auto& p = partitions_[pi];
+
+    // Finalize streaming index build if appendEntry was used.
+    if (p.batch_mode) {
+        p.index.endBatch();
+        p.batch_mode = false;
+    }
+
+    // Record where data ends / index begins.
+    p.data_size = p.log_file.size();
+
+    // Append serialized SegmentIndex.
+    Status s = p.index.writeTo(p.log_file);
+    if (!s.ok()) return s;
+
+    // Append lineage section.
+    s = writeLineage(p, lineage_type_, kLineageMagic);
+    if (!s.ok()) return s;
+
+    // Append footer: [segment_id:4][num_partitions:2][index_offset:8][lineage_offset:8][magic:4]
+    uint8_t footer[kFooterSize];
+    std::memcpy(footer, &id_, 4);
+    std::memcpy(footer + 4, &num_partitions_, 2);
+    std::memcpy(footer + 6, &p.data_size, 8);
+    std::memcpy(footer + 14, &p.lineage_offset, 8);
+    uint32_t magic = kFooterMagic;
+    std::memcpy(footer + 22, &magic, 4);
+
+    uint64_t footer_offset;
+    s = p.log_file.append(footer, kFooterSize, footer_offset);
+    if (!s.ok()) return s;
+
+    s = p.log_file.flushBuffer();
+    if (!s.ok()) return s;
+
+    return p.log_file.sync();
 }
 
 Status Segment::seal() {
@@ -84,43 +190,24 @@ Status Segment::seal() {
         return Status::InvalidArgument("Segment: seal requires Writing state");
     }
 
-    // Finalize streaming index build if appendEntry was used.
-    if (batch_mode_) {
-        index_.endBatch();
-        batch_mode_ = false;
+    if (num_partitions_ == 1) {
+        Status s = sealPartition(0);
+        if (!s.ok()) return s;
+    } else {
+        // Seal partitions in parallel.
+        std::vector<Status> results(num_partitions_);
+        std::vector<std::thread> threads;
+        threads.reserve(num_partitions_);
+        for (uint16_t i = 0; i < num_partitions_; ++i) {
+            threads.emplace_back([this, i, &results] {
+                results[i] = sealPartition(i);
+            });
+        }
+        for (auto& t : threads) t.join();
+        for (const auto& s : results) {
+            if (!s.ok()) return s;
+        }
     }
-
-    // Record where the data region ends / index begins.
-    data_size_ = log_file_.size();
-
-    // Append serialized SegmentIndex.
-    Status s = index_.writeTo(log_file_);
-    if (!s.ok()) return s;
-
-    // Append lineage section.
-    s = writeLineage();
-    if (!s.ok()) return s;
-
-    // Append footer: [segment_id:4][index_offset:8][lineage_offset:8][magic:4]
-    uint8_t footer[kFooterSize];
-    std::memcpy(footer, &id_, 4);
-    std::memcpy(footer + 4, &data_size_, 8);
-    std::memcpy(footer + 12, &lineage_offset_, 8);
-    uint32_t magic = kFooterMagic;
-    std::memcpy(footer + 20, &magic, 4);
-
-    uint64_t footer_offset;
-    s = log_file_.append(footer, kFooterSize, footer_offset);
-    if (!s.ok()) return s;
-
-    s = log_file_.flushBuffer();
-    if (!s.ok()) return s;
-
-    // The segment is the durability boundary — ensure all data (entries,
-    // index, lineage, footer) is on stable storage before we consider
-    // the segment sealed.
-    s = log_file_.sync();
-    if (!s.ok()) return s;
 
     state_ = State::kReadable;
     return Status::OK();
@@ -130,14 +217,16 @@ Status Segment::close() {
     if (state_ == State::kClosed) {
         return Status::OK();
     }
-    Status s = log_file_.close();
+    for (auto& p : partitions_) {
+        p.log_file.close();
+    }
     state_ = State::kClosed;
-    return s;
+    return Status::OK();
 }
 
 // --- Write ---
 
-Status Segment::writeEntry(std::string_view key, uint64_t version,
+Status Segment::writeEntry(Partition& p, std::string_view key, uint64_t version,
                             std::string_view value, bool tombstone,
                             uint64_t& entry_offset) {
     PackedVersion pv(version, tombstone);
@@ -156,23 +245,23 @@ Status Segment::writeEntry(std::string_view key, uint64_t version,
         buf = heap_buf.get();
     }
 
-    uint8_t* p = buf;
-    std::memcpy(p, &packed_ver, 8); p += 8;
-    std::memcpy(p, &key_len, 2);    p += 2;
-    std::memcpy(p, &val_len, 4);    p += 4;
-    std::memcpy(p, key.data(), raw_key_len);   p += raw_key_len;
-    std::memcpy(p, value.data(), val_len);  p += val_len;
+    uint8_t* bp = buf;
+    std::memcpy(bp, &packed_ver, 8); bp += 8;
+    std::memcpy(bp, &key_len, 2);    bp += 2;
+    std::memcpy(bp, &val_len, 4);    bp += 4;
+    std::memcpy(bp, key.data(), raw_key_len);   bp += raw_key_len;
+    std::memcpy(bp, value.data(), val_len);  bp += val_len;
 
     size_t payload_len = LogEntry::kHeaderSize + raw_key_len + val_len;
     uint32_t checksum = crc32(buf, payload_len);
-    std::memcpy(p, &checksum, 4);
+    std::memcpy(bp, &checksum, 4);
 
     uint64_t offset;
-    Status s = log_file_.append(buf, entry_size, offset);
+    Status s = p.log_file.append(buf, entry_size, offset);
     if (!s.ok()) return s;
 
     entry_offset = offset;
-    data_size_ = offset + entry_size;
+    p.data_size = offset + entry_size;
     return Status::OK();
 }
 
@@ -186,13 +275,14 @@ Status Segment::put(std::string_view key, uint64_t version,
         return Status::InvalidArgument("Segment: key too long");
     }
 
+    auto& p = partitions_[partitionFor(hash)];
     uint64_t offset;
-    Status s = writeEntry(key, version, value, tombstone, offset);
+    Status s = writeEntry(p, key, version, value, tombstone, offset);
     if (!s.ok()) return s;
 
     PackedVersion pv(version, tombstone);
-    index_.put(hash, static_cast<uint32_t>(offset), pv.data);
-    addLineageEntry(hash, pv.data);
+    p.index.put(hash, static_cast<uint32_t>(offset), pv.data);
+    addLineageEntry(p, hash, pv.data);
     return Status::OK();
 }
 
@@ -206,13 +296,14 @@ Status Segment::appendEntry(std::string_view key, uint64_t version,
         return Status::InvalidArgument("Segment: appendEntry key too long");
     }
 
-    Status s = writeEntry(key, version, value, tombstone, entry_offset);
+    auto& p = partitions_[partitionFor(hash)];
+    Status s = writeEntry(p, key, version, value, tombstone, entry_offset);
     if (!s.ok()) return s;
 
     PackedVersion pv(version, tombstone);
-    index_.addBatchEntry(hash, pv.data, static_cast<uint32_t>(entry_offset));
-    batch_mode_ = true;
-    addLineageEntry(hash, pv.data);
+    p.index.addBatchEntry(hash, pv.data, static_cast<uint32_t>(entry_offset));
+    p.batch_mode = true;
+    addLineageEntry(p, hash, pv.data);
     return Status::OK();
 }
 
@@ -222,46 +313,44 @@ Status Segment::appendRawEntry(const void* payload, size_t payload_len,
         return Status::InvalidArgument("Segment: appendRawEntry requires Writing state");
     }
 
+    auto& p = partitions_[partitionFor(hash)];
     uint32_t checksum = crc32(payload, payload_len);
 
     uint64_t offset;
-    Status s = log_file_.append(payload, payload_len, offset);
+    Status s = p.log_file.append(payload, payload_len, offset);
     if (!s.ok()) return s;
 
     uint64_t crc_offset;
-    s = log_file_.append(&checksum, sizeof(checksum), crc_offset);
+    s = p.log_file.append(&checksum, sizeof(checksum), crc_offset);
     if (!s.ok()) return s;
 
     entry_offset = offset;
-    data_size_ = offset + payload_len + sizeof(checksum);
+    p.data_size = offset + payload_len + sizeof(checksum);
 
     uint64_t packed_ver;
     std::memcpy(&packed_ver, payload, 8);
-    index_.addBatchEntry(hash, packed_ver, static_cast<uint32_t>(offset));
-    batch_mode_ = true;
-    addLineageEntry(hash, packed_ver);
+    p.index.addBatchEntry(hash, packed_ver, static_cast<uint32_t>(offset));
+    p.batch_mode = true;
+    addLineageEntry(p, hash, packed_ver);
     return Status::OK();
 }
 
 // --- Read ---
 
-Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {
-    // Speculative read: fetch up to 4KB in one I/O.  Most entries (header +
-    // key + value + CRC) fit entirely, so this avoids a second pread.
+Status Segment::readEntry(uint16_t partition, uint64_t offset, LogEntry& entry) const {
+    const auto& p = partitions_[partition];
     static constexpr size_t kReadAhead = 4096;
     uint8_t stack_buf[kReadAhead];
 
-    // Clamp to bytes remaining in the data region to avoid reading past EOF.
-    size_t avail = (offset < data_size_) ? static_cast<size_t>(data_size_ - offset) : 0;
+    size_t avail = (offset < p.data_size) ? static_cast<size_t>(p.data_size - offset) : 0;
     size_t first_read = (avail < kReadAhead) ? avail : kReadAhead;
     if (first_read < LogEntry::kHeaderSize + LogEntry::kChecksumSize) {
         return Status::Corruption("Segment: truncated entry at offset " +
                                   std::to_string(offset));
     }
-    Status s = log_file_.readAt(offset, stack_buf, first_read);
+    Status s = p.log_file.readAt(offset, stack_buf, first_read);
     if (!s.ok()) return s;
 
-    // Parse header from the speculative buffer.
     uint64_t packed_ver;
     uint16_t kl;
     uint32_t vl;
@@ -271,18 +360,15 @@ Status Segment::readEntry(uint64_t offset, LogEntry& entry) const {
 
     size_t entry_size = LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
 
-    // If the entry fits in the speculative buffer, use it directly (one I/O).
-    // Otherwise fall back to a heap allocation + second pread.
     uint8_t* buf = stack_buf;
     std::unique_ptr<uint8_t[]> heap_buf;
     if (entry_size > first_read) {
         heap_buf = std::make_unique<uint8_t[]>(entry_size);
         buf = heap_buf.get();
-        s = log_file_.readAt(offset, buf, entry_size);
+        s = p.log_file.readAt(offset, buf, entry_size);
         if (!s.ok()) return s;
     }
 
-    // Validate CRC.
     size_t payload_len = LogEntry::kHeaderSize + kl + vl;
     uint32_t stored_crc;
     std::memcpy(&stored_crc, buf + payload_len, 4);
@@ -302,31 +388,32 @@ Status Segment::getLatest(uint64_t hash, LogEntry& entry) const {
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: getLatest requires Readable state");
     }
+    uint16_t pi = partitionFor(hash);
     uint32_t offset;
     uint64_t packed_version;
-    if (!index_.getLatest(hash, offset, packed_version)) {
+    if (!partitions_[pi].index.getLatest(hash, offset, packed_version)) {
         return Status::NotFound("key not found");
     }
-    return readEntry(offset, entry);
+    return readEntry(pi, offset, entry);
 }
 
-Status Segment::get(uint64_t hash,
-                    std::vector<LogEntry>& entries) const {
+Status Segment::get(uint64_t hash, std::vector<LogEntry>& entries) const {
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: get requires Readable state");
     }
+    uint16_t pi = partitionFor(hash);
     std::vector<uint32_t> offsets;
     std::vector<uint64_t> packed_versions;
-    if (!index_.get(hash, offsets, packed_versions)) {
+    if (!partitions_[pi].index.get(hash, offsets, packed_versions)) {
         return Status::NotFound("key not found");
     }
     entries.clear();
     entries.reserve(offsets.size());
     for (size_t i = 0; i < offsets.size(); ++i) {
-        LogEntry entry;
-        Status s = readEntry(offsets[i], entry);
+        LogEntry e;
+        Status s = readEntry(pi, offsets[i], e);
         if (!s.ok()) return s;
-        entries.push_back(std::move(entry));
+        entries.push_back(std::move(e));
     }
     return Status::OK();
 }
@@ -336,72 +423,73 @@ Status Segment::get(uint64_t hash, uint64_t upper_bound,
     if (state_ != State::kReadable) {
         return Status::InvalidArgument("Segment: get requires Readable state");
     }
+    uint16_t pi = partitionFor(hash);
     uint64_t offset, packed_version;
-    if (!index_.get(hash, upper_bound, offset, packed_version)) {
+    if (!partitions_[pi].index.get(hash, upper_bound, offset, packed_version)) {
         return Status::NotFound("key not found");
     }
-    return readEntry(offset, entry);
+    return readEntry(pi, offset, entry);
 }
 
 bool Segment::contains(uint64_t hash) const {
     if (state_ != State::kReadable) return false;
-    return index_.contains(hash);
+    return partitions_[partitionFor(hash)].index.contains(hash);
 }
 
 // --- Lineage ---
 
-void Segment::addLineageEntry(uint64_t hkey, uint64_t packed_version) {
-    size_t off = lineage_buf_.size();
-    lineage_buf_.resize(off + 16);
-    uint8_t* p = lineage_buf_.data() + off;
-    std::memcpy(p, &hkey, 8);
-    std::memcpy(p + 8, &packed_version, 8);
-    ++lineage_entry_count_;
+void Segment::setLineageType(LineageType type) {
+    lineage_type_ = type;
+}
+
+void Segment::addLineageEntry(Partition& p, uint64_t hkey, uint64_t packed_version) {
+    size_t off = p.lineage_buf.size();
+    p.lineage_buf.resize(off + 16);
+    uint8_t* ptr = p.lineage_buf.data() + off;
+    std::memcpy(ptr, &hkey, 8);
+    std::memcpy(ptr + 8, &packed_version, 8);
+    ++p.lineage_entry_count;
 }
 
 void Segment::addLineageElimination(uint64_t hkey, uint64_t packed_version,
                                      uint32_t old_segment_id) {
-    size_t off = lineage_buf_.size();
-    lineage_buf_.resize(off + 20);
-    uint8_t* p = lineage_buf_.data() + off;
-    std::memcpy(p, &hkey, 8);
-    std::memcpy(p + 8, &packed_version, 8);
-    std::memcpy(p + 16, &old_segment_id, 4);
-    ++lineage_elimination_count_;
+    // Route elimination to the partition that owns this hash.
+    auto& p = partitions_[partitionFor(hkey)];
+    size_t off = p.lineage_buf.size();
+    p.lineage_buf.resize(off + 20);
+    uint8_t* ptr = p.lineage_buf.data() + off;
+    std::memcpy(ptr, &hkey, 8);
+    std::memcpy(ptr + 8, &packed_version, 8);
+    std::memcpy(ptr + 16, &old_segment_id, 4);
+    ++p.lineage_elimination_count;
 }
 
-Status Segment::writeLineage() {
-    lineage_offset_ = log_file_.size();
-
-    // Layout: [header:13][entries][eliminations][crc32:4]
-    // Header: [magic:4][type:1][entry_count:4][elimination_count:4]
-    // All appends go through the 1MB write buffer, so separate calls are fine.
+Status Segment::writeLineage(Partition& p, LineageType type, uint32_t lineage_magic) {
+    p.lineage_offset = p.log_file.size();
 
     constexpr size_t kHdrSize = 13;
     uint8_t hdr[kHdrSize];
-    uint32_t magic = kLineageMagic;
-    std::memcpy(hdr, &magic, 4);
-    hdr[4] = static_cast<uint8_t>(lineage_type_);
-    std::memcpy(hdr + 5, &lineage_entry_count_, 4);
-    std::memcpy(hdr + 9, &lineage_elimination_count_, 4);
+    std::memcpy(hdr, &lineage_magic, 4);
+    hdr[4] = static_cast<uint8_t>(type);
+    std::memcpy(hdr + 5, &p.lineage_entry_count, 4);
+    std::memcpy(hdr + 9, &p.lineage_elimination_count, 4);
 
-    // Compute CRC over header + body incrementally.
     uint32_t crc_state = updateCrc32(0xFFFFFFFFu, hdr, kHdrSize);
-    if (!lineage_buf_.empty()) {
-        crc_state = updateCrc32(crc_state, lineage_buf_.data(), lineage_buf_.size());
+    if (!p.lineage_buf.empty()) {
+        crc_state = updateCrc32(crc_state, p.lineage_buf.data(), p.lineage_buf.size());
     }
     uint32_t checksum = finalizeCrc32(crc_state);
 
     uint64_t off;
-    Status s = log_file_.append(hdr, kHdrSize, off);
+    Status s = p.log_file.append(hdr, kHdrSize, off);
     if (!s.ok()) return s;
 
-    if (!lineage_buf_.empty()) {
-        s = log_file_.append(lineage_buf_.data(), lineage_buf_.size(), off);
+    if (!p.lineage_buf.empty()) {
+        s = p.log_file.append(p.lineage_buf.data(), p.lineage_buf.size(), off);
         if (!s.ok()) return s;
     }
 
-    return log_file_.append(&checksum, sizeof(checksum), off);
+    return p.log_file.append(&checksum, sizeof(checksum), off);
 }
 
 Status Segment::readLineage(Lineage& lineage) const {
@@ -409,18 +497,35 @@ Status Segment::readLineage(Lineage& lineage) const {
         return Status::InvalidArgument("Segment: readLineage requires Readable state");
     }
 
-    if (lineage_offset_ == 0) {
-        // No lineage section (legacy segment or empty).
+    lineage.type = lineage_type_;
+    lineage.entries.clear();
+    lineage.eliminations.clear();
+
+    for (uint16_t i = 0; i < num_partitions_; ++i) {
+        Lineage part_lin;
+        Status s = readPartitionLineage(partitions_[i], part_lin);
+        if (!s.ok()) return s;
+        if (i == 0) lineage.type = part_lin.type;
+        lineage.entries.insert(lineage.entries.end(),
+                               part_lin.entries.begin(), part_lin.entries.end());
+        lineage.eliminations.insert(lineage.eliminations.end(),
+                                    part_lin.eliminations.begin(),
+                                    part_lin.eliminations.end());
+    }
+    return Status::OK();
+}
+
+Status Segment::readPartitionLineage(const Partition& p, Lineage& lineage) const {
+    if (p.lineage_offset == 0) {
         lineage.type = LineageType::kFlush;
         lineage.entries.clear();
         lineage.eliminations.clear();
         return Status::OK();
     }
 
-    // Read header first: [magic:4][type:1][entry_count:4][elimination_count:4]
-    constexpr size_t kHeaderSize = 13;
-    uint8_t hdr[kHeaderSize];
-    Status s = log_file_.readAt(lineage_offset_, hdr, kHeaderSize);
+    constexpr size_t kHdrSize = 13;
+    uint8_t hdr[kHdrSize];
+    Status s = p.log_file.readAt(p.lineage_offset, hdr, kHdrSize);
     if (!s.ok()) return s;
 
     uint32_t magic;
@@ -429,18 +534,18 @@ Status Segment::readLineage(Lineage& lineage) const {
         return Status::Corruption("Segment: bad lineage magic");
     }
 
-    auto type = static_cast<LineageType>(hdr[4]);
+    lineage.type = static_cast<LineageType>(hdr[4]);
     uint32_t entry_count, elim_count;
     std::memcpy(&entry_count, hdr + 5, 4);
     std::memcpy(&elim_count, hdr + 9, 4);
 
     size_t entries_bytes = static_cast<size_t>(entry_count) * 16;
     size_t elim_bytes = static_cast<size_t>(elim_count) * 20;
-    size_t payload_size = kHeaderSize + entries_bytes + elim_bytes;
+    size_t payload_size = kHdrSize + entries_bytes + elim_bytes;
     size_t total_size = payload_size + 4;
 
     std::vector<uint8_t> buf(total_size);
-    s = log_file_.readAt(lineage_offset_, buf.data(), total_size);
+    s = p.log_file.readAt(p.lineage_offset, buf.data(), total_size);
     if (!s.ok()) return s;
 
     uint32_t stored_crc;
@@ -449,26 +554,24 @@ Status Segment::readLineage(Lineage& lineage) const {
         return Status::ChecksumMismatch("Segment: lineage checksum mismatch");
     }
 
-    lineage.type = type;
-
-    const uint8_t* p = buf.data() + kHeaderSize;
+    const uint8_t* ptr = buf.data() + kHdrSize;
 
     lineage.entries.resize(entry_count);
     for (uint32_t i = 0; i < entry_count; ++i) {
         auto& e = lineage.entries[i];
-        std::memcpy(&e.hkey, p, 8);
-        std::memcpy(&e.packed_version, p + 8, 8);
+        std::memcpy(&e.hkey, ptr, 8);
+        std::memcpy(&e.packed_version, ptr + 8, 8);
         e.old_segment_id = 0;
-        p += 16;
+        ptr += 16;
     }
 
     lineage.eliminations.resize(elim_count);
     for (uint32_t i = 0; i < elim_count; ++i) {
         auto& e = lineage.eliminations[i];
-        std::memcpy(&e.hkey, p, 8);
-        std::memcpy(&e.packed_version, p + 8, 8);
-        std::memcpy(&e.old_segment_id, p + 16, 4);
-        p += 20;
+        std::memcpy(&e.hkey, ptr, 8);
+        std::memcpy(&e.packed_version, ptr + 8, 8);
+        std::memcpy(&e.old_segment_id, ptr + 16, 4);
+        ptr += 20;
     }
 
     return Status::OK();
@@ -477,15 +580,49 @@ Status Segment::readLineage(Lineage& lineage) const {
 // --- Stats ---
 
 uint64_t Segment::dataSize() const {
-    return data_size_;
+    uint64_t total = 0;
+    for (const auto& p : partitions_) total += p.data_size;
+    return total;
+}
+
+uint64_t Segment::dataSize(uint16_t partition) const {
+    return partitions_[partition].data_size;
 }
 
 size_t Segment::keyCount() const {
-    return index_.keyCount();
+    size_t total = 0;
+    for (const auto& p : partitions_) total += p.index.keyCount();
+    return total;
 }
 
 size_t Segment::entryCount() const {
-    return index_.entryCount();
+    size_t total = 0;
+    for (const auto& p : partitions_) total += p.index.entryCount();
+    return total;
+}
+
+uint64_t Segment::siEncodeCount() const {
+    uint64_t total = 0;
+    for (const auto& p : partitions_) total += p.index.encodeCount();
+    return total;
+}
+
+uint64_t Segment::siEncodeTotalNs() const {
+    uint64_t total = 0;
+    for (const auto& p : partitions_) total += p.index.encodeTotalNs();
+    return total;
+}
+
+uint64_t Segment::siDecodeCount() const {
+    uint64_t total = 0;
+    for (const auto& p : partitions_) total += p.index.decodeCount();
+    return total;
+}
+
+uint64_t Segment::siDecodeTotalNs() const {
+    uint64_t total = 0;
+    for (const auto& p : partitions_) total += p.index.decodeTotalNs();
+    return total;
 }
 
 }  // namespace internal

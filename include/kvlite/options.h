@@ -76,6 +76,12 @@ struct Options {
     // Default: true
     bool buffered_writes = true;
 
+    // Number of partition files per segment (must be a power of 2).
+    // Each partition is written and synced independently. K > 1 enables
+    // parallel flush I/O, reducing seal latency on multi-queue SSDs.
+    // Default: 1 (single file per segment)
+    uint16_t segment_partitions = 1;
+
     // --- General Options ---
 
     // Create the database directory if it does not exist

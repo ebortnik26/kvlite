@@ -26,12 +26,15 @@ class SegmentTest : public ::testing::Test {
 protected:
     void SetUp() override {
         path_ = ::testing::TempDir() + "/seg_test_" +
-                std::to_string(reinterpret_cast<uintptr_t>(this)) + ".data";
+                std::to_string(reinterpret_cast<uintptr_t>(this));
     }
 
     void TearDown() override {
         if (seg_.isOpen()) seg_.close();
-        std::remove(path_.c_str());
+        // Remove all partition files.
+        for (int i = 0; i < 16; ++i) {
+            std::remove(Segment::partitionPath(path_, i).c_str());
+        }
     }
 
     // Write a LogEntry into the segment via the high-level put API.
@@ -379,18 +382,22 @@ TEST_F(SegmentTest, OpenDataWrittenWithFakeFooter) {
     writeEntry("key1", 1, "val1", false);
     seg_.close();
 
-    // Append a fake footer that claims the index starts at offset 0
-    // (inside the data region -- readFrom should fail).
-    int fd = ::open(path_.c_str(), O_WRONLY | O_APPEND);
+    // Append a fake 26-byte footer that claims the index starts at offset 0.
+    std::string p0 = Segment::partitionPath(path_, 0);
+    int fd = ::open(p0.c_str(), O_WRONLY | O_APPEND);
     ASSERT_GE(fd, 0);
-    uint8_t footer[16];
+    uint8_t footer[26] = {};
     uint32_t fake_id = 0;
+    uint16_t num_parts = 1;
     uint64_t fake_index_offset = 0;
+    uint64_t fake_lineage_offset = 0;
     uint32_t magic = 0x53454746;  // "SEGF"
     std::memcpy(footer, &fake_id, 4);
-    std::memcpy(footer + 4, &fake_index_offset, 8);
-    std::memcpy(footer + 12, &magic, 4);
-    ASSERT_EQ(::write(fd, footer, 16), 16);
+    std::memcpy(footer + 4, &num_parts, 2);
+    std::memcpy(footer + 6, &fake_index_offset, 8);
+    std::memcpy(footer + 14, &fake_lineage_offset, 8);
+    std::memcpy(footer + 22, &magic, 4);
+    ASSERT_EQ(::write(fd, footer, 26), 26);
     ::close(fd);
 
     Segment loaded;
@@ -405,17 +412,21 @@ TEST_F(SegmentTest, OpenIndexOffsetBeyondFile) {
     writeEntry("key1", 1, "val1", false);
     seg_.close();
 
-    // Append a footer with an out-of-bounds index offset.
-    int fd = ::open(path_.c_str(), O_WRONLY | O_APPEND);
+    std::string p0 = Segment::partitionPath(path_, 0);
+    int fd = ::open(p0.c_str(), O_WRONLY | O_APPEND);
     ASSERT_GE(fd, 0);
-    uint8_t footer[16];
+    uint8_t footer[26] = {};
     uint32_t fake_id = 0;
+    uint16_t num_parts = 1;
     uint64_t bad_offset = 999999;
+    uint64_t zero = 0;
     uint32_t magic = 0x53454746;
     std::memcpy(footer, &fake_id, 4);
-    std::memcpy(footer + 4, &bad_offset, 8);
-    std::memcpy(footer + 12, &magic, 4);
-    ASSERT_EQ(::write(fd, footer, 16), 16);
+    std::memcpy(footer + 4, &num_parts, 2);
+    std::memcpy(footer + 6, &bad_offset, 8);
+    std::memcpy(footer + 14, &zero, 8);
+    std::memcpy(footer + 22, &magic, 4);
+    ASSERT_EQ(::write(fd, footer, 26), 26);
     ::close(fd);
 
     Segment loaded;
@@ -434,8 +445,9 @@ TEST_F(SegmentTest, OpenTruncatedIndex) {
     uint64_t data_size = seg_.dataSize();
     seg_.close();
 
-    // Truncate: keep data + a few bytes of the index, drop the rest.
-    int fd = ::open(path_.c_str(), O_WRONLY);
+    // Truncate partition 0: keep data + a few bytes, drop index + footer.
+    std::string p0 = Segment::partitionPath(path_, 0);
+    int fd = ::open(p0.c_str(), O_WRONLY);
     ASSERT_GE(fd, 0);
     int ret = ::ftruncate(fd, static_cast<off_t>(data_size + 4));
     ASSERT_EQ(ret, 0);

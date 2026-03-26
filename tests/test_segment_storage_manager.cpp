@@ -56,8 +56,16 @@ protected:
         std::string seg_dir = path_ + "/segments";
         std::filesystem::create_directories(seg_dir);
         std::string orphan =
-            seg_dir + "/segment_" + std::to_string(fake_id) + ".data";
+            seg_dir + "/segment_" + std::to_string(fake_id) + "_0.data";
         std::ofstream(orphan) << "orphan";
+    }
+
+    // Helper: delete all partition files for a segment.
+    void deleteSegmentFiles(uint32_t id) {
+        std::string base = sm_->segmentBasePath(id);
+        for (int p = 0; p < 16; ++p) {
+            std::filesystem::remove(Segment::partitionPath(base, p));
+        }
     }
 
     std::string path_;
@@ -70,7 +78,7 @@ TEST_F(SegmentStorageManagerTest, RemoveSegmentDeletesFile) {
     ASSERT_TRUE(openSM().ok());
 
     uint32_t id = createTrackedSegment("k", "v");
-    std::string seg_path = sm_->segmentPath(id);
+    std::string seg_path = Segment::partitionPath(sm_->segmentBasePath(id), 0);
 
     // File exists before removal.
     ASSERT_TRUE(std::filesystem::exists(seg_path));
@@ -96,7 +104,7 @@ TEST_F(SegmentStorageManagerTest, RecoverPurgesOrphanFiles) {
     // Plant an orphan file.
     createOrphanFile(999);
     ASSERT_TRUE(std::filesystem::exists(
-        path_ + "/segments/segment_999.data"));
+        path_ + "/segments/segment_999_0.data"));
 
     // Phase 2: reopen — orphan should be purged.
     {
@@ -104,7 +112,7 @@ TEST_F(SegmentStorageManagerTest, RecoverPurgesOrphanFiles) {
 
         // Orphan should be gone.
         EXPECT_FALSE(std::filesystem::exists(
-            path_ + "/segments/segment_999.data"));
+            path_ + "/segments/segment_999_0.data"));
 
         // Tracked segment should still exist.
         EXPECT_EQ(sm_->segmentCount(), 1u);
@@ -122,8 +130,8 @@ TEST_F(SegmentStorageManagerTest, RecoverToleratesMissingFile) {
         uint32_t id = createTrackedSegment("k1", "v1");
         closeSM();
 
-        // Delete the segment file behind the manifest's back.
-        std::filesystem::remove(path_ + "/segments/segment_" + std::to_string(id) + ".data");
+        // Delete the segment files behind the manifest's back.
+        deleteSegmentFiles(id);
     }
 
     // Reopen — recover should succeed, treating the gap as a removed segment.
@@ -142,9 +150,12 @@ TEST_F(SegmentStorageManagerTest, RecoverNonContiguousIds) {
     uint32_t id3 = createTrackedSegment("k3", "v3");
     closeSM();
 
-    // Delete segment 2's file (simulate GC crash that removed the file
+    // Delete segment 2's files (simulate GC crash that removed the file
     // but didn't update the manifest).
-    std::filesystem::remove(path_ + "/segments/segment_" + std::to_string(id2) + ".data");
+    for (int p = 0; p < 16; ++p) {
+        std::string base = path_ + "/segments/segment_" + std::to_string(id2);
+        std::filesystem::remove(Segment::partitionPath(base, p));
+    }
 
     // Reopen — should succeed with only segments 1 and 3.
     ASSERT_TRUE(openSM(false).ok());
@@ -196,13 +207,13 @@ TEST_F(SegmentStorageManagerTest, OrphanOutsideRangeIsPurged) {
     // Plant orphan with ID far outside the tracked range.
     createOrphanFile(12345);
     ASSERT_TRUE(std::filesystem::exists(
-        path_ + "/segments/segment_12345.data"));
+        path_ + "/segments/segment_12345_0.data"));
 
     {
         ASSERT_TRUE(openSM(false).ok());
 
         EXPECT_FALSE(std::filesystem::exists(
-            path_ + "/segments/segment_12345.data"));
+            path_ + "/segments/segment_12345_0.data"));
         EXPECT_EQ(sm_->segmentCount(), 1u);
         closeSM();
     }
@@ -218,8 +229,11 @@ TEST_F(SegmentStorageManagerTest, NonContiguousWithOrphanPurge) {
     uint32_t id3 = createTrackedSegment("k3", "v3");
     closeSM();
 
-    // Delete segment 2's file (gap).
-    std::filesystem::remove(path_ + "/segments/segment_" + std::to_string(id2) + ".data");
+    // Delete segment 2's files (gap).
+    for (int p = 0; p < 16; ++p) {
+        std::string base = path_ + "/segments/segment_" + std::to_string(id2);
+        std::filesystem::remove(Segment::partitionPath(base, p));
+    }
 
     // Also plant an orphan outside the range.
     createOrphanFile(999);
@@ -235,7 +249,7 @@ TEST_F(SegmentStorageManagerTest, NonContiguousWithOrphanPurge) {
 
         // Orphan outside range is purged.
         EXPECT_FALSE(std::filesystem::exists(
-            path_ + "/segments/segment_999.data"));
+            path_ + "/segments/segment_999_0.data"));
 
         closeSM();
     }

@@ -29,7 +29,8 @@ class Manifest;
 class SegmentStorageManager {
 public:
     explicit SegmentStorageManager(Manifest& manifest,
-                                   bool buffered_writes = true);
+                                   bool buffered_writes = true,
+                                   uint16_t num_partitions = 1);
     ~SegmentStorageManager();
 
     // Non-copyable
@@ -79,8 +80,11 @@ public:
     // Allocate a monotonically increasing segment ID.
     uint32_t allocateSegmentId();
 
-    // Return the file path for a given segment ID under db_path_/segments/.
-    std::string segmentPath(uint32_t segment_id) const;
+    // Return the base path for a given segment ID (without partition suffix).
+    // E.g. "<db_path>/segments/segment_7" — actual files are segment_7_0.data etc.
+    std::string segmentBasePath(uint32_t segment_id) const;
+
+    uint16_t numPartitions() const { return num_partitions_; }
 
     // Segments directory: <db_path>/segments/
     std::string segmentsDir() const;
@@ -91,6 +95,7 @@ private:
     std::string db_path_;
     Manifest& manifest_;
     bool buffered_writes_;
+    uint16_t num_partitions_;
     bool is_open_ = false;
     std::atomic<uint32_t> next_segment_id_{1};
 

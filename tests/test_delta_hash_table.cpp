@@ -2083,6 +2083,8 @@ protected:
             std::string key = "key_" + std::to_string(i);
             idx.applyPut(H(key), i + 1, i);
         }
+        // Write savepoint so data survives close+reopen.
+        if (N > 0) idx.storeSavepoint(static_cast<uint32_t>(N - 1));
     }
 
     // Verify index contains N keys with expected packed_version = i+1, segment_id = i.
@@ -2157,21 +2159,21 @@ TEST_F(RecoveryTest, CrashLeavingTmpDir) {
     populate(*idx, 50);
     ASSERT_TRUE(idx->storeSavepoint(0).ok());
 
-    // Add more data.
+    // Add more data and savepoint again.
     for (int i = 50; i < 80; ++i) {
         std::string key = "key_" + std::to_string(i);
         put(*idx, H(key), i + 1, i);
     }
+    ASSERT_TRUE(idx->storeSavepoint(79).ok());
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
 
     // Simulate a crashed .tmp dir from a partial savepoint write.
     std::filesystem::create_directories(savepointTmp());
-    // Write a garbage file inside to make it non-empty.
     std::ofstream(savepointTmp() + "/garbage.dat") << "corrupt";
 
     auto idx2 = openIndex();
-    // Should have all 80 keys (close() wrote a savepoint with all 80).
+    // Should have all 80 keys (savepoint captured all 80).
     verify(*idx2, 80);
     // .tmp should be cleaned up.
     EXPECT_FALSE(std::filesystem::exists(savepointTmp()));
@@ -2236,11 +2238,12 @@ TEST_F(RecoveryTest, IdempotentRecovery) {
     // Explicit savepoint captures all 100 keys.
     ASSERT_TRUE(idx->storeSavepoint(0).ok());
 
-    // Write the same keys again with different values.
+    // Write the same keys again with different values, then savepoint.
     for (int i = 0; i < 100; ++i) {
         std::string key = "key_" + std::to_string(i);
         put(*idx, H(key), (i + 1) * 10, i + 100);
     }
+    ASSERT_TRUE(idx->storeSavepoint(199).ok());
     ASSERT_TRUE(idx->close().ok());
     reopenManifest();
 
@@ -2288,6 +2291,7 @@ TEST_F(RecoveryTest, MultipleReopenCycles) {
             std::string key = "key_" + std::to_string(i);
             put(*idx, H(key), i + 1, i);
         }
+        ASSERT_TRUE(idx->storeSavepoint(static_cast<uint32_t>(base + 19)).ok());
         ASSERT_TRUE(idx->close().ok());
     }
 

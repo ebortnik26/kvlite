@@ -471,8 +471,9 @@ protected:
         dir_ = ::testing::TempDir() + "/flush_test_" +
                std::to_string(reinterpret_cast<uintptr_t>(this));
         std::filesystem::create_directories(dir_);
-        path_ = dir_ + "/seg_1.log";
-        ASSERT_TRUE(seg_.create(path_, 1).ok());
+        base_path_ = dir_ + "/seg_1";
+        path_ = Segment::partitionPath(base_path_, 0);
+        ASSERT_TRUE(seg_.create(base_path_, 1).ok());
     }
 
     void TearDown() override {
@@ -527,7 +528,8 @@ protected:
     }
 
     std::string dir_;
-    std::string path_;
+    std::string base_path_;
+    std::string path_;  // partition 0 file path
     Segment seg_;
 };
 
@@ -697,7 +699,7 @@ TEST_F(FlushTest, SealAndOpen) {
 
     // Open into a fresh Segment (outside storage manager).
     Segment loaded;
-    ASSERT_TRUE(loaded.open(path_).ok());
+    ASSERT_TRUE(loaded.open(base_path_).ok());
 
     // Verify data size matches (excludes index + footer).
     EXPECT_EQ(loaded.dataSize(), data_size);

@@ -12,15 +12,16 @@ namespace internal {
 
 using MK = ManifestKey;
 
-SegmentStorageManager::SegmentStorageManager(Manifest& manifest, bool buffered_writes)
-    : manifest_(manifest), buffered_writes_(buffered_writes) {}
+SegmentStorageManager::SegmentStorageManager(Manifest& manifest, bool buffered_writes,
+                                               uint16_t num_partitions)
+    : manifest_(manifest), buffered_writes_(buffered_writes),
+      num_partitions_(num_partitions) {}
 SegmentStorageManager::~SegmentStorageManager() = default;
 
 Status SegmentStorageManager::open(const std::string& db_path) {
     db_path_ = db_path;
     is_open_ = true;
 
-    // Create segments/ subdirectory if needed.
     std::error_code ec;
     std::filesystem::create_directories(segmentsDir(), ec);
 
@@ -50,29 +51,37 @@ Status SegmentStorageManager::recover() {
         next_segment_id_.store(max_id + 1, std::memory_order_relaxed);
     }
 
-    // Reopen segments in [min_id, max_id].
-    // Gaps are tolerated: a missing file means the segment was removed
-    // (e.g., by GC) but min/max weren't fully updated before a crash.
+    // Build set of tracked file names for orphan detection.
+    // Each segment ID maps to partition files: segment_<id>_<p>.data
     std::set<std::string> tracked_files;
     for (uint32_t id = min_id; has_range && id <= max_id; ++id) {
-        std::string path = segmentPath(id);
-        tracked_files.insert(std::filesystem::path(path).filename().string());
+        std::string base = segmentBasePath(id);
 
-        if (!std::filesystem::exists(path)) continue;
+        // Check if partition 0 exists to determine if this segment is present.
+        std::string p0 = Segment::partitionPath(base, 0);
+        if (!std::filesystem::exists(p0)) {
+            // Gap — segment was removed. Track nothing.
+            continue;
+        }
 
         Segment seg;
-        Status s = seg.open(path);
+        Status s = seg.open(base);
         if (!s.ok()) {
-            return Status::IOError("Failed to reopen segment " +
-                                   std::to_string(id) + ": " + s.message());
+            // Corrupt or incomplete segment — skip it.
+            continue;
+        }
+
+        // Track all partition files for this segment.
+        for (uint16_t p = 0; p < seg.numPartitions(); ++p) {
+            tracked_files.insert(
+                std::filesystem::path(Segment::partitionPath(base, p)).filename().string());
         }
 
         std::unique_lock lock(mutex_);
         segments_.emplace(id, std::move(seg));
     }
 
-    // Purge orphan segment files not tracked by manifest (e.g., from
-    // a flush that crashed before the Manifest commit point).
+    // Purge orphan segment files not tracked by manifest.
     {
         std::error_code ec;
         for (const auto& entry :
@@ -106,9 +115,9 @@ bool SegmentStorageManager::isOpen() const {
 }
 
 Status SegmentStorageManager::createSegment(uint32_t id) {
-    std::string path = segmentPath(id);
+    std::string base = segmentBasePath(id);
     Segment seg;
-    Status s = seg.create(path, id, buffered_writes_);
+    Status s = seg.create(base, id, num_partitions_, buffered_writes_);
     if (!s.ok()) return s;
 
     std::unique_lock lock(mutex_);
@@ -116,7 +125,6 @@ Status SegmentStorageManager::createSegment(uint32_t id) {
     lock.unlock();
 
     manifest_.set(MK::kSegmentsMaxSegId, std::to_string(id));
-    // Set min if this is the first segment.
     std::string val;
     if (!manifest_.get(MK::kSegmentsMinSegId, val)) {
         manifest_.set(MK::kSegmentsMinSegId, std::to_string(id));
@@ -134,16 +142,18 @@ Status SegmentStorageManager::removeSegment(uint32_t id) {
         return Status::OK();
     }
 
-    // Proceed with actual removal.
+    // Get partition count before erasing.
+    uint16_t num_parts = 1;
     auto it = segments_.find(id);
     if (it != segments_.end()) {
+        num_parts = it->second.numPartitions();
         it->second.close();
         segments_.erase(it);
     }
     deferred_removals_.erase(id);
     lock.unlock();
 
-    std::string path = segmentPath(id);
+    std::string base = segmentBasePath(id);
 
     // Advance min_segment_id if we're removing the lowest segment.
     std::string val;
@@ -154,10 +164,10 @@ Status SegmentStorageManager::removeSegment(uint32_t id) {
         }
     }
 
+    // Delete all partition files.
     std::error_code ec;
-    std::filesystem::remove(path, ec);
-    if (ec) {
-        return Status::IOError("Failed to delete segment file: " + ec.message());
+    for (uint16_t p = 0; p < num_parts; ++p) {
+        std::filesystem::remove(Segment::partitionPath(base, p), ec);
     }
     return Status::OK();
 }
@@ -233,8 +243,8 @@ uint32_t SegmentStorageManager::allocateSegmentId() {
     return next_segment_id_.fetch_add(1, std::memory_order_relaxed);
 }
 
-std::string SegmentStorageManager::segmentPath(uint32_t segment_id) const {
-    return segmentsDir() + "/segment_" + std::to_string(segment_id) + ".data";
+std::string SegmentStorageManager::segmentBasePath(uint32_t segment_id) const {
+    return segmentsDir() + "/segment_" + std::to_string(segment_id);
 }
 
 std::string SegmentStorageManager::segmentsDir() const {

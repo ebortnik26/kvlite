@@ -23,7 +23,8 @@ Status GC::merge(
     const RelocateFn& on_relocate,
     const EliminateFn& on_eliminate,
     Result& result,
-    bool buffered_writes) {
+    bool buffered_writes,
+    uint16_t num_partitions) {
 
     result.outputs.clear();
     result.entries_written = 0;
@@ -33,14 +34,15 @@ Status GC::merge(
     constexpr size_t kTagBase      = 0;
     constexpr size_t kDedupBase = kTagBase + GCTagSourceExt::kSize;
 
-    // 1. Build tagSource streams — one per input segment.
+    // 1. Build tagSource streams — one per partition per input segment.
     std::vector<std::unique_ptr<EntryStream>> streams;
-    streams.reserve(inputs.size());
 
     for (const auto* input : inputs) {
-        streams.push_back(stream::gcTagSource(
-            stream::scan(input->logFile(), input->dataSize()),
-            input->getId(), kTagBase));
+        for (uint16_t p = 0; p < input->numPartitions(); ++p) {
+            streams.push_back(stream::gcTagSource(
+                stream::scan(input->logFile(p), input->dataSize(p)),
+                input->getId(), kTagBase));
+        }
     }
 
     // 2. Merge all streams, then dedup using snapshot versions.
@@ -56,7 +58,8 @@ Status GC::merge(
     // 4. Allocate first output segment.
     Segment output;
     uint32_t output_id = id_fn();
-    Status s = output.create(path_fn(output_id), output_id, buffered_writes);
+    Status s = output.create(path_fn(output_id), output_id,
+                              num_partitions, buffered_writes);
     if (!s.ok()) return s;
     output.setLineageType(LineageType::kGC);
 
@@ -70,7 +73,6 @@ Status GC::merge(
 
         if (action == EntryAction::kEliminate) {
             on_eliminate(entry.hash, entry.pv.data, old_seg_id);
-            // Record elimination in current output segment's lineage.
             output.addLineageElimination(entry.hash, entry.pv.data, old_seg_id);
             result.entries_eliminated++;
             s = pipeline->next();
@@ -89,7 +91,8 @@ Status GC::merge(
 
             output = Segment();
             output_id = id_fn();
-            s = output.create(path_fn(output_id), output_id, buffered_writes);
+            s = output.create(path_fn(output_id), output_id,
+                               num_partitions, buffered_writes);
             if (!s.ok()) return s;
             output.setLineageType(LineageType::kGC);
         }
@@ -99,7 +102,6 @@ Status GC::merge(
                                entry.tombstone(), entry.hash, entry_offset);
         if (!s.ok()) return s;
 
-        // Lineage entry recorded automatically by appendEntry.
         on_relocate(entry.hash, entry.pv.data, old_seg_id, output_id);
         result.entries_written++;
 

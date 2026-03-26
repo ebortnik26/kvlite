@@ -56,7 +56,7 @@ Status DB::open(const std::string& path, const Options& options) {
 
     // Storage must open before GlobalIndex — recovery reads segment lineages.
     storage_ = std::make_unique<internal::SegmentStorageManager>(
-        *manifest_, options.buffered_writes);
+        *manifest_, options.buffered_writes, options.segment_partitions);
     s = storage_->open(path);
     if (!s.ok()) { teardown(); return s; }
 
@@ -97,12 +97,11 @@ void DB::initWriteBuffer(const Options& options) {
             global_index_->applyPut(e.hkey, e.packed_ver, seg_id);
         }
 
-        // Accumulate SI codec stats.
-        const auto& si = seg->index();
-        si_encode_count_.fetch_add(si.encodeCount(), std::memory_order_relaxed);
-        si_encode_total_ns_.fetch_add(si.encodeTotalNs(), std::memory_order_relaxed);
-        si_decode_count_.fetch_add(si.decodeCount(), std::memory_order_relaxed);
-        si_decode_total_ns_.fetch_add(si.decodeTotalNs(), std::memory_order_relaxed);
+        // Accumulate SI codec stats (summed across all partitions).
+        si_encode_count_.fetch_add(seg->siEncodeCount(), std::memory_order_relaxed);
+        si_encode_total_ns_.fetch_add(seg->siEncodeTotalNs(), std::memory_order_relaxed);
+        si_decode_count_.fetch_add(seg->siDecodeCount(), std::memory_order_relaxed);
+        si_decode_total_ns_.fetch_add(seg->siDecodeTotalNs(), std::memory_order_relaxed);
 
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0).count();
@@ -521,7 +520,7 @@ Status DB::mergeSegments(const std::vector<uint32_t>& input_ids) {
         internal::GlobalIndex::BatchGuard guard(*global_index_);
         s = internal::GC::merge(
             snapshot_versions, inputs, options_.log_file_size,
-            [this](uint32_t id) { return storage_->segmentPath(id); },
+            [this](uint32_t id) { return storage_->segmentBasePath(id); },
             [this]() {
                 uint32_t id = storage_->allocateSegmentId();
                 // Register in manifest immediately for crash recovery.
@@ -535,7 +534,7 @@ Status DB::mergeSegments(const std::vector<uint32_t>& input_ids) {
             [this](uint64_t hkey, uint64_t pv, uint32_t old_id) {
                 global_index_->applyEliminate(hkey, pv, old_id);
             },
-            result, options_.buffered_writes);
+            result, options_.buffered_writes, options_.segment_partitions);
         if (!s.ok()) {
             for (uint32_t id : input_ids) storage_->unpinSegment(id);
             return s;
