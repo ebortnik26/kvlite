@@ -38,6 +38,7 @@ struct Config {
     int report_interval = 5;
     size_t memtable_size = kvlite::Options{}.memtable_size;
     bool buffered_writes = true;
+    uint16_t segment_partitions = 1;
     std::string key_dist = "uniform";
     bool extended = false;
     std::string flame_output;  // empty = disabled
@@ -93,6 +94,7 @@ static bool parseArgs(int argc, char** argv, Config& cfg) {
         else if (arg("--value-size"))        cfg.value_size = static_cast<int>(nextInt());
         else if (arg("--no-preload"))        cfg.preload = false;
         else if (arg("--no-buffered-writes")) cfg.buffered_writes = false;
+        else if (arg("--segment-partitions")) cfg.segment_partitions = static_cast<uint16_t>(nextInt());
         else if (arg("--report-interval"))   cfg.report_interval = static_cast<int>(nextInt());
         else if (arg("--memtable-size")) cfg.memtable_size = static_cast<size_t>(nextInt());
         else if (arg("--key-dist")) {
@@ -731,6 +733,7 @@ int main(int argc, char** argv) {
     std::printf("  memtable_size: %llu\n",
                 static_cast<unsigned long long>(cfg.memtable_size));
     std::printf("  buffered_writes:   %s\n", cfg.buffered_writes ? "yes" : "no");
+    std::printf("  segment_partitions: %u\n", cfg.segment_partitions);
     std::printf("\n");
 
     // Open DB
@@ -740,6 +743,7 @@ int main(int argc, char** argv) {
     opts.verify_checksums = false;
     opts.memtable_size = cfg.memtable_size;
     opts.buffered_writes = cfg.buffered_writes;
+    opts.segment_partitions = cfg.segment_partitions;
 
     kvlite::DB db;
     auto s = db.open(cfg.db_path, opts);
