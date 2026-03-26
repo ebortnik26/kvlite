@@ -24,7 +24,8 @@ Status GC::merge(
     const EliminateFn& on_eliminate,
     Result& result,
     bool buffered_writes,
-    uint16_t num_partitions) {
+    uint16_t num_partitions,
+    FlushPool* flush_pool) {
 
     result.outputs.clear();
     result.entries_written = 0;
@@ -85,7 +86,7 @@ Status GC::merge(
                                  entry.value.size() + LogEntry::kChecksumSize;
         if (output.dataSize() > 0 &&
             output.dataSize() + serialized_size > max_segment_size) {
-            s = output.seal();
+            s = output.seal(flush_pool);
             if (!s.ok()) return s;
             result.outputs.push_back(std::move(output));
 

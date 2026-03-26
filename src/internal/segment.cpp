@@ -1,20 +1,81 @@
 #include "internal/segment.h"
 
+#include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 namespace kvlite {
 namespace internal {
 
 namespace {
-// log2 for power-of-2 values (C++17 compatible).
 uint16_t log2_pow2(uint16_t v) {
     uint16_t r = 0;
     while (v > 1) { v >>= 1; ++r; }
     return r;
 }
 }  // namespace
+
+// --- FlushPool implementation ---
+
+struct FlushPool::Impl {
+    std::vector<std::thread> workers;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::condition_variable done_cv;
+    std::vector<std::function<void()>> tasks;
+    size_t pending = 0;
+    bool stop = false;
+
+    void workerLoop() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock lk(mu);
+                cv.wait(lk, [this] { return stop || !tasks.empty(); });
+                if (stop && tasks.empty()) return;
+                task = std::move(tasks.front());
+                tasks.erase(tasks.begin());
+            }
+            task();
+            {
+                std::lock_guard lk(mu);
+                if (--pending == 0) done_cv.notify_all();
+            }
+        }
+    }
+};
+
+FlushPool::FlushPool(size_t num_threads) : impl_(std::make_unique<Impl>()) {
+    for (size_t i = 0; i < num_threads; ++i) {
+        impl_->workers.emplace_back([this] { impl_->workerLoop(); });
+    }
+}
+
+FlushPool::~FlushPool() {
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->stop = true;
+    }
+    impl_->cv.notify_all();
+    for (auto& t : impl_->workers) t.join();
+}
+
+void FlushPool::submit(std::function<void()> fn) {
+    {
+        std::lock_guard lk(impl_->mu);
+        ++impl_->pending;
+        impl_->tasks.push_back(std::move(fn));
+    }
+    impl_->cv.notify_one();
+}
+
+void FlushPool::wait() {
+    std::unique_lock lk(impl_->mu);
+    impl_->done_cv.wait(lk, [this] { return impl_->pending == 0; });
+}
 
 Segment::Segment() = default;
 Segment::~Segment() = default;
@@ -185,25 +246,26 @@ Status Segment::sealPartition(uint16_t pi) {
     return p.log_file.sync();
 }
 
-Status Segment::seal() {
+Status Segment::seal(FlushPool* pool) {
     if (state_ != State::kWriting) {
         return Status::InvalidArgument("Segment: seal requires Writing state");
     }
 
-    if (num_partitions_ == 1) {
-        Status s = sealPartition(0);
-        if (!s.ok()) return s;
-    } else {
-        // Seal partitions in parallel.
-        std::vector<Status> results(num_partitions_);
-        std::vector<std::thread> threads;
-        threads.reserve(num_partitions_);
+    if (num_partitions_ == 1 || !pool) {
+        // Single partition or no pool — seal sequentially.
         for (uint16_t i = 0; i < num_partitions_; ++i) {
-            threads.emplace_back([this, i, &results] {
+            Status s = sealPartition(i);
+            if (!s.ok()) return s;
+        }
+    } else {
+        // Seal partitions in parallel via the caller's thread pool.
+        std::vector<Status> results(num_partitions_);
+        for (uint16_t i = 0; i < num_partitions_; ++i) {
+            pool->submit([this, i, &results] {
                 results[i] = sealPartition(i);
             });
         }
-        for (auto& t : threads) t.join();
+        pool->wait();
         for (const auto& s : results) {
             if (!s.ok()) return s;
         }

@@ -22,6 +22,11 @@ Status SegmentStorageManager::open(const std::string& db_path) {
     db_path_ = db_path;
     is_open_ = true;
 
+    // Create flush pool for parallel partition sealing (K > 1).
+    if (num_partitions_ > 1) {
+        flush_pool_ = std::make_unique<FlushPool>(num_partitions_);
+    }
+
     std::error_code ec;
     std::filesystem::create_directories(segmentsDir(), ec);
 

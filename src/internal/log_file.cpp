@@ -6,6 +6,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <linux/fs.h>
+#endif
+
 namespace kvlite {
 namespace internal {
 
@@ -21,14 +25,18 @@ LogFile::LogFile(LogFile&& other) noexcept
     : fd_(other.fd_),
       sync_(other.sync_),
       buffered_(other.buffered_),
+      async_writeback_(other.async_writeback_),
       path_(std::move(other.path_)),
       size_(other.size_),
+      written_offset_(other.written_offset_),
       write_buf_(std::move(other.write_buf_)),
       buf_used_(other.buf_used_) {
     other.fd_ = -1;
     other.sync_ = false;
     other.buffered_ = true;
+    other.async_writeback_ = false;
     other.size_ = 0;
+    other.written_offset_ = 0;
     other.buf_used_ = 0;
 }
 
@@ -40,20 +48,24 @@ LogFile& LogFile::operator=(LogFile&& other) noexcept {
         fd_ = other.fd_;
         sync_ = other.sync_;
         buffered_ = other.buffered_;
+        async_writeback_ = other.async_writeback_;
         path_ = std::move(other.path_);
         size_ = other.size_;
+        written_offset_ = other.written_offset_;
         write_buf_ = std::move(other.write_buf_);
         buf_used_ = other.buf_used_;
         other.fd_ = -1;
         other.sync_ = false;
         other.buffered_ = true;
+        other.async_writeback_ = false;
         other.size_ = 0;
+        other.written_offset_ = 0;
         other.buf_used_ = 0;
     }
     return *this;
 }
 
-Status LogFile::open(const std::string& path, bool sync, bool buffered) {
+Status LogFile::open(const std::string& path, bool sync, bool buffered, bool async_writeback) {
     if (isOpen()) {
         return Status::IOError("file already open: " + path_);
     }
@@ -74,12 +86,14 @@ Status LogFile::open(const std::string& path, bool sync, bool buffered) {
     fd_ = fd;
     sync_ = sync;
     buffered_ = buffered;
+    async_writeback_ = async_writeback;
     path_ = path;
     size_ = static_cast<uint64_t>(end);
+    written_offset_ = size_;
     return Status::OK();
 }
 
-Status LogFile::create(const std::string& path, bool sync, bool buffered) {
+Status LogFile::create(const std::string& path, bool sync, bool buffered, bool async_writeback) {
     if (isOpen()) {
         return Status::IOError("file already open: " + path_);
     }
@@ -94,8 +108,10 @@ Status LogFile::create(const std::string& path, bool sync, bool buffered) {
     fd_ = fd;
     sync_ = sync;
     buffered_ = buffered;
+    async_writeback_ = async_writeback;
     path_ = path;
     size_ = 0;
+    written_offset_ = 0;
     return Status::OK();
 }
 
@@ -129,9 +145,12 @@ Status LogFile::append(const void* data, size_t len, uint64_t& offset) {
     offset = size_;
 
     if (!buffered_) {
+        uint64_t wo = written_offset_;
         Status s = writeAll(data, len);
         if (!s.ok()) return s;
+        written_offset_ += len;
         size_ += len;
+        if (async_writeback_) asyncWriteback(wo, len);
         return Status::OK();
     }
 
@@ -216,9 +235,15 @@ Status LogFile::truncateTo(uint64_t offset) {
 
 Status LogFile::flushBuffer() {
     if (buf_used_ == 0) return Status::OK();
-    Status s = writeAll(write_buf_.data(), buf_used_);
+    uint64_t flush_offset = written_offset_;
+    size_t flush_len = buf_used_;
+    Status s = writeAll(write_buf_.data(), flush_len);
     if (!s.ok()) return s;
+    written_offset_ += flush_len;
     buf_used_ = 0;
+    if (async_writeback_) {
+        asyncWriteback(flush_offset, flush_len);
+    }
     return Status::OK();
 }
 
@@ -235,6 +260,18 @@ Status LogFile::writeAll(const void* data, size_t len) {
         remaining -= static_cast<size_t>(written);
     }
     return Status::OK();
+}
+
+void LogFile::asyncWriteback(uint64_t offset, size_t len) {
+#ifdef __linux__
+    // SYNC_FILE_RANGE_WRITE starts async writeback of dirty pages in
+    // [offset, offset+len) without waiting.  Best-effort: ignore errors.
+    ::sync_file_range(fd_, static_cast<off_t>(offset),
+                      static_cast<off_t>(len), SYNC_FILE_RANGE_WRITE);
+#else
+    (void)offset;
+    (void)len;
+#endif
 }
 
 Status LogFile::sync() {

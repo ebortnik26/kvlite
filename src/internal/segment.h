@@ -2,6 +2,8 @@
 #define KVLITE_INTERNAL_SEGMENT_H
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -81,9 +83,9 @@ public:
     Status open(const std::string& path);
 
     // Seal all partitions: write SegmentIndex + lineage + footer + fdatasync
-    // for each partition.  When K > 1, partitions are sealed in parallel.
-    // Writing -> Readable.
-    Status seal();
+    // for each partition.  When K > 1 and a pool is provided, partitions are
+    // sealed in parallel.  Writing -> Readable.
+    Status seal(class FlushPool* pool = nullptr);
 
     // Close all partition files. Writing|Readable -> Closed.
     Status close();
@@ -202,6 +204,23 @@ private:
     State state_ = State::kClosed;
     LineageType lineage_type_ = LineageType::kFlush;
     std::string base_path_;  // e.g. "/db/segments/segment_7"
+};
+
+// Thread pool for parallel partition sealing.  Owned by SegmentStorageManager.
+class FlushPool {
+public:
+    explicit FlushPool(size_t num_threads);
+    ~FlushPool();
+
+    FlushPool(const FlushPool&) = delete;
+    FlushPool& operator=(const FlushPool&) = delete;
+
+    void submit(std::function<void()> fn);
+    void wait();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace internal

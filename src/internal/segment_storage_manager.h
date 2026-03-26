@@ -75,6 +75,11 @@ public:
     void pinSegment(uint32_t id);
     void unpinSegment(uint32_t id);
 
+    // --- Thread Pool ---
+
+    // Pool for parallel partition sealing (K > 1). nullptr when K == 1.
+    FlushPool* flushPool() { return flush_pool_.get(); }
+
     // --- Segment Factory ---
 
     // Allocate a monotonically increasing segment ID.
@@ -103,6 +108,7 @@ private:
     std::map<uint32_t, Segment> segments_;
     std::unordered_map<uint32_t, uint32_t> pin_counts_;
     std::unordered_set<uint32_t> deferred_removals_;
+    std::unique_ptr<FlushPool> flush_pool_;
 };
 
 }  // namespace internal

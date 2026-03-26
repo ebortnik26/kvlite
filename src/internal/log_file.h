@@ -33,14 +33,14 @@ public:
     // When sync=true, the fd is opened with O_DSYNC so every write is
     // durable on return (no separate fdatasync needed).
     // When buffered=true, writes go through a 1MB userspace buffer.
+    // When async_writeback=true, each buffer flush triggers sync_file_range
+    // to start async writeback, reducing final fdatasync latency.
     Status open(const std::string& path, bool sync = false,
-                bool buffered = true);
+                bool buffered = true, bool async_writeback = false);
 
     // Create a new file, truncating if it already exists.
-    // When sync=true, the fd is opened with O_DSYNC.
-    // When buffered=true, writes go through a 1MB userspace buffer.
     Status create(const std::string& path, bool sync = false,
-                  bool buffered = true);
+                  bool buffered = true, bool async_writeback = false);
 
     // Close the file.
     Status close();
@@ -78,12 +78,15 @@ private:
     static constexpr size_t kWriteBufSize = 1u << 20; // 1 MB
 
     Status writeAll(const void* data, size_t len);
+    void asyncWriteback(uint64_t offset, size_t len);
 
     int fd_ = -1;
     bool sync_ = false;
     bool buffered_ = true;
+    bool async_writeback_ = false;  // call sync_file_range after each flush
     std::string path_;
     uint64_t size_ = 0;
+    uint64_t written_offset_ = 0;  // file offset of next kernel write
     std::vector<uint8_t> write_buf_;
     size_t buf_used_ = 0;
 };

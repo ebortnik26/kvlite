@@ -19,6 +19,7 @@ namespace kvlite {
 namespace internal {
 
 class Segment;
+class FlushPool;
 
 // In-memory buffer for pending writes before flush to log files.
 //
@@ -96,7 +97,8 @@ public:
     // latestVersion), sorted ascending. Empty = eliminate all redundant
     // versions.
     FlushResult flush(Segment& out,
-                      const std::vector<uint64_t>& snapshot_versions = {});
+                      const std::vector<uint64_t>& snapshot_versions = {},
+                      FlushPool* seal_pool = nullptr);
 
     // Create a stream of entries visible at snapshot_version.
     // Thread-safe: locks each bucket during collection.

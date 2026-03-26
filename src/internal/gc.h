@@ -13,6 +13,8 @@
 namespace kvlite {
 namespace internal {
 
+class FlushPool;
+
 // GC: K-way merge compaction of N input segments into M output segments.
 //
 // Merges visible entries from N input segments using composable EntryStream
@@ -71,7 +73,8 @@ public:
         const EliminateFn& on_eliminate,
         Result& result,
         bool buffered_writes = true,
-        uint16_t num_partitions = 1);
+        uint16_t num_partitions = 1,
+        FlushPool* flush_pool = nullptr);
 };
 
 }  // namespace internal

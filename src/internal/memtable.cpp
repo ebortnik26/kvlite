@@ -452,7 +452,8 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
 }
 
 Memtable::FlushResult Memtable::flush(Segment& out,
-                                      const std::vector<uint64_t>& snapshot_versions) {
+                                      const std::vector<uint64_t>& snapshot_versions,
+                                      FlushPool* seal_pool) {
     Status s;
 
     // SlimEntry: 20 bytes, no string copies. Key/value read via string_view
@@ -543,7 +544,7 @@ Memtable::FlushResult Memtable::flush(Segment& out,
         }
     }
 
-    s = out.seal();
+    s = out.seal(seal_pool);
     if (!s.ok()) return {s, {}, 0};
 
     return {Status::OK(), std::move(flushed), max_ver};

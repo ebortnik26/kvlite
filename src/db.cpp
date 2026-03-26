@@ -88,7 +88,8 @@ void DB::initWriteBuffer(const Options& options) {
         auto* seg = storage_->getSegment(seg_id);
         seg->setLineageType(internal::LineageType::kFlush);
 
-        auto result = mt.flush(*seg, versions_->snapshotVersions());
+        auto result = mt.flush(*seg, versions_->snapshotVersions(),
+                              storage_->flushPool());
         if (!result.status.ok()) return result.status;
 
         // Segment is now sealed (data + index + lineage + footer on disk).
@@ -534,7 +535,8 @@ Status DB::mergeSegments(const std::vector<uint32_t>& input_ids) {
             [this](uint64_t hkey, uint64_t pv, uint32_t old_id) {
                 global_index_->applyEliminate(hkey, pv, old_id);
             },
-            result, options_.buffered_writes, options_.segment_partitions);
+            result, options_.buffered_writes, options_.segment_partitions,
+            storage_->flushPool());
         if (!s.ok()) {
             for (uint32_t id : input_ids) storage_->unpinSegment(id);
             return s;
