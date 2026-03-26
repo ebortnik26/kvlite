@@ -116,6 +116,12 @@ Status Segment::seal() {
     s = log_file_.flushBuffer();
     if (!s.ok()) return s;
 
+    // The segment is the durability boundary — ensure all data (entries,
+    // index, lineage, footer) is on stable storage before we consider
+    // the segment sealed.
+    s = log_file_.sync();
+    if (!s.ok()) return s;
+
     state_ = State::kReadable;
     return Status::OK();
 }

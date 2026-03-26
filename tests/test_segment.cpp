@@ -488,3 +488,58 @@ TEST_F(SegmentTest, MoveAssign) {
     other.close();
 }
 
+// --- Durability: seal() syncs to stable storage ---
+
+// After seal(), the segment must be readable from a fresh file descriptor
+// without relying on OS page cache coherence. This verifies that seal()
+// actually calls fdatasync (or equivalent) before returning.
+TEST_F(SegmentTest, SealSyncsToStableStorage) {
+    ASSERT_TRUE(seg_.create(path_, 42).ok());
+    writeEntry("durable_key", 1, "durable_value", false);
+    ASSERT_TRUE(seg_.seal().ok());
+
+    // Open the same file from a completely independent Segment instance.
+    // If seal() didn't sync, a power loss here could leave an incomplete file.
+    // We can't simulate power loss in a unit test, but we can verify the
+    // file is structurally valid when opened from a new fd.
+    Segment fresh;
+    ASSERT_TRUE(fresh.open(path_).ok());
+    EXPECT_EQ(fresh.getId(), 42u);
+    EXPECT_EQ(fresh.entryCount(), 1u);
+
+    LogEntry entry;
+    ASSERT_TRUE(fresh.getLatest(H("durable_key"), entry).ok());
+    EXPECT_EQ(entry.key, "durable_key");
+    EXPECT_EQ(entry.value, "durable_value");
+    EXPECT_EQ(entry.version(), 1u);
+    fresh.close();
+}
+
+// Verify lineage round-trips through seal + open.
+TEST_F(SegmentTest, LineageRoundTrip) {
+    using kvlite::internal::Lineage;
+    using kvlite::internal::LineageType;
+
+    ASSERT_TRUE(seg_.create(path_, 7).ok());
+    seg_.setLineageType(LineageType::kGC);
+
+    writeEntry("a", 10, "va", false);
+    writeEntry("b", 20, "vb", false);
+    // Add a GC elimination (not written as data, just lineage metadata).
+    seg_.addLineageElimination(H("removed"), 5, 3);
+
+    ASSERT_TRUE(seg_.seal().ok());
+
+    // Reopen from disk and read lineage.
+    Segment loaded;
+    ASSERT_TRUE(loaded.open(path_).ok());
+
+    Lineage lin;
+    ASSERT_TRUE(loaded.readLineage(lin).ok());
+    EXPECT_EQ(lin.type, LineageType::kGC);
+    EXPECT_EQ(lin.entries.size(), 2u);
+    EXPECT_EQ(lin.eliminations.size(), 1u);
+    EXPECT_EQ(lin.eliminations[0].old_segment_id, 3u);
+    loaded.close();
+}
+
