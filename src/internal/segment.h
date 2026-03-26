@@ -36,30 +36,98 @@ struct Lineage {
     std::vector<LineageEntry> eliminations;   // GC eliminations only.
 };
 
-// A Segment stores log entries partitioned across K files, each with its own
-// SegmentIndex and lineage section.  K=1 is the single-file degenerate case.
-//
-// Per-partition file layout:
-//   [LogEntry 0] ... [LogEntry N-1]  (data region)
-//   [SegmentIndex: magic + entries + crc]
-//   [Lineage: magic + type + entries + crc]
-//   [segment_id:4][num_partitions:2][index_offset:8][lineage_offset:8][magic:4]
-//
-// File naming: segment_<id>_<partition>.data  (e.g. segment_7_0.data)
-//
-// Hash routing: partition = hash >> (64 - partition_bits).
-// The Memtable iterates buckets in hash order, so consecutive hash ranges
-// map to the same partition — writes to each file are sequential.
-//
-// State machine:
-//   Closed  -> Writing   (create)
-//   Closed  -> Readable  (open)
-//   Writing -> Readable  (seal)
-//   Writing -> Closed    (close)
-//   Readable -> Closed   (close)
-//
-// Writing state:  put, appendEntry, appendRawEntry, seal, close
-// Readable state: getLatest, get, contains, readLineage, close
+// ---------------------------------------------------------------------------
+// SegmentPartition: one physical file with its own data, index, and lineage.
+// ---------------------------------------------------------------------------
+
+class SegmentPartition {
+public:
+    SegmentPartition();
+    ~SegmentPartition();
+
+    SegmentPartition(const SegmentPartition&) = delete;
+    SegmentPartition& operator=(const SegmentPartition&) = delete;
+    SegmentPartition(SegmentPartition&&) noexcept;
+    SegmentPartition& operator=(SegmentPartition&&) noexcept;
+
+    // --- Lifecycle ---
+
+    Status create(const std::string& path, bool buffered = true);
+
+    // Open and parse footer. Returns segment_id from footer.
+    Status open(const std::string& path, uint32_t& out_segment_id);
+
+    // Write SegmentIndex + lineage + footer + fdatasync.
+    Status seal(uint32_t segment_id);
+
+    Status close() { return log_file_.close(); }
+
+    // --- Write ---
+
+    Status put(std::string_view key, uint64_t version,
+               std::string_view value, bool tombstone, uint64_t hash);
+
+    Status appendEntry(std::string_view key, uint64_t version,
+                       std::string_view value, bool tombstone,
+                       uint64_t hash, uint64_t& entry_offset);
+
+    Status appendRawEntry(const void* payload, size_t payload_len,
+                          uint64_t hash, uint64_t& entry_offset);
+
+    // --- Read ---
+
+    Status getLatest(uint64_t hash, LogEntry& entry) const;
+    Status get(uint64_t hash, std::vector<LogEntry>& entries) const;
+    Status get(uint64_t hash, uint64_t upper_bound, LogEntry& entry) const;
+    bool contains(uint64_t hash) const { return index_.contains(hash); }
+    Status readEntry(uint64_t offset, LogEntry& entry) const;
+
+    // --- Lineage ---
+
+    void setLineageType(LineageType type) { lineage_type_ = type; }
+    void addLineageElimination(uint64_t hkey, uint64_t packed_version,
+                               uint32_t old_segment_id);
+    Status readLineage(Lineage& lineage) const;
+
+    // --- Accessors ---
+
+    const LogFile& logFile() const { return log_file_; }
+    const SegmentIndex& index() const { return index_; }
+    uint64_t dataSize() const { return data_size_; }
+    size_t keyCount() const { return index_.keyCount(); }
+    size_t entryCount() const { return index_.entryCount(); }
+    uint64_t siEncodeCount() const { return index_.encodeCount(); }
+    uint64_t siEncodeTotalNs() const { return index_.encodeTotalNs(); }
+    uint64_t siDecodeCount() const { return index_.decodeCount(); }
+    uint64_t siDecodeTotalNs() const { return index_.decodeTotalNs(); }
+
+private:
+    Status writeEntry(std::string_view key, uint64_t version,
+                      std::string_view value, bool tombstone,
+                      uint64_t& entry_offset);
+    void addLineageEntry(uint64_t hkey, uint64_t packed_version);
+    Status writeLineageSection();
+
+    static constexpr uint32_t kFooterMagic = 0x53454746;  // "SEGF"
+    static constexpr uint32_t kLineageMagic = 0x4C494E47; // "LING"
+    // segment_id(4) + index_offset(8) + lineage_offset(8) + magic(4)
+    static constexpr size_t kFooterSize = 24;
+
+    LogFile log_file_;
+    SegmentIndex index_;
+    uint64_t data_size_ = 0;
+    uint64_t lineage_offset_ = 0;
+    bool batch_mode_ = false;
+    LineageType lineage_type_ = LineageType::kFlush;
+    std::vector<uint8_t> lineage_buf_;
+    uint32_t lineage_entry_count_ = 0;
+    uint32_t lineage_elimination_count_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Segment: K partitions routed by hash.  K=1 is the single-file case.
+// ---------------------------------------------------------------------------
+
 class Segment {
 public:
     Segment();
@@ -72,141 +140,139 @@ public:
 
     enum class State { kClosed, kWriting, kReadable };
 
-    // --- Lifecycle ---
+    // --- Lifecycle (out-of-line) ---
 
-    // Create K partition files for writing. Closed -> Writing.
     Status create(const std::string& path, uint32_t id,
                   uint16_t num_partitions = 1, bool buffered = true);
-
-    // Open an existing segment (discovers K from first partition's footer).
-    // Closed -> Readable.
     Status open(const std::string& path);
-
-    // Seal all partitions: write SegmentIndex + lineage + footer + fdatasync
-    // for each partition.  When K > 1 and a pool is provided, partitions are
-    // sealed in parallel.  Writing -> Readable.
     Status seal(class FlushPool* pool = nullptr);
-
-    // Close all partition files. Writing|Readable -> Closed.
     Status close();
+
+    // --- State (inline) ---
 
     State state() const { return state_; }
     bool isOpen() const { return state_ != State::kClosed; }
     uint32_t getId() const { return id_; }
     uint16_t numPartitions() const { return num_partitions_; }
 
-    // --- Lineage ---
+    // --- Lineage (inline routing) ---
 
-    // Set the lineage type before writing entries.
-    void setLineageType(LineageType type);
+    void setLineageType(LineageType type) {
+        lineage_type_ = type;
+        for (auto& p : partitions_) p.setLineageType(type);
+    }
 
-    // Record a GC elimination (entry removed, not relocated).
     void addLineageElimination(uint64_t hkey, uint64_t packed_version,
-                               uint32_t old_segment_id);
+                               uint32_t old_segment_id) {
+        partitions_[partitionFor(hkey)].addLineageElimination(
+            hkey, packed_version, old_segment_id);
+    }
 
-    // Read lineage from all partitions of a sealed segment.
+    // Merge lineage from all partitions (out-of-line).
     Status readLineage(Lineage& lineage) const;
 
-    // --- Write (Writing only) ---
+    // --- Write (inline dispatch) ---
 
-    // Serialize a LogEntry, append to the partition selected by hash,
-    // and update that partition's SegmentIndex.
     Status put(std::string_view key, uint64_t version,
-               std::string_view value, bool tombstone,
-               uint64_t hash);
+               std::string_view value, bool tombstone, uint64_t hash) {
+        if (state_ != State::kWriting)
+            return Status::InvalidArgument("Segment: put requires Writing state");
+        if (key.size() > LogEntry::kMaxKeyLen)
+            return Status::InvalidArgument("Segment: key too long");
+        return partitions_[partitionFor(hash)].put(key, version, value, tombstone, hash);
+    }
 
-    // Streaming batch append. Routes to partition by hash.
     Status appendEntry(std::string_view key, uint64_t version,
                        std::string_view value, bool tombstone,
-                       uint64_t hash, uint64_t& entry_offset);
+                       uint64_t hash, uint64_t& entry_offset) {
+        if (state_ != State::kWriting)
+            return Status::InvalidArgument("Segment: appendEntry requires Writing state");
+        if (key.size() > LogEntry::kMaxKeyLen)
+            return Status::InvalidArgument("Segment: appendEntry key too long");
+        return partitions_[partitionFor(hash)].appendEntry(
+            key, version, value, tombstone, hash, entry_offset);
+    }
 
-    // Zero-copy raw append. Routes to partition by hash.
     Status appendRawEntry(const void* payload, size_t payload_len,
-                          uint64_t hash, uint64_t& entry_offset);
+                          uint64_t hash, uint64_t& entry_offset) {
+        if (state_ != State::kWriting)
+            return Status::InvalidArgument("Segment: appendRawEntry requires Writing state");
+        return partitions_[partitionFor(hash)].appendRawEntry(
+            payload, payload_len, hash, entry_offset);
+    }
 
-    // --- Read (Readable only) ---
+    // --- Read (inline dispatch) ---
 
-    Status getLatest(uint64_t hash, LogEntry& entry) const;
-    Status get(uint64_t hash, std::vector<LogEntry>& entries) const;
-    Status get(uint64_t hash, uint64_t upper_bound, LogEntry& entry) const;
-    bool contains(uint64_t hash) const;
+    Status getLatest(uint64_t hash, LogEntry& entry) const {
+        if (state_ != State::kReadable)
+            return Status::InvalidArgument("Segment: getLatest requires Readable state");
+        return partitions_[partitionFor(hash)].getLatest(hash, entry);
+    }
 
-    // --- Stats ---
+    Status get(uint64_t hash, std::vector<LogEntry>& entries) const {
+        if (state_ != State::kReadable)
+            return Status::InvalidArgument("Segment: get requires Readable state");
+        return partitions_[partitionFor(hash)].get(hash, entries);
+    }
 
-    // Access partition 0's LogFile (for GC scan streams that read data region).
-    // With K>1, use logFile(partition) instead.
-    const LogFile& logFile() const { return partitions_[0].log_file; }
-    const LogFile& logFile(uint16_t partition) const { return partitions_[partition].log_file; }
+    Status get(uint64_t hash, uint64_t upper_bound, LogEntry& entry) const {
+        if (state_ != State::kReadable)
+            return Status::InvalidArgument("Segment: get requires Readable state");
+        return partitions_[partitionFor(hash)].get(hash, upper_bound, entry);
+    }
 
-    const SegmentIndex& index() const { return partitions_[0].index; }
-    const SegmentIndex& index(uint16_t partition) const { return partitions_[partition].index; }
+    bool contains(uint64_t hash) const {
+        if (state_ != State::kReadable) return false;
+        return partitions_[partitionFor(hash)].contains(hash);
+    }
+
+    // --- Partition access (inline) ---
+
+    const SegmentPartition& partition(uint16_t p) const { return partitions_[p]; }
+
+    const LogFile& logFile() const { return partitions_[0].logFile(); }
+    const LogFile& logFile(uint16_t p) const { return partitions_[p].logFile(); }
+    const SegmentIndex& index() const { return partitions_[0].index(); }
+    const SegmentIndex& index(uint16_t p) const { return partitions_[p].index(); }
+    uint64_t dataSize(uint16_t p) const { return partitions_[p].dataSize(); }
+
+    Status readEntry(uint16_t p, uint64_t offset, LogEntry& entry) const {
+        return partitions_[p].readEntry(offset, entry);
+    }
+
+    // --- Aggregate stats (out-of-line) ---
 
     uint64_t dataSize() const;
-    uint64_t dataSize(uint16_t partition) const;
     size_t keyCount() const;
     size_t entryCount() const;
-
-    // Read and CRC-validate a LogEntry from a specific partition.
-    Status readEntry(uint16_t partition, uint64_t offset, LogEntry& entry) const;
-
-    // Codec instrumentation (summed across all partitions).
     uint64_t siEncodeCount() const;
     uint64_t siEncodeTotalNs() const;
     uint64_t siDecodeCount() const;
     uint64_t siDecodeTotalNs() const;
 
-    // Generate the partition file path from a base path and partition index.
+    // --- Path helper ---
+
     static std::string partitionPath(const std::string& base_path, uint16_t partition);
 
 private:
-    // Per-partition state.
-    struct Partition {
-        LogFile log_file;
-        SegmentIndex index;
-        uint64_t data_size = 0;
-        uint64_t lineage_offset = 0;
-        bool batch_mode = false;
+    uint16_t partitionFor(uint64_t hash) const {
+        if (num_partitions_ == 1) return 0;
+        return static_cast<uint16_t>(hash >> (64 - partition_bits_));
+    }
 
-        // Lineage accumulation (Writing state only).
-        std::vector<uint8_t> lineage_buf;
-        uint32_t lineage_entry_count = 0;
-        uint32_t lineage_elimination_count = 0;
-    };
-
-    uint16_t partitionFor(uint64_t hash) const;
-
-    // Serialize and append a LogEntry to a partition, return file offset.
-    Status writeEntry(Partition& p, std::string_view key, uint64_t version,
-                      std::string_view value, bool tombstone,
-                      uint64_t& entry_offset);
-
-    // Add a lineage entry to a partition's buffer.
-    static void addLineageEntry(Partition& p, uint64_t hkey, uint64_t packed_version);
-
-    // Write one partition's lineage section.
-    static Status writeLineage(Partition& p, LineageType type, uint32_t lineage_magic);
-
-    // Seal a single partition (index + lineage + footer + fdatasync).
-    Status sealPartition(uint16_t pi);
-
-    // Read lineage from one partition file.
-    Status readPartitionLineage(const Partition& p, Lineage& lineage) const;
-
-    static constexpr uint32_t kFooterMagic = 0x53454746;  // "SEGF"
-    static constexpr uint32_t kLineageMagic = 0x4C494E47; // "LING"
-    // segment_id(4) + num_partitions(2) + index_offset(8) + lineage_offset(8) + magic(4)
-    static constexpr size_t kFooterSize = 26;
-
-    std::vector<Partition> partitions_;
+    std::vector<SegmentPartition> partitions_;
     uint32_t id_ = 0;
     uint16_t num_partitions_ = 0;
-    uint16_t partition_bits_ = 0;  // log2(num_partitions_)
+    uint16_t partition_bits_ = 0;
     State state_ = State::kClosed;
     LineageType lineage_type_ = LineageType::kFlush;
-    std::string base_path_;  // e.g. "/db/segments/segment_7"
+    std::string base_path_;
 };
 
-// Thread pool for parallel partition sealing.  Owned by SegmentStorageManager.
+// ---------------------------------------------------------------------------
+// FlushPool: thread pool for parallel partition sealing.
+// ---------------------------------------------------------------------------
+
 class FlushPool {
 public:
     explicit FlushPool(size_t num_threads);

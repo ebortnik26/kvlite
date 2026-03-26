@@ -382,22 +382,20 @@ TEST_F(SegmentTest, OpenDataWrittenWithFakeFooter) {
     writeEntry("key1", 1, "val1", false);
     seg_.close();
 
-    // Append a fake 26-byte footer that claims the index starts at offset 0.
+    // Append a fake 24-byte footer that claims the index starts at offset 0.
     std::string p0 = Segment::partitionPath(path_, 0);
     int fd = ::open(p0.c_str(), O_WRONLY | O_APPEND);
     ASSERT_GE(fd, 0);
-    uint8_t footer[26] = {};
+    uint8_t footer[24] = {};
     uint32_t fake_id = 0;
-    uint16_t num_parts = 1;
     uint64_t fake_index_offset = 0;
     uint64_t fake_lineage_offset = 0;
     uint32_t magic = 0x53454746;  // "SEGF"
     std::memcpy(footer, &fake_id, 4);
-    std::memcpy(footer + 4, &num_parts, 2);
-    std::memcpy(footer + 6, &fake_index_offset, 8);
-    std::memcpy(footer + 14, &fake_lineage_offset, 8);
-    std::memcpy(footer + 22, &magic, 4);
-    ASSERT_EQ(::write(fd, footer, 26), 26);
+    std::memcpy(footer + 4, &fake_index_offset, 8);
+    std::memcpy(footer + 12, &fake_lineage_offset, 8);
+    std::memcpy(footer + 20, &magic, 4);
+    ASSERT_EQ(::write(fd, footer, 24), 24);
     ::close(fd);
 
     Segment loaded;
@@ -415,18 +413,16 @@ TEST_F(SegmentTest, OpenIndexOffsetBeyondFile) {
     std::string p0 = Segment::partitionPath(path_, 0);
     int fd = ::open(p0.c_str(), O_WRONLY | O_APPEND);
     ASSERT_GE(fd, 0);
-    uint8_t footer[26] = {};
+    uint8_t footer[24] = {};
     uint32_t fake_id = 0;
-    uint16_t num_parts = 1;
     uint64_t bad_offset = 999999;
     uint64_t zero = 0;
     uint32_t magic = 0x53454746;
     std::memcpy(footer, &fake_id, 4);
-    std::memcpy(footer + 4, &num_parts, 2);
-    std::memcpy(footer + 6, &bad_offset, 8);
-    std::memcpy(footer + 14, &zero, 8);
-    std::memcpy(footer + 22, &magic, 4);
-    ASSERT_EQ(::write(fd, footer, 26), 26);
+    std::memcpy(footer + 4, &bad_offset, 8);
+    std::memcpy(footer + 12, &zero, 8);
+    std::memcpy(footer + 20, &magic, 4);
+    ASSERT_EQ(::write(fd, footer, 24), 24);
     ::close(fd);
 
     Segment loaded;
