@@ -255,6 +255,91 @@ TEST_F(SegmentStorageManagerTest, NonContiguousWithOrphanPurge) {
     }
 }
 
+// Partial partition crash: a complete segment (4 partitions) survives recovery,
+// while an incomplete segment (only 2 of 4 partition files) is skipped and its
+// orphan files are purged.
+TEST_F(SegmentStorageManagerTest, PartialPartitionCrashRecovery) {
+    uint32_t complete_id;
+    uint32_t incomplete_id;
+
+    // Phase 1: create a fully sealed 4-partition segment.
+    {
+        manifest_ = std::make_unique<Manifest>();
+        ASSERT_TRUE(manifest_->create(path_).ok());
+        sm_ = std::make_unique<SegmentStorageManager>(*manifest_, true, 4);
+        ASSERT_TRUE(sm_->open(path_).ok());
+
+        complete_id = sm_->allocateSegmentId();
+        ASSERT_TRUE(sm_->createSegment(complete_id).ok());
+
+        Segment* seg = sm_->getSegment(complete_id);
+        ASSERT_NE(seg, nullptr);
+        ASSERT_TRUE(seg->put("k1", 1, "v1", false,
+                             dhtHashBytes("k1", 2)).ok());
+        ASSERT_TRUE(seg->put("k2", 2, "v2", false,
+                             dhtHashBytes("k2", 2)).ok());
+        ASSERT_TRUE(seg->put("k3", 3, "v3", false,
+                             dhtHashBytes("k3", 2)).ok());
+        ASSERT_TRUE(seg->seal().ok());
+
+        // Allocate a second ID so the manifest range covers it.
+        incomplete_id = sm_->allocateSegmentId();
+        // Register it so manifest max covers this ID.
+        sm_->registerSegmentId(incomplete_id);
+
+        closeSM();
+    }
+
+    // Phase 2: simulate a crash of the second segment mid-flush.
+    // Create only 2 of the 4 expected partition files with invalid content.
+    {
+        std::string seg_dir = path_ + "/segments";
+        std::string base = seg_dir + "/segment_" + std::to_string(incomplete_id);
+        for (int p = 0; p < 2; ++p) {
+            std::string ppath = Segment::partitionPath(base, p);
+            std::ofstream(ppath) << "fake partial flush data";
+        }
+
+        // Verify the fake files exist.
+        for (int p = 0; p < 2; ++p) {
+            ASSERT_TRUE(std::filesystem::exists(
+                Segment::partitionPath(base, p)));
+        }
+        // Partitions 2 and 3 should NOT exist.
+        for (int p = 2; p < 4; ++p) {
+            ASSERT_FALSE(std::filesystem::exists(
+                Segment::partitionPath(base, p)));
+        }
+    }
+
+    // Phase 3: reopen with 4 partitions — recovery should handle both cases.
+    {
+        manifest_ = std::make_unique<Manifest>();
+        ASSERT_TRUE(manifest_->open(path_).ok());
+        sm_ = std::make_unique<SegmentStorageManager>(*manifest_, true, 4);
+        ASSERT_TRUE(sm_->open(path_).ok());
+
+        // The complete segment should be present (4 valid sealed partitions).
+        EXPECT_NE(sm_->getSegment(complete_id), nullptr);
+
+        // The incomplete segment should NOT be loaded (open fails on fake data).
+        EXPECT_EQ(sm_->getSegment(incomplete_id), nullptr);
+
+        // Only the complete segment is counted.
+        EXPECT_EQ(sm_->segmentCount(), 1u);
+
+        // Orphan partition files from the incomplete segment should be purged.
+        std::string base = path_ + "/segments/segment_" +
+                           std::to_string(incomplete_id);
+        for (int p = 0; p < 2; ++p) {
+            EXPECT_FALSE(std::filesystem::exists(
+                Segment::partitionPath(base, p)));
+        }
+
+        closeSM();
+    }
+}
+
 // New DB (empty manifest) recovers successfully with no segments.
 TEST_F(SegmentStorageManagerTest, RecoverEmptyDB) {
     ASSERT_TRUE(openSM().ok());

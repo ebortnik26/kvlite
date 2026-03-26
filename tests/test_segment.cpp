@@ -551,3 +551,153 @@ TEST_F(SegmentTest, LineageRoundTrip) {
     loaded.close();
 }
 
+// ===========================================================================
+// SegmentPartitionTest
+// ===========================================================================
+
+namespace {
+
+class SegmentPartitionTest : public ::testing::Test {
+protected:
+    using SegmentPartition = kvlite::internal::SegmentPartition;
+
+    void SetUp() override {
+        path_ = ::testing::TempDir() + "/seg_part_test_" +
+                std::to_string(reinterpret_cast<uintptr_t>(this));
+    }
+
+    void TearDown() override {
+        std::remove(path_.c_str());
+        // Also remove multi-partition files.
+        for (int i = 0; i < 16; ++i) {
+            std::remove(Segment::partitionPath(path_, i).c_str());
+        }
+    }
+
+    std::string path_;
+};
+
+}  // namespace
+
+TEST_F(SegmentPartitionTest, CreateSealOpen) {
+    using SegmentPartition = kvlite::internal::SegmentPartition;
+
+    // Create a partition, write one entry, seal with ID 42.
+    {
+        SegmentPartition p;
+        ASSERT_TRUE(p.create(path_).ok());
+        ASSERT_TRUE(p.put("key1", 1, "val1", false, H("key1")).ok());
+        ASSERT_TRUE(p.seal(42).ok());
+        ASSERT_TRUE(p.close().ok());
+    }
+
+    // Reopen and verify.
+    {
+        SegmentPartition p2;
+        uint32_t id;
+        ASSERT_TRUE(p2.open(path_, id).ok());
+        EXPECT_EQ(id, 42u);
+        EXPECT_EQ(p2.entryCount(), 1u);
+
+        LogEntry entry;
+        ASSERT_TRUE(p2.getLatest(H("key1"), entry).ok());
+        EXPECT_EQ(entry.key, "key1");
+        EXPECT_EQ(entry.value, "val1");
+        EXPECT_EQ(entry.version(), 1u);
+
+        ASSERT_TRUE(p2.readEntry(0, entry).ok());
+        EXPECT_EQ(entry.key, "key1");
+        EXPECT_EQ(entry.value, "val1");
+
+        ASSERT_TRUE(p2.close().ok());
+    }
+}
+
+TEST_F(SegmentPartitionTest, Lineage) {
+    using SegmentPartition = kvlite::internal::SegmentPartition;
+    using kvlite::internal::Lineage;
+    using kvlite::internal::LineageType;
+
+    // Create partition with GC lineage, two entries, one elimination.
+    {
+        SegmentPartition p;
+        ASSERT_TRUE(p.create(path_).ok());
+        p.setLineageType(LineageType::kGC);
+        ASSERT_TRUE(p.put("a", 10, "va", false, H("a")).ok());
+        ASSERT_TRUE(p.put("b", 20, "vb", false, H("b")).ok());
+        p.addLineageElimination(H("removed"), 5, 3);
+        ASSERT_TRUE(p.seal(7).ok());
+        ASSERT_TRUE(p.close().ok());
+    }
+
+    // Reopen and verify lineage.
+    {
+        SegmentPartition p2;
+        uint32_t id;
+        ASSERT_TRUE(p2.open(path_, id).ok());
+        EXPECT_EQ(id, 7u);
+
+        Lineage lin;
+        ASSERT_TRUE(p2.readLineage(lin).ok());
+        EXPECT_EQ(lin.type, LineageType::kGC);
+        EXPECT_EQ(lin.entries.size(), 2u);
+        EXPECT_EQ(lin.eliminations.size(), 1u);
+        EXPECT_EQ(lin.eliminations[0].old_segment_id, 3u);
+
+        ASSERT_TRUE(p2.close().ok());
+    }
+}
+
+TEST_F(SegmentPartitionTest, MultiPartitionSegmentRoundTrip) {
+    const uint16_t K = 4;
+    const int N = 100;
+
+    // Create a 4-partition Segment, write 100 entries with diverse hashes.
+    {
+        Segment seg;
+        ASSERT_TRUE(seg.create(path_, 1, K).ok());
+
+        for (int i = 0; i < N; ++i) {
+            std::string key = "key_" + std::to_string(i);
+            std::string val = "val_" + std::to_string(i);
+            ASSERT_TRUE(seg.put(key, static_cast<uint64_t>(i + 1), val,
+                                false, HS(key)).ok());
+        }
+
+        ASSERT_TRUE(seg.seal().ok());
+        seg.close();
+    }
+
+    // Reopen and verify all entries are readable.
+    {
+        Segment loaded;
+        ASSERT_TRUE(loaded.open(path_).ok());
+        EXPECT_EQ(loaded.numPartitions(), K);
+        EXPECT_EQ(loaded.entryCount(), static_cast<size_t>(N));
+
+        for (int i = 0; i < N; ++i) {
+            std::string key = "key_" + std::to_string(i);
+            std::string expected_val = "val_" + std::to_string(i);
+            LogEntry entry;
+            ASSERT_TRUE(loaded.getLatest(HS(key), entry).ok())
+                << "Failed to get key: " << key;
+            EXPECT_EQ(entry.key, key);
+            EXPECT_EQ(entry.value, expected_val);
+            EXPECT_EQ(entry.version(), static_cast<uint64_t>(i + 1));
+        }
+
+        // Verify that not all entries landed in partition 0 --
+        // at least 2 partitions should have entries.
+        int non_empty_partitions = 0;
+        for (uint16_t p = 0; p < K; ++p) {
+            if (loaded.partition(p).entryCount() > 0) {
+                ++non_empty_partitions;
+            }
+        }
+        EXPECT_GE(non_empty_partitions, 2)
+            << "Expected entries spread across at least 2 partitions";
+
+        loaded.close();
+    }
+}
+

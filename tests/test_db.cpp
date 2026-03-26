@@ -723,3 +723,150 @@ TEST_F(DBTest, ExistsTombstoneNoIO) {
     ASSERT_TRUE(db_.exists("live", e).ok());
     EXPECT_TRUE(e);
 }
+
+// ── Partitioned segments end-to-end ─────────────────────────────────────────
+
+TEST_F(DBTest, PartitionedSegmentEndToEnd) {
+    kvlite::Options opts;
+    opts.segment_partitions = 4;
+    opts.memtable_size = 1 * 1024 * 1024;  // 1MB to force flushes
+    ASSERT_TRUE(openDB(opts).ok());
+
+    // Write 1000 key-value pairs, then sync the last to force flush.
+    for (int i = 0; i < 1000; ++i) {
+        std::string key = "key_" + std::to_string(i);
+        std::string val = "value_" + std::to_string(i);
+        auto wo = (i == 999) ? syncOpts() : kvlite::WriteOptions();
+        ASSERT_TRUE(db_.put(key, val, wo).ok());
+    }
+
+    // Verify all 1000 keys are readable.
+    for (int i = 0; i < 1000; ++i) {
+        std::string key = "key_" + std::to_string(i);
+        std::string val;
+        ASSERT_TRUE(db_.get(key, val).ok());
+        EXPECT_EQ(val, "value_" + std::to_string(i));
+    }
+
+    // Close and reopen with same options.
+    ASSERT_TRUE(db_.close().ok());
+    ASSERT_TRUE(openDB(opts).ok());
+
+    // Verify all 1000 keys still readable after recovery.
+    for (int i = 0; i < 1000; ++i) {
+        std::string key = "key_" + std::to_string(i);
+        std::string val;
+        ASSERT_TRUE(db_.get(key, val).ok());
+        EXPECT_EQ(val, "value_" + std::to_string(i));
+    }
+
+    // Verify segment files on disk use partition naming.
+    // With segment_partitions=4, each segment ID should have files like
+    // segment_<id>_0.data, segment_<id>_1.data, segment_<id>_2.data, segment_<id>_3.data
+    fs::path seg_dir = test_dir_ / "segments";
+    ASSERT_TRUE(fs::exists(seg_dir));
+
+    // Collect all .data files and verify partition naming.
+    bool found_partition_files = false;
+    std::set<std::string> data_files;
+    for (const auto& entry : fs::directory_iterator(seg_dir)) {
+        auto name = entry.path().filename().string();
+        if (name.size() > 5 && name.substr(name.size() - 5) == ".data") {
+            data_files.insert(name);
+        }
+    }
+    ASSERT_FALSE(data_files.empty());
+
+    // Check that at least one segment has all 4 partition files.
+    // Find a segment ID and verify all partitions exist.
+    for (const auto& name : data_files) {
+        // Parse segment_<id>_<partition>.data
+        if (name.substr(0, 8) == "segment_") {
+            // Extract the segment ID portion
+            size_t second_underscore = name.find('_', 8);
+            if (second_underscore != std::string::npos) {
+                std::string seg_id_str = name.substr(8, second_underscore - 8);
+                uint32_t seg_id = std::stoul(seg_id_str);
+                // Check all 4 partitions exist for this segment ID.
+                bool all_present = true;
+                for (int p = 0; p < 4; ++p) {
+                    std::string pname = "segment_" + std::to_string(seg_id)
+                                      + "_" + std::to_string(p) + ".data";
+                    if (data_files.find(pname) == data_files.end()) {
+                        all_present = false;
+                        break;
+                    }
+                }
+                if (all_present) {
+                    found_partition_files = true;
+                    break;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(found_partition_files)
+        << "Expected segment files with partition naming (segment_<id>_<p>.data)";
+}
+
+// ── Multi-segment lineage recovery ──────────────────────────────────────────
+
+TEST_F(DBTest, MultiSegmentLineageRecovery) {
+    // Test that data written after the last savepoint is recovered
+    // from segment lineage sections on reopen.
+    kvlite::Options opts;
+    opts.memtable_size = 64 * 1024;  // 64KB to force many flushes
+    opts.gc_interval_sec = 0;        // disable GC daemon
+    opts.savepoint_interval_sec = 0; // disable savepoint daemon
+    ASSERT_TRUE(openDB(opts).ok());
+
+    // Phase 1: write initial data and close (creates savepoint covering these).
+    const int N1 = 100;
+    for (int i = 0; i < N1; ++i) {
+        ASSERT_TRUE(db_.put("old_" + std::to_string(i),
+                            "v_" + std::to_string(i)).ok());
+    }
+    ASSERT_TRUE(db_.close().ok());
+
+    // Phase 2: reopen, write MORE data, then close without explicit savepoint.
+    // The new data creates segments whose lineage is not in the savepoint
+    // (savepoint daemon is disabled). Recovery must replay their lineage.
+    ASSERT_TRUE(openDB(opts).ok());
+    const int N2 = 500;
+    for (int i = 0; i < N2; ++i) {
+        std::string key = "new_" + std::to_string(i);
+        std::string val = "value_" + std::to_string(i) + std::string(64, 'x');
+        ASSERT_TRUE(db_.put(key, val).ok());
+    }
+    // Sync last write to force flush.
+    ASSERT_TRUE(db_.put("marker", "done", syncOpts()).ok());
+
+    // Verify multiple segments exist.
+    kvlite::DBStats stats;
+    ASSERT_TRUE(db_.getStats(stats).ok());
+    EXPECT_GT(stats.num_log_files, 1u);
+
+    ASSERT_TRUE(db_.close().ok());
+
+    // Phase 3: reopen — new data must be recovered from lineage.
+    ASSERT_TRUE(openDB(opts).ok());
+
+    // Old data (from phase 1, in savepoint).
+    for (int i = 0; i < N1; ++i) {
+        std::string val;
+        ASSERT_TRUE(db_.get("old_" + std::to_string(i), val).ok());
+        EXPECT_EQ(val, "v_" + std::to_string(i));
+    }
+
+    // New data (from phase 2, recovered from lineage).
+    for (int i = 0; i < N2; ++i) {
+        std::string key = "new_" + std::to_string(i);
+        std::string val;
+        ASSERT_TRUE(db_.get(key, val).ok()) << "Failed to recover: " << key;
+        std::string expected = "value_" + std::to_string(i) + std::string(64, 'x');
+        EXPECT_EQ(val, expected);
+    }
+
+    std::string marker_val;
+    ASSERT_TRUE(db_.get("marker", marker_val).ok());
+    EXPECT_EQ(marker_val, "done");
+}
