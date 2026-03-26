@@ -31,8 +31,8 @@ kvlite implements an **index-plus-log** architecture in software, providing effi
 │                         ▼                  ▼                    │
 │   ┌──────────┐  ┌──────────┐  ┌──────────┐                     │
 │   │ Segment  │  │ Segment  │  │ Segment  │  ...                 │
-│   │ .data    │  │ .data    │  │ .data    │                      │
-│   │ .idx     │  │ .idx     │  │ .idx     │                      │
+│   │ K files  │  │ K files  │  │ K files  │                      │
+│   │(parallel)│  │(parallel)│  │(parallel)│                      │
 │   └──────────┘  └──────────┘  └──────────┘                      │
 ├─────────────────────────────────────────────────────────────────┤
 │  Manifest  ·  Segment Lineage  ·  GlobalIndex Savepoints        │
@@ -195,6 +195,7 @@ kvlite::Options options;
 options.log_file_size = 1ULL * 1024 * 1024 * 1024;  // 1GB per segment file
 options.memtable_size = 64 * 1024 * 1024;             // 64MB memtable capacity
 options.flush_depth = 3;                              // Pipeline depth (mutable + immutable)
+options.segment_partitions = 1;                       // Partition files per segment (power of 2)
 
 // GlobalIndex Persistence
 options.savepoint_interval_sec = 10;                  // Savepoint daemon interval (0 = disable)
@@ -285,7 +286,7 @@ No active snapshots:
 
 1. VersionManager allocates a monotonic version
 2. Entry buffered in WriteBuffer (in-memory Memtable)
-3. When buffer full → flush: write sorted entries to new Segment, seal with SegmentIndex + lineage section
+3. When buffer full → flush: write sorted entries to new Segment (K partition files), seal with SegmentIndex + lineage per partition (parallel fdatasync when K > 1)
 4. Update in-memory GlobalIndex with (key, version, segment_id) for each flushed entry
 
 ### Read Path (latest)

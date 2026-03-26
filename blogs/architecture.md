@@ -37,10 +37,16 @@ any data is returned to the caller.
 
 ## Segments
 
-A **segment** is a single file containing a sequence of log entries
-followed by a per-file index and a footer.  It owns two components: a
-`LogFile` (thin POSIX wrapper for I/O) and a `SegmentIndex` (hash-based
-lookup structure).
+A **segment** is a logical unit of storage consisting of K **partition**
+files (K=1 by default, configurable via `Options::segment_partitions`).
+Each partition is a `SegmentPartition` — a self-contained file with its
+own data region, SegmentIndex, lineage section, and footer.  Entries are
+routed to partitions by hash: `partition = hash >> (64 - log2(K))`.
+File naming: `segment_<id>_<partition>.data`.
+
+The `Segment` class is a thin coordinator that owns K `SegmentPartition`
+objects and routes write/read calls by hash.  Write and read methods are
+inline one-liners that dispatch to the correct partition.
 
 Each segment follows a strict state machine:
 
@@ -51,25 +57,27 @@ Closed ──create()──► Writing ──seal()──► Readable
 ```
 
 In the **Writing** state, `put()` serializes each log entry, appends it
-to the file via the LogFile, records the entry's offset in the
-SegmentIndex, and advances the data size counter.
+to the partition's LogFile, records the entry's offset in that
+partition's SegmentIndex, and records a lineage entry.
 
-When writing is complete, `seal()` freezes the segment:
+When writing is complete, `seal()` freezes the segment.  Each partition
+is sealed independently (in parallel via `FlushPool` when K > 1):
 
 1. Record `data_size` — the byte offset where log entries end.
-2. Serialize the SegmentIndex and the lineage section, and append both
-   to the file.
+2. Serialize the SegmentIndex and lineage section, append both.
 3. Append a 24-byte footer:
    `[segment_id:4][index_offset:8][lineage_offset:8][magic:4]`.
-4. Transition to **Readable**.
+4. `fdatasync` to ensure durability.
 
-Each segment carries a **lineage section** that records the GlobalIndex
+After all partitions are sealed, the segment transitions to **Readable**.
+
+Each partition carries a **lineage section** that records the GlobalIndex
 mutations it contributes.  For flush segments, these are the put entries;
 for GC segments, these are relocations and eliminations.  This makes
-each segment self-describing — its lineage section contains everything
+each segment self-describing — its lineage sections contain everything
 needed to reconstruct the GlobalIndex entries it owns.
 
-The resulting file layout:
+The per-partition file layout:
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -85,6 +93,10 @@ The resulting file layout:
 │  [lineage_offset] [magic]                    │
 └──────────────────────────────────────────────┘
 ```
+
+On open, `Segment` discovers K by probing for partition files
+(`_0.data`, `_1.data`, ...) until one is missing.  K must be a power
+of 2.
 
 Opening an existing segment reads the footer from the last 24 bytes,
 validates the magic number, then deserializes the SegmentIndex from the

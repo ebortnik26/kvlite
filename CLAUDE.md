@@ -60,7 +60,8 @@ Each bucket stores unique key suffixes (the hash bits not used for bucket select
 
 ### Storage Layer
 
-- **Segment** (`segment.h`): Owns a LogFile + SegmentIndex pair. State machine: `Closed → Writing → Readable`. Writing state: `put()` serializes LogEntry (header + key + value + CRC32), appends to file, updates index. `seal()` writes SegmentIndex + lineage section + footer, transitions to Readable. Each segment carries a lineage section recording the GlobalIndex mutations it represents. Readable state: `getLatest()`/`get()` read and CRC-validate entries.
+- **Segment** (`segment.h`): Routes entries by hash across K `SegmentPartition` files (K=1 by default, configurable via `Options::segment_partitions`). State machine: `Closed → Writing → Readable`. Write methods dispatch to `partitions_[hash >> (64 - partition_bits)]`. `seal()` finalizes all partitions in parallel via a `FlushPool`. File naming: `segment_<id>_<partition>.data`.
+- **SegmentPartition** (`segment.h`): One physical file owning a LogFile + SegmentIndex + lineage section. `put()`/`appendRawEntry()` serialize entries and record lineage. `seal()` writes SegmentIndex + lineage + footer + fdatasync. Footer: `[segment_id:4][index_offset:8][lineage_offset:8][magic:4]` (24 bytes). Segment discovers K by probing partition files on open.
 - **LogFile** (`log_file.h`): Thin POSIX wrapper. `append()` for writes (not thread-safe), `readAt()` via pread (thread-safe, const).
 - **WriteBuffer** (`write_buffer.h`): In-memory staging area with contiguous data buffer and hash index. `flush()` sorts entries by (hash, version), writes to a new Segment, and seals it.
 
