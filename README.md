@@ -35,7 +35,7 @@ kvlite implements an **index-plus-log** architecture in software, providing effi
 │   │ .idx     │  │ .idx     │  │ .idx     │                      │
 │   └──────────┘  └──────────┘  └──────────┘                      │
 ├─────────────────────────────────────────────────────────────────┤
-│  Manifest  ·  GlobalIndex WAL  ·  GlobalIndex Savepoints        │
+│  Manifest  ·  Segment Lineage  ·  GlobalIndex Savepoints        │
 ├─────────────────────────────────────────────────────────────────┤
 │  Background:  GC Daemon (compaction) · Savepoint Daemon         │
 └─────────────────────────────────────────────────────────────────┘
@@ -207,7 +207,6 @@ options.gc_interval_sec = 10;                         // GC daemon interval (0 =
 
 // General
 options.create_if_missing = true;                     // Create DB dir if absent
-options.sync_writes = false;                          // fsync on every write
 options.verify_checksums = true;                      // CRC32 verification on reads
 ```
 
@@ -286,9 +285,8 @@ No active snapshots:
 
 1. VersionManager allocates a monotonic version
 2. Entry buffered in WriteBuffer (in-memory Memtable)
-3. When buffer full → flush: write sorted entries to new Segment, seal with SegmentIndex
-4. Update GlobalIndex with (key, version, segment_id) for each flushed entry
-5. Commit to GlobalIndex WAL
+3. When buffer full → flush: write sorted entries to new Segment, seal with SegmentIndex + lineage section
+4. Update in-memory GlobalIndex with (key, version, segment_id) for each flushed entry
 
 ### Read Path (latest)
 

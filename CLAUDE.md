@@ -45,7 +45,7 @@ kvlite is an **index-plus-log** key-value store. Point operations only (get/put/
 
 ### Two-Level Indexing
 
-- **GlobalIndex** (`global_index.h`): Always in memory. Maps key → list of (packed_version, segment_id) pairs (latest first). Persisted via WAL + periodic snapshots.
+- **GlobalIndex** (`global_index.h`): Always in memory. Maps key → list of (packed_version, segment_id) pairs (latest first). Persisted via segment lineage sections + periodic savepoints.
 - **SegmentIndex** (`segment_index.h`): Per-file. Maps key → list of (offset, packed_version) pairs. Stored inside each Segment file. Cached in `SegmentIndexCache` (LRU).
 
 Both indexes use the **DeltaHashTable** family — compact hash tables with sorted suffix-array buckets and overflow chain buckets:
@@ -60,13 +60,13 @@ Each bucket stores unique key suffixes (the hash bits not used for bucket select
 
 ### Storage Layer
 
-- **Segment** (`segment.h`): Owns a LogFile + SegmentIndex pair. State machine: `Closed → Writing → Readable`. Writing state: `put()` serializes LogEntry (header + key + value + CRC32), appends to file, updates index. `seal()` writes SegmentIndex + footer, transitions to Readable. Readable state: `getLatest()`/`get()` read and CRC-validate entries.
+- **Segment** (`segment.h`): Owns a LogFile + SegmentIndex pair. State machine: `Closed → Writing → Readable`. Writing state: `put()` serializes LogEntry (header + key + value + CRC32), appends to file, updates index. `seal()` writes SegmentIndex + lineage section + footer, transitions to Readable. Each segment carries a lineage section recording the GlobalIndex mutations it represents. Readable state: `getLatest()`/`get()` read and CRC-validate entries.
 - **LogFile** (`log_file.h`): Thin POSIX wrapper. `append()` for writes (not thread-safe), `readAt()` via pread (thread-safe, const).
 - **WriteBuffer** (`write_buffer.h`): In-memory staging area with contiguous data buffer and hash index. `flush()` sorts entries by (hash, version), writes to a new Segment, and seals it.
 
 ### Write Path
 
-`DB::put` → `VersionManager::allocateVersion` → `SegmentStorageManager::writeEntry` (buffers in WriteBuffer) → on capacity: `WriteBuffer::flush` → Segment → `GlobalIndexManager::put` (updates GlobalIndex + WAL).
+`DB::put` → `VersionManager::allocateVersion` → `SegmentStorageManager::writeEntry` (buffers in WriteBuffer) → on capacity: `WriteBuffer::flush` → Segment → `GlobalIndex::applyPut` (updates in-memory GlobalIndex).
 
 ### Version Persistence
 
@@ -87,7 +87,7 @@ Each bucket stores unique key suffixes (the hash bits not used for bucket select
 
 - **Status**: Returned by all fallible operations. Codes: OK, NotFound, Corruption, IOError, InvalidArgument, etc. Check with `.ok()`, `.isNotFound()`, etc.
 - **PackedVersion** (`log_entry.h`): In-memory 8-byte value encoding version (63 bits) + tombstone flag (MSB).
-- **LogEntry** (`log_entry.h`): `{ PackedVersion pv; string key; string value; }`. On-disk format: `[version:8][key_len|tombstone:2][val_len:4][key][value][crc32:4]`. Header is 14 bytes. The key_len field uses 15 bits for length (max 32767) and 1 bit (MSB) for tombstone.
+- **LogEntry** (`log_entry.h`): `{ PackedVersion pv; string key; string value; }`. On-disk format: `[packed_ver:8][key_len:2][val_len:4][key][value][crc32:4]`. Header is 14 bytes. packed_ver encodes (logical_version << 1) | tombstone_bit. key_len uses full 16 bits (max 65535).
 
 ### Naming Conventions
 

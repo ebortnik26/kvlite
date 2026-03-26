@@ -57,9 +57,17 @@ SegmentIndex, and advances the data size counter.
 When writing is complete, `seal()` freezes the segment:
 
 1. Record `data_size` — the byte offset where log entries end.
-2. Serialize the SegmentIndex and append it to the file.
-3. Append a 16-byte footer: `[segment_id:4][index_offset:8][magic:4]`.
+2. Serialize the SegmentIndex and the lineage section, and append both
+   to the file.
+3. Append a 24-byte footer:
+   `[segment_id:4][index_offset:8][lineage_offset:8][magic:4]`.
 4. Transition to **Readable**.
+
+Each segment carries a **lineage section** that records the GlobalIndex
+mutations it contributes.  For flush segments, these are the put entries;
+for GC segments, these are relocations and eliminations.  This makes
+each segment self-describing — its lineage section contains everything
+needed to reconstruct the GlobalIndex entries it owns.
 
 The resulting file layout:
 
@@ -70,12 +78,15 @@ The resulting file layout:
 ├──────────────────────────────────────────────┤
 │           SegmentIndex (serialized)          │
 ├──────────────────────────────────────────────┤
-│           Footer (16 bytes)                  │
-│  [segment_id] [index_offset] [magic]         │
+│           Lineage (serialized)               │
+├──────────────────────────────────────────────┤
+│           Footer (24 bytes)                  │
+│  [segment_id] [index_offset]                 │
+│  [lineage_offset] [magic]                    │
 └──────────────────────────────────────────────┘
 ```
 
-Opening an existing segment reads the footer from the last 16 bytes,
+Opening an existing segment reads the footer from the last 24 bytes,
 validates the magic number, then deserializes the SegmentIndex from the
 recorded offset.  The segment enters the Readable state directly.
 
@@ -119,22 +130,19 @@ The GlobalIndex uses a `ReadWriteDeltaHashTable` — the always-mutable
 variant with per-bucket spinlocks.  It is always resident in memory and
 is updated on every flush.
 
-The GlobalIndex is persisted through two mechanisms:
-
-**Write-ahead log (WAL).**  Every mutation (put, relocate, eliminate) is
-logged to a WAL file before being applied.  WAL records are batched:
-multiple entries accumulate in memory and are committed as a single
-transaction with a CRC-protected commit record.
+Persistence is via **segment lineage sections** embedded in each segment
+file.  Each segment records the GlobalIndex entries it contributes: puts
+for flush segments, relocations and eliminations for GC segments.  On
+recovery, kvlite loads the most recent savepoint, then replays lineage
+sections from all segments with ID above the savepoint's watermark.
 
 **Periodic savepoints.**  A background task periodically snapshots the
 entire DeltaHashTable to a binary checkpoint.  The savepoint uses an
 atomic rename-swap pattern (write to `tmp/`, swap with `valid/`, remove
 `old/`) so a crash mid-savepoint leaves the previous checkpoint intact.
-After a successful savepoint, WAL files older than the checkpoint version
-are deleted.
 
-On recovery, kvlite loads the most recent savepoint, then replays any WAL
-records written after it.
+On recovery, kvlite loads the most recent savepoint, then replays
+lineage from segments created after the savepoint's segment ID watermark.
 
 ## Two-level index coordination
 
@@ -217,9 +225,9 @@ A background daemon thread processes sealed Memtables in FIFO order:
    serialized with its CRC32 and appended to the log file.
 4. **Seal the segment** — the SegmentIndex and footer are written.
 5. **Update the GlobalIndex** — each flushed entry's
-   `(hash, packed_version, segment_id)` tuple is staged in the WAL and
-   applied to the in-memory DeltaHashTable, then committed as a batch.
-6. **Register the segment** in the Manifest (the durable commit point).
+   `(hash, packed_version, segment_id)` is applied to the in-memory
+   DeltaHashTable.  Durability is provided by the segment's lineage
+   section, written during seal.
 
 During flushing, the sealed Memtable remains readable — the WriteBuffer
 keeps a `flushing_` pointer so that in-flight reads can still find data
@@ -336,7 +344,7 @@ put/remove ──► VersionManager ──► WriteBuffer (Memtable)
                     ┌──────────────────┬┘
                     ▼                  ▼
                Segment            GlobalIndex
-           (LogFile + Index)    (WAL + Savepoint)
+           (LogFile + Index)    (Lineage + Savepoint)
 ```
 
 ```
@@ -353,6 +361,8 @@ speed at point operations.  Hash-based two-level indexing provides O(1)
 routing from key to byte offset.  The WriteBuffer absorbs writes in
 memory and flushes them in sorted batches, while snapshots provide
 consistent reads without global locks.  Versioned entries and sequential
-commitment give batch operations all-or-nothing visibility without a
-write-ahead log at the application level — the version counter alone is
-sufficient.
+commitment give batch operations all-or-nothing visibility — the version
+counter alone is sufficient.  Each segment is self-describing: its
+lineage section records the GlobalIndex mutations it contributes, so
+recovery needs only the most recent savepoint plus the lineage from
+segments created after it.

@@ -346,8 +346,8 @@ GlobalIndex
 Reads, puts, and flushes do **not** acquire `savepoint_mu_` — they go
 directly to the DHT's per-bucket spinlocks with zero overhead from the
 savepoint layer.  (A `DB::put` writes to the WriteBuffer; the
-GlobalIndex is updated later by the flush daemon via `stagePut` /
-`commitWB`, neither of which touches `savepoint_mu_`.)  GC operations
+GlobalIndex is updated later by the flush daemon via `applyPut`, which
+does not touch `savepoint_mu_`.)  GC operations
 (which relocate and eliminate entries) take a **shared lock**, allowing
 multiple GC batches to run concurrently.  Savepoint creation takes an
 **exclusive lock**, pausing GC while the DHT state is snapshotted to
@@ -358,27 +358,16 @@ flushes — within bucket spinlocks at sub-microsecond hold times, while
 the savepoint mutex coordinates only between the infrequent savepoint
 and GC operations.
 
-#### Lock-free counters
+#### Lock-free counter
 
-Two atomic counters avoid lock acquisition on the hot path:
+An atomic counter avoids lock acquisition on the hot path:
 
 ```cpp
 std::atomic<size_t> key_count_{0};     // Approximate live key count
-std::atomic<uint64_t> max_version_{0}; // Highest version seen
 ```
 
-`max_version_` uses a CAS loop that only updates when the new version
-exceeds the current maximum:
-
-```cpp
-uint64_t cur = max_version_.load(memory_order_relaxed);
-while (packed_version > cur &&
-       !max_version_.compare_exchange_weak(cur, packed_version,
-           memory_order_relaxed)) {}
-```
-
-Both use relaxed ordering — they're monotonic and informational, with no
-other operations depending on their exact values.
+It uses relaxed ordering — it's monotonic and informational, with no
+other operations depending on its exact value.
 
 ## Putting it together
 
