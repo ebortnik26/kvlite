@@ -28,16 +28,25 @@ cd build && ctest
 
 | Target | File | Scope |
 |--------|------|-------|
-| `kvlite_test` | `test_basic.cpp`, `test_batch.cpp`, `test_versioning.cpp`, `test_iterator.cpp`, `test_concurrency.cpp` | Integration tests (full DB) |
-| `kvlite_seg_test` | `test_segment.cpp` | Segment (LogFile + SegmentIndex pair) |
-| `kvlite_wb_test` | `test_write_buffer.cpp` | WriteBuffer + flush to Segment |
-| `kvlite_segment_index_test` | `test_segment_index.cpp` | SegmentIndex serialization/queries |
-| `kvlite_dht_test` | `test_delta_hash_table.cpp` | DeltaHashTable (BucketCodec, ReadOnly/ReadWrite DHT, GlobalIndex) |
-| `kvlite_vm_test` | `test_version_manager.cpp` | VersionManager persistence/snapshots |
+| `kvlite_int_basic` | `test_basic.cpp` | Integration: put/get/remove |
+| `kvlite_int_batch` | `test_batch.cpp` | Integration: WriteBatch/ReadBatch |
+| `kvlite_int_versioning` | `test_versioning.cpp` | Integration: version ordering |
+| `kvlite_int_iterator` | `test_iterator.cpp` | Integration: full-scan iterator |
+| `kvlite_int_concurrency` | `test_concurrency.cpp` | Integration: concurrent access |
+| `kvlite_int_db` | `test_db.cpp` | Integration: open/close, recovery, partitions |
+| `kvlite_int_gc_daemon` | `test_gc_daemon.cpp` | Integration: GC + savepoint daemons |
+| `kvlite_seg_test` | `test_segment.cpp` | Segment + SegmentPartition |
+| `kvlite_wb_test` | `test_write_buffer.cpp` | WriteBuffer + Memtable flush |
+| `kvlite_segment_index_test` | `test_segment_index.cpp` | SegmentIndex + GC integration |
+| `kvlite_dht_test` | `test_delta_hash_table.cpp` | DeltaHashTable, GlobalIndex, savepoint, recovery |
+| `kvlite_sm_test` | `test_segment_storage_manager.cpp` | SegmentStorageManager lifecycle |
+| `kvlite_vm_test` | `test_version_manager.cpp` | VersionManager persistence |
+| `kvlite_manifest_test` | `test_manifest.cpp` | Manifest KV store |
+| `kvlite_entry_stream_test` | `test_entry_stream.cpp` | EntryStream + GC pipeline |
 | `kvlite_lf_test` | `test_log_file.cpp` | LogFile POSIX I/O |
 | `kvlite_bitstream_test` | `test_bit_stream.cpp` | BitStream encoding |
 
-Unit test targets link only the sources they need (not the full library). The integration test (`kvlite_test`) links the full `kvlite` library.
+Unit test targets link only the sources they need (not the full library). The integration tests (`kvlite_int_*`) each link the full `kvlite` library.
 
 ## Architecture
 
