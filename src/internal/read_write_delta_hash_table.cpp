@@ -98,6 +98,30 @@ bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint64_t suffix,
     return is_new;
 }
 
+size_t ReadWriteDeltaHashTable::addEntriesBatch(
+        const HashVersionPair* entries, size_t count, uint32_t id) {
+    size_t new_keys = 0;
+    size_t i = 0;
+    while (i < count) {
+        uint32_t bi = bucketIndex(entries[i].hash);
+        SpinlockGuard guard(bucket_locks_[bi]);
+
+        size_t j = i;
+        while (j < count && bucketIndex(entries[j].hash) == bi) {
+            bool is_new = addToChain(bi, suffixFromHash(entries[j].hash),
+                entries[j].packed_version, id,
+                [this](Bucket& bucket) -> Bucket* {
+                    return createExtension(bucket);
+                });
+            if (is_new) ++new_keys;
+            ++j;
+        }
+        size_.fetch_add(j - i, std::memory_order_relaxed);
+        i = j;
+    }
+    return new_keys;
+}
+
 // --- Stats ---
 
 size_t ReadWriteDeltaHashTable::size() const {

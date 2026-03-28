@@ -169,6 +169,14 @@ void GlobalIndex::applyPut(uint64_t hkey, uint64_t packed_version, uint32_t segm
     }
 }
 
+void GlobalIndex::applyPutBatch(const HashVersionPair* entries, size_t count,
+                                 uint32_t segment_id) {
+    size_t new_keys = dht_.addEntriesBatch(entries, count, segment_id);
+    if (new_keys > 0) {
+        key_count_.fetch_add(new_keys, std::memory_order_relaxed);
+    }
+}
+
 bool GlobalIndex::get(uint64_t hkey,
                   std::vector<uint32_t>& segment_ids,
                   std::vector<uint64_t>& packed_versions) const {

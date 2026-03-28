@@ -81,6 +81,11 @@ public:
     // Apply a put to the in-memory index. Thread-safe (per-bucket spinlocks).
     void applyPut(uint64_t hkey, uint64_t packed_version, uint32_t segment_id);
 
+    // Batch-apply puts. Entries should be hash-sorted for optimal bucket
+    // locality (one lock acquisition per bucket run).
+    void applyPutBatch(const HashVersionPair* entries, size_t count,
+                       uint32_t segment_id);
+
     bool get(uint64_t hkey,
              std::vector<uint32_t>& segment_ids,
              std::vector<uint64_t>& packed_versions) const;

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "internal/delta_hash_table.h"
+#include "internal/log_entry.h"
 #include "internal/spinlock.h"
 
 namespace kvlite {
@@ -35,6 +36,14 @@ public:
 
     // Like addEntry, but returns true if the key's suffix group is new.
     bool addEntryIsNew(uint64_t hash, uint64_t packed_version, uint32_t id);
+
+    // Batch-add entries that are sorted by hash. Holds each bucket's spinlock
+    // for all entries in that bucket before moving to the next. Returns the
+    // number of entries whose suffix group was new (for key_count tracking).
+    // Batch-add entries sharing the same id (segment_id). Entries must be
+    // hash-sorted. Holds each bucket's spinlock for all entries in that
+    // bucket. Returns the number of new suffix groups (for key_count).
+    size_t addEntriesBatch(const HashVersionPair* entries, size_t count, uint32_t id);
 
     // Remove entry (packed_version, id) for hash. Returns true if suffix group is now empty.
     bool removeEntry(uint64_t hash, uint64_t packed_version, uint32_t id);

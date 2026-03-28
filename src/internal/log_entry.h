@@ -75,6 +75,13 @@ struct IndexEntry {
     }
 };
 
+// Hash + packed_version pair used in flush results, GlobalIndex batch updates,
+// and DHT batch inserts. One type used across all layers.
+struct HashVersionPair {
+    uint64_t hash;
+    uint64_t packed_version;
+};
+
 } // namespace internal
 } // namespace kvlite
 

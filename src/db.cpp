@@ -94,10 +94,9 @@ void DB::initWriteBuffer(const Options& options) {
         if (!result.status.ok()) return result.status;
 
         // Segment is now sealed (data + index + lineage + footer on disk).
-        // Apply to in-memory GlobalIndex.
-        for (const auto& e : result.entries) {
-            global_index_->applyPut(e.hkey, e.packed_ver, seg_id);
-        }
+        // Batch-apply to in-memory GlobalIndex (one lock per bucket run).
+        global_index_->applyPutBatch(
+            result.entries.data(), result.entries.size(), seg_id);
 
         // Accumulate SI codec stats (summed across all partitions).
         si_encode_count_.fetch_add(seg->siEncodeCount(), std::memory_order_relaxed);

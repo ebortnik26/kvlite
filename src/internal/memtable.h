@@ -78,11 +78,9 @@ public:
 
     void clear();
 
-    struct FlushedEntry { uint64_t hkey; uint64_t packed_ver; };
-
     struct FlushResult {
         Status status;
-        std::vector<FlushedEntry> entries;
+        std::vector<HashVersionPair> entries;
         uint64_t max_version = 0;  // max logical version across all flushed entries
     };
 

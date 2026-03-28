@@ -470,7 +470,7 @@ Memtable::FlushResult Memtable::flush(Segment& out,
     // is provided, partitions are flushed in parallel — no synchronization
     // needed because the bucket ranges are disjoint.
     struct PartFlush {
-        std::vector<FlushedEntry> flushed;
+        std::vector<HashVersionPair> flushed;
         uint64_t max_ver = 0;
         Status status;
     };
@@ -593,7 +593,7 @@ Memtable::FlushResult Memtable::flush(Segment& out,
         if (pf.max_ver > max_ver) max_ver = pf.max_ver;
     }
 
-    std::vector<FlushedEntry> flushed;
+    std::vector<HashVersionPair> flushed;
     flushed.reserve(total_flushed);
     for (auto& pf : parts) {
         flushed.insert(flushed.end(), pf.flushed.begin(), pf.flushed.end());
