@@ -87,6 +87,7 @@ void DB::initWriteBuffer(const Options& options) {
 
         auto* seg = storage_->getSegment(seg_id);
         seg->setLineageType(internal::LineageType::kFlush);
+        seg->reserveLineage(mt.entryCount());
 
         auto result = mt.flush(*seg, versions_->snapshotVersions(),
                               storage_->flushPool());

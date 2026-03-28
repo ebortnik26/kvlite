@@ -85,6 +85,7 @@ public:
     // --- Lineage ---
 
     void setLineageType(LineageType type) { lineage_type_ = type; }
+    void reserveLineage(size_t entry_count) { lineage_buf_.reserve(entry_count * 16); }
     void addLineageElimination(uint64_t hkey, uint64_t packed_version,
                                uint32_t old_segment_id);
     Status readLineage(Lineage& lineage) const;
@@ -165,6 +166,12 @@ public:
     void setLineageType(LineageType type) {
         lineage_type_ = type;
         for (auto& p : partitions_) p.setLineageType(type);
+    }
+
+    // Pre-allocate lineage buffers. total_entries is split evenly across partitions.
+    void reserveLineage(size_t total_entries) {
+        size_t per_part = (total_entries + num_partitions_ - 1) / num_partitions_;
+        for (auto& p : partitions_) p.reserveLineage(per_part);
     }
 
     void addLineageElimination(uint64_t hkey, uint64_t packed_version,
