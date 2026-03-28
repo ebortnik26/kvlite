@@ -257,6 +257,87 @@ that could be derived by scanning the data region.  But the lineage
 section is small (16 bytes per entry vs. ~130 bytes per data entry)
 and avoids the full-scan cost during recovery.
 
+## The Manifest
+
+Every recovery decision depends on knowing what segments exist and
+where the savepoint left off.  This metadata lives in the **Manifest**
+— a small, append-only key-value file that records four values:
+
+| Key | Purpose |
+|-----|---------|
+| `segments.min_seg_id` | Lowest segment ID in the tracked range |
+| `segments.max_seg_id` | Highest segment ID in the tracked range |
+| `gi.savepoint.max_segment_id` | Savepoint watermark for lineage replay |
+| `vm.next_version_block` | Version counter persistence (block-aligned) |
+
+The Manifest is the root of the recovery hierarchy — it opens first,
+and every other subsystem reads its decisions from it.
+
+### Atomic writes via O\_DSYNC
+
+The Manifest file is opened with `O_DSYNC`.  Every `set()` call
+appends a CRC-protected record and returns only after the data is
+durable on disk.  No buffering, no deferred flush.  This makes each
+Manifest mutation an atomic, synchronous commit point.
+
+The record format is self-describing:
+
+```
+[record_len:4][type:1][key_len:2][value_len:4][key][value][crc32:4]
+```
+
+The CRC covers the payload (type through value).  On recovery, records
+are read sequentially; the first record with a bad CRC or truncated
+length terminates replay.  The file is truncated to the last valid
+record boundary, discarding any partial write from a crash.
+
+### Log-structured compaction
+
+Over time, the Manifest accumulates redundant records — multiple
+`set()` calls for the same key.  The file has two logical sections:
+a **data section** (one record per key, written during compaction) and
+a **log section** (appended mutations since the last compaction).
+Reads are served from an in-memory map, so the log tail doesn't
+affect read performance.
+
+Compaction replays the log into a fresh file:
+
+1. Write header + one record per in-memory key-value pair to
+   `MANIFEST.tmp`.
+2. `fdatasync` the temporary file.
+3. Atomic `rename(MANIFEST.tmp, MANIFEST)`.
+4. `fsync` the directory entry.
+5. Reopen the new file with `O_DSYNC` for future appends.
+
+If a crash interrupts compaction, the old `MANIFEST` file is still
+intact (rename is atomic on POSIX).  The incomplete `.tmp` file is
+harmless — it will be overwritten by the next compaction.
+
+Compaction runs on `open()` (to start with a clean file) and on
+`close()` (to minimize log length for the next open).
+
+### Why the Manifest matters for recovery
+
+The Manifest establishes the contract between segment files on disk
+and the recovery algorithm:
+
+- **Segment ID range** `[min, max]` tells SegmentStorageManager which
+  files to expect.  Files outside this range are orphans from crashed
+  flushes — they are deleted.  Gaps within the range are tolerated
+  (segments removed by GC but min/max not yet updated).
+
+- **Savepoint watermark** `max_segment_id` tells GlobalIndex which
+  segments are already captured in the savepoint and can be skipped
+  during lineage replay.
+
+- **Version counter block** tells VersionManager the safe lower bound
+  for the next version.
+
+Because each `set()` is durable on return (O\_DSYNC), the Manifest
+never lies — if it says segment 7 exists, segment 7 was fully sealed
+and synced before the Manifest was updated.  This ordering is the
+foundation of the entire recovery model.
+
 ## The durability chain
 
 Every durable state change in kvlite flows through the same pattern:
