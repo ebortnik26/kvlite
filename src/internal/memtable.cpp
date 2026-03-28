@@ -453,9 +453,7 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
 
 Memtable::FlushResult Memtable::flush(Segment& out,
                                       const std::vector<uint64_t>& snapshot_versions,
-                                      FlushPool* seal_pool) {
-    Status s;
-
+                                      FlushPool* flush_pool) {
     // SlimEntry: 20 bytes, no string copies. Key/value read via string_view
     // from data buffer at emit time (zero-copy).
     struct SlimEntry {
@@ -464,88 +462,142 @@ Memtable::FlushResult Memtable::flush(Segment& out,
         uint32_t offset;
     };
 
-    std::vector<FlushedEntry> flushed;
-    flushed.reserve(key_count_.load(std::memory_order_relaxed));
-    uint64_t max_ver = 0;
-
     const uint8_t* data_base = data_.get();
+    const uint16_t num_parts = out.numPartitions();
 
-    auto emit = [&](const SlimEntry& e) -> Status {
-        const uint8_t* p = data_base + e.offset;
-        uint16_t kl;
-        uint32_t vl;
-        std::memcpy(&kl, p + kKeyLenOffset, kKeyLenSize);
-        std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
-        size_t payload_len = kRecordHeaderSize + kl + vl;
-        uint64_t entry_offset;
-        Status st = out.appendRawEntry(p, payload_len, e.hash, entry_offset);
-        if (!st.ok()) return st;
-        flushed.push_back({e.hash, e.packed_ver});
-        uint64_t v = PackedVersion(e.packed_ver).version();
-        if (v > max_ver) max_ver = v;
-        return Status::OK();
+    // Per-partition flush state. Each partition handles a contiguous bucket
+    // range and produces its own flushed-entry list.  When K > 1 and a pool
+    // is provided, partitions are flushed in parallel — no synchronization
+    // needed because the bucket ranges are disjoint.
+    struct PartFlush {
+        std::vector<FlushedEntry> flushed;
+        uint64_t max_ver = 0;
+        Status status;
     };
+    std::vector<PartFlush> parts(num_parts);
 
-    // Slots are sorted by (hash asc, pv desc) within each page.
-    // Iterate buckets 0→65535 for global hash order; concatenate pages
-    // per bucket chain — no sort needed.
-    std::vector<SlimEntry> bucket_entries;
+    // Flush one bucket range [bucket_lo, bucket_hi) into the segment.
+    // When seal_partition is true, also seals the partition after writing
+    // (merges emit + seal into a single parallel task).
+    auto flushRange = [&](uint32_t bucket_lo, uint32_t bucket_hi,
+                          uint16_t part_idx, bool seal_partition,
+                          PartFlush& pf) {
+        std::vector<SlimEntry> bucket_entries;
 
-    for (uint32_t bi = 0; bi < kNumBuckets; ++bi) {
-        const uint8_t* b = primaryBucket(bi);
-        if (bucketCount(b) == 0 && bucketExtPtr(b) == 0) continue;
+        for (uint32_t bi = bucket_lo; bi < bucket_hi; ++bi) {
+            const uint8_t* b = primaryBucket(bi);
+            if (bucketCount(b) == 0 && bucketExtPtr(b) == 0) continue;
 
-        bucket_entries.clear();
+            bucket_entries.clear();
 
-        while (b) {
-            uint16_t cnt = bucketCount(b);
-            const Slot* sl = bucketSlots(b);
-            for (uint16_t i = 0; i < cnt; ++i) {
-                bucket_entries.push_back({sl[i].hash, sl[i].pv, sl[i].offset});
-            }
-            uint32_t ext = bucketExtPtr(b);
-            b = ext ? extBucketData(ext) : nullptr;
-        }
-
-        // Dedup: entries are in (hash asc, pv desc) order — latest first.
-        size_t i = 0;
-        while (i < bucket_entries.size()) {
-            size_t j = i + 1;
-            while (j < bucket_entries.size() &&
-                   bucket_entries[j].hash == bucket_entries[i].hash) {
-                ++j;
-            }
-            size_t group_size = j - i;
-
-            if (snapshot_versions.empty() || group_size == 1) {
-                s = emit(bucket_entries[i]);
-                if (!s.ok()) return {s, {}, 0};
-            } else {
-                // Build ascending vers for dedupVersionGroup (reads group backward).
-                std::vector<uint64_t> vers(group_size);
-                for (size_t k = 0; k < group_size; ++k) {
-                    vers[k] = PackedVersion(
-                        bucket_entries[i + group_size - 1 - k].packed_ver).version();
+            while (b) {
+                uint16_t cnt = bucketCount(b);
+                const Slot* sl = bucketSlots(b);
+                for (uint16_t i = 0; i < cnt; ++i) {
+                    bucket_entries.push_back({sl[i].hash, sl[i].pv, sl[i].offset});
                 }
-                std::unique_ptr<bool[]> keep(new bool[group_size]);
-                dedupVersionGroup(vers.data(), group_size,
-                                     snapshot_versions, keep.get());
+                uint32_t ext = bucketExtPtr(b);
+                b = ext ? extBucketData(ext) : nullptr;
+            }
 
-                // Emit in descending order (original group order).
-                // keep[k] corresponds to ascending index, map back.
-                for (size_t k = 0; k < group_size; ++k) {
-                    if (keep[group_size - 1 - k]) {
-                        s = emit(bucket_entries[i + k]);
-                        if (!s.ok()) return {s, {}, 0};
+            size_t i = 0;
+            while (i < bucket_entries.size()) {
+                size_t j = i + 1;
+                while (j < bucket_entries.size() &&
+                       bucket_entries[j].hash == bucket_entries[i].hash) {
+                    ++j;
+                }
+                size_t group_size = j - i;
+
+                if (snapshot_versions.empty() || group_size == 1) {
+                    const auto& e = bucket_entries[i];
+                    const uint8_t* p = data_base + e.offset;
+                    uint16_t kl;
+                    uint32_t vl;
+                    std::memcpy(&kl, p + kKeyLenOffset, kKeyLenSize);
+                    std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
+                    size_t payload_len = kRecordHeaderSize + kl + vl;
+                    uint64_t entry_offset;
+                    Status st = out.appendRawEntry(p, payload_len, e.hash, entry_offset);
+                    if (!st.ok()) { pf.status = st; return; }
+                    pf.flushed.push_back({e.hash, e.packed_ver});
+                    uint64_t v = PackedVersion(e.packed_ver).version();
+                    if (v > pf.max_ver) pf.max_ver = v;
+                } else {
+                    std::vector<uint64_t> vers(group_size);
+                    for (size_t k = 0; k < group_size; ++k) {
+                        vers[k] = PackedVersion(
+                            bucket_entries[i + group_size - 1 - k].packed_ver).version();
+                    }
+                    std::unique_ptr<bool[]> keep(new bool[group_size]);
+                    dedupVersionGroup(vers.data(), group_size,
+                                         snapshot_versions, keep.get());
+
+                    for (size_t k = 0; k < group_size; ++k) {
+                        if (keep[group_size - 1 - k]) {
+                            const auto& e = bucket_entries[i + k];
+                            const uint8_t* p = data_base + e.offset;
+                            uint16_t kl;
+                            uint32_t vl;
+                            std::memcpy(&kl, p + kKeyLenOffset, kKeyLenSize);
+                            std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
+                            size_t payload_len = kRecordHeaderSize + kl + vl;
+                            uint64_t entry_offset;
+                            Status st = out.appendRawEntry(p, payload_len, e.hash, entry_offset);
+                            if (!st.ok()) { pf.status = st; return; }
+                            pf.flushed.push_back({e.hash, e.packed_ver});
+                            uint64_t v = PackedVersion(e.packed_ver).version();
+                            if (v > pf.max_ver) pf.max_ver = v;
+                        }
                     }
                 }
+                i = j;
             }
-            i = j;
+        }
+        if (seal_partition) {
+            Status st = out.partition(part_idx).seal(out.getId());
+            if (!st.ok()) { pf.status = st; return; }
+        }
+        pf.status = Status::OK();
+    };
+
+    uint32_t buckets_per_part = kNumBuckets / num_parts;
+
+    if (num_parts == 1 || !flush_pool) {
+        // Sequential: emit + seal each partition in order.
+        for (uint16_t p = 0; p < num_parts; ++p) {
+            flushRange(p * buckets_per_part, (p + 1) * buckets_per_part,
+                       p, true, parts[p]);
+            if (!parts[p].status.ok()) return {parts[p].status, {}, 0};
+        }
+    } else {
+        // Parallel: each task emits entries + seals its partition.
+        for (uint16_t p = 0; p < num_parts; ++p) {
+            flush_pool->submit([&, p] {
+                flushRange(p * buckets_per_part, (p + 1) * buckets_per_part,
+                           p, true, parts[p]);
+            });
+        }
+        flush_pool->wait();
+        for (const auto& pf : parts) {
+            if (!pf.status.ok()) return {pf.status, {}, 0};
         }
     }
+    out.markSealed();
 
-    s = out.seal(seal_pool);
-    if (!s.ok()) return {s, {}, 0};
+    // Merge results from all partitions.
+    size_t total_flushed = 0;
+    uint64_t max_ver = 0;
+    for (const auto& pf : parts) {
+        total_flushed += pf.flushed.size();
+        if (pf.max_ver > max_ver) max_ver = pf.max_ver;
+    }
+
+    std::vector<FlushedEntry> flushed;
+    flushed.reserve(total_flushed);
+    for (auto& pf : parts) {
+        flushed.insert(flushed.end(), pf.flushed.begin(), pf.flushed.end());
+    }
 
     return {Status::OK(), std::move(flushed), max_ver};
 }

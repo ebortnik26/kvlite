@@ -146,6 +146,11 @@ public:
                   uint16_t num_partitions = 1, bool buffered = true);
     Status open(const std::string& path);
     Status seal(class FlushPool* pool = nullptr);
+
+    // Transition to Readable after partitions have been sealed externally
+    // (e.g., by parallel flush tasks that called SegmentPartition::seal directly).
+    void markSealed() { state_ = State::kReadable; }
+
     Status close();
 
     // --- State (inline) ---
@@ -228,6 +233,7 @@ public:
 
     // --- Partition access (inline) ---
 
+    SegmentPartition& partition(uint16_t p) { return partitions_[p]; }
     const SegmentPartition& partition(uint16_t p) const { return partitions_[p]; }
 
     const LogFile& logFile() const { return partitions_[0].logFile(); }

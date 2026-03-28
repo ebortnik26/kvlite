@@ -91,7 +91,7 @@ SegmentPartition& SegmentPartition::operator=(SegmentPartition&&) noexcept = def
 // --- Lifecycle ---
 
 Status SegmentPartition::create(const std::string& path, bool buffered) {
-    return log_file_.create(path, /*sync=*/false, buffered);
+    return log_file_.create(path, /*sync=*/false, buffered, /*async_writeback=*/true);
 }
 
 Status SegmentPartition::open(const std::string& path,
