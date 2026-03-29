@@ -3,6 +3,8 @@
 #include <cassert>
 #include <chrono>
 
+#include "internal/profiling.h"
+
 namespace kvlite {
 namespace internal {
 
@@ -26,20 +28,17 @@ WriteBuffer::~WriteBuffer() {
 
 // --- Write operations ----------------------------------------------------
 
+
 void WriteBuffer::put(const std::string& key, uint64_t version,
                       const std::string& value, bool tombstone) {
     std::unique_lock<std::mutex> lock(mu_);
 
-    // Stall if all flush_depth slots are occupied.
     if (immutables_.size() >= opts_.flush_depth - 1 && !stop_) {
         auto t0 = std::chrono::steady_clock::now();
         stall_cv_.wait(lock, [this] {
             return immutables_.size() < opts_.flush_depth - 1 || stop_;
         });
-        auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t0).count();
-        stall_count_.fetch_add(1, std::memory_order_relaxed);
-        stall_total_us_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+        trackTime<std::chrono::microseconds>(stall_count_, stall_total_us_, t0);
     }
 
     active_->put(key, version, value, tombstone);
@@ -57,10 +56,7 @@ void WriteBuffer::putBatch(const std::vector<Memtable::BatchOp>& ops,
         stall_cv_.wait(lock, [this] {
             return immutables_.size() < opts_.flush_depth - 1 || stop_;
         });
-        auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t0).count();
-        stall_count_.fetch_add(1, std::memory_order_relaxed);
-        stall_total_us_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+        trackTime<std::chrono::microseconds>(stall_count_, stall_total_us_, t0);
     }
 
     active_->putBatch(ops, version);

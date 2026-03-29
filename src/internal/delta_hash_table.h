@@ -180,7 +180,7 @@ protected:
     std::vector<Bucket> buckets_;
     BucketArena* ext_arena_;    // non-owning; set by derived class
 
-    // Codec timing instrumentation
+    // Codec timing instrumentation.
     mutable std::atomic<uint64_t> encode_count_{0};
     mutable std::atomic<uint64_t> encode_total_ns_{0};
     mutable std::atomic<uint64_t> decode_count_{0};

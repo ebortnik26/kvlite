@@ -17,8 +17,11 @@
 #include "internal/memtable.h"
 #include "internal/log_entry.h"
 #include "internal/segment.h"
+#include "internal/profiling.h"
 
 namespace kvlite {
+
+using internal::trackTime;
 
 // --- DB Implementation ---
 
@@ -98,16 +101,16 @@ void DB::initWriteBuffer(const Options& options) {
         global_index_->applyPutBatch(
             result.entries.data(), result.entries.size(), seg_id);
 
-        // Accumulate SI codec stats (summed across all partitions).
-        si_encode_count_.fetch_add(seg->siEncodeCount(), std::memory_order_relaxed);
-        si_encode_total_ns_.fetch_add(seg->siEncodeTotalNs(), std::memory_order_relaxed);
-        si_decode_count_.fetch_add(seg->siDecodeCount(), std::memory_order_relaxed);
-        si_decode_total_ns_.fetch_add(seg->siDecodeTotalNs(), std::memory_order_relaxed);
+        // Accumulate SI codec stats.
+        auto accum = [](std::atomic<uint64_t>& a, uint64_t v) {
+            a.fetch_add(v, std::memory_order_relaxed);
+        };
+        accum(si_encode_count_, seg->siEncodeCount());
+        accum(si_encode_total_ns_, seg->siEncodeTotalNs());
+        accum(si_decode_count_, seg->siDecodeCount());
+        accum(si_decode_total_ns_, seg->siDecodeTotalNs());
 
-        auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t0).count();
-        flush_count_.fetch_add(1, std::memory_order_relaxed);
-        flush_total_us_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+        trackTime<std::chrono::microseconds>(flush_count_, flush_total_us_, t0);
         return s;
     };
 
@@ -131,11 +134,7 @@ void DB::startDaemons(const Options& options) {
             auto seg_ids = storage_->getSegmentIds();
             uint32_t max_seg_id = seg_ids.empty() ? 0 : seg_ids.back();
             global_index_->maybeSavepoint(max_seg_id);
-            auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0).count();
-            savepoint_count_.fetch_add(1, std::memory_order_relaxed);
-            savepoint_total_us_.fetch_add(static_cast<uint64_t>(us),
-                                          std::memory_order_relaxed);
+            trackTime<std::chrono::microseconds>(savepoint_count_, savepoint_total_us_, t0);
         });
     }
 }
@@ -564,10 +563,7 @@ Status DB::runGC() {
         storage_->removeSegment(id);
     }
 
-    auto t1 = std::chrono::steady_clock::now();
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-    gc_count_.fetch_add(1, std::memory_order_relaxed);
-    gc_total_us_.fetch_add(static_cast<uint64_t>(us), std::memory_order_relaxed);
+    trackTime<std::chrono::microseconds>(gc_count_, gc_total_us_, t0);
 
     return Status::OK();
 }
