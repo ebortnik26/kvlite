@@ -71,11 +71,15 @@ is sealed independently (in parallel via `FlushPool` when K > 1):
 
 After all partitions are sealed, the segment transitions to **Readable**.
 
-Each partition carries a **lineage section** that records the GlobalIndex
-mutations it contributes.  For flush segments, these are the put entries;
-for GC segments, these are relocations and eliminations.  This makes
-each segment self-describing — its lineage sections contain everything
-needed to reconstruct the GlobalIndex entries it owns.
+Each partition carries a **lineage section** — a sequence of uniform
+20-byte records (`{hkey, packed_version, old_segment_id}`) split into
+two groups: *present* (entries in this segment) and *deleted* (entries
+removed during GC).  For flush segments, all present records have
+`old_segment_id = 0` (new puts).  For GC segments, present records
+carry the source segment ID (relocations) and deleted records identify
+eliminated entries.  This makes each segment self-describing — its
+lineage contains everything needed to reconstruct the GlobalIndex
+entries it owns.
 
 The per-partition file layout:
 
@@ -143,10 +147,12 @@ variant with per-bucket spinlocks.  It is always resident in memory and
 is updated on every flush.
 
 Persistence is via **segment lineage sections** embedded in each segment
-file.  Each segment records the GlobalIndex entries it contributes: puts
-for flush segments, relocations and eliminations for GC segments.  On
-recovery, kvlite loads the most recent savepoint, then replays lineage
-sections from all segments with ID above the savepoint's watermark.
+file.  Each record is a uniform `{hkey, packed_version, old_segment_id}`
+triple.  Flush segments record puts (`old_segment_id = 0`).  GC segments
+record relocations (`old_segment_id != 0`, entry moved from source to
+this segment) and deletions (entry removed entirely).  On recovery,
+kvlite loads the most recent savepoint, then replays lineage from all
+segments with ID above the savepoint's watermark.
 
 **Periodic savepoints.**  A background task periodically snapshots the
 entire DeltaHashTable to a binary checkpoint.  The savepoint uses an
