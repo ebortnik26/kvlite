@@ -101,14 +101,9 @@ void DB::initWriteBuffer(const Options& options) {
         global_index_->applyPutBatch(
             result.entries.data(), result.entries.size(), seg_id);
 
-        // Accumulate SI codec stats.
-        auto accum = [](std::atomic<uint64_t>& a, uint64_t v) {
-            a.fetch_add(v, std::memory_order_relaxed);
-        };
-        accum(si_encode_count_, seg->siEncodeCount());
-        accum(si_encode_total_ns_, seg->siEncodeTotalNs());
-        accum(si_decode_count_, seg->siDecodeCount());
-        accum(si_decode_total_ns_, seg->siDecodeTotalNs());
+        // Accumulate SI encode stats (write path only).
+        si_encode_count_.fetch_add(seg->siEncodeCount(), std::memory_order_relaxed);
+        si_encode_total_ns_.fetch_add(seg->siEncodeTotalNs(), std::memory_order_relaxed);
 
         trackTime<std::chrono::microseconds>(flush_count_, flush_total_us_, t0);
         return s;
@@ -456,8 +451,17 @@ Status DB::getStats(DBStats& stats) const {
 
     stats.si_encode_count = si_encode_count_.load(std::memory_order_relaxed);
     stats.si_encode_total_ns = si_encode_total_ns_.load(std::memory_order_relaxed);
-    stats.si_decode_count = si_decode_count_.load(std::memory_order_relaxed);
-    stats.si_decode_total_ns = si_decode_total_ns_.load(std::memory_order_relaxed);
+
+    // SI decode stats: sum across all live segments (read-path decodes).
+    uint64_t si_dec_count = 0, si_dec_ns = 0;
+    for (uint32_t id : storage_->getSegmentIds()) {
+        const auto* seg = storage_->getSegment(id);
+        if (!seg) continue;
+        si_dec_count += seg->siDecodeCount();
+        si_dec_ns += seg->siDecodeTotalNs();
+    }
+    stats.si_decode_count = si_dec_count;
+    stats.si_decode_total_ns = si_dec_ns;
 
     stats.mt_ext_count = write_buffer_->extensionCount();
     stats.mt_num_buckets = internal::Memtable::numBuckets();

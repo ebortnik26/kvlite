@@ -200,11 +200,10 @@ private:
     std::atomic<uint64_t> savepoint_count_{0};
     std::atomic<uint64_t> savepoint_total_us_{0};
 
-    // SegmentIndex codec accumulators (from flush + GC)
+    // SegmentIndex encode accumulators (flush path only).
+    // Decode stats are computed on demand from live segments in getStats().
     std::atomic<uint64_t> si_encode_count_{0};
     std::atomic<uint64_t> si_encode_total_ns_{0};
-    std::atomic<uint64_t> si_decode_count_{0};
-    std::atomic<uint64_t> si_decode_total_ns_{0};
 };
 
 }  // namespace kvlite
