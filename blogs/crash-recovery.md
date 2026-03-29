@@ -67,39 +67,43 @@ and its footer:
 [Data entries] [SegmentIndex] [Lineage] [Footer]
 ```
 
-The lineage section has a 13-byte header followed by entry payloads
-and a CRC32 checksum:
+The lineage section has a 13-byte header followed by uniform 20-byte
+records and a CRC32 checksum:
 
 ```
 Header:
   magic:4             "LING" (0x4C494E47)
   type:1              kFlush (1) or kGC (2)
-  entry_count:4       number of put/relocate entries
-  elimination_count:4 number of GC eliminations
+  present_count:4     entries written to or relocated into this segment
+  deleted_count:4     entries eliminated during GC
 
-Put entries (16 bytes each):
+All records (20 bytes each):
   hkey:8              FNV-1a hash of the key
   packed_version:8    (logical_version << 1) | tombstone_bit
+  old_segment_id:4    0 for flush puts; source segment for GC
 
-Elimination entries (20 bytes each, GC segments only):
-  hkey:8
-  packed_version:8
-  old_segment_id:4    the segment this entry was removed from
-
-CRC32:4               covers header + all entries
+CRC32:4               covers header + all records
 ```
 
-For a **flush segment**, lineage records every key written — the hash
-and packed version.  The segment ID is implicit (it's the segment
-containing the lineage).  Replaying a flush lineage means: for each
-entry, tell the GlobalIndex "this key at this version lives in this
-segment."
+The record format is the same for all entries — only
+`old_segment_id` distinguishes puts from relocations.
 
-For a **GC segment**, lineage records two things: which keys were
-relocated into this segment (same format as flush entries), and which
-keys were eliminated (removed from the index entirely because they are
-no longer visible to any snapshot).  Replaying GC lineage applies both
-puts and eliminations.
+For a **flush segment**, every record has `old_segment_id = 0`.
+Replaying means: tell the GlobalIndex "this key at this version lives
+in this segment."
+
+For a **GC segment**, records split into two groups.  **Present**
+records have `old_segment_id != 0` — these are relocations.
+Replaying calls `applyRelocate`, which updates the existing
+GlobalIndex entry to point from the old segment to this one.
+**Deleted** records are eliminations — replaying removes the entry
+from the GlobalIndex entirely.
+
+The distinction between put and relocate matters for partial GC
+crashes.  If a GC output segment is sealed but the input segments
+haven't been deleted yet, recovery replays lineage from both.
+`applyRelocate` correctly updates the entry (old → new segment),
+whereas `applyPut` would create a duplicate.
 
 Lineage is recorded automatically — every call to `put()`,
 `appendEntry()`, or `appendRawEntry()` on a SegmentPartition appends
@@ -159,8 +163,10 @@ recover():
   3. Read savepoint_max_segment_id from Manifest
   4. For each segment with ID > savepoint_max_segment_id (ascending order):
        Read lineage from all partition files
-       For each put entry:      applyPut(hkey, packed_version, segment_id)
-       For each elimination:    applyEliminate(hkey, packed_version, old_segment_id)
+       For each present record:
+         if old_segment_id == 0:  applyPut(hkey, pv, this_segment_id)
+         else:                    applyRelocate(hkey, pv, old_segment_id, this_segment_id)
+       For each deleted record:   applyEliminate(hkey, pv, old_segment_id)
   5. Write convergence savepoint (captures fully recovered state)
 ```
 

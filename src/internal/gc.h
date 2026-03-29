@@ -33,19 +33,6 @@ public:
         uint64_t hkey, uint64_t packed_version,
         uint32_t old_segment_id)>;
 
-    struct Relocation {
-        uint64_t hkey;
-        uint64_t packed_version;
-        uint32_t old_segment_id;
-        uint32_t new_segment_id;
-    };
-
-    struct Elimination {
-        uint64_t hkey;
-        uint64_t packed_version;
-        uint32_t old_segment_id;
-    };
-
     struct Result {
         std::vector<Segment> outputs;   // sealed output segments
         size_t entries_written = 0;

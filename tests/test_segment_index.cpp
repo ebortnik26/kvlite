@@ -368,8 +368,9 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
     std::vector<uint64_t> snapshots = {3};
     std::vector<const Segment*> inputs = {&seg};
 
-    std::vector<GC::Relocation> relocations;
-    std::vector<GC::Elimination> eliminations;
+    struct TestReloc { uint64_t hkey; uint64_t packed_version; uint32_t old_segment_id; uint32_t new_id; };
+    std::vector<TestReloc> relocations;
+    std::vector<Lineage::Record> eliminations;
 
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
@@ -392,7 +393,7 @@ TEST_F(GCMergeTest, MergeSingleSegmentAllVisible) {
     EXPECT_EQ(relocations.size(), 3u);
     for (const auto& r : relocations) {
         EXPECT_EQ(r.old_segment_id, 1u);
-        EXPECT_EQ(r.new_segment_id, last_result_.outputs[0].getId());
+        EXPECT_EQ(r.new_id, last_result_.outputs[0].getId());
     }
 
     auto& out = last_result_.outputs[0];
@@ -421,8 +422,9 @@ TEST_F(GCMergeTest, MergeEliminatesInvisible) {
     std::vector<uint64_t> snapshots = {2};
     std::vector<const Segment*> inputs = {&seg1, &seg2};
 
-    std::vector<GC::Relocation> relocations;
-    std::vector<GC::Elimination> eliminations;
+    struct TestReloc { uint64_t hkey; uint64_t packed_version; uint32_t old_segment_id; uint32_t new_id; };
+    std::vector<TestReloc> relocations;
+    std::vector<Lineage::Record> eliminations;
 
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
@@ -605,8 +607,9 @@ TEST_F(GCMergeTest, MergeReleasesVersionsBelowOldestSnapshot) {
     std::vector<uint64_t> snapshots = {2, 3};
     std::vector<const Segment*> inputs = {&seg1, &seg2, &seg3};
 
-    std::vector<GC::Relocation> relocations;
-    std::vector<GC::Elimination> eliminations;
+    struct TestReloc { uint64_t hkey; uint64_t packed_version; uint32_t old_segment_id; uint32_t new_id; };
+    std::vector<TestReloc> relocations;
+    std::vector<Lineage::Record> eliminations;
 
     Status s = GC::merge(
         snapshots, inputs, /*max_segment_size=*/1 << 20,
@@ -890,4 +893,116 @@ TEST_F(GCMergeTest, TombstoneOnlyKeyEliminatedOnSecondGC) {
     EXPECT_EQ(gi.keyCount(), 0u);
     EXPECT_EQ(gi.entryCount(), 0u);
     EXPECT_FALSE(gi.contains(H("key1")));
+}
+
+// Partial GC crash: output segment is sealed but input segments not yet deleted.
+// Both exist on disk. Recovery must replay lineage from all segments without
+// creating duplicate GlobalIndex entries. The GC output's lineage uses
+// relocations (old_segment_id != 0), so recovery calls applyRelocate (update)
+// instead of applyPut (which would duplicate).
+TEST_F(GCMergeTest, PartialGCCrashRecoveryNoDuplicates) {
+    // Set up: create a GlobalIndex with SSM and real segment files.
+    auto& gi_inst = gi_instances_.emplace_back();
+    gi_inst.dir = base_ + "gi_recovery";
+    std::filesystem::create_directories(gi_inst.dir);
+    std::filesystem::create_directories(gi_inst.dir + "/segments");
+    ASSERT_TRUE(gi_inst.manifest.create(gi_inst.dir).ok());
+    gi_inst.storage = std::make_unique<SegmentStorageManager>(gi_inst.manifest);
+    ASSERT_TRUE(gi_inst.storage->open(gi_inst.dir).ok());
+
+    auto& ssm = *gi_inst.storage;
+
+    // Create input segment A with 2 keys.
+    uint32_t seg_a_id = ssm.allocateSegmentId();
+    ASSERT_TRUE(ssm.createSegment(seg_a_id).ok());
+    auto* seg_a = ssm.getSegment(seg_a_id);
+    seg_a->setLineageType(LineageType::kFlush);
+    ASSERT_TRUE(seg_a->put("key1", 1, "val1", false, H("key1")).ok());
+    ASSERT_TRUE(seg_a->put("key2", 2, "val2", false, H("key2")).ok());
+    ASSERT_TRUE(seg_a->seal().ok());
+
+    // Create input segment B with updated key1.
+    uint32_t seg_b_id = ssm.allocateSegmentId();
+    ASSERT_TRUE(ssm.createSegment(seg_b_id).ok());
+    auto* seg_b = ssm.getSegment(seg_b_id);
+    seg_b->setLineageType(LineageType::kFlush);
+    ASSERT_TRUE(seg_b->put("key1", 3, "val1_updated", false, H("key1")).ok());
+    ASSERT_TRUE(seg_b->seal().ok());
+
+    // Open GlobalIndex and replay lineage from A and B.
+    gi_inst.index = std::make_unique<GlobalIndex>(gi_inst.manifest);
+    GlobalIndex::Options opts;
+    ASSERT_TRUE(gi_inst.index->open(gi_inst.dir, opts, ssm).ok());
+    auto& gi = *gi_inst.index;
+
+    // Verify: key1 has 2 versions, key2 has 1.
+    EXPECT_EQ(gi.entryCount(), 3u);  // key1@v1, key1@v3, key2@v2
+    EXPECT_EQ(gi.keyCount(), 2u);
+
+    // Run GC: merge A+B into output segment C.
+    std::vector<const Segment*> inputs = {
+        ssm.getSegment(seg_a_id), ssm.getSegment(seg_b_id)
+    };
+    std::vector<uint64_t> snapshots = {3};
+
+    GC::Result gc_result;
+    {
+        GlobalIndex::BatchGuard guard(gi);
+        Status s = GC::merge(
+            snapshots, inputs, 1 << 20,
+            [&](uint32_t id) { return ssm.segmentBasePath(id); },
+            [&]() {
+                uint32_t id = ssm.allocateSegmentId();
+                ssm.registerSegmentId(id);
+                return id;
+            },
+            [&](uint64_t hkey, uint64_t pv, uint32_t old_id, uint32_t new_id) {
+                gi.applyRelocate(hkey, pv, old_id, new_id);
+            },
+            [&](uint64_t hkey, uint64_t pv, uint32_t old_id) {
+                gi.applyEliminate(hkey, pv, old_id);
+            },
+            gc_result);
+        ASSERT_TRUE(s.ok());
+    }
+
+    // Adopt GC output into SSM.
+    ASSERT_EQ(gc_result.outputs.size(), 1u);
+    uint32_t seg_c_id = gc_result.outputs[0].getId();
+    ssm.adoptSegment(seg_c_id, std::move(gc_result.outputs[0]));
+
+    // At this point: A, B, C all exist in SSM. In a real crash, the
+    // process would die here before removing A and B.
+    // Simulate by writing a savepoint, closing, and reopening.
+    ASSERT_TRUE(gi.storeSavepoint(seg_c_id).ok());
+    gi.close();
+    ssm.close();
+    gi_inst.manifest.close();
+
+    // Reopen everything — all three segments exist on disk.
+    ASSERT_TRUE(gi_inst.manifest.open(gi_inst.dir).ok());
+    gi_inst.storage = std::make_unique<SegmentStorageManager>(gi_inst.manifest);
+    ASSERT_TRUE(gi_inst.storage->open(gi_inst.dir).ok());
+    gi_inst.index = std::make_unique<GlobalIndex>(gi_inst.manifest);
+    ASSERT_TRUE(gi_inst.index->open(gi_inst.dir, opts, *gi_inst.storage).ok());
+
+    auto& gi2 = *gi_inst.index;
+
+    // Key invariant: no duplicate entries. GC output's relocations should
+    // have updated (not duplicated) the entries from A and B.
+    // After GC with snapshot@3: key1@v3 survives (latest), key1@v1 eliminated,
+    // key2@v2 survives.
+    EXPECT_EQ(gi2.keyCount(), 2u);
+    EXPECT_EQ(gi2.entryCount(), 2u);  // NOT 3 or more (no duplicates)
+
+    // Verify correct values.
+    uint64_t pv;
+    uint32_t seg_id;
+    ASSERT_TRUE(gi2.getLatest(H("key1"), pv, seg_id).ok());
+    EXPECT_EQ(PackedVersion(pv).version(), 3u);
+    EXPECT_EQ(seg_id, seg_c_id);  // Points to GC output, not input A or B.
+
+    ASSERT_TRUE(gi2.getLatest(H("key2"), pv, seg_id).ok());
+    EXPECT_EQ(PackedVersion(pv).version(), 2u);
+    EXPECT_EQ(seg_id, seg_c_id);
 }

@@ -211,7 +211,7 @@ Status SegmentPartition::put(std::string_view key, uint64_t version,
 
     PackedVersion pv(version, tombstone);
     index_.put(hash, static_cast<uint32_t>(offset), pv.data);
-    addLineageEntry(hash, pv.data);
+    if (lineage_type_ == LineageType::kFlush) addLineagePresent(hash, pv.data);
     return Status::OK();
 }
 
@@ -224,7 +224,7 @@ Status SegmentPartition::appendEntry(std::string_view key, uint64_t version,
     PackedVersion pv(version, tombstone);
     index_.addBatchEntry(hash, pv.data, static_cast<uint32_t>(entry_offset));
     batch_mode_ = true;
-    addLineageEntry(hash, pv.data);
+    if (lineage_type_ == LineageType::kFlush) addLineagePresent(hash, pv.data);
     return Status::OK();
 }
 
@@ -247,7 +247,7 @@ Status SegmentPartition::appendRawEntry(const void* payload, size_t payload_len,
     std::memcpy(&packed_ver, payload, 8);
     index_.addBatchEntry(hash, packed_ver, static_cast<uint32_t>(offset));
     batch_mode_ = true;
-    addLineageEntry(hash, packed_ver);
+    if (lineage_type_ == LineageType::kFlush) addLineagePresent(hash, packed_ver);
     return Status::OK();
 }
 
@@ -335,36 +335,40 @@ Status SegmentPartition::get(uint64_t hash, uint64_t upper_bound,
 
 // --- Lineage ---
 
-void SegmentPartition::addLineageEntry(uint64_t hkey, uint64_t packed_version) {
-    size_t off = lineage_buf_.size();
-    lineage_buf_.resize(off + 16);
-    uint8_t* ptr = lineage_buf_.data() + off;
-    std::memcpy(ptr, &hkey, 8);
-    std::memcpy(ptr + 8, &packed_version, 8);
-    ++lineage_entry_count_;
-}
-
-void SegmentPartition::addLineageElimination(uint64_t hkey, uint64_t packed_version,
-                                              uint32_t old_segment_id) {
-    size_t off = lineage_buf_.size();
-    lineage_buf_.resize(off + 20);
-    uint8_t* ptr = lineage_buf_.data() + off;
+static void appendRecord(std::vector<uint8_t>& buf,
+                         uint64_t hkey, uint64_t packed_version,
+                         uint32_t old_segment_id) {
+    size_t off = buf.size();
+    buf.resize(off + 20);
+    uint8_t* ptr = buf.data() + off;
     std::memcpy(ptr, &hkey, 8);
     std::memcpy(ptr + 8, &packed_version, 8);
     std::memcpy(ptr + 16, &old_segment_id, 4);
-    ++lineage_elimination_count_;
+}
+
+void SegmentPartition::addLineagePresent(uint64_t hkey, uint64_t packed_version,
+                                          uint32_t old_segment_id) {
+    appendRecord(lineage_buf_, hkey, packed_version, old_segment_id);
+    ++lineage_present_count_;
+}
+
+void SegmentPartition::addLineageDeleted(uint64_t hkey, uint64_t packed_version,
+                                          uint32_t old_segment_id) {
+    appendRecord(lineage_buf_, hkey, packed_version, old_segment_id);
+    ++lineage_deleted_count_;
 }
 
 Status SegmentPartition::writeLineageSection() {
     lineage_offset_ = log_file_.size();
 
+    // Header: [magic:4][type:1][present_count:4][deleted_count:4] = 13 bytes
     constexpr size_t kHdrSize = 13;
     uint8_t hdr[kHdrSize];
     uint32_t magic = kLineageMagic;
     std::memcpy(hdr, &magic, 4);
     hdr[4] = static_cast<uint8_t>(lineage_type_);
-    std::memcpy(hdr + 5, &lineage_entry_count_, 4);
-    std::memcpy(hdr + 9, &lineage_elimination_count_, 4);
+    std::memcpy(hdr + 5, &lineage_present_count_, 4);
+    std::memcpy(hdr + 9, &lineage_deleted_count_, 4);
 
     uint32_t crc_state = updateCrc32(0xFFFFFFFFu, hdr, kHdrSize);
     if (!lineage_buf_.empty()) {
@@ -387,8 +391,8 @@ Status SegmentPartition::writeLineageSection() {
 Status SegmentPartition::readLineage(Lineage& lineage) const {
     if (lineage_offset_ == 0) {
         lineage.type = LineageType::kFlush;
-        lineage.entries.clear();
-        lineage.eliminations.clear();
+        lineage.present.clear();
+        lineage.deleted.clear();
         return Status::OK();
     }
 
@@ -404,13 +408,12 @@ Status SegmentPartition::readLineage(Lineage& lineage) const {
     }
 
     lineage.type = static_cast<LineageType>(hdr[4]);
-    uint32_t entry_count, elim_count;
-    std::memcpy(&entry_count, hdr + 5, 4);
-    std::memcpy(&elim_count, hdr + 9, 4);
+    uint32_t present_count, deleted_count;
+    std::memcpy(&present_count, hdr + 5, 4);
+    std::memcpy(&deleted_count, hdr + 9, 4);
 
-    size_t entries_bytes = static_cast<size_t>(entry_count) * 16;
-    size_t elim_bytes = static_cast<size_t>(elim_count) * 20;
-    size_t payload_size = kHdrSize + entries_bytes + elim_bytes;
+    uint32_t total_records = present_count + deleted_count;
+    size_t payload_size = kHdrSize + static_cast<size_t>(total_records) * 20;
     size_t total_size = payload_size + 4;
 
     std::vector<uint8_t> buf(total_size);
@@ -425,23 +428,18 @@ Status SegmentPartition::readLineage(Lineage& lineage) const {
 
     const uint8_t* ptr = buf.data() + kHdrSize;
 
-    lineage.entries.resize(entry_count);
-    for (uint32_t i = 0; i < entry_count; ++i) {
-        auto& e = lineage.entries[i];
-        std::memcpy(&e.hkey, ptr, 8);
-        std::memcpy(&e.packed_version, ptr + 8, 8);
-        e.old_segment_id = 0;
-        ptr += 16;
-    }
-
-    lineage.eliminations.resize(elim_count);
-    for (uint32_t i = 0; i < elim_count; ++i) {
-        auto& e = lineage.eliminations[i];
-        std::memcpy(&e.hkey, ptr, 8);
-        std::memcpy(&e.packed_version, ptr + 8, 8);
-        std::memcpy(&e.old_segment_id, ptr + 16, 4);
-        ptr += 20;
-    }
+    auto readRecords = [&](std::vector<Lineage::Record>& vec, uint32_t count) {
+        vec.resize(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            auto& e = vec[i];
+            std::memcpy(&e.hkey, ptr, 8);
+            std::memcpy(&e.packed_version, ptr + 8, 8);
+            std::memcpy(&e.old_segment_id, ptr + 16, 4);
+            ptr += 20;
+        }
+    };
+    readRecords(lineage.present, present_count);
+    readRecords(lineage.deleted, deleted_count);
 
     return Status::OK();
 }
@@ -568,19 +566,18 @@ Status Segment::readLineage(Lineage& lineage) const {
         return Status::InvalidArgument("Segment: readLineage requires Readable state");
     }
 
-    lineage.entries.clear();
-    lineage.eliminations.clear();
+    lineage.present.clear();
+    lineage.deleted.clear();
 
     for (uint16_t i = 0; i < num_partitions_; ++i) {
         Lineage part_lin;
         Status s = partitions_[i].readLineage(part_lin);
         if (!s.ok()) return s;
         if (i == 0) lineage.type = part_lin.type;
-        lineage.entries.insert(lineage.entries.end(),
-                               part_lin.entries.begin(), part_lin.entries.end());
-        lineage.eliminations.insert(lineage.eliminations.end(),
-                                    part_lin.eliminations.begin(),
-                                    part_lin.eliminations.end());
+        lineage.present.insert(lineage.present.end(),
+                               part_lin.present.begin(), part_lin.present.end());
+        lineage.deleted.insert(lineage.deleted.end(),
+                               part_lin.deleted.begin(), part_lin.deleted.end());
     }
     return Status::OK();
 }

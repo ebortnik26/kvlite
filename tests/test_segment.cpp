@@ -533,8 +533,10 @@ TEST_F(SegmentTest, LineageRoundTrip) {
 
     writeEntry("a", 10, "va", false);
     writeEntry("b", 20, "vb", false);
-    // Add a GC elimination (not written as data, just lineage metadata).
-    seg_.addLineageElimination(H("removed"), 5, 3);
+    // GC lineage: relocations + deletions (not auto-recorded by write methods).
+    seg_.addLineagePresent(H("a"), PackedVersion(10, false).data, 1);
+    seg_.addLineagePresent(H("b"), PackedVersion(20, false).data, 2);
+    seg_.addLineageDeleted(H("removed"), 5, 3);
 
     ASSERT_TRUE(seg_.seal().ok());
 
@@ -545,9 +547,9 @@ TEST_F(SegmentTest, LineageRoundTrip) {
     Lineage lin;
     ASSERT_TRUE(loaded.readLineage(lin).ok());
     EXPECT_EQ(lin.type, LineageType::kGC);
-    EXPECT_EQ(lin.entries.size(), 2u);
-    EXPECT_EQ(lin.eliminations.size(), 1u);
-    EXPECT_EQ(lin.eliminations[0].old_segment_id, 3u);
+    EXPECT_EQ(lin.present.size(), 2u);  // 2 relocations
+    EXPECT_EQ(lin.deleted.size(), 1u);
+    EXPECT_EQ(lin.deleted[0].old_segment_id, 3u);
     loaded.close();
 }
 
@@ -625,7 +627,9 @@ TEST_F(SegmentPartitionTest, Lineage) {
         p.setLineageType(LineageType::kGC);
         ASSERT_TRUE(p.put("a", 10, "va", false, H("a")).ok());
         ASSERT_TRUE(p.put("b", 20, "vb", false, H("b")).ok());
-        p.addLineageElimination(H("removed"), 5, 3);
+        p.addLineagePresent(H("a"), PackedVersion(10, false).data, 1);
+        p.addLineagePresent(H("b"), PackedVersion(20, false).data, 2);
+        p.addLineageDeleted(H("removed"), 5, 3);
         ASSERT_TRUE(p.seal(7).ok());
         ASSERT_TRUE(p.close().ok());
     }
@@ -640,9 +644,9 @@ TEST_F(SegmentPartitionTest, Lineage) {
         Lineage lin;
         ASSERT_TRUE(p2.readLineage(lin).ok());
         EXPECT_EQ(lin.type, LineageType::kGC);
-        EXPECT_EQ(lin.entries.size(), 2u);
-        EXPECT_EQ(lin.eliminations.size(), 1u);
-        EXPECT_EQ(lin.eliminations[0].old_segment_id, 3u);
+        EXPECT_EQ(lin.present.size(), 2u);  // 2 relocations
+        EXPECT_EQ(lin.deleted.size(), 1u);
+        EXPECT_EQ(lin.deleted[0].old_segment_id, 3u);
 
         ASSERT_TRUE(p2.close().ok());
     }

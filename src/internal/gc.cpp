@@ -74,7 +74,7 @@ Status GC::merge(
 
         if (action == EntryAction::kEliminate) {
             on_eliminate(entry.hash, entry.pv.data, old_seg_id);
-            output.addLineageElimination(entry.hash, entry.pv.data, old_seg_id);
+            output.addLineageDeleted(entry.hash, entry.pv.data, old_seg_id);
             result.entries_eliminated++;
             s = pipeline->next();
             if (!s.ok()) return s;
@@ -103,6 +103,7 @@ Status GC::merge(
                                entry.tombstone(), entry.hash, entry_offset);
         if (!s.ok()) return s;
 
+        output.addLineagePresent(entry.hash, entry.pv.data, old_seg_id);
         on_relocate(entry.hash, entry.pv.data, old_seg_id, output_id);
         result.entries_written++;
 

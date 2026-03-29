@@ -22,18 +22,24 @@ enum class LineageType : uint8_t {
     kGC    = 2,  // GC output segment (compaction)
 };
 
-// A single lineage record for GlobalIndex recovery.
-struct LineageEntry {
-    uint64_t hkey;
-    uint64_t packed_version;
-    uint32_t old_segment_id;  // Only set for GC eliminations.
-};
-
 // Lineage section read from a sealed segment.
+//
+// Each record is 20 bytes: {hkey, packed_version, old_segment_id}.
+// For flush puts, old_segment_id is 0.  For GC relocations, it
+// identifies the source segment.  Recovery disambiguates:
+//   present + old_segment_id == 0  →  applyPut
+//   present + old_segment_id != 0  →  applyRelocate
+//   deleted                        →  applyEliminate
 struct Lineage {
+    struct Record {
+        uint64_t hkey;
+        uint64_t packed_version;
+        uint32_t old_segment_id;  // 0 for flush puts
+    };
+
     LineageType type;
-    std::vector<LineageEntry> entries;        // Put/relocated entries.
-    std::vector<LineageEntry> eliminations;   // GC eliminations only.
+    std::vector<Record> present;  // puts (flush) or relocations (GC)
+    std::vector<Record> deleted;  // eliminations (GC only)
 };
 
 // ---------------------------------------------------------------------------
@@ -85,9 +91,11 @@ public:
     // --- Lineage ---
 
     void setLineageType(LineageType type) { lineage_type_ = type; }
-    void reserveLineage(size_t entry_count) { lineage_buf_.reserve(entry_count * 16); }
-    void addLineageElimination(uint64_t hkey, uint64_t packed_version,
-                               uint32_t old_segment_id);
+    void reserveLineage(size_t count) { lineage_buf_.reserve(count * 20); }
+    void addLineagePresent(uint64_t hkey, uint64_t packed_version,
+                           uint32_t old_segment_id = 0);
+    void addLineageDeleted(uint64_t hkey, uint64_t packed_version,
+                           uint32_t old_segment_id);
     Status readLineage(Lineage& lineage) const;
 
     // --- Accessors ---
@@ -121,8 +129,8 @@ private:
     bool batch_mode_ = false;
     LineageType lineage_type_ = LineageType::kFlush;
     std::vector<uint8_t> lineage_buf_;
-    uint32_t lineage_entry_count_ = 0;
-    uint32_t lineage_elimination_count_ = 0;
+    uint32_t lineage_present_count_ = 0;
+    uint32_t lineage_deleted_count_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -174,9 +182,15 @@ public:
         for (auto& p : partitions_) p.reserveLineage(per_part);
     }
 
-    void addLineageElimination(uint64_t hkey, uint64_t packed_version,
-                               uint32_t old_segment_id) {
-        partitions_[partitionFor(hkey)].addLineageElimination(
+    void addLineagePresent(uint64_t hkey, uint64_t packed_version,
+                           uint32_t old_segment_id = 0) {
+        partitions_[partitionFor(hkey)].addLineagePresent(
+            hkey, packed_version, old_segment_id);
+    }
+
+    void addLineageDeleted(uint64_t hkey, uint64_t packed_version,
+                           uint32_t old_segment_id) {
+        partitions_[partitionFor(hkey)].addLineageDeleted(
             hkey, packed_version, old_segment_id);
     }
 

@@ -107,14 +107,17 @@ Status GlobalIndex::replaySegmentLineages(SegmentStorageManager& storage,
         Status s = seg->readLineage(lineage);
         if (!s.ok()) return s;
 
-        // Apply put/relocation entries.
-        for (const auto& e : lineage.entries) {
-            applyPut(e.hkey, e.packed_version, id);
+        // Apply present entries: put (old=0) or relocate (old!=0).
+        for (const auto& r : lineage.present) {
+            if (r.old_segment_id == 0)
+                applyPut(r.hkey, r.packed_version, id);
+            else
+                applyRelocate(r.hkey, r.packed_version, r.old_segment_id, id);
         }
 
-        // Apply eliminations (GC segments only).
-        for (const auto& e : lineage.eliminations) {
-            applyEliminate(e.hkey, e.packed_version, e.old_segment_id);
+        // Apply deleted entries.
+        for (const auto& r : lineage.deleted) {
+            applyEliminate(r.hkey, r.packed_version, r.old_segment_id);
         }
     }
     return Status::OK();
