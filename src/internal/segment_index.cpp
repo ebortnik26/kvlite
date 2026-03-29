@@ -60,18 +60,10 @@ bool SegmentIndex::get(uint64_t hash,
 
 bool SegmentIndex::get(uint64_t hash, uint64_t upper_bound,
                   uint64_t& offset, uint64_t& packed_version) const {
-    std::vector<uint32_t> offsets;
-    std::vector<uint64_t> packed_versions;
-    if (!get(hash, offsets, packed_versions)) return false;
-
-    for (size_t i = 0; i < packed_versions.size(); ++i) {
-        if (packed_versions[i] <= upper_bound) {
-            offset = offsets[i];
-            packed_version = packed_versions[i];
-            return true;
-        }
-    }
-    return false;
+    uint32_t id;
+    if (!dht_.findFirstBounded(hash, upper_bound, packed_version, id)) return false;
+    offset = id;  // SegmentIndex stores offset in the id field
+    return true;
 }
 
 bool SegmentIndex::getLatest(uint64_t hash,

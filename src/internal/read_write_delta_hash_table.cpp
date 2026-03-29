@@ -40,6 +40,16 @@ bool ReadWriteDeltaHashTable::findFirst(uint64_t hash,
     return findFirstByHash(bi, suffix, packed_version, id);
 }
 
+bool ReadWriteDeltaHashTable::findFirstBounded(uint64_t hash, uint64_t upper_bound,
+                                                uint64_t& packed_version,
+                                                uint32_t& id) const {
+    uint32_t bi = bucketIndex(hash);
+    uint64_t suffix = suffixFromHash(hash);
+
+    SpinlockGuard guard(bucket_locks_[bi]);
+    return findFirstBoundedByHash(bi, suffix, upper_bound, packed_version, id);
+}
+
 bool ReadWriteDeltaHashTable::contains(uint64_t hash) const {
     uint32_t bi = bucketIndex(hash);
     uint64_t suffix = suffixFromHash(hash);

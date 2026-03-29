@@ -65,6 +65,10 @@ public:
     bool findFirst(uint64_t hash,
                    uint64_t& packed_version, uint32_t& id) const;
 
+    // Find the highest packed_version <= upper_bound. No allocation.
+    bool findFirstBounded(uint64_t hash, uint64_t upper_bound,
+                          uint64_t& packed_version, uint32_t& id) const;
+
     bool contains(uint64_t hash) const;
 
     void forEach(const std::function<void(uint64_t hash,
@@ -138,6 +142,16 @@ protected:
 
     bool findFirstByHash(uint32_t bi, uint64_t suffix,
                          uint64_t& packed_version, uint32_t& id) const;
+
+    bool findFirstBoundedByHash(uint32_t bi, uint64_t suffix,
+                                uint64_t upper_bound,
+                                uint64_t& packed_version, uint32_t& id) const;
+
+    // Walk bucket chain for suffix, call visitor on match.
+    template<typename Visitor>
+    auto findKeyInChain(uint32_t bi, uint64_t suffix, Visitor&& visitor) const
+        -> decltype(visitor(std::declval<const Bucket&>(), uint16_t{},
+                            std::declval<const SuffixScanResult&>()));
 
     // --- Protected write helpers ---
 

@@ -88,6 +88,10 @@ public:
     bool contains(uint64_t hash) const { return index_.contains(hash); }
     Status readEntry(uint64_t offset, LogEntry& entry) const;
 
+    // Read only the value at offset, skipping key copy. For the common
+    // read path where the caller already knows the key.
+    Status readValue(uint64_t offset, std::string& value) const;
+
     // --- Lineage ---
 
     void setLineageType(LineageType type) { lineage_type_ = type; }
@@ -111,6 +115,13 @@ public:
     uint64_t siDecodeTotalNs() const { return index_.decodeTotalNs(); }
 
 private:
+    // Read entry at offset, validate CRC, return buffer + parsed lengths.
+    Status readRaw(uint64_t offset,
+                   uint8_t* stack_buf, size_t stack_size,
+                   std::unique_ptr<uint8_t[]>& heap_buf,
+                   const uint8_t*& out_buf,
+                   uint16_t& out_key_len, uint32_t& out_val_len) const;
+
     Status writeEntry(std::string_view key, uint64_t version,
                       std::string_view value, bool tombstone,
                       uint64_t& entry_offset);
@@ -245,6 +256,19 @@ public:
         if (state_ != State::kReadable)
             return Status::InvalidArgument("Segment: get requires Readable state");
         return partitions_[partitionFor(hash)].get(hash, upper_bound, entry);
+    }
+
+    // Read only the value for a key at the given version bound.
+    // Avoids copying the key — more efficient for the common read path.
+    Status getValue(uint64_t hash, uint64_t upper_bound, std::string& value) const {
+        if (state_ != State::kReadable)
+            return Status::InvalidArgument("Segment: getValue requires Readable state");
+        auto& p = partitions_[partitionFor(hash)];
+        uint64_t offset, pv;
+        if (!p.index().get(hash, upper_bound, offset, pv)) {
+            return Status::NotFound("key not found");
+        }
+        return p.readValue(offset, value);
     }
 
     bool contains(uint64_t hash) const {

@@ -380,12 +380,48 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
 
 // --- Public read API ---
 
+// Walk the bucket chain for (bi, suffix). If found, decode the key and
+// call visitor(bucket, key_index, scan). Returns whatever the visitor returns.
+// The visitor receives the decoded SuffixScanResult and the key's position
+// within the bucket. It can then decode entries as needed (first-only,
+// all, bounded).
+template<typename Visitor>
+auto DeltaHashTable::findKeyInChain(uint32_t bi, uint64_t suffix,
+                                     Visitor&& visitor) const
+    -> decltype(visitor(std::declval<const Bucket&>(), uint16_t{},
+                        std::declval<const SuffixScanResult&>())) {
+    using R = decltype(visitor(std::declval<const Bucket&>(), uint16_t{},
+                               std::declval<const SuffixScanResult&>()));
+
+    const Bucket* bucket = &buckets_[bi];
+    while (bucket) {
+        auto dt0 = std::chrono::steady_clock::now();
+        auto scan = codec_.decodeSuffixes(*bucket);
+        auto dt1 = std::chrono::steady_clock::now();
+        decode_count_.fetch_add(1, std::memory_order_relaxed);
+        decode_total_ns_.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(dt1 - dt0).count()),
+            std::memory_order_relaxed);
+
+        auto it = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
+        if (it != scan.suffixes.end() && *it == suffix) {
+            uint16_t idx = static_cast<uint16_t>(it - scan.suffixes.begin());
+            return visitor(*bucket, idx, scan);
+        }
+        bucket = nextBucket(*bucket);
+    }
+    return R{};
+}
+
 bool DeltaHashTable::findAllByHash(uint32_t bi, uint64_t suffix,
                                     std::vector<uint64_t>& packed_versions,
                                     std::vector<uint32_t>& ids) const {
     packed_versions.clear();
     ids.clear();
 
+    // findKeyInChain only returns the first bucket match. For findAll we
+    // need to walk the full chain ourselves since a key can span extension
+    // buckets.  Keep the existing manual walk for this case.
     const Bucket* bucket = &buckets_[bi];
     while (bucket) {
         auto dt0 = std::chrono::steady_clock::now();
@@ -420,46 +456,50 @@ bool DeltaHashTable::findAllByHash(uint32_t bi, uint64_t suffix,
 
 bool DeltaHashTable::findFirstByHash(uint32_t bi, uint64_t suffix,
                                       uint64_t& packed_version, uint32_t& id) const {
-    bool found = false;
-    uint64_t best_pv = 0;
-    uint32_t best_id = 0;
+    return findKeyInChain(bi, suffix,
+        [&](const Bucket& bkt, uint16_t idx, const SuffixScanResult& scan) -> bool {
+            auto dt0 = std::chrono::steady_clock::now();
+            auto [pv, fid] = codec_.decodeFirstEntry(bkt, idx, scan.data_start_bit);
+            auto dt1 = std::chrono::steady_clock::now();
+            decode_count_.fetch_add(1, std::memory_order_relaxed);
+            decode_total_ns_.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(dt1 - dt0).count()),
+                std::memory_order_relaxed);
+            packed_version = pv;
+            id = fid;
+            return true;
+        });
+}
 
-    const Bucket* bucket = &buckets_[bi];
-    while (bucket) {
-        auto dt0 = std::chrono::steady_clock::now();
-        auto scan = codec_.decodeSuffixes(*bucket);
-        auto dt1 = std::chrono::steady_clock::now();
-        decode_count_.fetch_add(1, std::memory_order_relaxed);
-        decode_total_ns_.fetch_add(
-            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(dt1 - dt0).count()),
-            std::memory_order_relaxed);
-
-        auto it = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
-        if (it != scan.suffixes.end() && *it == suffix) {
-            size_t idx = it - scan.suffixes.begin();
-            dt0 = std::chrono::steady_clock::now();
-            auto [pv, fid] = codec_.decodeFirstEntry(
-                *bucket, static_cast<uint16_t>(idx), scan.data_start_bit);
-            dt1 = std::chrono::steady_clock::now();
+bool DeltaHashTable::findFirstBoundedByHash(uint32_t bi, uint64_t suffix,
+                                             uint64_t upper_bound,
+                                             uint64_t& packed_version,
+                                             uint32_t& id) const {
+    return findKeyInChain(bi, suffix,
+        [&](const Bucket& bkt, uint16_t idx, const SuffixScanResult& scan) -> bool {
+            auto dt0 = std::chrono::steady_clock::now();
+            auto key = codec_.decodeKeyAt(bkt, idx, suffix, scan.data_start_bit);
+            auto dt1 = std::chrono::steady_clock::now();
             decode_count_.fetch_add(1, std::memory_order_relaxed);
             decode_total_ns_.fetch_add(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(dt1 - dt0).count()),
                 std::memory_order_relaxed);
 
-            if (!found || pv > best_pv) {
-                best_pv = pv;
-                best_id = fid;
-                found = true;
+            for (size_t i = 0; i < key.packed_versions.size(); ++i) {
+                if (key.packed_versions[i] <= upper_bound) {
+                    packed_version = key.packed_versions[i];
+                    id = key.ids[i];
+                    return true;
+                }
             }
-        }
-        bucket = nextBucket(*bucket);
-    }
+            return false;
+        });
+}
 
-    if (found) {
-        packed_version = best_pv;
-        id = best_id;
-    }
-    return found;
+bool DeltaHashTable::findFirstBounded(uint64_t hash, uint64_t upper_bound,
+                                       uint64_t& packed_version, uint32_t& id) const {
+    return findFirstBoundedByHash(bucketIndex(hash), suffixFromHash(hash),
+                                  upper_bound, packed_version, id);
 }
 
 bool DeltaHashTable::findAll(uint64_t hash,

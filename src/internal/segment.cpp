@@ -253,12 +253,17 @@ Status SegmentPartition::appendRawEntry(const void* payload, size_t payload_len,
 
 // --- Read ---
 
-Status SegmentPartition::readEntry(uint64_t offset, LogEntry& entry) const {
-    static constexpr size_t kReadAhead = 4096;
-    uint8_t stack_buf[kReadAhead];
-
+// Speculative 4KB read + CRC validation. Returns a pointer to the
+// validated buffer and parsed field lengths. The buffer is either
+// stack_buf (if the entry fits in 4KB) or heap_buf (caller owns).
+Status SegmentPartition::readRaw(uint64_t offset,
+                                  uint8_t* stack_buf, size_t stack_size,
+                                  std::unique_ptr<uint8_t[]>& heap_buf,
+                                  const uint8_t*& out_buf,
+                                  uint16_t& out_key_len,
+                                  uint32_t& out_val_len) const {
     size_t avail = (offset < data_size_) ? static_cast<size_t>(data_size_ - offset) : 0;
-    size_t first_read = (avail < kReadAhead) ? avail : kReadAhead;
+    size_t first_read = (avail < stack_size) ? avail : stack_size;
     if (first_read < LogEntry::kHeaderSize + LogEntry::kChecksumSize) {
         return Status::Corruption("Segment: truncated entry at offset " +
                                   std::to_string(offset));
@@ -266,17 +271,13 @@ Status SegmentPartition::readEntry(uint64_t offset, LogEntry& entry) const {
     Status s = log_file_.readAt(offset, stack_buf, first_read);
     if (!s.ok()) return s;
 
-    uint64_t packed_ver;
-    uint16_t kl;
-    uint32_t vl;
-    std::memcpy(&packed_ver, stack_buf, 8);
-    std::memcpy(&kl, stack_buf + 8, 2);
-    std::memcpy(&vl, stack_buf + 10, 4);
+    std::memcpy(&out_key_len, stack_buf + 8, 2);
+    std::memcpy(&out_val_len, stack_buf + 10, 4);
 
-    size_t entry_size = LogEntry::kHeaderSize + kl + vl + LogEntry::kChecksumSize;
+    size_t entry_size = LogEntry::kHeaderSize + out_key_len + out_val_len +
+                        LogEntry::kChecksumSize;
 
     uint8_t* buf = stack_buf;
-    std::unique_ptr<uint8_t[]> heap_buf;
     if (entry_size > first_read) {
         heap_buf = std::make_unique<uint8_t[]>(entry_size);
         buf = heap_buf.get();
@@ -284,7 +285,7 @@ Status SegmentPartition::readEntry(uint64_t offset, LogEntry& entry) const {
         if (!s.ok()) return s;
     }
 
-    size_t payload_len = LogEntry::kHeaderSize + kl + vl;
+    size_t payload_len = LogEntry::kHeaderSize + out_key_len + out_val_len;
     uint32_t stored_crc;
     std::memcpy(&stored_crc, buf + payload_len, 4);
     if (crc32(buf, payload_len) != stored_crc) {
@@ -292,9 +293,41 @@ Status SegmentPartition::readEntry(uint64_t offset, LogEntry& entry) const {
                                   std::to_string(offset));
     }
 
+    out_buf = buf;
+    return Status::OK();
+}
+
+Status SegmentPartition::readEntry(uint64_t offset, LogEntry& entry) const {
+    static constexpr size_t kReadAhead = 4096;
+    uint8_t stack_buf[kReadAhead];
+    std::unique_ptr<uint8_t[]> heap_buf;
+    const uint8_t* buf;
+    uint16_t kl;
+    uint32_t vl;
+
+    Status s = readRaw(offset, stack_buf, kReadAhead, heap_buf, buf, kl, vl);
+    if (!s.ok()) return s;
+
+    uint64_t packed_ver;
+    std::memcpy(&packed_ver, buf, 8);
     entry.pv = PackedVersion(packed_ver);
     entry.key.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize), kl);
     entry.value.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize + kl), vl);
+    return Status::OK();
+}
+
+Status SegmentPartition::readValue(uint64_t offset, std::string& value) const {
+    static constexpr size_t kReadAhead = 4096;
+    uint8_t stack_buf[kReadAhead];
+    std::unique_ptr<uint8_t[]> heap_buf;
+    const uint8_t* buf;
+    uint16_t kl;
+    uint32_t vl;
+
+    Status s = readRaw(offset, stack_buf, kReadAhead, heap_buf, buf, kl, vl);
+    if (!s.ok()) return s;
+
+    value.assign(reinterpret_cast<const char*>(buf + LogEntry::kHeaderSize + kl), vl);
     return Status::OK();
 }
 

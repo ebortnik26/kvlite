@@ -193,18 +193,7 @@ bool GlobalIndex::get(uint64_t hkey,
 
 bool GlobalIndex::get(uint64_t hkey, uint64_t upper_bound,
                   uint64_t& packed_version, uint32_t& segment_id) const {
-    std::vector<uint64_t> pvs;
-    std::vector<uint32_t> ids;
-    if (!dht_.findAll(hkey, pvs, ids)) return false;
-    // Entries are sorted by packed_version descending; find the first <= upper_bound.
-    for (size_t i = 0; i < pvs.size(); ++i) {
-        if (pvs[i] <= upper_bound) {
-            packed_version = pvs[i];
-            segment_id = ids[i];
-            return true;
-        }
-    }
-    return false;
+    return dht_.findFirstBounded(hkey, upper_bound, packed_version, segment_id);
 }
 
 Status GlobalIndex::getLatest(uint64_t hkey,

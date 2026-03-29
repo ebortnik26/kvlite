@@ -60,6 +60,9 @@ public:
     bool findFirst(uint64_t hash,
                    uint64_t& packed_version, uint32_t& id) const;
 
+    bool findFirstBounded(uint64_t hash, uint64_t upper_bound,
+                          uint64_t& packed_version, uint32_t& id) const;
+
     bool contains(uint64_t hash) const;
 
     size_t size() const;

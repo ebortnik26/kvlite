@@ -278,11 +278,9 @@ Status DB::getByVersion(const std::string& key, uint64_t upper_bound,
     internal::PackedVersion gi_pv(r.gi_packed_version);
     if (gi_pv.tombstone()) return Status::NotFound(key);
 
-    internal::LogEntry entry;
-    s = r.segment->get(r.hkey, upper_bound, entry);
+    s = r.segment->getValue(r.hkey, upper_bound, value);
     if (!s.ok()) return s;
 
-    value = std::move(entry.value);
     entry_version = gi_pv.version();
     return Status::OK();
 }
