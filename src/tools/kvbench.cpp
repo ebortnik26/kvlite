@@ -40,6 +40,7 @@ struct Config {
     bool buffered_writes = true;
     uint16_t segment_partitions = 1;
     std::string key_dist = "uniform";
+    bool sequential_keys = false;  // writes use keys 0..N-1 in order
     bool extended = false;
     std::string flame_output;  // empty = disabled
     std::string db_path;
@@ -64,6 +65,7 @@ static void printUsage(const char* prog) {
         "  --report-interval N    Seconds between reports (default: 5)\n"
         "  --memtable-size N      Memtable capacity in bytes (default: 67108864)\n"
         "  --key-dist NAME        Key distribution: uniform or zipf [YCSB] (default: uniform)\n"
+        "  --sequential-keys      Write keys 0..N-1 in order (default: random)\n"
         "  --no-buffered-writes   Disable LogFile write buffering\n"
         "  -x, --extended         Print extended report (DB stats, DHT codec stats)\n"
         "  -f, --flame [PATH]     Generate flame graph SVG (default: flamegraph.svg)\n"
@@ -94,6 +96,7 @@ static bool parseArgs(int argc, char** argv, Config& cfg) {
         else if (arg("--value-size"))        cfg.value_size = static_cast<int>(nextInt());
         else if (arg("--no-preload"))        cfg.preload = false;
         else if (arg("--no-buffered-writes")) cfg.buffered_writes = false;
+        else if (arg("--sequential-keys"))   cfg.sequential_keys = true;
         else if (arg("--segment-partitions")) cfg.segment_partitions = static_cast<uint16_t>(nextInt());
         else if (arg("--report-interval"))   cfg.report_interval = static_cast<int>(nextInt());
         else if (arg("--memtable-size")) cfg.memtable_size = static_cast<size_t>(nextInt());
@@ -300,7 +303,15 @@ static void workerThread(kvlite::DB& db, const Config& cfg,
         zipf_gen = std::make_unique<ZipfianGenerator>(cfg.num_keys);
     }
 
+    // Sequential counter for --sequential-keys mode.
+    uint64_t seq_counter = static_cast<uint64_t>(thread_id);
+
     auto nextKey = [&]() -> uint64_t {
+        if (cfg.sequential_keys) {
+            uint64_t k = seq_counter;
+            seq_counter += cfg.threads;  // stride by thread count
+            return k % cfg.num_keys;
+        }
         if (zipf_gen) return (*zipf_gen)(rng);
         return uniform_key_dist(rng);
     };
@@ -734,6 +745,7 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(cfg.memtable_size));
     std::printf("  buffered_writes:   %s\n", cfg.buffered_writes ? "yes" : "no");
     std::printf("  segment_partitions: %u\n", cfg.segment_partitions);
+    if (cfg.sequential_keys) std::printf("  sequential_keys:   yes\n");
     std::printf("\n");
 
     // Open DB
