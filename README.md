@@ -27,7 +27,7 @@ A persistent key-value store for point operations on SSD.
 +---------------------------------------------------------------+
 |                                                                |
 |  VersionManager    WriteBuffer        GlobalIndex              |
-|  (monotonic IDs)   (Memtable xN)      (in-memory DHT)         |
+|  (monotonic IDs)   (Memtable xN)      (in-memory hash index)  |
 |                         |                  |                   |
 |                         | flush            | lookup            |
 |                         v                  v                   |
