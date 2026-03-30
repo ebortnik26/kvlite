@@ -384,15 +384,39 @@ bool DeltaHashTable::findAllByHash(uint32_t bi, uint64_t suffix,
 
 bool DeltaHashTable::findFirstByHash(uint32_t bi, uint64_t suffix,
                                       uint64_t& packed_version, uint32_t& id) const {
-    return findKeyInChain(bi, suffix,
-        [&](const Bucket& bkt, uint16_t idx, const SuffixScanResult& scan) -> bool {
-            auto t0 = std::chrono::steady_clock::now();
-            auto [pv, fid] = codec_.decodeFirstEntry(bkt, idx, scan.data_start_bit);
+    // Must walk the full chain — a key can span extension buckets, and the
+    // highest version may be in any bucket.
+    bool found = false;
+    uint64_t best_pv = 0;
+    uint32_t best_id = 0;
+
+    const Bucket* bucket = &buckets_[bi];
+    while (bucket) {
+        auto t0 = std::chrono::steady_clock::now();
+        auto scan = codec_.decodeSuffixes(*bucket);
+        trackTime(decode_count_, decode_total_ns_, t0);
+
+        auto it = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
+        if (it != scan.suffixes.end() && *it == suffix) {
+            uint16_t idx = static_cast<uint16_t>(it - scan.suffixes.begin());
+            t0 = std::chrono::steady_clock::now();
+            auto [pv, fid] = codec_.decodeFirstEntry(*bucket, idx, scan.data_start_bit);
             trackTime(decode_count_, decode_total_ns_, t0);
-            packed_version = pv;
-            id = fid;
-            return true;
-        });
+
+            if (!found || pv > best_pv) {
+                best_pv = pv;
+                best_id = fid;
+                found = true;
+            }
+        }
+        bucket = nextBucket(*bucket);
+    }
+
+    if (found) {
+        packed_version = best_pv;
+        id = best_id;
+    }
+    return found;
 }
 
 bool DeltaHashTable::findFirstBoundedByHash(uint32_t bi, uint64_t suffix,
