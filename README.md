@@ -12,7 +12,7 @@ A persistent key-value store for point operations on SSD.
 
 ## How it works
 
-- **Index-plus-log** — two-level hash index (in-memory GlobalIndex + per-file SegmentIndex) with append-only data files.
+- **Index-plus-log** — two-level hash index (in-memory GlobalIndex + per-segment SegmentIndex) with append-only data files.  Each segment is a group of partition files to parallelize flush I/O.
 - **SSD-friendly** — sequential writes, no in-place updates.
 - **Multi-version** — global monotonic versioning; every write gets a unique version.
 - **Partitioned flush** — each segment is K files written and synced in parallel.
