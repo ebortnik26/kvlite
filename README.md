@@ -1,17 +1,22 @@
 # kvlite
 
-A high-performance persistent key-value store optimized for SSD drives.
+A persistent key-value store for point operations on SSD.
 
-kvlite implements an **index-plus-log** architecture in software, providing efficient point lookups with SSD-friendly sequential writes.
+## What it does
 
-## Features
+- **Simple API** — get, put, remove, exists.  No range queries, no SQL.
+- **Snapshots** — lightweight point-in-time reads.  Multiple concurrent snapshots at different versions.
+- **Atomic batches** — WriteBatch groups puts and deletes into a single version (all-or-nothing visibility).  ReadBatch reads multiple keys at the same snapshot.
+- **Unordered iteration** — full-scan iterator over all keys, useful for backup/replication.
+- **Background GC** — compacts dead versions automatically, respects active snapshots.
 
-- **Index-Plus-Log Architecture**: Two-level hash index with append-only log files
-- **SSD-Optimized**: Sequential writes minimize SSD wear and maximize throughput
-- **Multi-Version Storage**: Global monotonic versioning enables point-in-time reads
-- **Snapshots**: Consistent reads across multiple keys at a specific version
-- **Simple API**: Point operations only (get/put/remove) - no range queries
-- **Concurrent GC**: Background garbage collection respects active snapshots
+## How it works
+
+- **Index-plus-log** — two-level hash index (in-memory GlobalIndex + per-file SegmentIndex) with append-only data files.
+- **SSD-friendly** — sequential writes, no in-place updates.
+- **Multi-version** — global monotonic versioning; every write gets a unique version.
+- **Partitioned flush** — each segment is K files written and synced in parallel.
+- **No WAL** — durability via segment-embedded lineage sections; recovery replays lineage from segments above the last savepoint.
 
 ## Architecture
 
