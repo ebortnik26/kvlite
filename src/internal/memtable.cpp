@@ -65,6 +65,24 @@ std::string Memtable::readKey(uint32_t off) const {
 
 // --- Public API ----------------------------------------------------------
 
+bool Memtable::keyExistsInBucket(uint32_t bi, uint64_t hash) const {
+    const uint8_t* scan = primaryBucket(bi);
+    while (scan) {
+        uint16_t cnt = bucketCount(scan);
+        const Slot* s = bucketSlots(scan);
+        uint16_t lo = 0, hi = cnt;
+        while (lo < hi) {
+            uint16_t mid = (lo + hi) / 2;
+            if (s[mid].hash < hash) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < cnt && s[lo].hash == hash) return true;
+        uint32_t ext = bucketExtPtr(scan);
+        scan = ext ? extBucketData(ext) : nullptr;
+    }
+    return false;
+}
+
 void Memtable::put(const std::string& key, uint64_t version,
                    const std::string& value, bool tombstone) {
     uint64_t hash = dhtHashBytes(key.data(), key.size());
@@ -76,25 +94,7 @@ void Memtable::put(const std::string& key, uint64_t version,
 
     locks_[bi].lock();
 
-    // Check if key already exists via binary search on hash.
-    bool key_exists = false;
-    {
-        const uint8_t* scan = primaryBucket(bi);
-        while (scan && !key_exists) {
-            uint16_t cnt = bucketCount(scan);
-            const Slot* s = bucketSlots(scan);
-            // Binary search for first slot with this hash.
-            uint16_t lo = 0, hi = cnt;
-            while (lo < hi) {
-                uint16_t mid = (lo + hi) / 2;
-                if (s[mid].hash < hash) lo = mid + 1;
-                else hi = mid;
-            }
-            if (lo < cnt && s[lo].hash == hash) key_exists = true;
-            uint32_t ext = bucketExtPtr(scan);
-            scan = ext ? extBucketData(ext) : nullptr;
-        }
-    }
+    bool key_exists = keyExistsInBucket(bi, hash);
 
     // Find a bucket in the chain with a free slot.
     uint8_t* b = primaryBucket(bi);
@@ -180,24 +180,7 @@ void Memtable::putBatch(const std::vector<BatchOp>& ops, uint64_t version) {
     for (const auto& item : items) {
         PackedVersion pv(version, ops[item.op_idx].tombstone);
 
-        // Check if key already exists via binary search on hash.
-        bool key_exists = false;
-        {
-            const uint8_t* scan = primaryBucket(item.bi);
-            while (scan && !key_exists) {
-                uint16_t cnt = bucketCount(scan);
-                const Slot* s = bucketSlots(scan);
-                uint16_t lo = 0, hi = cnt;
-                while (lo < hi) {
-                    uint16_t mid = (lo + hi) / 2;
-                    if (s[mid].hash < item.hash) lo = mid + 1;
-                    else hi = mid;
-                }
-                if (lo < cnt && s[lo].hash == item.hash) key_exists = true;
-                uint32_t ext = bucketExtPtr(scan);
-                scan = ext ? extBucketData(ext) : nullptr;
-            }
-        }
+        bool key_exists = keyExistsInBucket(item.bi, item.hash);
 
         // Find a bucket with a free slot.
         uint8_t* b = primaryBucket(item.bi);
@@ -454,14 +437,6 @@ std::unique_ptr<EntryStream> Memtable::createStream(uint64_t snapshot_version) c
 Memtable::FlushResult Memtable::flush(Segment& out,
                                       const std::vector<uint64_t>& snapshot_versions,
                                       FlushPool* flush_pool) {
-    // SlimEntry: 20 bytes, no string copies. Key/value read via string_view
-    // from data buffer at emit time (zero-copy).
-    struct SlimEntry {
-        uint64_t hash;
-        uint64_t packed_ver;
-        uint32_t offset;
-    };
-
     const uint8_t* data_base = data_.get();
     const uint16_t num_parts = out.numPartitions();
 
@@ -482,7 +457,7 @@ Memtable::FlushResult Memtable::flush(Segment& out,
     auto flushRange = [&](uint32_t bucket_lo, uint32_t bucket_hi,
                           uint16_t part_idx, bool seal_partition,
                           PartFlush& pf) {
-        std::vector<SlimEntry> bucket_entries;
+        std::vector<Slot> bucket_entries;
 
         for (uint32_t bi = bucket_lo; bi < bucket_hi; ++bi) {
             const uint8_t* b = primaryBucket(bi);
@@ -509,8 +484,8 @@ Memtable::FlushResult Memtable::flush(Segment& out,
                 }
                 size_t group_size = j - i;
 
-                if (snapshot_versions.empty() || group_size == 1) {
-                    const auto& e = bucket_entries[i];
+                // Emit one entry: append to segment, record in flushed list.
+                auto emitEntry = [&](const Slot& e) -> bool {
                     const uint8_t* p = data_base + e.offset;
                     uint16_t kl;
                     uint32_t vl;
@@ -519,15 +494,20 @@ Memtable::FlushResult Memtable::flush(Segment& out,
                     size_t payload_len = kRecordHeaderSize + kl + vl;
                     uint64_t entry_offset;
                     Status st = out.appendRawEntry(p, payload_len, e.hash, entry_offset);
-                    if (!st.ok()) { pf.status = st; return; }
-                    pf.flushed.push_back({e.hash, e.packed_ver});
-                    uint64_t v = PackedVersion(e.packed_ver).version();
+                    if (!st.ok()) { pf.status = st; return false; }
+                    pf.flushed.push_back({e.hash, e.pv});
+                    uint64_t v = PackedVersion(e.pv).version();
                     if (v > pf.max_ver) pf.max_ver = v;
+                    return true;
+                };
+
+                if (snapshot_versions.empty() || group_size == 1) {
+                    if (!emitEntry(bucket_entries[i])) return;
                 } else {
                     std::vector<uint64_t> vers(group_size);
                     for (size_t k = 0; k < group_size; ++k) {
                         vers[k] = PackedVersion(
-                            bucket_entries[i + group_size - 1 - k].packed_ver).version();
+                            bucket_entries[i + group_size - 1 - k].pv).version();
                     }
                     std::unique_ptr<bool[]> keep(new bool[group_size]);
                     dedupVersionGroup(vers.data(), group_size,
@@ -535,19 +515,7 @@ Memtable::FlushResult Memtable::flush(Segment& out,
 
                     for (size_t k = 0; k < group_size; ++k) {
                         if (keep[group_size - 1 - k]) {
-                            const auto& e = bucket_entries[i + k];
-                            const uint8_t* p = data_base + e.offset;
-                            uint16_t kl;
-                            uint32_t vl;
-                            std::memcpy(&kl, p + kKeyLenOffset, kKeyLenSize);
-                            std::memcpy(&vl, p + kValueLenOffset, kValueLenSize);
-                            size_t payload_len = kRecordHeaderSize + kl + vl;
-                            uint64_t entry_offset;
-                            Status st = out.appendRawEntry(p, payload_len, e.hash, entry_offset);
-                            if (!st.ok()) { pf.status = st; return; }
-                            pf.flushed.push_back({e.hash, e.packed_ver});
-                            uint64_t v = PackedVersion(e.packed_ver).version();
-                            if (v > pf.max_ver) pf.max_ver = v;
+                            if (!emitEntry(bucket_entries[i + k])) return;
                         }
                     }
                 }

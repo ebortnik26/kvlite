@@ -125,6 +125,7 @@ private:
     Status writeEntry(std::string_view key, uint64_t version,
                       std::string_view value, bool tombstone,
                       uint64_t& entry_offset);
+    void recordBatchEntry(uint64_t hash, uint64_t packed_ver, uint32_t offset);
     void addLineageEntry(uint64_t hkey, uint64_t packed_version);
     Status writeLineageSection();
 

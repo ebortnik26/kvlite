@@ -222,9 +222,7 @@ Status SegmentPartition::appendEntry(std::string_view key, uint64_t version,
     if (!s.ok()) return s;
 
     PackedVersion pv(version, tombstone);
-    index_.addBatchEntry(hash, pv.data, static_cast<uint32_t>(entry_offset));
-    batch_mode_ = true;
-    if (lineage_type_ == LineageType::kFlush) addLineagePresent(hash, pv.data);
+    recordBatchEntry(hash, pv.data, static_cast<uint32_t>(entry_offset));
     return Status::OK();
 }
 
@@ -245,10 +243,14 @@ Status SegmentPartition::appendRawEntry(const void* payload, size_t payload_len,
 
     uint64_t packed_ver;
     std::memcpy(&packed_ver, payload, 8);
-    index_.addBatchEntry(hash, packed_ver, static_cast<uint32_t>(offset));
+    recordBatchEntry(hash, packed_ver, static_cast<uint32_t>(offset));
+    return Status::OK();
+}
+
+void SegmentPartition::recordBatchEntry(uint64_t hash, uint64_t packed_ver, uint32_t offset) {
+    index_.addBatchEntry(hash, packed_ver, offset);
     batch_mode_ = true;
     if (lineage_type_ == LineageType::kFlush) addLineagePresent(hash, packed_ver);
-    return Status::OK();
 }
 
 // --- Read ---

@@ -131,6 +131,9 @@ public:
     static constexpr size_t kValueLenOffset = kPackedVerSize + kKeyLenSize;   // 10
 
 private:
+    // Check if a key hash exists in a bucket chain.
+    bool keyExistsInBucket(uint32_t bi, uint64_t hash) const;
+
     // --- Slot: 20 bytes (packed) ---
     //
     // Full 64-bit hash stored so flush/createStream can pass it to
