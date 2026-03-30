@@ -2,7 +2,8 @@
 
 #include <algorithm>
 #include <cassert>
-#include <chrono>
+
+#include "internal/profiling.h"
 
 namespace kvlite {
 namespace internal {
@@ -74,14 +75,9 @@ void ReadOnlyDeltaHashTable::flushPendingBucket() {
     if (pending_bi_ == UINT32_MAX) return;
 
     if (codec_.contentsBitsNeeded(pending_contents_) <= codec_.bucketDataBits()) {
-        auto et0 = std::chrono::steady_clock::now();
+        auto t0 = now();
         codec_.encodeBucket(buckets_[pending_bi_], pending_contents_);
-        auto et1 = std::chrono::steady_clock::now();
-        encode_count_.fetch_add(1, std::memory_order_relaxed);
-        encode_total_ns_.fetch_add(
-            static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(et1 - et0).count()),
-            std::memory_order_relaxed);
+        trackTime(encode_count_, encode_total_ns_, t0);
         size_ += pending_entries_;
         batch_key_count_ += pending_keys_;
     } else {

@@ -115,7 +115,7 @@ Bucket* DeltaHashTable::createExtension(Bucket& bucket) {
 bool DeltaHashTable::containsByHash(uint32_t bi, uint64_t suffix) const {
     const Bucket* bucket = &buckets_[bi];
     while (bucket) {
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = now();
         auto scan = codec_.decodeSuffixes(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
         if (std::binary_search(scan.suffixes.begin(), scan.suffixes.end(), suffix)) {
@@ -135,7 +135,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
     bool is_new = true;
 
     while (true) {
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = now();
         auto scan = codec_.decodeSuffixes(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
 
@@ -147,7 +147,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
 
             // Single full decode replaces decodeKeyAt + decodeBucketUsedBits
             // + bitsForAddVersion + decodeBucket.
-            t0 = std::chrono::steady_clock::now();
+            t0 = now();
             auto contents = codec_.decodeBucket(*bucket);
             trackTime(decode_count_, decode_total_ns_, t0);
 
@@ -162,7 +162,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
             cit->ids.insert(cit->ids.begin() + vi, id);
 
             if (codec_.contentsBitsNeeded(contents) <= codec_.bucketDataBits()) {
-                t0 = std::chrono::steady_clock::now();
+                t0 = now();
                 codec_.encodeBucket(*bucket, contents);
                 trackTime(encode_count_, encode_total_ns_, t0);
                 return is_new;
@@ -176,7 +176,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
             if (is_new) {
                 const Bucket* check = nextBucket(*bucket);
                 while (check) {
-                    t0 = std::chrono::steady_clock::now();
+                    t0 = now();
                     auto check_scan = codec_.decodeSuffixes(*check);
                     trackTime(decode_count_, decode_total_ns_, t0);
                     if (std::binary_search(check_scan.suffixes.begin(),
@@ -190,7 +190,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
 
             // Single full decode replaces decodeBucketUsedBits +
             // bitsForNewEntry + decodeBucket.
-            t0 = std::chrono::steady_clock::now();
+            t0 = now();
             auto contents = codec_.decodeBucket(*bucket);
             trackTime(decode_count_, decode_total_ns_, t0);
 
@@ -203,7 +203,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
             contents.keys.insert(cit, std::move(new_entry));
 
             if (codec_.contentsBitsNeeded(contents) <= codec_.bucketDataBits()) {
-                t0 = std::chrono::steady_clock::now();
+                t0 = now();
                 codec_.encodeBucket(*bucket, contents);
                 trackTime(encode_count_, encode_total_ns_, t0);
                 return is_new;
@@ -224,7 +224,7 @@ bool DeltaHashTable::removeFromChain(uint32_t bi, uint64_t suffix,
     Bucket* bucket = &buckets_[bi];
 
     while (bucket) {
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = now();
         auto contents = codec_.decodeBucket(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
 
@@ -239,7 +239,7 @@ bool DeltaHashTable::removeFromChain(uint32_t bi, uint64_t suffix,
                     if (it->packed_versions.empty()) {
                         contents.keys.erase(it);
                     }
-                    t0 = std::chrono::steady_clock::now();
+                    t0 = now();
                     codec_.encodeBucket(*bucket, contents);
                     trackTime(encode_count_, encode_total_ns_, t0);
                     pruneEmptyExtension(bucket);
@@ -263,7 +263,7 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
     Bucket* bucket = &buckets_[bi];
 
     while (bucket) {
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = now();
         auto contents = codec_.decodeBucket(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
 
@@ -275,12 +275,12 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
                 if (it->packed_versions[j] == packed_version && it->ids[j] == old_id) {
                     it->ids[j] = new_id;
 
-                    t0 = std::chrono::steady_clock::now();
+                    t0 = now();
                     size_t bits = codec_.contentsBitsNeeded(contents);
                     trackTime(decode_count_, decode_total_ns_, t0);
 
                     if (bits <= codec_.bucketDataBits()) {
-                        t0 = std::chrono::steady_clock::now();
+                        t0 = now();
                         codec_.encodeBucket(*bucket, contents);
                         trackTime(encode_count_, encode_total_ns_, t0);
                         return true;
@@ -288,14 +288,14 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
                     KeyEntry spilled = std::move(*it);
                     contents.keys.erase(it);
 
-                    t0 = std::chrono::steady_clock::now();
+                    t0 = now();
                     codec_.encodeBucket(*bucket, contents);
                     trackTime(encode_count_, encode_total_ns_, t0);
 
                     Bucket* ext = nextBucketMut(*bucket);
                     if (!ext) ext = createExtFn(*bucket);
 
-                    t0 = std::chrono::steady_clock::now();
+                    t0 = now();
                     auto ext_contents = codec_.decodeBucket(*ext);
                     trackTime(decode_count_, decode_total_ns_, t0);
 
@@ -304,7 +304,7 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
                         [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
                     ext_contents.keys.insert(ext_it, std::move(spilled));
 
-                    t0 = std::chrono::steady_clock::now();
+                    t0 = now();
                     codec_.encodeBucket(*ext, ext_contents);
                     trackTime(encode_count_, encode_total_ns_, t0);
                     return true;
@@ -332,14 +332,14 @@ bool DeltaHashTable::findAllByHash(uint32_t bi, uint64_t suffix,
     // buckets.  Keep the existing manual walk for this case.
     const Bucket* bucket = &buckets_[bi];
     while (bucket) {
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = now();
         auto scan = codec_.decodeSuffixes(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
 
         auto it = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
         if (it != scan.suffixes.end() && *it == suffix) {
             size_t idx = it - scan.suffixes.begin();
-            t0 = std::chrono::steady_clock::now();
+            t0 = now();
             auto key = codec_.decodeKeyAt(*bucket, static_cast<uint16_t>(idx),
                                           suffix, scan.data_start_bit);
             trackTime(decode_count_, decode_total_ns_, t0);
@@ -367,14 +367,14 @@ bool DeltaHashTable::findBestInChain(uint32_t bi, uint64_t suffix,
 
     const Bucket* bucket = &buckets_[bi];
     while (bucket) {
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = now();
         auto scan = codec_.decodeSuffixes(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
 
         auto it = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
         if (it != scan.suffixes.end() && *it == suffix) {
             uint16_t idx = static_cast<uint16_t>(it - scan.suffixes.begin());
-            t0 = std::chrono::steady_clock::now();
+            t0 = now();
             auto key = codec_.decodeKeyAt(*bucket, idx, suffix, scan.data_start_bit);
             trackTime(decode_count_, decode_total_ns_, t0);
 
@@ -442,7 +442,7 @@ void DeltaHashTable::forEach(
         const Bucket* b = &buckets_[bi];
         if (isEmptyBucket(*b) && !nextBucket(*b)) continue;
         while (b) {
-            auto t0 = std::chrono::steady_clock::now();
+            auto t0 = now();
             auto contents = codec_.decodeBucket(*b);
             trackTime(decode_count_, decode_total_ns_, t0);
 
@@ -472,7 +472,7 @@ void DeltaHashTable::forEachGroup(
 
         const Bucket* b = first;
         while (b) {
-            auto t0 = std::chrono::steady_clock::now();
+            auto t0 = now();
             auto contents = codec_.decodeBucket(*b);
             trackTime(decode_count_, decode_total_ns_, t0);
 
@@ -552,7 +552,7 @@ void DeltaHashTable::initBucket(Bucket& bucket) {
 void DeltaHashTable::pruneEmptyExtension(Bucket* bucket) {
     Bucket* ext = nextBucketMut(*bucket);
     if (!ext) return;
-    auto t0 = std::chrono::steady_clock::now();
+    auto t0 = now();
     auto contents = codec_.decodeBucket(*ext);
     trackTime(decode_count_, decode_total_ns_, t0);
     if (contents.keys.empty() && !nextBucket(*ext)) {

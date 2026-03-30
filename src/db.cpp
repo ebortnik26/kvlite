@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -82,7 +81,7 @@ void DB::initWriteBuffer(const Options& options) {
     wb_opts.flush_depth = options.flush_depth;
 
     auto flush_fn = [this](internal::Memtable& mt) -> Status {
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = internal::now();
 
         uint32_t seg_id = storage_->allocateSegmentId();
         Status s = storage_->createSegment(seg_id);
@@ -125,7 +124,7 @@ void DB::startDaemons(const Options& options) {
     if (options.savepoint_interval_sec > 0) {
         sp_daemon_ = std::make_unique<internal::PeriodicDaemon>();
         sp_daemon_->start(options.savepoint_interval_sec, [this] {
-            auto t0 = std::chrono::steady_clock::now();
+            auto t0 = internal::now();
             auto seg_ids = storage_->getSegmentIds();
             uint32_t max_seg_id = seg_ids.empty() ? 0 : seg_ids.back();
             global_index_->maybeSavepoint(max_seg_id);
@@ -557,7 +556,7 @@ Status DB::runGC() {
     auto input_ids = selectGCInputs();
     if (input_ids.empty()) return Status::OK();
 
-    auto t0 = std::chrono::steady_clock::now();
+    auto t0 = internal::now();
 
     Status s = mergeSegments(input_ids);
     if (!s.ok()) return s;

@@ -1,7 +1,6 @@
 #include "internal/write_buffer.h"
 
 #include <cassert>
-#include <chrono>
 
 #include "internal/profiling.h"
 
@@ -34,7 +33,7 @@ void WriteBuffer::put(const std::string& key, uint64_t version,
     std::unique_lock<std::mutex> lock(mu_);
 
     if (immutables_.size() >= opts_.flush_depth - 1 && !stop_) {
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = now();
         stall_cv_.wait(lock, [this] {
             return immutables_.size() < opts_.flush_depth - 1 || stop_;
         });
@@ -52,7 +51,7 @@ void WriteBuffer::putBatch(const std::vector<Memtable::BatchOp>& ops,
     std::unique_lock<std::mutex> lock(mu_);
 
     if (immutables_.size() >= opts_.flush_depth - 1 && !stop_) {
-        auto t0 = std::chrono::steady_clock::now();
+        auto t0 = now();
         stall_cv_.wait(lock, [this] {
             return immutables_.size() < opts_.flush_depth - 1 || stop_;
         });

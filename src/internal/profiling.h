@@ -8,6 +8,11 @@
 namespace kvlite {
 namespace internal {
 
+// Profiling timestamp — call before the operation being timed.
+inline std::chrono::steady_clock::time_point now() {
+    return std::chrono::steady_clock::now();
+}
+
 // Record elapsed time since t0 into (count, total) atomics.
 // Duration selects the time unit (nanoseconds, microseconds, etc.).
 template<typename Duration = std::chrono::nanoseconds>
