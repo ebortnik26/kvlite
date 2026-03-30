@@ -542,6 +542,99 @@ TEST(ReadOnlyDHTOverflow, FindFirstSingleEntryPerBucket) {
     EXPECT_EQ(packed_version, 20u);
 }
 
+// findFirst must return the highest version across the ENTIRE bucket chain,
+// not just the first bucket that contains the suffix.  Regression test for
+// a bug where findKeyInChain stopped at the first match.
+TEST(ReadOnlyDHTOverflow, FindFirstWalksFullChain) {
+    ReadOnlyDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 32;  // tiny buckets → many extensions
+    ReadOnlyDeltaHashTable dht(cfg);
+
+    uint64_t hkey = H("chain_key");
+
+    // Insert versions 1..50.  With 32-byte buckets, entries spill across
+    // many extension buckets.  The highest version (50) may land in any bucket.
+    for (int i = 1; i <= 50; ++i) {
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    uint64_t pv;
+    uint32_t id;
+    ASSERT_TRUE(dht.findFirst(hkey, pv, id));
+    EXPECT_EQ(pv, 50u) << "findFirst must return highest version across all buckets";
+    EXPECT_EQ(id, 50u);
+}
+
+// findFirstBounded must return the highest version <= bound, even when
+// the key spans multiple extension buckets.
+TEST(ReadOnlyDHTOverflow, FindFirstBoundedAcrossChain) {
+    ReadOnlyDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 32;
+    ReadOnlyDeltaHashTable dht(cfg);
+
+    uint64_t hkey = H("bounded_key");
+    for (int i = 1; i <= 50; ++i) {
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    // Bound at 35 — should return version 35, not the first version found
+    // in the primary bucket that happens to be <= 35.
+    uint64_t pv;
+    uint32_t id;
+    ASSERT_TRUE(dht.findFirstBounded(hkey, 35, pv, id));
+    EXPECT_EQ(pv, 35u);
+    EXPECT_EQ(id, 35u);
+
+    // Bound at 1 — should return version 1.
+    ASSERT_TRUE(dht.findFirstBounded(hkey, 1, pv, id));
+    EXPECT_EQ(pv, 1u);
+
+    // Bound at 0 — no version <= 0.
+    EXPECT_FALSE(dht.findFirstBounded(hkey, 0, pv, id));
+}
+
+// Same tests on ReadWriteDeltaHashTable (locked path).
+TEST(ReadWriteDHT, FindFirstWalksFullChain) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 32;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    uint64_t hkey = H("rw_chain");
+    for (int i = 1; i <= 50; ++i) {
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    uint64_t pv;
+    uint32_t id;
+    ASSERT_TRUE(dht.findFirst(hkey, pv, id));
+    EXPECT_EQ(pv, 50u);
+}
+
+TEST(ReadWriteDHT, FindFirstBoundedAcrossChain) {
+    DeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 32;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    uint64_t hkey = H("rw_bounded");
+    for (int i = 1; i <= 50; ++i) {
+        dht.addEntry(hkey, static_cast<uint64_t>(i), static_cast<uint32_t>(i));
+    }
+
+    uint64_t pv;
+    uint32_t id;
+    ASSERT_TRUE(dht.findFirstBounded(hkey, 35, pv, id));
+    EXPECT_EQ(pv, 35u);
+
+    ASSERT_TRUE(dht.findFirstBounded(hkey, 1, pv, id));
+    EXPECT_EQ(pv, 1u);
+
+    EXPECT_FALSE(dht.findFirstBounded(hkey, 0, pv, id));
+}
+
 // ============================================================
 // findAll ordering across overflow chains
 // ============================================================
