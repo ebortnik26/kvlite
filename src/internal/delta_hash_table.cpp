@@ -126,98 +126,74 @@ bool DeltaHashTable::containsByHash(uint32_t bi, uint64_t suffix) const {
     return false;
 }
 
+// --- addToChain helpers ---
+
+bool DeltaHashTable::suffixExistsInChain(uint32_t bi, uint64_t suffix) const {
+    const Bucket* scan = &buckets_[bi];
+    while (scan) {
+        auto t0 = now();
+        auto result = codec_.decodeSuffixes(*scan);
+        trackTime(decode_count_, decode_total_ns_, t0);
+        if (std::binary_search(result.suffixes.begin(),
+                               result.suffixes.end(), suffix))
+            return true;
+        scan = nextBucket(*scan);
+    }
+    return false;
+}
+
+bool DeltaHashTable::tryInsertAndEncode(Bucket& bucket,
+                                         BucketContents& contents) {
+    if (codec_.contentsBitsNeeded(contents) <= codec_.bucketDataBits()) {
+        auto t0 = now();
+        codec_.encodeBucket(bucket, contents);
+        trackTime(encode_count_, encode_total_ns_, t0);
+        return true;
+    }
+    return false;
+}
+
 // --- addToChain ---
 
 bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
                                  uint64_t packed_version, uint32_t id,
                                  const std::function<Bucket*(Bucket&)>& createExtFn) {
     Bucket* bucket = &buckets_[bi];
-    assert(bucket->data != nullptr && "primary bucket->data null in addToChain");
     bool is_new = true;
 
     while (true) {
-        assert(bucket->data != nullptr && "bucket->data null at top of addToChain loop");
+        assert(bucket->data != nullptr);
         auto t0 = now();
-        auto scan = codec_.decodeSuffixes(*bucket);
+        auto contents = codec_.decodeBucket(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
 
-        auto sit = std::lower_bound(scan.suffixes.begin(), scan.suffixes.end(), suffix);
-        bool suffix_found = (sit != scan.suffixes.end() && *sit == suffix);
+        auto it = std::lower_bound(contents.keys.begin(), contents.keys.end(),
+            suffix, [](const KeyEntry& e, uint64_t s) { return e.suffix < s; });
 
-        if (suffix_found) {
+        if (it != contents.keys.end() && it->suffix == suffix) {
+            // Existing key — add version in descending order.
             is_new = false;
-
-            // Single full decode replaces decodeKeyAt + decodeBucketUsedBits
-            // + bitsForAddVersion + decodeBucket.
-            t0 = now();
-            auto contents = codec_.decodeBucket(*bucket);
-            trackTime(decode_count_, decode_total_ns_, t0);
-
-            auto cit = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
-                [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
-            auto vpos = std::lower_bound(cit->packed_versions.begin(),
-                                         cit->packed_versions.end(),
-                                         packed_version,
-                                         std::greater<uint64_t>());
-            size_t vi = vpos - cit->packed_versions.begin();
-            cit->packed_versions.insert(vpos, packed_version);
-            cit->ids.insert(cit->ids.begin() + vi, id);
-
-            if (codec_.contentsBitsNeeded(contents) <= codec_.bucketDataBits()) {
-                t0 = now();
-                codec_.encodeBucket(*bucket, contents);
-                trackTime(encode_count_, encode_total_ns_, t0);
-                return is_new;
-            }
-
-            // Doesn't fit — discard local contents, move to extension.
-            Bucket* ext = nextBucketMut(*bucket);
-            if (!ext) ext = createExtFn(*bucket);
-            assert(ext->data != nullptr && "ext->data null after suffix_found spill in addToChain");
-            bucket = ext;
+            auto vpos = std::lower_bound(it->packed_versions.begin(),
+                it->packed_versions.end(), packed_version, std::greater<uint64_t>());
+            size_t vi = vpos - it->packed_versions.begin();
+            it->packed_versions.insert(vpos, packed_version);
+            it->ids.insert(it->ids.begin() + vi, id);
         } else {
-            if (is_new) {
-                const Bucket* check = nextBucket(*bucket);
-                while (check) {
-                    t0 = now();
-                    auto check_scan = codec_.decodeSuffixes(*check);
-                    trackTime(decode_count_, decode_total_ns_, t0);
-                    if (std::binary_search(check_scan.suffixes.begin(),
-                                           check_scan.suffixes.end(), suffix)) {
-                        is_new = false;
-                        break;
-                    }
-                    check = nextBucket(*check);
-                }
-            }
-
-            // Single full decode replaces decodeBucketUsedBits +
-            // bitsForNewEntry + decodeBucket.
-            t0 = now();
-            auto contents = codec_.decodeBucket(*bucket);
-            trackTime(decode_count_, decode_total_ns_, t0);
-
-            auto cit = std::lower_bound(contents.keys.begin(), contents.keys.end(), suffix,
-                [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
-            KeyEntry new_entry;
-            new_entry.suffix = suffix;
-            new_entry.packed_versions.push_back(packed_version);
-            new_entry.ids.push_back(id);
-            contents.keys.insert(cit, std::move(new_entry));
-
-            if (codec_.contentsBitsNeeded(contents) <= codec_.bucketDataBits()) {
-                t0 = now();
-                codec_.encodeBucket(*bucket, contents);
-                trackTime(encode_count_, encode_total_ns_, t0);
-                return is_new;
-            }
-
-            // Doesn't fit — discard local contents, move to extension.
-            Bucket* ext = nextBucketMut(*bucket);
-            if (!ext) ext = createExtFn(*bucket);
-            assert(ext->data != nullptr && "ext->data null after new-key spill in addToChain");
-            bucket = ext;
+            // New suffix in this bucket — check rest of chain for is_new.
+            if (is_new) is_new = !suffixExistsInChain(bi, suffix);
+            KeyEntry entry;
+            entry.suffix = suffix;
+            entry.packed_versions.push_back(packed_version);
+            entry.ids.push_back(id);
+            contents.keys.insert(it, std::move(entry));
         }
+
+        if (tryInsertAndEncode(*bucket, contents)) return is_new;
+
+        // Doesn't fit — discard local contents, advance to extension.
+        Bucket* ext = nextBucketMut(*bucket);
+        if (!ext) ext = createExtFn(*bucket);
+        bucket = ext;
     }
 }
 
@@ -258,6 +234,47 @@ bool DeltaHashTable::removeFromChain(uint32_t bi, uint64_t suffix,
     return isSuffixEmpty(bi, suffix);
 }
 
+// --- splitKeyAcrossBucket ---
+
+void DeltaHashTable::splitKeyAcrossBucket(
+        KeyEntry& key, Bucket& bucket,
+        const std::function<Bucket*(Bucket&)>& /*createExtFn*/) {
+    // Binary search for the max version count that fits alone.
+    size_t lo = 1, hi = key.packed_versions.size();
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo + 1) / 2;
+        BucketContents probe;
+        KeyEntry trial;
+        trial.suffix = key.suffix;
+        trial.packed_versions.assign(
+            key.packed_versions.begin(), key.packed_versions.begin() + mid);
+        trial.ids.assign(key.ids.begin(), key.ids.begin() + mid);
+        probe.keys.push_back(std::move(trial));
+        if (codec_.contentsBitsNeeded(probe) <= codec_.bucketDataBits())
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+
+    // Encode the first `lo` versions into bucket.
+    KeyEntry head;
+    head.suffix = key.suffix;
+    head.packed_versions.assign(
+        key.packed_versions.begin(), key.packed_versions.begin() + lo);
+    head.ids.assign(key.ids.begin(), key.ids.begin() + lo);
+
+    BucketContents tc;
+    tc.keys.push_back(std::move(head));
+    auto t0 = now();
+    codec_.encodeBucket(bucket, tc);
+    trackTime(encode_count_, encode_total_ns_, t0);
+
+    // Trim key to the remaining versions.
+    key.packed_versions.erase(key.packed_versions.begin(),
+                               key.packed_versions.begin() + lo);
+    key.ids.erase(key.ids.begin(), key.ids.begin() + lo);
+}
+
 // --- insertKeyIntoExtChain ---
 
 Bucket* DeltaHashTable::insertKeyIntoExtChain(
@@ -279,7 +296,7 @@ Bucket* DeltaHashTable::insertKeyIntoExtChain(
 
         auto ti = std::lower_bound(tc.keys.begin(), tc.keys.end(), remaining.suffix,
             [](const KeyEntry& e, uint64_t s) { return e.suffix < s; });
-        tc.keys.insert(ti, remaining);
+        ti = tc.keys.insert(ti, std::move(remaining));  // move in
 
         if (codec_.contentsBitsNeeded(tc) <= codec_.bucketDataBits()) {
             t0 = now();
@@ -288,42 +305,12 @@ Bucket* DeltaHashTable::insertKeyIntoExtChain(
             return target;
         }
 
-        // Doesn't fit with all versions. If this is a fresh bucket
-        // (key is alone), split: keep as many versions as will fit.
+        // Doesn't fit — recover remaining from the inserted position.
+        remaining = std::move(*ti);
+
+        // If the key is alone in the bucket, split its version list.
         if (tc.keys.size() == 1) {
-            // Binary search for the max versions that fit.
-            auto& sole = tc.keys[0];
-            size_t lo = 1, hi = sole.packed_versions.size();
-            while (lo < hi) {
-                size_t mid = lo + (hi - lo + 1) / 2;
-                KeyEntry trial;
-                trial.suffix = sole.suffix;
-                trial.packed_versions.assign(
-                    sole.packed_versions.begin(), sole.packed_versions.begin() + mid);
-                trial.ids.assign(sole.ids.begin(), sole.ids.begin() + mid);
-                BucketContents probe;
-                probe.keys.push_back(std::move(trial));
-                if (codec_.contentsBitsNeeded(probe) <= codec_.bucketDataBits())
-                    lo = mid;
-                else
-                    hi = mid - 1;
-            }
-            // Encode first `lo` versions here, carry the rest.
-            KeyEntry head;
-            head.suffix = sole.suffix;
-            head.packed_versions.assign(
-                sole.packed_versions.begin(), sole.packed_versions.begin() + lo);
-            head.ids.assign(sole.ids.begin(), sole.ids.begin() + lo);
-
-            remaining.packed_versions.assign(
-                sole.packed_versions.begin() + lo, sole.packed_versions.end());
-            remaining.ids.assign(sole.ids.begin() + lo, sole.ids.end());
-
-            tc.keys[0] = std::move(head);
-            t0 = now();
-            codec_.encodeBucket(*target, tc);
-            trackTime(encode_count_, encode_total_ns_, t0);
-
+            splitKeyAcrossBucket(remaining, *target, createExtFn);
             // Advance to next extension for the remaining versions.
             Bucket* next = nextBucketMut(*target);
             if (!next) next = createExtFn(*target);
@@ -332,11 +319,7 @@ Bucket* DeltaHashTable::insertKeyIntoExtChain(
             continue;
         }
 
-        // Multiple keys — key doesn't fit alongside others.
-        // Remove and try the next extension.
-        ti = std::lower_bound(tc.keys.begin(), tc.keys.end(), remaining.suffix,
-            [](const KeyEntry& e, uint64_t s) { return e.suffix < s; });
-        tc.keys.erase(ti);
+        // Multiple keys — doesn't fit alongside others.
         Bucket* next = nextBucketMut(*target);
         if (!next) next = createExtFn(*target);
         target = next;

@@ -159,6 +159,13 @@ protected:
                     uint64_t packed_version, uint32_t id,
                     const std::function<Bucket*(Bucket&)>& createExtFn);
 
+    // Check if suffix exists anywhere in the bucket chain starting at bi.
+    bool suffixExistsInChain(uint32_t bi, uint64_t suffix) const;
+
+    // Try to insert entry into bucket. If it fits, encode and return true.
+    // If it doesn't fit, leave bucket unchanged and return false.
+    bool tryInsertAndEncode(Bucket& bucket, BucketContents& contents);
+
     bool removeFromChain(uint32_t bi, uint64_t suffix,
                          uint64_t packed_version, uint32_t id);
 
@@ -171,6 +178,11 @@ protected:
     // Returns the bucket into which the key was inserted.
     Bucket* insertKeyIntoExtChain(Bucket* start, const KeyEntry& key,
                                    const std::function<Bucket*(Bucket&)>& createExtFn);
+
+    // Split a key's version list: encode the max fitting prefix into
+    // `bucket`, leave the rest in `key` for the next extension.
+    void splitKeyAcrossBucket(KeyEntry& key, Bucket& bucket,
+                               const std::function<Bucket*(Bucket&)>& createExtFn);
 
     // --- Bulk helpers ---
 

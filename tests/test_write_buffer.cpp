@@ -1277,3 +1277,32 @@ TEST(WriteBufferOrchestrator, PreSealLargeRecordAfterSmall) {
     // At minimum, the writes didn't crash.
 }
 
+TEST(WriteBufferOrchestrator, PreSealBatchOverflow) {
+    constexpr size_t kMTSize = 512;
+    std::atomic<int> flush_count{0};
+
+    WriteBuffer wb(
+        wbOpts(kMTSize, /*flush_depth=*/3),
+        [&](Memtable& mt) -> kvlite::Status {
+            flush_count.fetch_add(1);
+            return kvlite::Status::OK();
+        });
+
+    // Fill most of the memtable.
+    wb.put("seed", 1, std::string(200, 's'), false);
+
+    // Now a batch whose total size exceeds remaining capacity.
+    // Pre-seal must trigger before the batch write.
+    std::string k1("bk1"), k2("bk2"), k3("bk3");
+    std::string v1(100, '1'), v2(100, '2'), v3(100, '3');
+    std::vector<Memtable::BatchOp> ops = {
+        {&k1, &v1, false},
+        {&k2, &v2, false},
+        {&k3, &v3, false},
+    };
+    wb.putBatch(ops, 2);
+
+    wb.drainFlush();
+    EXPECT_GE(flush_count.load(), 1);
+}
+
