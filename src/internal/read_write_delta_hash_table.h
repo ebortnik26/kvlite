@@ -7,7 +7,6 @@
 #include <memory>
 #include <vector>
 
-#include "internal/bitmap.h"
 #include "internal/delta_hash_table.h"
 #include "internal/log_entry.h"
 #include "internal/spinlock.h"
@@ -66,14 +65,6 @@ public:
 
     bool contains(uint64_t hash) const;
 
-    // Prune stale versions from all flagged buckets. For each key with
-    // multiple versions, keeps only the versions visible at the given
-    // snapshot observation points. Returns the number of entries removed.
-    size_t pruneStaleVersions(const std::vector<uint64_t>& snapshot_versions);
-
-    // Average bucket utilization (used bits / total capacity bits), 0.0–1.0.
-    double bucketUtilization() const;
-
     size_t size() const;
     size_t memoryUsage() const;
     void clear();
@@ -96,12 +87,7 @@ private:
     bool addImpl(uint32_t bi, uint64_t suffix,
                  uint64_t packed_version, uint32_t id);
 
-    // Pruning helpers.
-    std::vector<KeyEntry> gatherBucketKeys(uint32_t bi) const;
-    void rewriteBucket(uint32_t bi, const std::vector<KeyEntry>& keys);
-
     std::unique_ptr<Spinlock[]> bucket_locks_;
-    Bitmap multi_version_;  // 1 bit per bucket: set when a key gains 2nd version
     BucketArena ext_arena_owned_;
     std::atomic<size_t> size_{0};
 };

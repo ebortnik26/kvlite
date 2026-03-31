@@ -169,7 +169,6 @@ protected:
     // --- Bulk helpers ---
 
     void clearBuckets();
-    void clearBucketChain(uint32_t bi);
     void loadArenaData(const uint8_t* data, size_t len);
 
     // --- Members ---
