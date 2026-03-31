@@ -131,12 +131,20 @@ void DB::startDaemons(const Options& options) {
             trackTime<std::chrono::microseconds>(savepoint_count_, savepoint_total_us_, t0);
         });
     }
+
+    if (options.version_prune_interval_sec > 0) {
+        prune_daemon_ = std::make_unique<internal::PeriodicDaemon>();
+        prune_daemon_->start(options.version_prune_interval_sec, [this] {
+            global_index_->pruneStaleVersions(versions_->snapshotVersions());
+        });
+    }
 }
 
 void DB::teardown() {
     write_buffer_.reset();
     gc_daemon_.reset();
     sp_daemon_.reset();
+    prune_daemon_.reset();
     if (global_index_) { global_index_->close(); global_index_.reset(); }
     if (storage_)      { storage_->close(); storage_.reset(); }
     if (versions_)     { versions_->close(); versions_.reset(); }

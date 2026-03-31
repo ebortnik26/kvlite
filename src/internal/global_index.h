@@ -130,6 +130,13 @@ public:
     size_t entryCount() const;
     size_t memoryUsage() const;
 
+    // Prune stale versions from the in-memory index. Keeps only versions
+    // visible at the given snapshot observation points. Returns entries removed.
+    size_t pruneStaleVersions(const std::vector<uint64_t>& snapshot_versions);
+
+    // Average primary bucket utilization (0.0–1.0).
+    double bucketUtilization() const;
+
     // Fraction of key groups with more than one version (0.0–1.0).
     double estimateDeadRatio() const;
 

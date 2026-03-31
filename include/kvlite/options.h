@@ -50,6 +50,12 @@ struct Options {
     // Default: 10
     uint32_t savepoint_interval_sec = 10;
 
+    // Seconds between version pruning daemon wake-ups (0 = disable).
+    // The daemon eliminates stale GlobalIndex versions not visible to any
+    // active snapshot, reducing memory usage without touching segment files.
+    // Default: 30
+    uint32_t version_prune_interval_sec = 30;
+
     // --- Garbage Collection Options ---
 
     // Policy for selecting log files to compact

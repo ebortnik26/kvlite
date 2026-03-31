@@ -300,6 +300,14 @@ size_t GlobalIndex::memoryUsage() const {
     return dht_.memoryUsage();
 }
 
+size_t GlobalIndex::pruneStaleVersions(const std::vector<uint64_t>& snapshot_versions) {
+    return dht_.pruneStaleVersions(snapshot_versions);
+}
+
+double GlobalIndex::bucketUtilization() const {
+    return dht_.bucketUtilization();
+}
+
 double GlobalIndex::estimateDeadRatio() const {
     size_t total_groups = 0;
     size_t multi_version_groups = 0;

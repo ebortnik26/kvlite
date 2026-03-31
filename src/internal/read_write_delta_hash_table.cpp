@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cstring>
 
+#include "internal/profiling.h"
+#include "internal/version_dedup.h"
+
 namespace kvlite {
 namespace internal {
 
@@ -11,6 +14,7 @@ ReadWriteDeltaHashTable::ReadWriteDeltaHashTable()
 
 ReadWriteDeltaHashTable::ReadWriteDeltaHashTable(const Config& config)
     : DeltaHashTable(config),
+      multi_version_(1u << config.bucket_bits),
       ext_arena_owned_(sizeof(Bucket) + bucketStride(), /*concurrent=*/true) {
     ext_arena_ = &ext_arena_owned_;
     bucket_locks_ = std::make_unique<Spinlock[]>(1u << config.bucket_bits);
@@ -105,6 +109,7 @@ bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint64_t suffix,
             return createExtension(bucket);
         });
     size_.fetch_add(1, std::memory_order_relaxed);
+    if (!is_new) multi_version_.set(bi);
     return is_new;
 }
 
@@ -124,12 +129,151 @@ size_t ReadWriteDeltaHashTable::addEntriesBatch(
                     return createExtension(bucket);
                 });
             if (is_new) ++new_keys;
+            else multi_version_.set(bi);
             ++j;
         }
         size_.fetch_add(j - i, std::memory_order_relaxed);
         i = j;
     }
     return new_keys;
+}
+
+// --- Pruning ---
+
+// Gather all keys from a bucket chain, merging entries that span extensions.
+std::vector<KeyEntry> ReadWriteDeltaHashTable::gatherBucketKeys(uint32_t bi) const {
+    std::vector<KeyEntry> all_keys;
+    const Bucket* b = &buckets_[bi];
+    while (b) {
+        auto contents = codec_.decodeBucket(*b);
+        for (auto& key : contents.keys) {
+            auto it = std::lower_bound(all_keys.begin(), all_keys.end(),
+                key.suffix, [](const KeyEntry& e, uint64_t s) {
+                    return e.suffix < s;
+                });
+            if (it != all_keys.end() && it->suffix == key.suffix) {
+                it->packed_versions.insert(it->packed_versions.end(),
+                    key.packed_versions.begin(), key.packed_versions.end());
+                it->ids.insert(it->ids.end(),
+                    key.ids.begin(), key.ids.end());
+            } else {
+                all_keys.insert(it, std::move(key));
+            }
+        }
+        b = nextBucket(*b);
+    }
+    // Sort each key's versions descending (may be unsorted after merge).
+    for (auto& key : all_keys) {
+        if (key.packed_versions.size() > 1) {
+            // Sort (pv, id) pairs by pv descending.
+            std::vector<std::pair<uint64_t, uint32_t>> pairs(key.packed_versions.size());
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                pairs[i] = {key.packed_versions[i], key.ids[i]};
+            }
+            std::sort(pairs.begin(), pairs.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (size_t i = 0; i < pairs.size(); ++i) {
+                key.packed_versions[i] = pairs[i].first;
+                key.ids[i] = pairs[i].second;
+            }
+        }
+    }
+
+    return all_keys;
+}
+
+// Dedup one key's versions against snapshot observation points.
+// Returns number of entries removed. Updates key in place.
+static size_t dedupKeyVersions(KeyEntry& key,
+                               const std::vector<uint64_t>& snapshot_versions) {
+    size_t n = key.packed_versions.size();
+    std::vector<uint64_t> vers_asc(n);
+    for (size_t i = 0; i < n; ++i) {
+        vers_asc[i] = PackedVersion(key.packed_versions[n - 1 - i]).version();
+    }
+
+    std::unique_ptr<bool[]> keep(new bool[n]);
+    dedupVersionGroup(vers_asc.data(), n, snapshot_versions, keep.get());
+
+    std::vector<uint64_t> new_pvs;
+    std::vector<uint32_t> new_ids;
+    size_t removed = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (keep[n - 1 - i]) {
+            new_pvs.push_back(key.packed_versions[i]);
+            new_ids.push_back(key.ids[i]);
+        } else {
+            ++removed;
+        }
+    }
+    key.packed_versions = std::move(new_pvs);
+    key.ids = std::move(new_ids);
+    return removed;
+}
+
+// Re-encode a bucket chain from a list of keys.
+void ReadWriteDeltaHashTable::rewriteBucket(uint32_t bi,
+                                             const std::vector<KeyEntry>& keys) {
+    clearBucketChain(bi);
+    for (const auto& key : keys) {
+        for (size_t i = 0; i < key.packed_versions.size(); ++i) {
+            addToChain(bi, key.suffix, key.packed_versions[i], key.ids[i],
+                [this](Bucket& bucket) -> Bucket* {
+                    return createExtension(bucket);
+                });
+        }
+    }
+}
+
+size_t ReadWriteDeltaHashTable::pruneStaleVersions(
+        const std::vector<uint64_t>& snapshot_versions) {
+    uint32_t num_buckets = 1u << config_.bucket_bits;
+    size_t total_removed = 0;
+
+    for (uint32_t bi = 0; bi < num_buckets; ++bi) {
+        if (!multi_version_.test(bi)) continue;
+
+        SpinlockGuard guard(bucket_locks_[bi]);
+
+        auto t0 = now();
+        auto all_keys = gatherBucketKeys(bi);
+        trackTime(decode_count_, decode_total_ns_, t0);
+
+        size_t removed = 0;
+        bool still_multi = false;
+        for (auto& key : all_keys) {
+            if (key.packed_versions.size() > 1) {
+                removed += dedupKeyVersions(key, snapshot_versions);
+            }
+            if (key.packed_versions.size() > 1) still_multi = true;
+        }
+
+        if (removed > 0) {
+            rewriteBucket(bi, all_keys);
+            total_removed += removed;
+            size_.fetch_sub(removed, std::memory_order_relaxed);
+        }
+
+        if (still_multi) multi_version_.set(bi); else multi_version_.clear(bi);
+    }
+
+    return total_removed;
+}
+
+double ReadWriteDeltaHashTable::bucketUtilization() const {
+    uint32_t num_buckets = 1u << config_.bucket_bits;
+    size_t capacity_bits = static_cast<size_t>(num_buckets) * codec_.bucketDataBits();
+    if (capacity_bits == 0) return 0.0;
+
+    // Scan primary buckets only (no extensions, no locks).
+    // Called infrequently for stats reporting. The read is racy but
+    // decodeBucketUsedBits only reads the bucket's num_keys field,
+    // which is always consistent within a single bucket.
+    uint64_t total = 0;
+    for (uint32_t bi = 0; bi < num_buckets; ++bi) {
+        total += codec_.decodeBucketUsedBits(buckets_[bi]);
+    }
+    return static_cast<double>(total) / capacity_bits;
 }
 
 // --- Stats ---

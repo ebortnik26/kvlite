@@ -508,6 +508,13 @@ size_t DeltaHashTable::memoryUsage() const {
     return buckets_.size() * stride + ext_arena_->dataBytes();
 }
 
+void DeltaHashTable::clearBucketChain(uint32_t bi) {
+    // Note: extension buckets from the old chain are not freed (arena doesn't support per-slot free).
+    // They will be reclaimed on full clear or DB close.
+    setExtensionPtr(buckets_[bi], 0);
+    initBucket(buckets_[bi]);
+}
+
 void DeltaHashTable::clearBuckets() {
     for (auto& bucket : buckets_) {
         setExtensionPtr(bucket, 0);

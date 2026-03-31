@@ -191,6 +191,7 @@ private:
 
     std::unique_ptr<internal::PeriodicDaemon> gc_daemon_;
     std::unique_ptr<internal::PeriodicDaemon> sp_daemon_;
+    std::unique_ptr<internal::PeriodicDaemon> prune_daemon_;
 
     // Background operation counters (updated from bg threads)
     std::atomic<uint64_t> flush_count_{0};
