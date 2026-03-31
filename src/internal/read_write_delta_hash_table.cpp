@@ -15,7 +15,6 @@ ReadWriteDeltaHashTable::ReadWriteDeltaHashTable()
 ReadWriteDeltaHashTable::ReadWriteDeltaHashTable(const Config& config)
     : DeltaHashTable(config),
       multi_version_(1u << config.bucket_bits),
-      used_bits_(1u << config.bucket_bits),
       ext_arena_owned_(sizeof(Bucket) + bucketStride(), /*concurrent=*/true) {
     ext_arena_ = &ext_arena_owned_;
     bucket_locks_ = std::make_unique<Spinlock[]>(1u << config.bucket_bits);
@@ -85,7 +84,6 @@ bool ReadWriteDeltaHashTable::removeEntry(uint64_t hash,
     SpinlockGuard guard(bucket_locks_[bi]);
     bool group_empty = removeFromChain(bi, suffix, packed_version, id);
     size_.fetch_sub(1, std::memory_order_relaxed);
-    updateUsedBits(bi);
     return group_empty;
 }
 
@@ -96,16 +94,10 @@ bool ReadWriteDeltaHashTable::updateEntryId(uint64_t hash,
     uint64_t suffix = suffixFromHash(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
-    bool found = updateIdInChain(bi, suffix, packed_version, old_id, new_id,
+    return updateIdInChain(bi, suffix, packed_version, old_id, new_id,
         [this](Bucket& bucket) -> Bucket* {
             return createExtension(bucket);
         });
-    updateUsedBits(bi);
-    return found;
-}
-
-void ReadWriteDeltaHashTable::updateUsedBits(uint32_t bi) {
-    used_bits_.set(bi, static_cast<uint16_t>(codec_.decodeBucketUsedBits(buckets_[bi])));
 }
 
 bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint64_t suffix,
@@ -118,7 +110,6 @@ bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint64_t suffix,
         });
     size_.fetch_add(1, std::memory_order_relaxed);
     if (!is_new) multi_version_.set(bi);
-    updateUsedBits(bi);
     return is_new;
 }
 
@@ -142,7 +133,6 @@ size_t ReadWriteDeltaHashTable::addEntriesBatch(
             ++j;
         }
         size_.fetch_add(j - i, std::memory_order_relaxed);
-        updateUsedBits(bi);
         i = j;
     }
     return new_keys;
@@ -233,7 +223,6 @@ void ReadWriteDeltaHashTable::rewriteBucket(uint32_t bi,
                 });
         }
     }
-    updateUsedBits(bi);
 }
 
 size_t ReadWriteDeltaHashTable::pruneStaleVersions(
@@ -275,7 +264,16 @@ double ReadWriteDeltaHashTable::bucketUtilization() const {
     uint32_t num_buckets = 1u << config_.bucket_bits;
     size_t capacity_bits = static_cast<size_t>(num_buckets) * codec_.bucketDataBits();
     if (capacity_bits == 0) return 0.0;
-    return static_cast<double>(used_bits_.sum()) / capacity_bits;
+
+    // Scan primary buckets only (no extensions, no locks).
+    // Called infrequently for stats reporting. The read is racy but
+    // decodeBucketUsedBits only reads the bucket's num_keys field,
+    // which is always consistent within a single bucket.
+    uint64_t total = 0;
+    for (uint32_t bi = 0; bi < num_buckets; ++bi) {
+        total += codec_.decodeBucketUsedBits(buckets_[bi]);
+    }
+    return static_cast<double>(total) / capacity_bits;
 }
 
 // --- Stats ---
