@@ -7,7 +7,7 @@
 #include <memory>
 #include <vector>
 
-#include "internal/bitmap.h"
+#include "internal/bucket_stats.h"
 #include "internal/delta_hash_table.h"
 #include "internal/log_entry.h"
 #include "internal/spinlock.h"
@@ -100,8 +100,11 @@ private:
     std::vector<KeyEntry> gatherBucketKeys(uint32_t bi) const;
     void rewriteBucket(uint32_t bi, const std::vector<KeyEntry>& keys);
 
+    void updateUsedBits(uint32_t bi);
+
     std::unique_ptr<Spinlock[]> bucket_locks_;
-    Bitmap multi_version_;  // 1 bit per bucket: set when a key gains 2nd version
+    BucketBitmap multi_version_;       // 1 bit per bucket: set when key gains 2nd version
+    BucketArray<uint16_t> used_bits_;  // per-bucket: used data bits in primary bucket
     BucketArena ext_arena_owned_;
     std::atomic<size_t> size_{0};
 };
