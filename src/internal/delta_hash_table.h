@@ -166,6 +166,12 @@ protected:
                          uint64_t packed_version, uint32_t old_id, uint32_t new_id,
                          const std::function<Bucket*(Bucket&)>& createExtFn);
 
+    // Insert a KeyEntry into the extension chain starting from `start`.
+    // Walks extensions until it finds one with room, creating as needed.
+    // Returns the bucket into which the key was inserted.
+    Bucket* insertKeyIntoExtChain(Bucket* start, const KeyEntry& key,
+                                   const std::function<Bucket*(Bucket&)>& createExtFn);
+
     // --- Bulk helpers ---
 
     void clearBuckets();

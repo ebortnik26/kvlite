@@ -1226,3 +1226,54 @@ TEST(WriteBufferOrchestrator, ConcurrentReadsWhileFlushing) {
     gf.releaseAll();
 }
 
+// ===========================================================================
+// Pre-seal tests: WriteBuffer must seal before writing if the record
+// would overflow the Memtable data buffer.
+// ===========================================================================
+
+TEST(WriteBufferOrchestrator, PreSealPreventsOverflow) {
+    constexpr size_t kMTSize = 1024;  // tiny memtable
+    std::atomic<int> flush_count{0};
+
+    WriteBuffer wb(
+        wbOpts(kMTSize, /*flush_depth=*/3),
+        [&](Memtable& mt) -> kvlite::Status {
+            flush_count.fetch_add(1);
+            return kvlite::Status::OK();
+        });
+
+    // Write records with ~114 bytes each until well past the memtable
+    // capacity. Must not crash (pre-seal prevents buffer overflow).
+    std::string val(100, 'x');
+    for (int i = 0; i < 200; ++i) {
+        std::string key = "k" + std::to_string(i);
+        wb.put(key, static_cast<uint64_t>(i + 1), val, false);
+    }
+    wb.drainFlush();
+    EXPECT_GT(flush_count.load(), 0) << "should have flushed at least once";
+}
+
+TEST(WriteBufferOrchestrator, PreSealLargeRecordAfterSmall) {
+    constexpr size_t kMTSize = 256;
+    std::atomic<int> flush_count{0};
+
+    WriteBuffer wb(
+        wbOpts(kMTSize, /*flush_depth=*/3),
+        [&](Memtable& mt) -> kvlite::Status {
+            flush_count.fetch_add(1);
+            return kvlite::Status::OK();
+        });
+
+    // Fill most of the memtable with a small record.
+    wb.put("small", 1, std::string(100, 'a'), false);
+
+    // Then a large record that won't fit in the remaining space.
+    // Pre-seal must trigger before writing this record.
+    wb.put("big", 2, std::string(200, 'b'), false);
+
+    wb.drainFlush();
+    EXPECT_GE(flush_count.load(), 1);
+
+    // At minimum, the writes didn't crash.
+}
+

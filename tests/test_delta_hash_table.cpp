@@ -3127,3 +3127,158 @@ TEST(DHTChaos, ConcurrentForEachGroupDuringWrites) {
     stop.store(true, std::memory_order_relaxed);
     reader.join();
 }
+
+// ===========================================================================
+// Spill and overflow tests for updateIdInChain / insertKeyIntoExtChain
+// ===========================================================================
+
+// A single key with many versions triggers the cascade spill in
+// updateIdInChain when the ID change causes the bucket to overflow.
+// After the update, all versions must still be findable.
+TEST(ReadWriteDHT, UpdateIdSpillManyVersionsSameKey) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 128;  // small → forces overflow quickly
+    ReadWriteDeltaHashTable dht(cfg);
+
+    uint64_t hkey = H("hot_key");
+    const int N = 200;
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry(hkey, static_cast<uint64_t>(i * 2),
+                     static_cast<uint32_t>(1));  // all in segment 1
+    }
+    ASSERT_EQ(dht.size(), static_cast<size_t>(N));
+
+    // Update the middle entry's segment ID from 1 to 999.
+    // This can cause a spill if the new ID's delta encoding is larger.
+    bool found = dht.updateEntryId(hkey, 100, 1, 999);
+    EXPECT_TRUE(found);
+    EXPECT_EQ(dht.size(), static_cast<size_t>(N));
+
+    // Verify all N versions are still findable.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
+    ASSERT_EQ(pvs.size(), static_cast<size_t>(N));
+    for (size_t i = 0; i < pvs.size(); ++i) {
+        if (pvs[i] == 100) {
+            EXPECT_EQ(ids[i], 999u) << "updated version should have new ID";
+        } else {
+            EXPECT_EQ(ids[i], 1u) << "non-updated version should keep old ID";
+        }
+    }
+}
+
+// Multiple keys sharing a bucket, each with many versions.
+// Updating one key's ID spills it and potentially others.
+TEST(ReadWriteDHT, UpdateIdSpillMultipleHotKeys) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;     // 16 buckets → many collisions
+    cfg.bucket_bytes = 128;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    // Insert 4 keys that map to the same bucket, each with 40 versions.
+    std::vector<uint64_t> hkeys;
+    for (int k = 0; k < 1000; ++k) {
+        uint64_t h = H("key_" + std::to_string(k));
+        if (hkeys.empty() ||
+            (h >> (64 - cfg.bucket_bits)) ==
+            (hkeys[0] >> (64 - cfg.bucket_bits))) {
+            hkeys.push_back(h);
+            if (hkeys.size() == 4) break;
+        }
+    }
+    ASSERT_EQ(hkeys.size(), 4u) << "couldn't find 4 keys in same bucket";
+
+    for (auto h : hkeys) {
+        for (int v = 1; v <= 40; ++v) {
+            dht.addEntry(h, static_cast<uint64_t>(v * 2), 1);
+        }
+    }
+
+    // Update one entry per key with a very different ID → likely spill.
+    for (auto h : hkeys) {
+        EXPECT_TRUE(dht.updateEntryId(h, 20, 1, 50000));
+    }
+
+    // Verify all entries survive.
+    for (auto h : hkeys) {
+        std::vector<uint64_t> pvs;
+        std::vector<uint32_t> ids;
+        ASSERT_TRUE(dht.findAll(h, pvs, ids));
+        ASSERT_EQ(pvs.size(), 40u);
+        for (size_t i = 0; i < pvs.size(); ++i) {
+            if (pvs[i] == 20)
+                EXPECT_EQ(ids[i], 50000u);
+            else
+                EXPECT_EQ(ids[i], 1u);
+        }
+    }
+}
+
+// Key with enough versions to exceed a single bucket's capacity.
+// insertKeyIntoExtChain must split the version list across buckets.
+TEST(ReadWriteDHT, VersionSplitAcrossBuckets) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 64;  // tiny → forces version splitting
+    ReadWriteDeltaHashTable dht(cfg);
+
+    uint64_t hkey = H("megakey");
+    const int N = 500;  // way more than a 64-byte bucket can hold
+    for (int i = 1; i <= N; ++i) {
+        dht.addEntry(hkey, static_cast<uint64_t>(i * 2), 1);
+    }
+    ASSERT_EQ(dht.size(), static_cast<size_t>(N));
+
+    // Update the first version → triggers spill+split.
+    bool found = dht.updateEntryId(hkey, 2, 1, 42);
+    EXPECT_TRUE(found);
+
+    // All N versions must still be readable.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
+    ASSERT_EQ(pvs.size(), static_cast<size_t>(N));
+
+    // findFirst and findFirstBounded must still work.
+    uint64_t best_pv;
+    uint32_t best_id;
+    ASSERT_TRUE(dht.findFirst(hkey, best_pv, best_id));
+    EXPECT_EQ(best_pv, static_cast<uint64_t>(N * 2));  // highest version
+
+    ASSERT_TRUE(dht.findFirstBounded(hkey, 10, best_pv, best_id));
+    EXPECT_LE(best_pv, 10u);  // bounded by 10
+}
+
+// Extension pointer must survive bucket re-encoding.
+// Fill a bucket to near-capacity, force a re-encode that writes
+// near the extension pointer boundary, then verify the extension
+// pointer is intact.
+TEST(ReadWriteDHT, ExtensionPointerSurvivesReencode) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 64;   // tiny → forces extensions quickly
+    ReadWriteDeltaHashTable dht(cfg);
+
+    uint64_t h1 = H("alpha");
+
+    // Add entries until extensions are created.
+    for (int i = 1; i <= 100; ++i) {
+        dht.addEntry(h1, static_cast<uint64_t>(i), 1);
+    }
+    EXPECT_GT(dht.extCount(), 0u) << "should have extensions";
+
+    // Update IDs back and forth — exercises re-encoding near boundary.
+    for (int round = 0; round < 10; ++round) {
+        uint32_t new_id = static_cast<uint32_t>(100 + round);
+        dht.updateEntryId(h1, 25, (round == 0 ? 1 : 99 + round), new_id);
+    }
+
+    // All entries must still be intact.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(h1, pvs, ids));
+    EXPECT_EQ(pvs.size(), 100u);
+}
+

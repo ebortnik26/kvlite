@@ -258,6 +258,92 @@ bool DeltaHashTable::removeFromChain(uint32_t bi, uint64_t suffix,
     return isSuffixEmpty(bi, suffix);
 }
 
+// --- insertKeyIntoExtChain ---
+
+Bucket* DeltaHashTable::insertKeyIntoExtChain(
+        Bucket* start, const KeyEntry& key,
+        const std::function<Bucket*(Bucket&)>& createExtFn) {
+    Bucket* target = nextBucketMut(*start);
+    if (!target) target = createExtFn(*start);
+
+    // Try to insert the whole key into an existing or new extension.
+    // If the key alone exceeds bucket capacity (many versions), split
+    // its version list across successive extensions.
+    KeyEntry remaining = key;  // versions still to be placed
+
+    while (remaining.packed_versions.size() > 0) {
+        assert(target->data != nullptr);
+        auto t0 = now();
+        auto tc = codec_.decodeBucket(*target);
+        trackTime(decode_count_, decode_total_ns_, t0);
+
+        auto ti = std::lower_bound(tc.keys.begin(), tc.keys.end(), remaining.suffix,
+            [](const KeyEntry& e, uint64_t s) { return e.suffix < s; });
+        tc.keys.insert(ti, remaining);
+
+        if (codec_.contentsBitsNeeded(tc) <= codec_.bucketDataBits()) {
+            t0 = now();
+            codec_.encodeBucket(*target, tc);
+            trackTime(encode_count_, encode_total_ns_, t0);
+            return target;
+        }
+
+        // Doesn't fit with all versions. If this is a fresh bucket
+        // (key is alone), split: keep as many versions as will fit.
+        if (tc.keys.size() == 1) {
+            // Binary search for the max versions that fit.
+            auto& sole = tc.keys[0];
+            size_t lo = 1, hi = sole.packed_versions.size();
+            while (lo < hi) {
+                size_t mid = lo + (hi - lo + 1) / 2;
+                KeyEntry trial;
+                trial.suffix = sole.suffix;
+                trial.packed_versions.assign(
+                    sole.packed_versions.begin(), sole.packed_versions.begin() + mid);
+                trial.ids.assign(sole.ids.begin(), sole.ids.begin() + mid);
+                BucketContents probe;
+                probe.keys.push_back(std::move(trial));
+                if (codec_.contentsBitsNeeded(probe) <= codec_.bucketDataBits())
+                    lo = mid;
+                else
+                    hi = mid - 1;
+            }
+            // Encode first `lo` versions here, carry the rest.
+            KeyEntry head;
+            head.suffix = sole.suffix;
+            head.packed_versions.assign(
+                sole.packed_versions.begin(), sole.packed_versions.begin() + lo);
+            head.ids.assign(sole.ids.begin(), sole.ids.begin() + lo);
+
+            remaining.packed_versions.assign(
+                sole.packed_versions.begin() + lo, sole.packed_versions.end());
+            remaining.ids.assign(sole.ids.begin() + lo, sole.ids.end());
+
+            tc.keys[0] = std::move(head);
+            t0 = now();
+            codec_.encodeBucket(*target, tc);
+            trackTime(encode_count_, encode_total_ns_, t0);
+
+            // Advance to next extension for the remaining versions.
+            Bucket* next = nextBucketMut(*target);
+            if (!next) next = createExtFn(*target);
+            start = target;
+            target = next;
+            continue;
+        }
+
+        // Multiple keys — key doesn't fit alongside others.
+        // Remove and try the next extension.
+        ti = std::lower_bound(tc.keys.begin(), tc.keys.end(), remaining.suffix,
+            [](const KeyEntry& e, uint64_t s) { return e.suffix < s; });
+        tc.keys.erase(ti);
+        Bucket* next = nextBucketMut(*target);
+        if (!next) next = createExtFn(*target);
+        target = next;
+    }
+    return target;
+}
+
 // --- updateIdInChain ---
 
 bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
@@ -267,7 +353,7 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
     Bucket* bucket = &buckets_[bi];
 
     while (bucket) {
-        assert(bucket->data != nullptr && "bucket->data is null in updateIdInChain");
+        assert(bucket->data != nullptr && "bucket->data null in updateIdInChain");
         auto t0 = now();
         auto contents = codec_.decodeBucket(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
@@ -280,26 +366,24 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
                 if (it->packed_versions[j] == packed_version && it->ids[j] == old_id) {
                     it->ids[j] = new_id;
 
-                    t0 = now();
-                    size_t bits = codec_.contentsBitsNeeded(contents);
-                    trackTime(decode_count_, decode_total_ns_, t0);
-
-                    if (bits <= codec_.bucketDataBits()) {
+                    // Fast path: still fits after ID change.
+                    if (codec_.contentsBitsNeeded(contents) <= codec_.bucketDataBits()) {
                         t0 = now();
                         codec_.encodeBucket(*bucket, contents);
                         trackTime(encode_count_, encode_total_ns_, t0);
                         return true;
                     }
-                    // Spill the modified key to extension, cascading if needed.
+
+                    // Slow path: ID change caused overflow.  Remove the
+                    // modified key (and any cascading overflow keys),
+                    // re-encode, then re-insert into extensions.
                     KeyEntry spilled = std::move(*it);
                     contents.keys.erase(it);
 
-                    // Cascade: keep spilling the LAST key while bucket overflows.
-                    std::vector<KeyEntry> spill_queue;
-                    spill_queue.push_back(std::move(spilled));
+                    std::vector<KeyEntry> extras;
                     while (!contents.keys.empty() &&
                            codec_.contentsBitsNeeded(contents) > codec_.bucketDataBits()) {
-                        spill_queue.push_back(std::move(contents.keys.back()));
+                        extras.push_back(std::move(contents.keys.back()));
                         contents.keys.pop_back();
                     }
 
@@ -307,32 +391,9 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
                     codec_.encodeBucket(*bucket, contents);
                     trackTime(encode_count_, encode_total_ns_, t0);
 
-                    // Insert all spilled keys into extensions.
-                    for (auto& spilled_key : spill_queue) {
-                        Bucket* ext = nextBucketMut(*bucket);
-                        if (!ext) ext = createExtFn(*bucket);
-                        assert(ext->data != nullptr && "ext->data null after spill in updateIdInChain");
-
-                        t0 = now();
-                        auto ext_contents = codec_.decodeBucket(*ext);
-                        trackTime(decode_count_, decode_total_ns_, t0);
-
-                        auto ext_it = std::lower_bound(ext_contents.keys.begin(),
-                            ext_contents.keys.end(), spilled_key.suffix,
-                            [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
-                        ext_contents.keys.insert(ext_it, std::move(spilled_key));
-
-                        // If extension also overflows, continue cascading.
-                        while (!ext_contents.keys.empty() &&
-                               codec_.contentsBitsNeeded(ext_contents) > codec_.bucketDataBits()) {
-                            spill_queue.push_back(std::move(ext_contents.keys.back()));
-                            ext_contents.keys.pop_back();
-                        }
-
-                        t0 = now();
-                        codec_.encodeBucket(*ext, ext_contents);
-                        trackTime(encode_count_, encode_total_ns_, t0);
-                        bucket = ext;
+                    bucket = insertKeyIntoExtChain(bucket, spilled, createExtFn);
+                    for (const auto& extra : extras) {
+                        bucket = insertKeyIntoExtChain(bucket, extra, createExtFn);
                     }
                     return true;
                 }
