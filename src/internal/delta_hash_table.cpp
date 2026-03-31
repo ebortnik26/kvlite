@@ -132,9 +132,11 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
                                  uint64_t packed_version, uint32_t id,
                                  const std::function<Bucket*(Bucket&)>& createExtFn) {
     Bucket* bucket = &buckets_[bi];
+    assert(bucket->data != nullptr && "primary bucket->data null in addToChain");
     bool is_new = true;
 
     while (true) {
+        assert(bucket->data != nullptr && "bucket->data null at top of addToChain loop");
         auto t0 = now();
         auto scan = codec_.decodeSuffixes(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
@@ -171,6 +173,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
             // Doesn't fit — discard local contents, move to extension.
             Bucket* ext = nextBucketMut(*bucket);
             if (!ext) ext = createExtFn(*bucket);
+            assert(ext->data != nullptr && "ext->data null after suffix_found spill in addToChain");
             bucket = ext;
         } else {
             if (is_new) {
@@ -212,6 +215,7 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
             // Doesn't fit — discard local contents, move to extension.
             Bucket* ext = nextBucketMut(*bucket);
             if (!ext) ext = createExtFn(*bucket);
+            assert(ext->data != nullptr && "ext->data null after new-key spill in addToChain");
             bucket = ext;
         }
     }
@@ -263,6 +267,7 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
     Bucket* bucket = &buckets_[bi];
 
     while (bucket) {
+        assert(bucket->data != nullptr && "bucket->data is null in updateIdInChain");
         auto t0 = now();
         auto contents = codec_.decodeBucket(*bucket);
         trackTime(decode_count_, decode_total_ns_, t0);
@@ -285,28 +290,50 @@ bool DeltaHashTable::updateIdInChain(uint32_t bi, uint64_t suffix,
                         trackTime(encode_count_, encode_total_ns_, t0);
                         return true;
                     }
+                    // Spill the modified key to extension, cascading if needed.
                     KeyEntry spilled = std::move(*it);
                     contents.keys.erase(it);
+
+                    // Cascade: keep spilling the LAST key while bucket overflows.
+                    std::vector<KeyEntry> spill_queue;
+                    spill_queue.push_back(std::move(spilled));
+                    while (!contents.keys.empty() &&
+                           codec_.contentsBitsNeeded(contents) > codec_.bucketDataBits()) {
+                        spill_queue.push_back(std::move(contents.keys.back()));
+                        contents.keys.pop_back();
+                    }
 
                     t0 = now();
                     codec_.encodeBucket(*bucket, contents);
                     trackTime(encode_count_, encode_total_ns_, t0);
 
-                    Bucket* ext = nextBucketMut(*bucket);
-                    if (!ext) ext = createExtFn(*bucket);
+                    // Insert all spilled keys into extensions.
+                    for (auto& spilled_key : spill_queue) {
+                        Bucket* ext = nextBucketMut(*bucket);
+                        if (!ext) ext = createExtFn(*bucket);
+                        assert(ext->data != nullptr && "ext->data null after spill in updateIdInChain");
 
-                    t0 = now();
-                    auto ext_contents = codec_.decodeBucket(*ext);
-                    trackTime(decode_count_, decode_total_ns_, t0);
+                        t0 = now();
+                        auto ext_contents = codec_.decodeBucket(*ext);
+                        trackTime(decode_count_, decode_total_ns_, t0);
 
-                    auto ext_it = std::lower_bound(ext_contents.keys.begin(),
-                        ext_contents.keys.end(), spilled.suffix,
-                        [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
-                    ext_contents.keys.insert(ext_it, std::move(spilled));
+                        auto ext_it = std::lower_bound(ext_contents.keys.begin(),
+                            ext_contents.keys.end(), spilled_key.suffix,
+                            [](const KeyEntry& entry, uint64_t s) { return entry.suffix < s; });
+                        ext_contents.keys.insert(ext_it, std::move(spilled_key));
 
-                    t0 = now();
-                    codec_.encodeBucket(*ext, ext_contents);
-                    trackTime(encode_count_, encode_total_ns_, t0);
+                        // If extension also overflows, continue cascading.
+                        while (!ext_contents.keys.empty() &&
+                               codec_.contentsBitsNeeded(ext_contents) > codec_.bucketDataBits()) {
+                            spill_queue.push_back(std::move(ext_contents.keys.back()));
+                            ext_contents.keys.pop_back();
+                        }
+
+                        t0 = now();
+                        codec_.encodeBucket(*ext, ext_contents);
+                        trackTime(encode_count_, encode_total_ns_, t0);
+                        bucket = ext;
+                    }
                     return true;
                 }
             }

@@ -79,6 +79,7 @@ public:
 private:
     void maybeSeal();           // seal active if over capacity (must hold mu_)
     void sealActive();          // move active to immutable queue (must hold mu_)
+    void waitForRoom(std::unique_lock<std::mutex>& lock);  // stall until queue has room
     void flushLoop();           // daemon thread function
 
     Options opts_;

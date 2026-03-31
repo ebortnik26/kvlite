@@ -1,5 +1,6 @@
 #include "internal/bucket_arena.h"
 
+#include <cassert>
 #include <cstring>
 
 namespace kvlite {
@@ -7,7 +8,12 @@ namespace internal {
 
 BucketArena::BucketArena(uint32_t slot_size, bool concurrent)
     : slot_size_(slot_size), concurrent_(concurrent) {
-    chunks_.reserve(256);
+    // Reserve enough chunks so push_back never reallocates while
+    // concurrent get() calls are reading the vector.
+    // 65536 chunks × 64 slots/chunk = 4M extensions — far more than any
+    // realistic workload.  If exceeded, push_back would reallocate and
+    // race with concurrent get().
+    chunks_.reserve(65536);
 }
 
 BucketArena::BucketArena(BucketArena&& other) noexcept
@@ -54,6 +60,7 @@ uint32_t BucketArena::allocateImpl() {
 }
 
 Bucket* BucketArena::get(uint32_t one_based) {
+    assert(one_based > 0 && one_based <= size_ && "BucketArena::get out of bounds");
     uint32_t idx = one_based - 1;
     uint32_t chunk = idx / kSlotsPerChunk;
     uint32_t offset = idx % kSlotsPerChunk;
@@ -62,6 +69,7 @@ Bucket* BucketArena::get(uint32_t one_based) {
 }
 
 const Bucket* BucketArena::get(uint32_t one_based) const {
+    assert(one_based > 0 && one_based <= size_ && "BucketArena::get out of bounds (const)");
     uint32_t idx = one_based - 1;
     uint32_t chunk = idx / kSlotsPerChunk;
     uint32_t offset = idx % kSlotsPerChunk;

@@ -31,13 +31,13 @@ WriteBuffer::~WriteBuffer() {
 void WriteBuffer::put(const std::string& key, uint64_t version,
                       const std::string& value, bool tombstone) {
     std::unique_lock<std::mutex> lock(mu_);
+    waitForRoom(lock);
 
-    if (immutables_.size() >= opts_.flush_depth - 1 && !stop_) {
-        auto t0 = now();
-        stall_cv_.wait(lock, [this] {
-            return immutables_.size() < opts_.flush_depth - 1 || stop_;
-        });
-        trackTime<std::chrono::microseconds>(stall_count_, stall_total_us_, t0);
+    // Pre-seal if this record would overflow the data buffer.
+    size_t needed = Memtable::kRecordHeaderSize + key.size() + value.size();
+    if (active_->memoryUsage() + needed > opts_.memtable_size && !active_->empty()) {
+        sealActive();
+        waitForRoom(lock);
     }
 
     active_->put(key, version, value, tombstone);
@@ -49,13 +49,16 @@ void WriteBuffer::putBatch(const std::vector<Memtable::BatchOp>& ops,
     if (ops.empty()) return;
 
     std::unique_lock<std::mutex> lock(mu_);
+    waitForRoom(lock);
 
-    if (immutables_.size() >= opts_.flush_depth - 1 && !stop_) {
-        auto t0 = now();
-        stall_cv_.wait(lock, [this] {
-            return immutables_.size() < opts_.flush_depth - 1 || stop_;
-        });
-        trackTime<std::chrono::microseconds>(stall_count_, stall_total_us_, t0);
+    // Pre-seal if this batch would overflow the data buffer.
+    size_t needed = 0;
+    for (const auto& op : ops) {
+        needed += Memtable::kRecordHeaderSize + op.key->size() + op.value->size();
+    }
+    if (active_->memoryUsage() + needed > opts_.memtable_size && !active_->empty()) {
+        sealActive();
+        waitForRoom(lock);
     }
 
     active_->putBatch(ops, version);
@@ -96,6 +99,17 @@ void WriteBuffer::maybeSeal() {
     // Caller must hold mu_.
     if (active_->memoryUsage() >= opts_.memtable_size) {
         sealActive();
+    }
+}
+
+void WriteBuffer::waitForRoom(std::unique_lock<std::mutex>& lock) {
+    // Caller must hold mu_. Stalls until the immutable queue has room.
+    if (immutables_.size() >= opts_.flush_depth - 1 && !stop_) {
+        auto t0 = now();
+        stall_cv_.wait(lock, [this] {
+            return immutables_.size() < opts_.flush_depth - 1 || stop_;
+        });
+        trackTime<std::chrono::microseconds>(stall_count_, stall_total_us_, t0);
     }
 }
 
@@ -194,6 +208,9 @@ void WriteBuffer::flushLoop() {
 
         // Set flushing_ so reads can still find this Memtable's data.
         flushing_ = mt.get();
+
+        // Wake stalled writers — queue size just decreased.
+        stall_cv_.notify_all();
 
         // Release mu_ while flushing — the Memtable is immutable,
         // no locking needed inside it.

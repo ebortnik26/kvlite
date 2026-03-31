@@ -57,6 +57,7 @@ uint8_t BucketCodec<Layout>::suffixBits() const {
 template<typename Layout>
 SuffixScanResult BucketCodec<Layout>::decodeSuffixes(const Bucket& bucket) const {
     SuffixScanResult result;
+    assert(bucket.data != nullptr && "decodeSuffixes: bucket.data is null");
 
     uint16_t num_keys = 0;
     std::memcpy(&num_keys, bucket.data, sizeof(uint16_t));
@@ -85,6 +86,7 @@ SuffixScanResult BucketCodec<Layout>::decodeSuffixes(const Bucket& bucket) const
 template<typename Layout>
 BucketContents BucketCodec<Layout>::decodeBucket(const Bucket& bucket) const {
     BucketContents contents;
+    assert(bucket.data != nullptr && "decodeBucket: bucket.data is null");
 
     uint16_t num_keys = 0;
     std::memcpy(&num_keys, bucket.data, sizeof(uint16_t));
@@ -190,16 +192,19 @@ BucketContents BucketCodec<Layout>::decodeBucket(const Bucket& bucket) const {
 
 template<typename Layout>
 size_t BucketCodec<Layout>::encodeBucket(Bucket& bucket, const BucketContents& contents) const {
-    // Preserve the extension pointer in the last 8 bytes.
+    // Save the extension pointer (last 8 bytes) before clearing.
+    // Restore it AFTER BitWriter is done — BitWriter's 64-bit stores
+    // can overwrite trailing bytes as padding.
     uint64_t ext_ptr = 0;
     std::memcpy(&ext_ptr, bucket.data + bucket_bytes_ - 8, 8);
-    size_t data_bytes = bucket_bytes_ - 8;
-    std::memset(bucket.data, 0, data_bytes);
-    std::memcpy(bucket.data + bucket_bytes_ - 8, &ext_ptr, 8);
+    std::memset(bucket.data, 0, bucket_bytes_);
 
     uint16_t num_keys = static_cast<uint16_t>(contents.keys.size());
     std::memcpy(bucket.data, &num_keys, sizeof(uint16_t));
-    if (num_keys == 0) return 16;
+    if (num_keys == 0) {
+        std::memcpy(bucket.data + bucket_bytes_ - 8, &ext_ptr, 8);
+        return 16;
+    }
 
     BitWriter writer(bucket.data, 16);
 
@@ -281,6 +286,13 @@ size_t BucketCodec<Layout>::encodeBucket(Bucket& bucket, const BucketContents& c
             }
         }
     }
+
+    // Verify BitWriter didn't overflow into extension pointer area.
+    assert(writer.position() <= (bucket_bytes_ - 8) * 8 &&
+           "encodeBucket: BitWriter overflowed into extension pointer area");
+
+    // Restore the extension pointer after BitWriter is done.
+    std::memcpy(bucket.data + bucket_bytes_ - 8, &ext_ptr, 8);
 
     return writer.position();
 }
