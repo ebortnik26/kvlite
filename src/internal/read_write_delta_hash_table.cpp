@@ -132,6 +132,36 @@ size_t ReadWriteDeltaHashTable::addEntriesBatch(
     return new_keys;
 }
 
+ReadWriteDeltaHashTable::BatchResult
+ReadWriteDeltaHashTable::addEntriesBatchPrune(
+        const HashVersionPair* entries, size_t count, uint32_t id,
+        const std::vector<uint64_t>& snapshot_versions) {
+    size_t new_keys = 0;
+    size_t total_pruned = 0;
+    size_t i = 0;
+    while (i < count) {
+        uint32_t bi = bucketIndex(entries[i].hash);
+        SpinlockGuard guard(bucket_locks_[bi]);
+
+        size_t j = i;
+        size_t bucket_pruned = 0;
+        while (j < count && bucketIndex(entries[j].hash) == bi) {
+            bool is_new = addToChain(bi, suffixFromHash(entries[j].hash),
+                entries[j].packed_version, id,
+                [this](Bucket& bucket) -> Bucket* {
+                    return createExtension(bucket);
+                },
+                &snapshot_versions, &bucket_pruned);
+            if (is_new) ++new_keys;
+            ++j;
+        }
+        size_.fetch_add(j - i - bucket_pruned, std::memory_order_relaxed);
+        total_pruned += bucket_pruned;
+        i = j;
+    }
+    return {new_keys, total_pruned};
+}
+
 // --- Stats ---
 
 size_t ReadWriteDeltaHashTable::size() const {

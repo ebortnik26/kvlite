@@ -40,6 +40,7 @@ TEST_F(GCDaemonTest, AutoGCCompactsSegments) {
     opts.gc_threshold = 0.1;        // very low threshold to trigger easily
     opts.gc_interval_sec = 1;       // fast wake-up
     opts.gc_max_segments = 10;
+    opts.dedup_on_put = false;  // disable inline dedup so GI accumulates dead entries
     ASSERT_TRUE(db_.open(test_dir_.string(), opts).ok());
 
     // Write multiple versions of the same keys to create dead entries.

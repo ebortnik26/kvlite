@@ -86,6 +86,11 @@ public:
     void applyPutBatch(const HashVersionPair* entries, size_t count,
                        uint32_t segment_id);
 
+    // Batch-apply with inline dedup: prunes stale versions while adding.
+    void applyPutBatch(const HashVersionPair* entries, size_t count,
+                       uint32_t segment_id,
+                       const std::vector<uint64_t>& snapshot_versions);
+
     bool get(uint64_t hkey,
              std::vector<uint32_t>& segment_ids,
              std::vector<uint64_t>& packed_versions) const;

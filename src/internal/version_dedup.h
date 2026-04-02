@@ -62,6 +62,58 @@ inline void dedupVersionGroup(
     }
 }
 
+// Prune stale versions from a KeyEntry whose packed_versions are
+// sorted descending (newest first).  Keeps only versions visible at
+// the given snapshot observation points.
+//
+// Single-pass sweep: walk pvs left→right (desc), snapshots right→left
+// (desc).  For each snapshot the first pv whose logical version ≤
+// snapshot is kept; all others are dropped.  pvs[0] is always kept
+// (serves latestVersion, which is snapshots.back()).
+//
+// Modifies key.packed_versions and key.ids in-place.
+// Returns the number of entries removed.
+//
+// Requires: snapshots sorted ascending, non-empty (must include
+// latestVersion as the last element).
+inline size_t pruneKeyVersionsDesc(
+    std::vector<uint64_t>& packed_versions,
+    std::vector<uint32_t>& ids,
+    const std::vector<uint64_t>& snapshots) {
+
+    size_t n = packed_versions.size();
+    if (n <= 1 || snapshots.empty()) return 0;
+
+    // Walk pvs left→right (descending) and snapshots right→left
+    // (descending).  For each pv, consume all snapshots whose
+    // observation point ≥ this version's logical value — this pv is
+    // the latest version visible at those snapshots.  Keep the pv if
+    // it serves at least one snapshot.
+    int si = static_cast<int>(snapshots.size()) - 1;
+    size_t write = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t logical_ver = packed_versions[i] >> 1;  // PackedVersion shift
+        // Does this version serve any remaining snapshot?
+        // A snapshot S is served if logical_ver <= S.
+        if (si >= 0 && logical_ver <= static_cast<uint64_t>(snapshots[si])) {
+            packed_versions[write] = packed_versions[i];
+            ids[write] = ids[i];
+            ++write;
+            // Consume all snapshots this version serves.
+            while (si >= 0 && logical_ver <= static_cast<uint64_t>(snapshots[si])) {
+                --si;
+            }
+        }
+        // else: no remaining snapshot needs this version → drop
+    }
+
+    size_t removed = n - write;
+    packed_versions.resize(write);
+    ids.resize(write);
+    return removed;
+}
+
 }  // namespace internal
 }  // namespace kvlite
 

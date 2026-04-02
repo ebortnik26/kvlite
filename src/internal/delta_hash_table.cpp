@@ -5,6 +5,7 @@
 
 #include "internal/bit_stream.h"
 #include "internal/profiling.h"
+#include "internal/version_dedup.h"
 
 namespace kvlite {
 namespace internal {
@@ -157,7 +158,9 @@ bool DeltaHashTable::tryInsertAndEncode(Bucket& bucket,
 
 bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
                                  uint64_t packed_version, uint32_t id,
-                                 const std::function<Bucket*(Bucket&)>& createExtFn) {
+                                 const std::function<Bucket*(Bucket&)>& createExtFn,
+                                 const std::vector<uint64_t>* snapshot_versions,
+                                 size_t* pruned_out) {
     Bucket* bucket = &buckets_[bi];
     bool is_new = true;
 
@@ -178,6 +181,13 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
             size_t vi = vpos - it->packed_versions.begin();
             it->packed_versions.insert(vpos, packed_version);
             it->ids.insert(it->ids.begin() + vi, id);
+
+            // Inline dedup: prune stale versions before encoding.
+            if (snapshot_versions && it->packed_versions.size() > 1) {
+                size_t removed = pruneKeyVersionsDesc(
+                    it->packed_versions, it->ids, *snapshot_versions);
+                if (pruned_out) *pruned_out += removed;
+            }
         } else {
             // New suffix in this bucket — check rest of chain for is_new.
             if (is_new) is_new = !suffixExistsInChain(bi, suffix);

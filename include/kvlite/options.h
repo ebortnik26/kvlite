@@ -65,6 +65,12 @@ struct Options {
     // Default: 10
     int gc_max_segments = 10;
 
+    // Prune stale GlobalIndex versions inline during flush.
+    // Bounds per-key version chains to ~active_snapshot_count without
+    // waiting for GC.  Zero overhead for non-overwrite workloads.
+    // Default: true
+    bool dedup_on_put = true;
+
     // Seconds between GC daemon wake-ups (0 = disable daemon)
     // Default: 10
     uint32_t gc_interval_sec = 10;

@@ -41,6 +41,7 @@ struct Config {
     uint16_t segment_partitions = 1;
     std::string key_dist = "uniform";
     bool sequential_keys = false;  // writes use keys 0..N-1 in order
+    bool dedup_on_put = true;
     bool extended = false;
     std::string flame_output;  // empty = disabled
     std::string db_path;
@@ -67,6 +68,7 @@ static void printUsage(const char* prog) {
         "  --key-dist NAME        Key distribution: uniform or zipf [YCSB] (default: uniform)\n"
         "  --sequential-keys      Write keys 0..N-1 in order (default: random)\n"
         "  --no-buffered-writes   Disable LogFile write buffering\n"
+        "  --no-dedup-on-put      Disable inline GI version pruning on flush\n"
         "  -x, --extended         Print extended report (DB stats, DHT codec stats)\n"
         "  -f, --flame [PATH]     Generate flame graph SVG (default: flamegraph.svg)\n"
         "  --help                 Show this message\n",
@@ -96,6 +98,7 @@ static bool parseArgs(int argc, char** argv, Config& cfg) {
         else if (arg("--value-size"))        cfg.value_size = static_cast<int>(nextInt());
         else if (arg("--no-preload"))        cfg.preload = false;
         else if (arg("--no-buffered-writes")) cfg.buffered_writes = false;
+        else if (arg("--no-dedup-on-put")) cfg.dedup_on_put = false;
         else if (arg("--sequential-keys"))   cfg.sequential_keys = true;
         else if (arg("--segment-partitions")) cfg.segment_partitions = static_cast<uint16_t>(nextInt());
         else if (arg("--report-interval"))   cfg.report_interval = static_cast<int>(nextInt());
@@ -756,6 +759,7 @@ int main(int argc, char** argv) {
     opts.memtable_size = cfg.memtable_size;
     opts.buffered_writes = cfg.buffered_writes;
     opts.segment_partitions = cfg.segment_partitions;
+    opts.dedup_on_put = cfg.dedup_on_put;
 
     kvlite::DB db;
     auto s = db.open(cfg.db_path, opts);

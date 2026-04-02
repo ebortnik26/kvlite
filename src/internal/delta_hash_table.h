@@ -157,7 +157,9 @@ protected:
 
     bool addToChain(uint32_t bi, uint64_t suffix,
                     uint64_t packed_version, uint32_t id,
-                    const std::function<Bucket*(Bucket&)>& createExtFn);
+                    const std::function<Bucket*(Bucket&)>& createExtFn,
+                    const std::vector<uint64_t>* snapshot_versions = nullptr,
+                    size_t* pruned_out = nullptr);
 
     // Check if suffix exists anywhere in the bucket chain starting at bi.
     bool suffixExistsInChain(uint32_t bi, uint64_t suffix) const;

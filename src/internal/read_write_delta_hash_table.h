@@ -45,6 +45,13 @@ public:
     // bucket. Returns the number of new suffix groups (for key_count).
     size_t addEntriesBatch(const HashVersionPair* entries, size_t count, uint32_t id);
 
+    // Batch-add with inline dedup: after adding each entry, prune stale
+    // versions using snapshot_versions. Returns {new_keys, pruned_entries}.
+    struct BatchResult { size_t new_keys; size_t pruned; };
+    BatchResult addEntriesBatchPrune(const HashVersionPair* entries, size_t count,
+                                     uint32_t id,
+                                     const std::vector<uint64_t>& snapshot_versions);
+
     // Remove entry (packed_version, id) for hash. Returns true if suffix group is now empty.
     bool removeEntry(uint64_t hash, uint64_t packed_version, uint32_t id);
 

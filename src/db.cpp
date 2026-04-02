@@ -97,8 +97,14 @@ void DB::initWriteBuffer(const Options& options) {
 
         // Segment is now sealed (data + index + lineage + footer on disk).
         // Batch-apply to in-memory GlobalIndex (one lock per bucket run).
-        global_index_->applyPutBatch(
-            result.entries.data(), result.entries.size(), seg_id);
+        if (options_.dedup_on_put) {
+            global_index_->applyPutBatch(
+                result.entries.data(), result.entries.size(), seg_id,
+                versions_->snapshotVersions());
+        } else {
+            global_index_->applyPutBatch(
+                result.entries.data(), result.entries.size(), seg_id);
+        }
 
         // Accumulate SI encode stats (write path only).
         si_encode_count_.fetch_add(seg->siEncodeCount(), std::memory_order_relaxed);

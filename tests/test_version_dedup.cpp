@@ -1,7 +1,6 @@
-// Benchmark: write to a small key set with rotating snapshots.
-// Verifies that version deduplication keeps the GlobalIndex compact —
-// the number of versions per key should be bounded by the number of
-// concurrent snapshots, not by the total number of writes.
+// Stress test: write to a small key set with rotating snapshots.
+// Parameterized on dedup_on_put — verifies that inline dedup bounds
+// versions per key, and that the system is stable without it.
 
 #include <gtest/gtest.h>
 #include <kvlite/kvlite.h>
@@ -15,7 +14,11 @@
 
 namespace fs = std::filesystem;
 
-TEST(VersionDedup, RotatingSnapshotsLimitVersions) {
+class VersionDedupTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
+    bool dedup_on_put = GetParam();
+
     fs::path test_dir = fs::temp_directory_path() / "kvlite_dedup_test";
     fs::remove_all(test_dir);
 
@@ -26,6 +29,7 @@ TEST(VersionDedup, RotatingSnapshotsLimitVersions) {
     opts.gc_interval_sec = 2;               // aggressive GC
     opts.gc_threshold = 0.1;                // low threshold
     opts.savepoint_interval_sec = 5;
+    opts.dedup_on_put = dedup_on_put;
     ASSERT_TRUE(db.open(test_dir.string(), opts).ok());
 
     const int kNumKeys = 256;
@@ -71,12 +75,13 @@ TEST(VersionDedup, RotatingSnapshotsLimitVersions) {
             std::chrono::steady_clock::now() - start).count();
 
         std::cout << "[" << elapsed << "s] "
-                  << "writes=" << write_count.load()
-                  << "  live_entries=" << stats.num_live_entries
-                  << "  historical=" << stats.num_historical_entries
-                  << "  segments=" << stats.num_log_files
-                  << "  gc_runs=" << stats.gc_count
-                  << "  flushes=" << stats.flush_count
+                  << "dedup=" << dedup_on_put
+                  << "  writes=" << write_count.load()
+                  << "  live=" << stats.num_live_entries
+                  << "  hist=" << stats.num_historical_entries
+                  << "  segs=" << stats.num_log_files
+                  << "  gc=" << stats.gc_count
+                  << "  flush=" << stats.flush_count
                   << std::endl;
     }
 
@@ -88,27 +93,36 @@ TEST(VersionDedup, RotatingSnapshotsLimitVersions) {
     kvlite::DBStats stats;
     ASSERT_TRUE(db.getStats(stats).ok());
 
-    std::cout << "\n=== FINAL ===\n"
+    uint64_t total_entries = stats.num_live_entries + stats.num_historical_entries;
+    double versions_per_key = static_cast<double>(total_entries) / kNumKeys;
+
+    std::cout << "\n=== FINAL (dedup_on_put=" << dedup_on_put << ") ===\n"
               << "Total writes:      " << write_count.load() << "\n"
               << "Live entries:      " << stats.num_live_entries << "\n"
               << "Historical entries: " << stats.num_historical_entries << "\n"
+              << "Versions per key:  " << versions_per_key << "\n"
               << "Segments:          " << stats.num_log_files << "\n"
               << "GC runs:           " << stats.gc_count << "\n"
               << "Flushes:           " << stats.flush_count << "\n"
               << std::endl;
 
-    // Versions accumulate in the GI between GC runs.
-    // The key invariant is that the system doesn't crash and total entries
-    // are bounded (much less than total writes).
-    uint64_t total_entries = stats.num_live_entries + stats.num_historical_entries;
-    double versions_per_key = static_cast<double>(total_entries) / kNumKeys;
+    if (dedup_on_put) {
+        // With inline dedup: versions per key bounded by snapshot count + slack.
+        EXPECT_LT(versions_per_key, 10.0)
+            << "dedup_on_put should bound versions per key";
+    }
 
-    std::cout << "Versions per key:  " << versions_per_key << "\n";
-
-    // Total entries should be much less than total writes (flush dedup is working).
+    // Both modes: total entries much less than total writes.
     EXPECT_LT(total_entries, write_count.load() / 10)
         << "GlobalIndex not deduplicating — entry count proportional to writes";
 
     db.close();
     fs::remove_all(test_dir);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    DedupOnPut, VersionDedupTest,
+    ::testing::Values(true, false),
+    [](const ::testing::TestParamInfo<bool>& info) {
+        return info.param ? "DedupEnabled" : "DedupDisabled";
+    });

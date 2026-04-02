@@ -180,6 +180,19 @@ void GlobalIndex::applyPutBatch(const HashVersionPair* entries, size_t count,
     }
 }
 
+void GlobalIndex::applyPutBatch(const HashVersionPair* entries, size_t count,
+                                 uint32_t segment_id,
+                                 const std::vector<uint64_t>& snapshot_versions) {
+    auto result = dht_.addEntriesBatchPrune(entries, count, segment_id,
+                                             snapshot_versions);
+    if (result.new_keys > 0) {
+        key_count_.fetch_add(result.new_keys, std::memory_order_relaxed);
+    }
+    // Note: pruned entries are already subtracted from dht_.size_ in
+    // addEntriesBatchPrune. key_count_ is unaffected because pruning
+    // removes versions, not entire keys.
+}
+
 bool GlobalIndex::get(uint64_t hkey,
                   std::vector<uint32_t>& segment_ids,
                   std::vector<uint64_t>& packed_versions) const {
