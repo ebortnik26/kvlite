@@ -43,6 +43,8 @@ struct DBStats {
     uint64_t gc_total_us = 0;           // cumulative GC time in microseconds
     uint64_t savepoint_count = 0;
     uint64_t savepoint_total_us = 0;    // cumulative savepoint time in microseconds
+    uint64_t prune_count = 0;
+    uint64_t prune_total_us = 0;        // cumulative prune daemon time in microseconds
 
     // Write stall stats (writer blocked waiting for flush to free a slot)
     uint64_t stall_count = 0;
@@ -191,6 +193,7 @@ private:
 
     std::unique_ptr<internal::PeriodicDaemon> gc_daemon_;
     std::unique_ptr<internal::PeriodicDaemon> sp_daemon_;
+    std::unique_ptr<internal::PeriodicDaemon> prune_daemon_;
 
     // Background operation counters (updated from bg threads)
     std::atomic<uint64_t> flush_count_{0};
@@ -199,6 +202,8 @@ private:
     std::atomic<uint64_t> gc_total_us_{0};
     std::atomic<uint64_t> savepoint_count_{0};
     std::atomic<uint64_t> savepoint_total_us_{0};
+    std::atomic<uint64_t> prune_count_{0};
+    std::atomic<uint64_t> prune_total_us_{0};
 
     // SegmentIndex encode accumulators (flush path only).
     // Decode stats are computed on demand from live segments in getStats().

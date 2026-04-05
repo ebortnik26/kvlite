@@ -3313,3 +3313,78 @@ TEST(ReadWriteDHT, ExtensionPointerSurvivesReencode) {
     EXPECT_EQ(pvs.size(), 100u);
 }
 
+// ===========================================================================
+// pruneStaleVersions — background dedup daemon sweep
+// ===========================================================================
+
+// Populate N keys with M versions each, then sweep with a small snapshot
+// set. Only snapshot-visible versions must survive.
+TEST(ReadWriteDHT, PruneStaleVersionsSweep) {
+    ReadWriteDeltaHashTable dht;
+
+    const int kNumKeys = 50;
+    const int kVersionsPerKey = 20;
+    // Version schema: key k, version v → packed = (k*1000 + v*10) << 1
+    // Logical versions per key: 10, 20, 30, ..., 200 (all < 10000)
+    for (int k = 0; k < kNumKeys; ++k) {
+        uint64_t hkey = H("k_" + std::to_string(k));
+        for (int v = 1; v <= kVersionsPerKey; ++v) {
+            uint64_t pv = (static_cast<uint64_t>(v * 10) << 1);
+            dht.addEntry(hkey, pv, static_cast<uint32_t>(v));
+        }
+    }
+    size_t before = dht.size();
+    EXPECT_EQ(before, static_cast<size_t>(kNumKeys * kVersionsPerKey));
+
+    // Snapshots at logical 55, 125, and latest (205 > 200).
+    std::vector<uint64_t> snapshots = {55, 125, 205};
+    size_t removed = dht.pruneStaleVersions(snapshots);
+
+    // Each key should keep exactly 3 versions (snapshot 55→v50, snapshot
+    // 125→v120, snapshot 205→v200).
+    EXPECT_EQ(dht.size(), static_cast<size_t>(kNumKeys * 3));
+    EXPECT_EQ(removed, before - dht.size());
+
+    // Verify one key in detail.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(H("k_0"), pvs, ids));
+    ASSERT_EQ(pvs.size(), 3u);
+    // pvs desc: logical 200, 120, 50 → packed 400, 240, 100
+    EXPECT_EQ(pvs[0], 400u);
+    EXPECT_EQ(pvs[1], 240u);
+    EXPECT_EQ(pvs[2], 100u);
+}
+
+// After pruning, a second call is a no-op (all multi-version bits cleared).
+TEST(ReadWriteDHT, PruneStaleVersionsIdempotent) {
+    ReadWriteDeltaHashTable dht;
+    uint64_t hkey = H("key");
+    for (int v = 1; v <= 10; ++v) {
+        dht.addEntry(hkey, static_cast<uint64_t>(v) << 1, static_cast<uint32_t>(v));
+    }
+    std::vector<uint64_t> snapshots = {5, 10};
+
+    size_t first = dht.pruneStaleVersions(snapshots);
+    EXPECT_GT(first, 0u);
+
+    size_t second = dht.pruneStaleVersions(snapshots);
+    EXPECT_EQ(second, 0u) << "second sweep should find nothing to prune";
+}
+
+// Keys that never had duplicates are untouched (bitmap skips them).
+TEST(ReadWriteDHT, PruneStaleVersionsLeavesSingleVersionKeysAlone) {
+    ReadWriteDeltaHashTable dht;
+    for (int k = 0; k < 100; ++k) {
+        dht.addEntry(H("unique_" + std::to_string(k)),
+                     static_cast<uint64_t>(k + 1) << 1, static_cast<uint32_t>(k));
+    }
+    size_t before = dht.size();
+
+    std::vector<uint64_t> snapshots = {50, 101};
+    size_t removed = dht.pruneStaleVersions(snapshots);
+
+    EXPECT_EQ(removed, 0u);
+    EXPECT_EQ(dht.size(), before);
+}
+

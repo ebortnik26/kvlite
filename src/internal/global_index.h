@@ -120,6 +120,13 @@ public:
 
     void clear();
 
+    // --- Background dedup ---
+
+    // Sweep the GI to prune stale versions. Caller supplies the current
+    // snapshot observation points.  Returns the number of entries
+    // removed.
+    size_t pruneStaleVersions(const std::vector<uint64_t>& snapshot_versions);
+
     // --- Savepoint ---
 
     // Takes exclusive lock on savepoint_mu_, writes savepoint to disk,

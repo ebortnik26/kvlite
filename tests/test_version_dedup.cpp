@@ -1,6 +1,8 @@
 // Stress test: write to a small key set with rotating snapshots.
-// Parameterized on dedup_on_put — verifies that inline dedup bounds
-// versions per key, and that the system is stable without it.
+// Parameterized across three dedup modes:
+//   Inline  — dedup_on_put=true, prune daemon off
+//   Daemon  — dedup_on_put=false, prune daemon every 1s
+//   Neither — dedup_on_put=false, prune daemon off (GC-only baseline)
 
 #include <gtest/gtest.h>
 #include <kvlite/kvlite.h>
@@ -14,10 +16,21 @@
 
 namespace fs = std::filesystem;
 
-class VersionDedupTest : public ::testing::TestWithParam<bool> {};
+enum class DedupMode { Inline, Daemon, Neither };
+
+static const char* modeName(DedupMode m) {
+    switch (m) {
+        case DedupMode::Inline:  return "Inline";
+        case DedupMode::Daemon:  return "Daemon";
+        case DedupMode::Neither: return "Neither";
+    }
+    return "?";
+}
+
+class VersionDedupTest : public ::testing::TestWithParam<DedupMode> {};
 
 TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
-    bool dedup_on_put = GetParam();
+    DedupMode mode = GetParam();
 
     fs::path test_dir = fs::temp_directory_path() / "kvlite_dedup_test";
     fs::remove_all(test_dir);
@@ -26,10 +39,11 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
     kvlite::Options opts;
     opts.create_if_missing = true;
     opts.memtable_size = 1 * 1024 * 1024;  // 1MB — forces frequent flushes
-    opts.gc_interval_sec = 2;               // aggressive GC
-    opts.gc_threshold = 0.1;                // low threshold
+    opts.gc_interval_sec = 2;
+    opts.gc_threshold = 0.1;
     opts.savepoint_interval_sec = 5;
-    opts.dedup_on_put = dedup_on_put;
+    opts.dedup_on_put = (mode == DedupMode::Inline);
+    opts.version_prune_interval_sec = (mode == DedupMode::Daemon) ? 1 : 0;
     ASSERT_TRUE(db.open(test_dir.string(), opts).ok());
 
     const int kNumKeys = 256;
@@ -39,7 +53,6 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> write_count{0};
 
-    // Writer thread: hammer 256 keys with random updates.
     std::thread writer([&] {
         std::mt19937 rng(42);
         std::uniform_int_distribution<int> key_dist(0, kNumKeys - 1);
@@ -54,7 +67,6 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
         }
     });
 
-    // Snapshot thread: create and release a snapshot every 100ms.
     std::thread snapshotter([&] {
         while (!stop.load(std::memory_order_relaxed)) {
             auto snap = db.createSnapshot();
@@ -63,7 +75,6 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
         }
     });
 
-    // Run for the specified duration, printing stats every 10s.
     auto start = std::chrono::steady_clock::now();
     while (std::chrono::steady_clock::now() - start < kDuration) {
         std::this_thread::sleep_for(std::chrono::seconds(10));
@@ -75,13 +86,14 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
             std::chrono::steady_clock::now() - start).count();
 
         std::cout << "[" << elapsed << "s] "
-                  << "dedup=" << dedup_on_put
+                  << "mode=" << modeName(mode)
                   << "  writes=" << write_count.load()
                   << "  live=" << stats.num_live_entries
                   << "  hist=" << stats.num_historical_entries
                   << "  segs=" << stats.num_log_files
                   << "  gc=" << stats.gc_count
                   << "  flush=" << stats.flush_count
+                  << "  prune=" << stats.prune_count
                   << std::endl;
     }
 
@@ -89,14 +101,13 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
     writer.join();
     snapshotter.join();
 
-    // Final stats.
     kvlite::DBStats stats;
     ASSERT_TRUE(db.getStats(stats).ok());
 
     uint64_t total_entries = stats.num_live_entries + stats.num_historical_entries;
     double versions_per_key = static_cast<double>(total_entries) / kNumKeys;
 
-    std::cout << "\n=== FINAL (dedup_on_put=" << dedup_on_put << ") ===\n"
+    std::cout << "\n=== FINAL (mode=" << modeName(mode) << ") ===\n"
               << "Total writes:      " << write_count.load() << "\n"
               << "Live entries:      " << stats.num_live_entries << "\n"
               << "Historical entries: " << stats.num_historical_entries << "\n"
@@ -104,15 +115,14 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
               << "Segments:          " << stats.num_log_files << "\n"
               << "GC runs:           " << stats.gc_count << "\n"
               << "Flushes:           " << stats.flush_count << "\n"
+              << "Prune runs:        " << stats.prune_count << "\n"
               << std::endl;
 
-    if (dedup_on_put) {
-        // With inline dedup: versions per key bounded by snapshot count + slack.
+    if (mode == DedupMode::Inline || mode == DedupMode::Daemon) {
         EXPECT_LT(versions_per_key, 10.0)
-            << "dedup_on_put should bound versions per key";
+            << modeName(mode) << " dedup should bound versions per key";
     }
 
-    // Both modes: total entries much less than total writes.
     EXPECT_LT(total_entries, write_count.load() / 10)
         << "GlobalIndex not deduplicating — entry count proportional to writes";
 
@@ -121,8 +131,8 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    DedupOnPut, VersionDedupTest,
-    ::testing::Values(true, false),
-    [](const ::testing::TestParamInfo<bool>& info) {
-        return info.param ? "DedupEnabled" : "DedupDisabled";
+    DedupModes, VersionDedupTest,
+    ::testing::Values(DedupMode::Inline, DedupMode::Daemon, DedupMode::Neither),
+    [](const ::testing::TestParamInfo<DedupMode>& info) {
+        return modeName(info.param);
     });

@@ -137,12 +137,22 @@ void DB::startDaemons(const Options& options) {
             trackTime<std::chrono::microseconds>(savepoint_count_, savepoint_total_us_, t0);
         });
     }
+
+    if (options.version_prune_interval_sec > 0) {
+        prune_daemon_ = std::make_unique<internal::PeriodicDaemon>();
+        prune_daemon_->start(options.version_prune_interval_sec, [this] {
+            auto t0 = internal::now();
+            global_index_->pruneStaleVersions(versions_->snapshotVersions());
+            trackTime<std::chrono::microseconds>(prune_count_, prune_total_us_, t0);
+        });
+    }
 }
 
 void DB::teardown() {
     write_buffer_.reset();
     gc_daemon_.reset();
     sp_daemon_.reset();
+    prune_daemon_.reset();
     if (global_index_) { global_index_->close(); global_index_.reset(); }
     if (storage_)      { storage_->close(); storage_.reset(); }
     if (versions_)     { versions_->close(); versions_.reset(); }
@@ -443,6 +453,8 @@ Status DB::getStats(DBStats& stats) const {
     stats.gc_total_us = gc_total_us_.load(std::memory_order_relaxed);
     stats.savepoint_count = savepoint_count_.load(std::memory_order_relaxed);
     stats.savepoint_total_us = savepoint_total_us_.load(std::memory_order_relaxed);
+    stats.prune_count = prune_count_.load(std::memory_order_relaxed);
+    stats.prune_total_us = prune_total_us_.load(std::memory_order_relaxed);
 
     stats.stall_count = write_buffer_->stallCount();
     stats.stall_total_us = write_buffer_->stallTotalUs();

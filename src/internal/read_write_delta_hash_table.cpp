@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "internal/version_dedup.h"
+
 namespace kvlite {
 namespace internal {
 
@@ -11,7 +13,8 @@ ReadWriteDeltaHashTable::ReadWriteDeltaHashTable()
 
 ReadWriteDeltaHashTable::ReadWriteDeltaHashTable(const Config& config)
     : DeltaHashTable(config),
-      ext_arena_owned_(sizeof(Bucket) + bucketStride(), /*concurrent=*/true) {
+      ext_arena_owned_(sizeof(Bucket) + bucketStride(), /*concurrent=*/true),
+      duplicates_(1u << config.bucket_bits) {
     ext_arena_ = &ext_arena_owned_;
     bucket_locks_ = std::make_unique<Spinlock[]>(1u << config.bucket_bits);
 }
@@ -108,6 +111,7 @@ bool ReadWriteDeltaHashTable::addImpl(uint32_t bi, uint64_t suffix,
             return createExtension(bucket);
         });
     size_.fetch_add(1, std::memory_order_relaxed);
+    if (!is_new) duplicates_.set(bi);
     return is_new;
 }
 
@@ -120,6 +124,7 @@ size_t ReadWriteDeltaHashTable::addEntriesBatch(
         SpinlockGuard guard(bucket_locks_[bi]);
 
         size_t j = i;
+        bool any_dup = false;
         while (j < count && bucketIndex(entries[j].hash) == bi) {
             bool is_new = addToChain(bi, suffixFromHash(entries[j].hash),
                 entries[j].packed_version, id,
@@ -127,9 +132,11 @@ size_t ReadWriteDeltaHashTable::addEntriesBatch(
                     return createExtension(bucket);
                 });
             if (is_new) ++new_keys;
+            else any_dup = true;
             ++j;
         }
         size_.fetch_add(j - i, std::memory_order_relaxed);
+        if (any_dup) duplicates_.set(bi);
         i = j;
     }
     return new_keys;
@@ -148,6 +155,7 @@ ReadWriteDeltaHashTable::addEntriesBatchPrune(
 
         size_t j = i;
         size_t bucket_pruned = 0;
+        bool any_dup = false;
         while (j < count && bucketIndex(entries[j].hash) == bi) {
             bool is_new = addToChain(bi, suffixFromHash(entries[j].hash),
                 entries[j].packed_version, id,
@@ -156,13 +164,57 @@ ReadWriteDeltaHashTable::addEntriesBatchPrune(
                 },
                 &snapshot_versions, &bucket_pruned);
             if (is_new) ++new_keys;
+            else any_dup = true;
             ++j;
         }
         size_.fetch_add(j - i - bucket_pruned, std::memory_order_relaxed);
         total_pruned += bucket_pruned;
+        // Inline dedup may leave some multi-version keys (snapshot-visible).
+        // Mark the bucket so the background daemon revisits if snapshots
+        // change later.
+        if (any_dup) duplicates_.set(bi);
         i = j;
     }
     return {new_keys, total_pruned};
+}
+
+size_t ReadWriteDeltaHashTable::pruneStaleVersions(
+        const std::vector<uint64_t>& snapshots) {
+    uint32_t num_buckets = 1u << config_.bucket_bits;
+    size_t total_removed = 0;
+
+    for (uint32_t bi = 0; bi < num_buckets; ++bi) {
+        if (!duplicates_.test(bi)) continue;
+
+        SpinlockGuard guard(bucket_locks_[bi]);
+
+        bool still_multi = false;
+        Bucket* bucket = &buckets_[bi];
+        while (bucket) {
+            auto contents = codec_.decodeBucket(*bucket);
+            bool dirty = false;
+            for (auto& key : contents.keys) {
+                if (key.packed_versions.size() > 1) {
+                    size_t r = pruneKeyVersionsDesc(
+                        key.packed_versions, key.ids, snapshots);
+                    if (r > 0) {
+                        total_removed += r;
+                        dirty = true;
+                    }
+                    if (key.packed_versions.size() > 1) still_multi = true;
+                }
+            }
+            if (dirty) codec_.encodeBucket(*bucket, contents);
+            bucket = nextBucketMut(*bucket);
+        }
+
+        if (!still_multi) duplicates_.clear(bi);
+    }
+
+    if (total_removed > 0) {
+        size_.fetch_sub(total_removed, std::memory_order_relaxed);
+    }
+    return total_removed;
 }
 
 // --- Stats ---
@@ -179,6 +231,7 @@ size_t ReadWriteDeltaHashTable::memoryUsage() const {
 void ReadWriteDeltaHashTable::clear() {
     clearBuckets();
     size_.store(0, std::memory_order_relaxed);
+    duplicates_.clearAll();
 }
 
 // --- Binary snapshot support ---

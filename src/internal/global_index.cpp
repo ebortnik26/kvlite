@@ -180,6 +180,12 @@ void GlobalIndex::applyPutBatch(const HashVersionPair* entries, size_t count,
     }
 }
 
+size_t GlobalIndex::pruneStaleVersions(
+        const std::vector<uint64_t>& snapshot_versions) {
+    BatchGuard guard(*this);
+    return dht_.pruneStaleVersions(snapshot_versions);
+}
+
 void GlobalIndex::applyPutBatch(const HashVersionPair* entries, size_t count,
                                  uint32_t segment_id,
                                  const std::vector<uint64_t>& snapshot_versions) {

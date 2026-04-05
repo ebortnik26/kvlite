@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "internal/delta_hash_table.h"
+#include "internal/duplicates_bucket_bitmap.h"
 #include "internal/log_entry.h"
 #include "internal/spinlock.h"
 
@@ -59,6 +60,11 @@ public:
     bool updateEntryId(uint64_t hash, uint64_t packed_version,
                        uint32_t old_id, uint32_t new_id);
 
+    // Sweep multi-version buckets and prune stale versions using the
+    // given snapshot observation points.  Returns the number of
+    // entries removed.
+    size_t pruneStaleVersions(const std::vector<uint64_t>& snapshot_versions);
+
     // Locked read methods (hide base class unlocked versions)
     bool findAll(uint64_t hash,
                  std::vector<uint64_t>& packed_versions,
@@ -97,6 +103,7 @@ private:
     std::unique_ptr<Spinlock[]> bucket_locks_;
     BucketArena ext_arena_owned_;
     std::atomic<size_t> size_{0};
+    DuplicatesBucketBitmap duplicates_;
 };
 
 }  // namespace internal

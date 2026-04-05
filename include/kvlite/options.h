@@ -75,6 +75,13 @@ struct Options {
     // Default: 10
     uint32_t gc_interval_sec = 10;
 
+    // Seconds between version-prune daemon wake-ups (0 = disabled).
+    // Periodically sweeps the GlobalIndex to eliminate stale versions
+    // for keys that are not being actively written (complements
+    // dedup_on_put, which only prunes on flush).
+    // Default: 0 (opt-in)
+    uint32_t version_prune_interval_sec = 0;
+
     // --- I/O Options ---
 
     // Buffer segment writes through a 1MB userspace buffer.
