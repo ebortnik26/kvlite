@@ -970,6 +970,37 @@ TEST(ReadWriteDHT, RemoveEntryLastInGroup) {
     EXPECT_FALSE(dht.findAll(hkey, pvs, ids));
 }
 
+// Removing an entry that doesn't exist (already pruned by dedup-on-put)
+// must not change size or key count.
+TEST(ReadWriteDHT, RemoveNonExistentEntryNoSizeChange) {
+    ReadWriteDeltaHashTable dht;
+    uint64_t hkey = H("key");
+    dht.addEntry(hkey, 100, 1);
+    dht.addEntry(hkey, 200, 2);
+    EXPECT_EQ(dht.size(), 2u);
+
+    // Try to remove an entry that was never added.
+    bool group_empty = dht.removeEntry(hkey, 300, 3);
+    EXPECT_FALSE(group_empty);
+    EXPECT_EQ(dht.size(), 2u) << "size must not change when entry not found";
+
+    // Try to remove with wrong segment_id.
+    group_empty = dht.removeEntry(hkey, 100, 99);
+    EXPECT_FALSE(group_empty);
+    EXPECT_EQ(dht.size(), 2u) << "size must not change when segment_id mismatches";
+
+    // Try to remove from a completely unknown key.
+    group_empty = dht.removeEntry(H("ghost"), 100, 1);
+    EXPECT_FALSE(group_empty);
+    EXPECT_EQ(dht.size(), 2u) << "size must not change for unknown key";
+
+    // Original entries still intact.
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
+    EXPECT_EQ(pvs.size(), 2u);
+}
+
 TEST(ReadWriteDHT, RemoveEntryFromOverflowChain) {
     ReadWriteDeltaHashTable::Config cfg;
     cfg.bucket_bits = 4;

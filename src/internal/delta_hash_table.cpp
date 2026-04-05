@@ -210,7 +210,9 @@ bool DeltaHashTable::addToChain(uint32_t bi, uint64_t suffix,
 // --- removeFromChain ---
 
 bool DeltaHashTable::removeFromChain(uint32_t bi, uint64_t suffix,
-                                      uint64_t packed_version, uint32_t id) {
+                                      uint64_t packed_version, uint32_t id,
+                                      bool& actually_removed) {
+    actually_removed = false;
     Bucket* bucket = &buckets_[bi];
 
     while (bucket) {
@@ -233,6 +235,7 @@ bool DeltaHashTable::removeFromChain(uint32_t bi, uint64_t suffix,
                     codec_.encodeBucket(*bucket, contents);
                     trackTime(encode_count_, encode_total_ns_, t0);
                     pruneEmptyExtension(bucket);
+                    actually_removed = true;
                     return isSuffixEmpty(bi, suffix);
                 }
             }

@@ -78,7 +78,10 @@ bool ReadWriteDeltaHashTable::removeEntry(uint64_t hash,
     uint64_t suffix = suffixFromHash(hash);
 
     SpinlockGuard guard(bucket_locks_[bi]);
-    bool group_empty = removeFromChain(bi, suffix, packed_version, id);
+    bool actually_removed = false;
+    bool group_empty = removeFromChain(bi, suffix, packed_version, id,
+                                        actually_removed);
+    if (!actually_removed) return false;
     size_.fetch_sub(1, std::memory_order_relaxed);
     return group_empty;
 }

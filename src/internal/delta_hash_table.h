@@ -168,8 +168,11 @@ protected:
     // If it doesn't fit, leave bucket unchanged and return false.
     bool tryInsertAndEncode(Bucket& bucket, BucketContents& contents);
 
+    // Returns true if the suffix group is now empty after removal.
+    // Sets `actually_removed` to true if the entry was found and removed.
     bool removeFromChain(uint32_t bi, uint64_t suffix,
-                         uint64_t packed_version, uint32_t id);
+                         uint64_t packed_version, uint32_t id,
+                         bool& actually_removed);
 
     bool updateIdInChain(uint32_t bi, uint64_t suffix,
                          uint64_t packed_version, uint32_t old_id, uint32_t new_id,
