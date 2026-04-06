@@ -3508,3 +3508,153 @@ TEST(ReadWriteDHT, PruneAddCycleWithExtensions) {
     EXPECT_EQ(pvs[1], 120u);  // logical 60
 }
 
+// ===========================================================================
+// Reads after prune: verify get / findFirst / findFirstBounded still work
+// ===========================================================================
+
+// After pruning, findFirst must return the newest surviving version.
+TEST(ReadWriteDHT, ReadAfterPruneReturnsLatest) {
+    ReadWriteDeltaHashTable dht;
+    uint64_t hkey = H("rkey");
+    // Add versions 10..100 (packed = logical << 1).
+    for (int v = 1; v <= 10; ++v) {
+        dht.addEntry(hkey, static_cast<uint64_t>(v * 10) << 1,
+                     static_cast<uint32_t>(v));
+    }
+    // Prune: keep snapshots at 50 and 100.
+    std::vector<uint64_t> snaps = {50, 100};
+    dht.pruneStaleVersions(snaps);
+
+    uint64_t pv;
+    uint32_t id;
+    ASSERT_TRUE(dht.findFirst(hkey, pv, id));
+    EXPECT_EQ(pv >> 1, 100u) << "findFirst must return newest version";
+}
+
+// findFirstBounded after prune: bounded reads must still resolve.
+TEST(ReadWriteDHT, ReadBoundedAfterPrune) {
+    ReadWriteDeltaHashTable dht;
+    uint64_t hkey = H("bkey");
+    for (int v = 1; v <= 10; ++v) {
+        dht.addEntry(hkey, static_cast<uint64_t>(v * 10) << 1,
+                     static_cast<uint32_t>(v));
+    }
+    // Snapshots at 35, 75, 100 → keep versions 30, 70, 100.
+    std::vector<uint64_t> snaps = {35, 75, 100};
+    dht.pruneStaleVersions(snaps);
+
+    uint64_t pv;
+    uint32_t id;
+    // Bounded by packed 75<<1 = 150. Latest version <= 75 → logical 70.
+    ASSERT_TRUE(dht.findFirstBounded(hkey, 75 << 1, pv, id));
+    EXPECT_EQ(pv >> 1, 70u);
+
+    // Bounded by packed 40<<1 = 80. Latest version <= 40 → logical 30.
+    ASSERT_TRUE(dht.findFirstBounded(hkey, 40 << 1, pv, id));
+    EXPECT_EQ(pv >> 1, 30u);
+
+    // Bounded by packed 20<<1 = 40. No version ≤ 20 survives → not found.
+    EXPECT_FALSE(dht.findFirstBounded(hkey, 20 << 1, pv, id));
+}
+
+// ===========================================================================
+// Tombstone handling in dedup
+// ===========================================================================
+
+// Tombstones are kept when they're the latest visible version.
+TEST(ReadWriteDHT, PruneTombstoneAsLatest) {
+    ReadWriteDeltaHashTable dht;
+    uint64_t hkey = H("tkey");
+    // Version 10 put (packed = 20), version 20 tombstone (packed = 41).
+    dht.addEntry(hkey, 20, 1);   // put at logical 10
+    dht.addEntry(hkey, 41, 2);   // tombstone at logical 20
+
+    std::vector<uint64_t> snaps = {25};  // latest = 25
+    size_t removed = dht.pruneStaleVersions(snaps);
+    EXPECT_EQ(removed, 1u);  // put at logical 10 pruned
+
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
+    ASSERT_EQ(pvs.size(), 1u);
+    EXPECT_EQ(pvs[0], 41u) << "tombstone must survive as latest";
+}
+
+// Mix of puts and tombstones across versions — prune keeps the
+// correct one per snapshot.
+TEST(ReadWriteDHT, PruneMixedPutsAndTombstones) {
+    ReadWriteDeltaHashTable dht;
+    uint64_t hkey = H("mkey");
+    // v1=put(2), v2=tombstone(5), v3=put(6), v4=tombstone(9), v5=put(10)
+    dht.addEntry(hkey, 2, 1);   // put at logical 1
+    dht.addEntry(hkey, 5, 2);   // tombstone at logical 2
+    dht.addEntry(hkey, 6, 3);   // put at logical 3
+    dht.addEntry(hkey, 9, 4);   // tombstone at logical 4
+    dht.addEntry(hkey, 10, 5);  // put at logical 5
+    ASSERT_EQ(dht.size(), 5u);
+
+    // Snapshot at 2, 4, 5 → keep tombstone@2 (snap 2), tombstone@4 (snap 4), put@5 (snap 5).
+    std::vector<uint64_t> snaps = {2, 4, 5};
+    size_t removed = dht.pruneStaleVersions(snaps);
+    EXPECT_EQ(removed, 2u);  // put@1 and put@3 pruned
+
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
+    ASSERT_EQ(pvs.size(), 3u);
+    // Desc order: put@5(10), tombstone@4(9), tombstone@2(5)
+    EXPECT_EQ(pvs[0], 10u);
+    EXPECT_EQ(pvs[1], 9u);
+    EXPECT_EQ(pvs[2], 5u);
+}
+
+// Delete-then-rewrite: key deleted, then re-put. After prune,
+// only the latest put survives.
+TEST(ReadWriteDHT, PruneDeleteThenRewrite) {
+    ReadWriteDeltaHashTable dht;
+    uint64_t hkey = H("drkey");
+    dht.addEntry(hkey, 2, 1);   // put at logical 1
+    dht.addEntry(hkey, 5, 2);   // tombstone at logical 2
+    dht.addEntry(hkey, 6, 3);   // put at logical 3 (re-create)
+
+    std::vector<uint64_t> snaps = {10};  // latest only
+    dht.pruneStaleVersions(snaps);
+
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
+    ASSERT_EQ(pvs.size(), 1u);
+    EXPECT_EQ(pvs[0], 6u) << "only the latest put survives";
+}
+
+// After pruning a key down to just a tombstone, findFirst still
+// returns the tombstone (reads must see the delete).
+TEST(ReadWriteDHT, ReadAfterPruneToTombstone) {
+    ReadWriteDeltaHashTable dht;
+    uint64_t hkey = H("rtkey");
+    dht.addEntry(hkey, 2, 1);   // put at logical 1
+    dht.addEntry(hkey, 5, 2);   // tombstone at logical 2
+
+    std::vector<uint64_t> snaps = {5};
+    dht.pruneStaleVersions(snaps);
+
+    uint64_t pv;
+    uint32_t id;
+    ASSERT_TRUE(dht.findFirst(hkey, pv, id));
+    EXPECT_EQ(pv, 5u) << "tombstone must be readable via findFirst";
+    EXPECT_TRUE(pv & 1) << "low bit must indicate tombstone";
+}
+
+// Empty snapshots vector: pruneKeyVersionsDesc returns 0 (no-op).
+TEST(ReadWriteDHT, PruneWithEmptySnapshots) {
+    ReadWriteDeltaHashTable dht;
+    uint64_t hkey = H("ekey");
+    for (int v = 1; v <= 5; ++v) {
+        dht.addEntry(hkey, static_cast<uint64_t>(v) << 1, static_cast<uint32_t>(v));
+    }
+    std::vector<uint64_t> empty;
+    size_t removed = dht.pruneStaleVersions(empty);
+    EXPECT_EQ(removed, 0u);
+    EXPECT_EQ(dht.size(), 5u);
+}
+

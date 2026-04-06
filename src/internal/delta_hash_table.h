@@ -186,8 +186,9 @@ protected:
 
     // Split a key's version list: encode the max fitting prefix into
     // `bucket`, leave the rest in `key` for the next extension.
-    void splitKeyAcrossBucket(KeyEntry& key, Bucket& bucket,
-                               const std::function<Bucket*(Bucket&)>& createExtFn);
+    // Split a key's version list: encode the max fitting prefix into
+    // `bucket`, leave the rest in `key` for the caller to place.
+    void splitKeyAcrossBucket(KeyEntry& key, Bucket& bucket);
 
     // --- Bulk helpers ---
 

@@ -846,3 +846,51 @@ TEST_F(ConcurrencyTest, WriteBatchSameVersionUnderConcurrency) {
         }
     }
 }
+
+// Iterator must see a consistent snapshot while a writer overwrites
+// the same keys (triggers dedup-on-put) and deletes keys concurrently.
+TEST_F(ConcurrencyTest, IteratorStableDuringOverwritesAndDeletes) {
+    // Pre-populate 200 keys.
+    for (int i = 0; i < 200; ++i) {
+        ASSERT_TRUE(db_.put("k" + std::to_string(i),
+                            "v0_" + std::to_string(i)).ok());
+    }
+
+    // Create iterator at this snapshot.
+    std::unique_ptr<kvlite::Iterator> iter;
+    ASSERT_TRUE(db_.createIterator(iter).ok());
+
+    // Concurrent writer: overwrite first 100 keys, delete next 50.
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        int round = 1;
+        while (!stop.load(std::memory_order_relaxed)) {
+            for (int i = 0; i < 100; ++i) {
+                db_.put("k" + std::to_string(i),
+                        "v" + std::to_string(round) + "_" + std::to_string(i));
+            }
+            for (int i = 100; i < 150; ++i) {
+                db_.remove("k" + std::to_string(i));
+            }
+            ++round;
+        }
+    });
+
+    // Iterate: must see ALL 200 original keys with their original values.
+    std::map<std::string, std::string> seen;
+    std::string key, value;
+    while (iter->next(key, value).ok()) {
+        seen[key] = value;
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    writer.join();
+
+    EXPECT_EQ(seen.size(), 200u) << "iterator must see all pre-populated keys";
+    for (int i = 0; i < 200; ++i) {
+        std::string k = "k" + std::to_string(i);
+        ASSERT_TRUE(seen.count(k)) << "missing key " << k;
+        EXPECT_EQ(seen[k], "v0_" + std::to_string(i))
+            << "iterator must see original value for " << k;
+    }
+}

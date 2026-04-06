@@ -249,9 +249,7 @@ bool DeltaHashTable::removeFromChain(uint32_t bi, uint64_t suffix,
 
 // --- splitKeyAcrossBucket ---
 
-void DeltaHashTable::splitKeyAcrossBucket(
-        KeyEntry& key, Bucket& bucket,
-        const std::function<Bucket*(Bucket&)>& /*createExtFn*/) {
+void DeltaHashTable::splitKeyAcrossBucket(KeyEntry& key, Bucket& bucket) {
     // Binary search for the max version count that fits alone.
     size_t lo = 1, hi = key.packed_versions.size();
     while (lo < hi) {
@@ -323,7 +321,7 @@ Bucket* DeltaHashTable::insertKeyIntoExtChain(
 
         // If the key is alone in the bucket, split its version list.
         if (tc.keys.size() == 1) {
-            splitKeyAcrossBucket(remaining, *target, createExtFn);
+            splitKeyAcrossBucket(remaining, *target);
             // Advance to next extension for the remaining versions.
             Bucket* next = nextBucketMut(*target);
             if (!next) next = createExtFn(*target);

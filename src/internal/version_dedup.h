@@ -14,9 +14,11 @@ namespace internal {
 // latestVersion).
 //
 // Input:
-//   versions    — per-entry logical versions, sorted ascending.
-//   snapshots   — observation points, sorted ascending. Must include
-//                 latestVersion() as the last element.
+//   versions    — per-entry *logical* versions (no tombstone bit),
+//                 sorted ascending.
+//   snapshots   — observation points (logical versions), sorted
+//                 ascending, non-empty. Must include latestVersion()
+//                 as the last element (caller's responsibility).
 //
 // Output:
 //   keep        — boolean per entry. true = keep, false = eliminate.
@@ -62,20 +64,22 @@ inline void dedupVersionGroup(
     }
 }
 
-// Prune stale versions from a KeyEntry whose packed_versions are
-// sorted descending (newest first).  Keeps only versions visible at
-// the given snapshot observation points.
+// Prune stale versions from packed_versions sorted descending (newest
+// first).  packed_versions[i] = (logical_version << 1) | tombstone_bit.
+// The tombstone bit is ignored for comparison — a tombstone is kept
+// if its logical version is the latest visible at some snapshot.
 //
 // Single-pass sweep: walk pvs left→right (desc), snapshots right→left
-// (desc).  For each snapshot the first pv whose logical version ≤
-// snapshot is kept; all others are dropped.  pvs[0] is always kept
-// (serves latestVersion, which is snapshots.back()).
+// (desc).  For each pv, consume all snapshots whose observation
+// point ≥ this version's logical value.  Keep the pv if it serves
+// at least one snapshot.
 //
-// Modifies key.packed_versions and key.ids in-place.
+// Modifies packed_versions and ids in-place.
 // Returns the number of entries removed.
 //
 // Requires: snapshots sorted ascending, non-empty (must include
-// latestVersion as the last element).
+// latestVersion as the last element).  If snapshots is empty, returns
+// 0 (no-op).
 inline size_t pruneKeyVersionsDesc(
     std::vector<uint64_t>& packed_versions,
     std::vector<uint32_t>& ids,
