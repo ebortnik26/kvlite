@@ -100,6 +100,10 @@ private:
     bool addImpl(uint32_t bi, uint64_t suffix,
                  uint64_t packed_version, uint32_t id);
 
+    // Prune one primary bucket's full chain. Must hold bucket_locks_[bi].
+    size_t prunePrimaryBucketChain(uint32_t bi,
+                                    const std::vector<uint64_t>& snapshots);
+
     std::unique_ptr<Spinlock[]> bucket_locks_;
     BucketArena ext_arena_owned_;
     std::atomic<size_t> size_{0};

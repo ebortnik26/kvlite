@@ -16,13 +16,19 @@
 
 namespace fs = std::filesystem;
 
-enum class DedupMode { Inline, Daemon, Neither };
+// Inline     — flush dedup on, daemon off, GC on (baseline: flush handles it)
+// Daemon     — flush dedup off, daemon on (1s), GC on
+// DaemonOnly — flush dedup off, daemon on (1s), GC DISABLED
+//              (proves the daemon alone handles dedup — no help from flush or GC)
+// Neither    — flush dedup off, daemon off, GC on (GC does all the work)
+enum class DedupMode { Inline, Daemon, DaemonOnly, Neither };
 
 static const char* modeName(DedupMode m) {
     switch (m) {
-        case DedupMode::Inline:  return "Inline";
-        case DedupMode::Daemon:  return "Daemon";
-        case DedupMode::Neither: return "Neither";
+        case DedupMode::Inline:     return "Inline";
+        case DedupMode::Daemon:     return "Daemon";
+        case DedupMode::DaemonOnly: return "DaemonOnly";
+        case DedupMode::Neither:    return "Neither";
     }
     return "?";
 }
@@ -39,11 +45,18 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
     kvlite::Options opts;
     opts.create_if_missing = true;
     opts.memtable_size = 1 * 1024 * 1024;  // 1MB — forces frequent flushes
-    opts.gc_interval_sec = 2;
     opts.gc_threshold = 0.1;
     opts.savepoint_interval_sec = 5;
     opts.dedup_on_put = (mode == DedupMode::Inline);
-    opts.version_prune_interval_sec = (mode == DedupMode::Daemon) ? 1 : 0;
+    // DaemonOnly disables GC entirely so the daemon is the sole deduper.
+    if (mode == DedupMode::DaemonOnly) {
+        opts.gc_policy = kvlite::GCPolicy::MANUAL;  // no auto-GC
+        opts.gc_interval_sec = 0;
+    } else {
+        opts.gc_interval_sec = 2;
+    }
+    opts.version_prune_interval_sec =
+        (mode == DedupMode::Daemon || mode == DedupMode::DaemonOnly) ? 1 : 0;
     ASSERT_TRUE(db.open(test_dir.string(), opts).ok());
 
     const int kNumKeys = 256;
@@ -118,7 +131,8 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
               << "Prune runs:        " << stats.prune_count << "\n"
               << std::endl;
 
-    if (mode == DedupMode::Inline || mode == DedupMode::Daemon) {
+    if (mode == DedupMode::Inline || mode == DedupMode::Daemon ||
+        mode == DedupMode::DaemonOnly) {
         EXPECT_LT(versions_per_key, 10.0)
             << modeName(mode) << " dedup should bound versions per key";
     }
@@ -132,7 +146,8 @@ TEST_P(VersionDedupTest, RotatingSnapshotsLimitVersions) {
 
 INSTANTIATE_TEST_SUITE_P(
     DedupModes, VersionDedupTest,
-    ::testing::Values(DedupMode::Inline, DedupMode::Daemon, DedupMode::Neither),
+    ::testing::Values(DedupMode::Inline, DedupMode::Daemon,
+                      DedupMode::DaemonOnly, DedupMode::Neither),
     [](const ::testing::TestParamInfo<DedupMode>& info) {
         return modeName(info.param);
     });

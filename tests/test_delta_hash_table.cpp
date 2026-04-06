@@ -3388,3 +3388,123 @@ TEST(ReadWriteDHT, PruneStaleVersionsLeavesSingleVersionKeysAlone) {
     EXPECT_EQ(dht.size(), before);
 }
 
+// Keys whose versions span extension buckets must be pruned correctly
+// across the whole chain.
+TEST(ReadWriteDHT, PruneStaleVersionsAcrossExtensionChain) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 64;   // tiny → forces extensions after ~10 versions
+    ReadWriteDeltaHashTable dht(cfg);
+
+    uint64_t hkey = H("longkey");
+    const int N = 80;
+    for (int v = 1; v <= N; ++v) {
+        dht.addEntry(hkey, static_cast<uint64_t>(v) << 1, static_cast<uint32_t>(v));
+    }
+    ASSERT_GT(dht.extCount(), 0u) << "test setup: chain should have extensions";
+    ASSERT_EQ(dht.size(), static_cast<size_t>(N));
+
+    // Snapshots at logical 10, 40, 80 → keep 3 versions.
+    std::vector<uint64_t> snapshots = {10, 40, 80};
+    size_t removed = dht.pruneStaleVersions(snapshots);
+    EXPECT_EQ(removed, static_cast<size_t>(N - 3));
+
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
+    ASSERT_EQ(pvs.size(), 3u);
+    // pvs desc: logical 80, 40, 10 → packed 160, 80, 20
+    EXPECT_EQ(pvs[0], 160u);
+    EXPECT_EQ(pvs[1], 80u);
+    EXPECT_EQ(pvs[2], 20u);
+}
+
+// Multiple keys sharing a bucket chain: pruning each one independently
+// in the correct extension bucket.
+TEST(ReadWriteDHT, PruneStaleVersionsMultipleKeysAcrossExtensions) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 96;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    // Find 3 keys mapping to the same primary bucket.
+    std::vector<uint64_t> hkeys;
+    for (int k = 0; k < 2000 && hkeys.size() < 3; ++k) {
+        uint64_t h = H("mk_" + std::to_string(k));
+        if (hkeys.empty() ||
+            (h >> (64 - cfg.bucket_bits)) ==
+                (hkeys[0] >> (64 - cfg.bucket_bits))) {
+            hkeys.push_back(h);
+        }
+    }
+    ASSERT_EQ(hkeys.size(), 3u);
+
+    // 30 versions each → forces extensions.
+    for (auto h : hkeys) {
+        for (int v = 1; v <= 30; ++v) {
+            dht.addEntry(h, static_cast<uint64_t>(v) << 1, static_cast<uint32_t>(v));
+        }
+    }
+    ASSERT_GT(dht.extCount(), 0u);
+    ASSERT_EQ(dht.size(), 90u);
+
+    // Keep 2 versions per key (snapshot 15, latest 30).
+    std::vector<uint64_t> snapshots = {15, 30};
+    size_t removed = dht.pruneStaleVersions(snapshots);
+    EXPECT_EQ(removed, 3u * 28u);  // 28 stale versions per key × 3 keys
+    EXPECT_EQ(dht.size(), 6u);
+
+    // Each key must still resolve correctly.
+    for (auto h : hkeys) {
+        std::vector<uint64_t> pvs;
+        std::vector<uint32_t> ids;
+        ASSERT_TRUE(dht.findAll(h, pvs, ids));
+        ASSERT_EQ(pvs.size(), 2u);
+        EXPECT_EQ(pvs[0], 60u);  // logical 30
+        EXPECT_EQ(pvs[1], 30u);  // logical 15
+    }
+}
+
+// Add → prune → re-add cycle on a chain with extensions: the bitmap
+// must be re-set after a prune clears it, and subsequent re-adds with
+// stale versions must be prunable again.
+TEST(ReadWriteDHT, PruneAddCycleWithExtensions) {
+    ReadWriteDeltaHashTable::Config cfg;
+    cfg.bucket_bits = 4;
+    cfg.bucket_bytes = 64;
+    ReadWriteDeltaHashTable dht(cfg);
+
+    uint64_t hkey = H("cycle_key");
+
+    // Round 1: insert 50 versions, prune down to 2.
+    for (int v = 1; v <= 50; ++v) {
+        dht.addEntry(hkey, static_cast<uint64_t>(v) << 1, static_cast<uint32_t>(v));
+    }
+    ASSERT_GT(dht.extCount(), 0u);
+
+    std::vector<uint64_t> snaps1 = {25, 50};
+    dht.pruneStaleVersions(snaps1);
+    EXPECT_EQ(dht.size(), 2u);
+
+    // Second prune with same snapshots → no-op (bit was cleared).
+    EXPECT_EQ(dht.pruneStaleVersions(snaps1), 0u);
+
+    // Round 2: add 30 more versions, prune again with new snapshots.
+    for (int v = 51; v <= 80; ++v) {
+        dht.addEntry(hkey, static_cast<uint64_t>(v) << 1, static_cast<uint32_t>(v));
+    }
+    ASSERT_EQ(dht.size(), 32u);
+
+    std::vector<uint64_t> snaps2 = {60, 80};
+    size_t removed = dht.pruneStaleVersions(snaps2);
+    EXPECT_GT(removed, 0u);
+    EXPECT_EQ(dht.size(), 2u);
+
+    std::vector<uint64_t> pvs;
+    std::vector<uint32_t> ids;
+    ASSERT_TRUE(dht.findAll(hkey, pvs, ids));
+    ASSERT_EQ(pvs.size(), 2u);
+    EXPECT_EQ(pvs[0], 160u);  // logical 80
+    EXPECT_EQ(pvs[1], 120u);  // logical 60
+}
+

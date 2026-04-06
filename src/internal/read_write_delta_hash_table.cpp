@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
 
 #include "internal/version_dedup.h"
 
@@ -187,34 +188,109 @@ size_t ReadWriteDeltaHashTable::pruneStaleVersions(
         if (!duplicates_.test(bi)) continue;
 
         SpinlockGuard guard(bucket_locks_[bi]);
-
-        bool still_multi = false;
-        Bucket* bucket = &buckets_[bi];
-        while (bucket) {
-            auto contents = codec_.decodeBucket(*bucket);
-            bool dirty = false;
-            for (auto& key : contents.keys) {
-                if (key.packed_versions.size() > 1) {
-                    size_t r = pruneKeyVersionsDesc(
-                        key.packed_versions, key.ids, snapshots);
-                    if (r > 0) {
-                        total_removed += r;
-                        dirty = true;
-                    }
-                    if (key.packed_versions.size() > 1) still_multi = true;
-                }
-            }
-            if (dirty) codec_.encodeBucket(*bucket, contents);
-            bucket = nextBucketMut(*bucket);
-        }
-
-        if (!still_multi) duplicates_.clear(bi);
+        total_removed += prunePrimaryBucketChain(bi, snapshots);
     }
 
     if (total_removed > 0) {
         size_.fetch_sub(total_removed, std::memory_order_relaxed);
     }
     return total_removed;
+}
+
+// Merge all chain buckets into a single flat BucketContents, with each
+// suffix appearing exactly once (versions merged desc across the chain).
+static BucketContents mergeChain(const std::vector<BucketContents>& chain) {
+    std::map<uint64_t, KeyEntry> merged;  // keyed by suffix, sorted asc
+    for (const auto& c : chain) {
+        for (const auto& key : c.keys) {
+            auto& dst = merged[key.suffix];
+            if (dst.packed_versions.empty()) {
+                dst.suffix = key.suffix;
+                dst.packed_versions = key.packed_versions;
+                dst.ids = key.ids;
+            } else {
+                // Merge two desc-sorted lists.
+                std::vector<uint64_t> out_pvs;
+                std::vector<uint32_t> out_ids;
+                size_t a = 0, b = 0;
+                const auto& ap = dst.packed_versions;
+                const auto& ai = dst.ids;
+                const auto& bp = key.packed_versions;
+                const auto& bi_ = key.ids;
+                out_pvs.reserve(ap.size() + bp.size());
+                out_ids.reserve(ai.size() + bi_.size());
+                while (a < ap.size() && b < bp.size()) {
+                    if (ap[a] >= bp[b]) { out_pvs.push_back(ap[a]); out_ids.push_back(ai[a]); ++a; }
+                    else                { out_pvs.push_back(bp[b]); out_ids.push_back(bi_[b]); ++b; }
+                }
+                while (a < ap.size()) { out_pvs.push_back(ap[a]); out_ids.push_back(ai[a]); ++a; }
+                while (b < bp.size()) { out_pvs.push_back(bp[b]); out_ids.push_back(bi_[b]); ++b; }
+                dst.packed_versions = std::move(out_pvs);
+                dst.ids = std::move(out_ids);
+            }
+        }
+    }
+    BucketContents flat;
+    flat.keys.reserve(merged.size());
+    for (auto& [suffix, key] : merged) flat.keys.push_back(std::move(key));
+    return flat;
+}
+
+// Prune stale versions across one primary bucket's full chain.
+// Decode chain → merge → prune → re-encode into primary + extensions.
+// Must hold bucket_locks_[bi].
+size_t ReadWriteDeltaHashTable::prunePrimaryBucketChain(
+        uint32_t bi, const std::vector<uint64_t>& snapshots) {
+    // Decode the chain into a list of buckets.
+    std::vector<BucketContents> chain;
+    std::vector<Bucket*> chain_buckets;
+    for (Bucket* b = &buckets_[bi]; b; b = nextBucketMut(*b)) {
+        chain_buckets.push_back(b);
+        chain.push_back(codec_.decodeBucket(*b));
+    }
+
+    // Merge into a single flat contents.
+    BucketContents flat = mergeChain(chain);
+
+    // Prune each key against the snapshot set.
+    size_t removed = 0;
+    bool still_multi = false;
+    for (auto& key : flat.keys) {
+        if (key.packed_versions.size() > 1) {
+            removed += pruneKeyVersionsDesc(key.packed_versions, key.ids, snapshots);
+            if (key.packed_versions.size() > 1) still_multi = true;
+        }
+    }
+
+    if (removed == 0) {
+        if (!still_multi) duplicates_.clear(bi);
+        return 0;
+    }
+
+    // Re-encode flat into the chain: fill primary, overflow to
+    // existing extensions.  Chain length is sufficient since we only
+    // removed entries.
+    size_t chain_idx = 0;
+    BucketContents cur;
+    for (auto& key : flat.keys) {
+        cur.keys.push_back(std::move(key));
+        if (codec_.contentsBitsNeeded(cur) > codec_.bucketDataBits()) {
+            auto overflow = std::move(cur.keys.back());
+            cur.keys.pop_back();
+            codec_.encodeBucket(*chain_buckets[chain_idx++], cur);
+            cur.keys.clear();
+            cur.keys.push_back(std::move(overflow));
+        }
+    }
+    codec_.encodeBucket(*chain_buckets[chain_idx++], cur);
+    // Clear any remaining (now-unused) extension buckets.
+    BucketContents empty;
+    while (chain_idx < chain_buckets.size()) {
+        codec_.encodeBucket(*chain_buckets[chain_idx++], empty);
+    }
+
+    if (!still_multi) duplicates_.clear(bi);
+    return removed;
 }
 
 // --- Stats ---

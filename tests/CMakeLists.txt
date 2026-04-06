@@ -318,7 +318,7 @@ add_test(NAME iterator_tests COMMAND kvlite_int_iterator)
 add_test(NAME db_tests COMMAND kvlite_int_db)
 add_test(NAME gc_daemon_tests COMMAND kvlite_int_gc_daemon)
 add_test(NAME version_dedup_tests COMMAND kvlite_int_version_dedup)
-set_tests_properties(version_dedup_tests PROPERTIES TIMEOUT 180)
+set_tests_properties(version_dedup_tests PROPERTIES TIMEOUT 300)
 
 # Concurrency tests — split into two halves for parallel runs (~50s each).
 add_test(NAME concurrency_1 COMMAND kvlite_int_concurrency
