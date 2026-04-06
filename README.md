@@ -86,6 +86,7 @@ int main() {
 - [Architecture](blogs/architecture.md) — segments, lineage, two-level indexing, flush and GC pipelines
 - [Crash Recovery](blogs/crash-recovery.md) — storage-embedded lineage, recovery algorithm, crash scenarios
 - [DHT Internals](blogs/dht-internals.md) — bucket encoding, columnar codec, concurrency model
+- [Version Dedup](blogs/version-dedup.md) — snapshot-aware pruning at flush, GC, and background daemon
 
 ## License
 
